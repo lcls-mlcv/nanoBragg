@@ -1,0 +1,31 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Clean",
+            "detail": "Remove all build artifacts from the build directory to prepare for a fresh build.",
+            "type": "shell",
+            "command": "make",
+            "args": ["clean"],
+            "group": "build",
+            "problemMatcher": []
+        },
+        {
+            "label": "Build All",
+            "detail": "Build both debug and release versions of the project using the Makefile (with verbose compiler output).",
+            "type": "shell",
+            "command": "make",
+            "args": ["all"],
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        },
+        {
+            "label": "ReBuild All",
+            "detail": "Clean the project first, then build both debug and release versions for a complete rebuild (with verbose compiler output).",
+            "dependsOn": ["Clean", "Build All"],
+            "dependsOrder": "sequence",
+            "group": "build",
+            "problemMatcher": ["$gcc"]
+        }
+    ]
+}

@@ -1,4 +1,4 @@
-/* perfect-lattice nanocrystal diffraction simulator            -James Holton and Ken Frankel           8-10-25
+/* perfect-lattice nanocrystal diffraction simulator            -James Holton and Ken Frankel           9-17-17
 
 example:
 
@@ -61,6 +61,10 @@ so detector distances should always be much larger than the crystal size
 #include <time.h>
 #include <limits.h>
 #include <float.h>
+#include "nanotypes.h"
+#include "nanoBraggCPU.h"
+#include "nanoBraggCUDA.h"
+
 #ifndef NAN
 #define NAN strtod("NAN",NULL)
 #endif
@@ -71,40 +75,6 @@ so detector distances should always be much larger than the crystal size
 
 /* read in text file into double arrays at provided addresses */
 size_t read_text_file(char *filename, size_t nargs, ... );
-
-/* cubic spline interpolation functions */
-void polint(double *xa, double *ya, double x, double *y);
-void polin2(double *x1a, double *x2a, double **ya, double x1,double x2, double *y);
-void polin3(double *x1a, double *x2a, double *x3a, double ***ya, double x1,double x2, double x3, double *y);
-
-
-
-/* rotate a 3-vector in space applied in order phix,phiy,phiz*/
-double *rotate(double *v, double *newv, double phix, double phiy, double phiz);
-/* rotate a 3-vector about a unit vector axis */
-double *rotate_axis(double *v, double *newv, double *axis, double phi);
-/* rotate a 3-vector using a 9-element unitary matrix */
-double *rotate_umat(double *v, double *newv, double *umat);
-
-/* vector cross product where vector magnitude is 0th element */
-double *cross_product(double *x, double *y, double *z);
-/* vector inner product where vector magnitude is 0th element */
-double dot_product(double *x, double *y);
-/* compute difference between two vectors */
-double vector_diff(double *vector, double *origin_vector, double *new_vector);
-/* measure magnitude of vector and put it in 0th element */
-double magnitude(double *vector);
-/* scale the magnitude of a vector */
-double vector_scale(double *vector, double *new_vector, double scale);
-/* force the magnitude of vector to given value */
-double vector_rescale(double *vector, double *new_vector, double magnitude);
-/* make a unit vector pointing in same direction and report magnitude (both args can be same vector) */
-double unitize(double *vector, double *new_unit_vector);
-
-
-/* polarization factor from vectors */
-double polarization_factor(double kahn_factor, double *incident, double *diffracted, double *axis);
-
 
 /* generate unit vector in random direction */
 float uniform3Ddev(float *dx, float *dy, float *dz, long *idum);
@@ -124,13 +94,6 @@ float triangledev(long *idum);
 float expdev(long *idum);
 /* random deviate with uniform distribution */
 float ran1(long *idum);
-
-/* Fourier transform of a truncated lattice */
-double sincg(double x, double N);
-/* Fourier transform of a sphere */
-double sinc3(double x);
-/* Fourier transform of a spherically-truncated lattice */
-double sinc_conv_sinc3(double x);
 
 
 /* file stuff */
@@ -152,10 +115,6 @@ FILE *infile = NULL;
 FILE *Fdumpfile = NULL;
 FILE *outfile = NULL;
 FILE *stoloutfile = NULL;
-
-typedef enum { SAMPLE, BEAM } pivot;
-typedef enum { SQUARE, ROUND, GAUSS, TOPHAT } shapetype;
-typedef enum { CUSTOM, ADXV, MOSFLM, XDS, DIALS, DENZO } convention;
 
 /* frame handling routines */
 typedef struct _SMVinfo
@@ -185,7 +144,7 @@ int main(int argc, char** argv)
     int progress_meter=1;
     int babble=1;
     int printout = 0;
-    int printout_spixel=-1,printout_fpixel=-1;
+    int printout_spixel,printout_fpixel=-1;
 
     /* x-ray beam properties */
     double beam_vector[4]  = {0,1,0,0};
@@ -220,7 +179,7 @@ int main(int argc, char** argv)
     double reciprocal_pixel_size;
 
     shapetype xtal_shape = SQUARE;
-    double hrad_sqr,rad_star_sqr,fudge=1;
+    double hrad_sqr,fudge=1;
     double sample_x   = 0;              /* m */
     double sample_y   = 0;              /* m */
     double sample_z   = 0;              /* m */
@@ -241,7 +200,7 @@ int main(int argc, char** argv)
     double distance = 100.0e-3;
     double detsize_f = 102.4e-3;
     double detsize_s = 102.4e-3;
-    double detector_mu=-1.0,detector_thick=0.0,detector_thickstep=-1.0,parallax,capture_fraction;
+    double detector_mu=0.0,detector_thick=0.0,detector_thickstep,parallax,capture_fraction;
     int    detector_thicksteps=-1,thick_tic;
     double fdet_vector[4]  = {0,0,0,1};
     double sdet_vector[4]  = {0,0,-1,0};
@@ -295,9 +254,6 @@ int main(int argc, char** argv)
     int steps;
     int roi_xmin=-1,roi_xmax=-1,roi_ymin=-1,roi_ymax=-1;
     int oversample = -1,recommended_oversample,subS,subF;
-    int oversample_thick = 0;
-    int oversample_polar = 0;
-    int oversample_omega = 0;
     double subpixel_size;
 
     /* spindle */
@@ -330,16 +286,15 @@ int main(int argc, char** argv)
 
     /* image file data */
     float *floatimage;
-    int imgidx;
     SMVinfo maskfile;
     unsigned short int *maskimage = NULL;
 //    float *sinimage;
 //    float *cosimage;
-    unsigned short int *intimage = NULL;
-    unsigned char *pgmimage = NULL;
+    unsigned short int *intimage;
+    unsigned char *pgmimage;
     char *byte_order = get_byte_order();
     SMVinfo imginfile;
-    float *imginfileimage = NULL;
+    float *imginfileimage;
 
     /* misc variables */
     int i,j,n;
@@ -355,7 +310,6 @@ int main(int argc, char** argv)
     seed = -time((time_t *)0);
 //    printf("random number seed = %u\n",seed);
     long mosaic_seed = -12345678;
-    long misset_seed = seed;
 
     /* interpolation arrays */
     int interpolate = 2;
@@ -450,10 +404,10 @@ int main(int argc, char** argv)
             if(! isnan(test)) twotheta = test/RTD;
 
             maskimage = (unsigned short int*) calloc(pixels+10,sizeof(unsigned short int));
-            imgidx = maskfile.header_size / sizeof(unsigned short int);
+            j = maskfile.header_size / sizeof(unsigned short int);
             for(i=0;i<pixels;++i){
-                maskimage[i] = (float) maskfile.mmapdata[imgidx];
-                 ++imgidx;
+                maskimage[i] = (float) maskfile.mmapdata[j];
+                 ++j;
             }
         }
     }
@@ -493,10 +447,10 @@ int main(int argc, char** argv)
             if(! isnan(test)) twotheta = test/RTD;
 
             imginfileimage = (float *) calloc(pixels+10,sizeof(float));
-            imgidx = imginfile.header_size / sizeof(unsigned short int);
+            j = imginfile.header_size / sizeof(unsigned short int);
             for(i=0;i<pixels;++i){
-                imginfileimage[i] = (float) imginfile.mmapdata[imgidx];
-                 ++imgidx;
+                imginfileimage[i] = (float) imginfile.mmapdata[j];
+                 ++j;
             }
         }
     }
@@ -511,22 +465,18 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-Na") && (argc > (i+1)))
             {
                 Na = atoi(argv[i+1]);
-                continue;
             }
             if(strstr(argv[i], "-Nb") && (argc > (i+1)))
             {
                 Nb = atoi(argv[i+1]);
-                continue;
             }
             if(strstr(argv[i], "-Nc") && (argc > (i+1)))
             {
                 Nc = atoi(argv[i+1]);
-                continue;
             }
             if(0==strcmp(argv[i], "-N") && (argc > (i+1)))
             {
                 Na = Nb = Nc = atoi(argv[i+1]);
-                continue;
             }
             if(strstr(argv[i], "-cell") && (argc > (i+1)))
             {
@@ -571,7 +521,7 @@ int main(int argc, char** argv)
                 sample_y = atof(argv[i+1])/1000;
                 sample_z = atof(argv[i+1])/1000;
             }
-            if((strstr(argv[i], "-sample_thick") || strstr(argv[i], "-sample_x") ) && (argc > (i+1)))
+            if((strstr(argv[i], "-sample_thick") || strstr(argv[i], "-sample_x") || strstr(argv[i], "-thick")) && (argc > (i+1)))
             {
                 sample_x = atof(argv[i+1])/1000;
             }
@@ -589,7 +539,7 @@ int main(int argc, char** argv)
                 sample_y = atof(argv[i+1])/1000;
                 sample_z = atof(argv[i+1])/1000;
             }
-            if((strstr(argv[i], "-xtal_thick") || strstr(argv[i], "-xtal_x") ) && (argc > (i+1)))
+            if((strstr(argv[i], "-xtal_thick") || strstr(argv[i], "-xtal_x") || strstr(argv[i], "-thick")) && (argc > (i+1)))
             {
                 sample_x = atof(argv[i+1])/1000;
             }
@@ -757,10 +707,6 @@ int main(int argc, char** argv)
             {
                 detector_thicksteps = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-thicksteps") && (argc >= (i+1)))
-            {
-                detector_thicksteps = atoi(argv[i+1]);
-            }
             if(strstr(argv[i], "-twotheta") && (argc > (i+1)))
             {
                 detector_twotheta = atof(argv[i+1])/RTD;
@@ -795,11 +741,11 @@ int main(int argc, char** argv)
             {
                 fpixels = spixels = atoi(argv[i+1]);
             }
-            if((strstr(argv[i], "-detpixels_f") || strstr(argv[i], "-detpixels_x")) && (argc > (i+1)))
+            if(strstr(argv[i], "-detpixels_f") && (argc > (i+1)))
             {
                 fpixels = atoi(argv[i+1]);
             }
-            if((strstr(argv[i], "-detpixels_s") || strstr(argv[i], "-detpixels_y")) && (argc > (i+1)))
+            if(strstr(argv[i], "-detpixels_s") && (argc > (i+1)))
             {
                 spixels = atoi(argv[i+1]);
             }
@@ -823,21 +769,6 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-nopolar") )
             {
                 nopolar = 1;
-            }
-            if(strstr(argv[i], "-oversample_thick") )
-            {
-                oversample_thick = 1;
-                continue;
-            }
-            if(strstr(argv[i], "-oversample_polar") )
-            {
-                oversample_polar = 1;
-                continue;
-            }
-            if(strstr(argv[i], "-oversample_omega") )
-            {
-                oversample_omega = 1;
-                continue;
             }
             if(strstr(argv[i], "-oversample") && (argc > (i+1)))
             {
@@ -967,10 +898,6 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-default_F") && (argc > (i+1)))
             {
                 default_F = atof(argv[i+1]);
-            }
-            if(strstr(argv[i], "-dump") && (argc > (i+1)))
-            {
-                dumpfilename = argv[i+1];
             }
             if(strstr(argv[i], "-img") && (argc > (i+1)))
             {
@@ -1103,10 +1030,6 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-mosaic_seed") && (argc > (i+1)))
             {
                 mosaic_seed = -atoi(argv[i+1]);
-            }
-            if(strstr(argv[i], "-misset_seed") && (argc > (i+1)))
-            {
-                misset_seed = -atoi(argv[i+1]);
             }
             if(strstr(argv[i], "-water") && (argc > (i+1)))
             {
@@ -1286,38 +1209,26 @@ int main(int argc, char** argv)
 
     if(hklfilename == NULL && Fdumpfile == NULL && default_F == 0.0 || matfilename == NULL && a[0] == 0.0){
         printf("usage: nanoBragg -mat auto.mat -hkl Fs.hkl\n");
-        printf("options:\n");
+        printf("options:\n");\
         printf("\t-mat filename.mat\tmosflm-style matrix file containing three reciprocal unit cell vectors\n");
         printf("\t-hkl filename.hkl\ttext file containing h, k, l and F for P1 unit cell\n");
-        printf("\t-misset 10 20 30 \talternative to mat file: crystal rotations about x,y,z axes (degrees)\n");
-        printf("\t-misset random   \talternative to mat file: random orientation\n");
-        printf("\t-cell a b c al be ga\talternative to mat file: specify crystal unit cell (Angstroms and degrees)\n");
-        printf("\t-default_F       \talternative to -hkl: assign all unspecified structure factors (default: 0)\n");
         printf("\t-distance        \tdistance from origin to detector center in mm\n");
         printf("\t-detsize         \tdetector size in mm.  may also use -detsize_f -detsize_s\n");
         printf("\t-detpixels       \tdetector size in pixels.  may also use -detpixels_x -detpixels_y\n");
         printf("\t-pixel           \tdetector pixel size in mm.\n");
-        printf("\t-img header.img  \tattempt to initialize camera parameters from an ADSC img header\n");
-        printf("\t-mask mask.img   \tuse ADSC img file full of 0 or non-0 values as a mask\n");
         printf("\t-detector_absorb \tdetector sensor material attenuation depth (um) (default: \"inf\" to save time)\n");
         printf("\t-detector_thick  \tdetector sensor thickness (um)\n");
         printf("\t-detector_thicksteps\tnumber of layers of detector sensor material. Default: 1\n");
         printf("\t-Xbeam           \timage fast coordinate of direct-beam spot (mm). (default: center)\n");
         printf("\t-Ybeam           \timage slow coordinate of direct-beam spot (mm). (default: center)\n");
-        printf("\t-mosflm          \tuse MOSFLM's direct-beam convention, same as -denzo. (default: adxv)\n");
+        printf("\t-mosflm          \tuse MOSFLM's direct-beam convention. (default: adxv)\n");
         printf("\t-xds             \tuse XDS detector origin convention. (default: adxv)\n");
-        printf("\t-ORGX  -ORGY     \tXDS-convention beam center\n");
         printf("\t-twotheta        \trotation of detector about spindle axis (deg). (default: 0)\n");
         printf("\t-N               \tnumber of unit cells in all directions. may also use -Na -Nb or -Nc\n");
-        printf("\t-xtalsize        \talternative to -N: specify crystal full width (mm)\n");
         printf("\t-square_xtal     \tspecify parallelpiped crystal shape (default)\n");
         printf("\t-round_xtal      \tspecify ellipsoidal crystal shape (sort of)\n");
-        printf("\t-gauss_xtal      \tGaussian-shaped spots: no inter-Bragg maxima\n");
         printf("\t-tophat_spots    \tclip lattice transform at fwhm: no inter-Bragg maxima\n");
         printf("\t-oversample      \tnumber of sub-pixels per pixel. use this if xtalsize/lambda > distance/pixel\n");
-        printf("\t-oversample_thick \tre-calculate thickness effect for sub-pixels (not the default)\n");
-        printf("\t-oversample_polar \tre-calculate polarization effect for sub-pixels (not the default)\n");
-        printf("\t-oversample_omega \tre-calculate solid-angle effect for sub-pixels (not the default)\n");
         printf("\t-lambda          \tincident x-ray wavelength in Angstrom. may also use -energy in eV\n");
         printf("\t-mosaic          \tisotropic mosaic spread in degrees (use 90 for powder)\n");
         printf("\t-mosaic_domains  \tnumber of randomly-oriented mosaic domains to render\n");
@@ -1335,21 +1246,11 @@ int main(int argc, char** argv)
         printf("\t-floatfile       \tname of binary output file (4-byte floats)\n");
         printf("\t-intfile         \tname of noiseless smv-formatted output file (not on absolute scale by default)\n");
         printf("\t-scale           \tscale factor to apply to intfile (default: autoscale)\n");
-        printf("\t-adc             \toffset to apply to output img file pixels (default: %g)\n",adc_offset);
-        printf("\t-polar           \tspecify Kahn polarization factor (default: %g)\n",polar);
         printf("\t-noisefile       \tname of photon-scale smv-formatted output file (with Poisson noise)\n");
-        printf("\t-pgmfile         \tname of 8-bit portable greymap format output file\n");
-        printf("\t-pgmscale        \trelative scale of pgm file (default: auto)\n");
-        printf("\t-nopgm           \tdo not write pgm file\n");
         printf("\t-roi             \tonly render part of the image: xmin xmax ymin ymax\n");
         printf("\t-printout        \tprint pixel values out to the screen\n");
-        printf("\t-seed            \tspecify random-number seed for noisefile (default, initialize with time)\n");
-        printf("\t-mosaic_seed     \tspecify random-number seed for mosaic domain generation (default: 1234567)\n");
-        printf("\t-misset_seed     \tspecify random-number seed for crystal orentaiton when -misset random (default, same as -seed)\n");
+        printf("\t-seed            \tspecify random-number seed for noisefile\n");
         printf("\t-fluence         \tincident beam intensity for photon-counting statistics (photons/m^2)\n");
-        printf("\t-flux            \talternative to -fluence, specify flux, along with -beamsize and -exposure (photons/s)\n");
-        printf("\t-beamsize        \talternative to -fluence, specify beam size, along with -flux and -exposure (default: %g mm)\n",beamsize*1000);
-        printf("\t-exposure        \talternative to -fluence, specify flux, along with -flux and -beamsize (default: %g s)\n", exposure);
         printf("\t-nonoise         \tdisable generating the noisefile\n");
         printf("\t-noprogress      \tturn off the progress meter\n");
         printf("\t-nopolar         \tturn off the polarization correction\n");
@@ -1629,12 +1530,6 @@ int main(int argc, char** argv)
             }
         }
     }
-    if(detector_thick > 0.0 && detector_mu < 0.0)
-    {
-        /* detector mu was not initialized */
-        detector_mu = 1.0/detector_thick;
-        printf("WARNING: setting detector attenuation depth to %g m\n",detector_mu);
-    }
 
     if(mosaic_domains <= 0){
         /* auto-select number of domains */
@@ -1899,7 +1794,7 @@ int main(int argc, char** argv)
     if(misset[0] == -1.0)
     {
         /* use spherical cap as sphere to generate random orientation in umat */
-        mosaic_rotation_umat(90.0, umat, &misset_seed);
+        mosaic_rotation_umat(90.0, umat, &seed);
         /* get the missetting angles, in case we want to use them again on -misset option */
         umat2misset(umat,misset);
         printf("random orientation misset angles: %f %f %f deg\n",misset[1]*RTD,misset[2]*RTD,misset[3]*RTD);
@@ -2418,20 +2313,15 @@ int main(int argc, char** argv)
     for(source=0;source<sources;++source){
 
         /* retrieve stuff from cache */
-        X = vector[1] = source_X[source];
-        Y = vector[2] = source_Y[source];
-        Z = vector[3] = source_Z[source];
+        X = source_X[source];
+        Y = source_Y[source];
+        Z = source_Z[source];
         I = source_I[source];
         lambda = source_lambda[source];
 
-        /* make sure these are unit vectors */
-        unitize(vector,vector);
-        source_X[source] = vector[1];
-        source_Y[source] = vector[2];
-        source_Z[source] = vector[3];
-
         printf("%g %g %g   %g %g\n",X,Y,Z,I,lambda);
     }
+
 
     /* allocate enough space */
     mosaic_umats = (double *) calloc(mosaic_domains+10,9*sizeof(double));
@@ -2447,7 +2337,7 @@ int main(int argc, char** argv)
             mosaic_umats[6]=0.0;mosaic_umats[7]=0.0;mosaic_umats[8]=1.0;
         }
 //      printf("%d diagonal %f %f %f\n",mos_tic,mosaic_umats[mos_tic*9],mosaic_umats[mos_tic*9+4],mosaic_umats[mos_tic*9+8]);
-//        printf("%d by: %f deg\n",mos_tic,acos((mosaic_umats[mos_tic*9]+mosaic_umats[mos_tic*9+4]+mosaic_umats[mos_tic*9+8]-1)/2)*RTD);
+//      printf("%d by: %f deg\n",mos_tic,acos((mosaic_umats[mos_tic*9]+mosaic_umats[mos_tic*9+4]+mosaic_umats[mos_tic*9+8]-1)/2)*RTD);
 //      umat2misset(mosaic_umats+9*mos_tic,mosaic_missets);
 //      printf("%d by: %f %f %f deg\n",mos_tic,mosaic_missets[1]*RTD,mosaic_missets[2]*RTD,mosaic_missets[3]*RTD);
 //      printf("%f %f %f\n",mos_tic,*(mosaic_umats+9*mos_tic+0),*(mosaic_umats+9*mos_tic+1),*(mosaic_umats+9*mos_tic+2));
@@ -2477,7 +2367,6 @@ int main(int argc, char** argv)
     if(point_pixel) printf("  pixel obliquity effect disabled\n");
     printf("  incident fluence: %lg photons/m^2\n",fluence);
     printf("  distance=%lg detsize=%lgx%lg  pixel=%lg meters (%dx%d pixels)\n",distance,detsize_f,detsize_s,pixel_size,fpixels,spixels);
-    printf("  sensor is %lg m thick in %d layers with mu= %lg\n",detector_thick,detector_thicksteps,detector_mu);
     printf("  Xbeam=%lg Ybeam=%lg\n",Xbeam,Ybeam);
     printf("  Fbeam=%lg Sbeam=%lg\n",Fbeam,Sbeam);
     printf("  Xclose=%lg Yclose=%lg\n",Xclose,Yclose);
@@ -2497,11 +2386,7 @@ int main(int argc, char** argv)
     printf("  %d sources\n",sources);
     printf("  %d mosaic domains over mosaic spread of %g degrees\n",mosaic_domains,mosaic_spread*RTD);
     printf("  %d phi steps from %g to %g degrees\n",phisteps,phi0*RTD,(phi0+osc)*RTD);
-    printf("  %dx%d pixel oversample steps",oversample,oversample);
-    if(oversample_thick) printf(" +thick");
-    if(oversample_polar) printf(" +polar");
-    if(oversample_omega) printf(" +omega");
-    printf("\n");
+    printf("  %dx%d pixel oversample steps\n",oversample,oversample);
     if(maskimage != NULL) printf("  skipping zero-flagged pixels in %s\n",maskfilename);
 //    printf("  coherent source: %d\n",coherent);
     if(calculate_noise){
@@ -2510,10 +2395,6 @@ int main(int argc, char** argv)
         printf("  water droplet size: %g m\n",water_size);
     }
 
-    /* pre-calculaate background from something amorphous */
-    F_bg = water_F;
-    I_bg = F_bg*F_bg*r_e_sqr*fluence*water_size*water_size*water_size*1e6*Avogadro/water_MW;
-
 
     /* sweep over detector */
     sum = sumsqr = 0.0;
@@ -2521,573 +2402,13 @@ int main(int argc, char** argv)
     progress_pixel = 0;
     omega_sum = 0.0;
 
-#if defined(_OPENMP)
-//    omp_set_num_threads(72);
-#endif
+	nanoBraggSpotsCUDA(spixels, fpixels, roi_xmin, roi_xmax, roi_ymin, roi_ymax, oversample, point_pixel, pixel_size, subpixel_size, steps, detector_thickstep,
+		detector_thicksteps, detector_thick, detector_mu, sdet_vector, fdet_vector, odet_vector, pix0_vector, curved_detector, distance, close_distance, beam_vector,
+		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
+		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,
+		interpolate, Fhkl, h_min, h_max, h_range, k_min, k_max, k_range, l_min, l_max, l_range, hkls, nopolar, polar_vector, polarization, fudge, maskimage,
+		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/);
 
-
-int debug_printed_thread = 0;
-int debug_printed = 0;
-    #pragma omp parallel for \
-    schedule(auto) \
-    private(fpixel,spixel)\
-    firstprivate(imgidx,subS,subF,Fdet,Sdet,Fdet0,Sdet0,Odet,stol,twotheta,\
-        theta,vector,newvector,pixel_pos,\
-        airpath,source_path,lambda,\
-        diffracted,diffracted0,d_r,incident,scattering,parallax,\
-        fdet_vector,sdet_vector,odet_vector,beam_vector,pix0_vector,polar_vector,spindle_vector,\
-        hdiv_tic,vdiv_tic,disp_tic,mos_tic,phi_tic,thick_tic,source,\
-        phi,\
-        phi0,osc,phistep,phisteps,\
-        a,b,c,ap,bp,cp,a_star,b_star,c_star,a_cross_b,b_cross_c,c_cross_a,\
-        h,k,l,h0,k0,l0,h0_flr,k0_flr,l0_flr,\
-        h_interp,k_interp,l_interp,h_interp_d,k_interp_d,l_interp_d,hrad_sqr,rad_star_sqr,\
-        i1,i2,i3,\
-        Ewald0,Ewald,relp,\
-        xd,yd,zd,xd0,yd0,zd0,\
-        capture_fraction,\
-        I,I_bg,F_bg,\
-        F_cell,F_latt,polar,omega_pixel,\
-        test,i,sub_Fhkl,\
-        Fhkl,\
-        debug_printed_thread)\
-    shared(debug_printed,\
-        floatimage,maskimage,\
-        fpixels,spixels,pixels,pixel_size,subpixel_size,\
-        oversample,oversample_thick,oversample_polar,oversample_omega,\
-        Xbeam,Ybeam,\
-        interpolate,integral_form,curved_detector,\
-        polarization,nopolar,\
-        point_pixel,coherent,babble,\
-        distance,close_distance,\
-        source_X,source_Y,source_Z,source_lambda,\
-        sources,\
-        progress_meter,progress_pixels,\
-        a0,b0,c0,V_cell,\
-        Na,Nb,Nc,\
-        h_min,h_max,h_range,k_min,k_max,k_range,l_min,l_max,l_range,hkls,\
-        dmin,\
-        xtal_shape,fudge,\
-        fluence,r_e_sqr,\
-        lambda0,dispersion,dispstep,dispsteps,\
-        source_distance,\
-        default_F,water_F,water_size,water_MW,\
-        steps,\
-        hdiv,hdivrange,hdivstep,hdivsteps,vdiv,vdivrange,vdivstep,vdivsteps,round_div,\
-        mosaic_spread,mosaic_umats,mosaic_domains,\
-        detector_thick,detector_thickstep,detector_thicksteps,detector_mu,\
-        roi_xmin,roi_xmax,roi_ymin,roi_ymax,\
-        max_I,max_I_x,max_I_y,\
-        printout,printout_fpixel,printout_spixel,stdout)\
-     reduction(+:sum,sumsqr,sumn,omega_sum,progress_pixel)\
-     default(none)
-    for(spixel=0;spixel<spixels;++spixel)
-    {
-
-#if defined(_OPENMP)
-//if(! debug_printed) {
-//    debug_printed = 1;
-//    printf("OMP: %d of %d threads\n", omp_get_thread_num(),omp_get_num_threads());
-//}
-if(! debug_printed_thread) {
-    /* avoid memory contention: make a copy of each dynamically-allocated array for each thread *
-    double *newptr;
-    double **newpptr;
-    double ***newFhkl;
-    newptr = (double *) calloc((h_range+1)*(k_range+1)*(l_range+1),sizeof(double));
-    newpptr = (double **) calloc((h_range+1)*(k_range+1),sizeof(double *));
-    newFhkl = (double ***) calloc((h_range+1),sizeof(double **));
-    for (h0=0; h0<=h_range;h0++) {
-        newFhkl[h0] = newpptr;
-        for (k0=0; k0<=k_range;k0++) {
-            newFhkl[h0][k0] = newptr;
-            memcpy(newptr,*(*(Fhkl +h0)+k0),(l_range+1)*sizeof(double));
-            newptr += l_range+1;
-        }
-        ++newpptr;
-    }
-    Fhkl = newFhkl;
-    /* */
-//    newptr = (double *) calloc(sources+10,sizeof(double));
-//    memcpy(newptr,source_X,sources*sizeof(double));
-//    source_X = newptr;
-//    newptr = (double *) calloc(sources+10,sizeof(double));
-//    memcpy(newptr,source_Y,sources*sizeof(double));
-//    source_Y = newptr;
-//    newptr = (double *) calloc(sources+10,sizeof(double));
-//    memcpy(newptr,source_Z,sources*sizeof(double));
-//    source_Z = newptr;
-//    newptr = (double *) calloc(sources+10,sizeof(double));
-//    memcpy(newptr,source_lambda,sources*sizeof(double));
-//    source_lambda = newptr;
-//    newptr = (double *) calloc(mosaic_domains+10,9*sizeof(double));
-//    memcpy(newptr,mosaic_umats,9*mosaic_domains*sizeof(double));
-//    printf("thread: %d mosaic_umats = %p\n", omp_get_thread_num(),mosaic_umats);
-//    mosaic_umats = newptr;
-//    printf("thread: %d mosaic_umats = %p\n", omp_get_thread_num(),mosaic_umats);
-    debug_printed_thread = 1;
-}
-    if(interpolate){
-//        printf("re-allocating sub_Fhkl on thread %d\n",omp_get_thread_num());
-        sub_Fhkl = (double***) calloc(6,sizeof(double**));
-        for (h0=0; h0<=5;h0++) {
-            *(sub_Fhkl +h0) = (double**) calloc(6,sizeof(double*));
-            for (k0=0; k0<=5;k0++) {
-                *(*(sub_Fhkl +h0)+k0) = (double*) calloc(6,sizeof(double));
-            }
-        }
-    }
-
-#endif
-
-        for(fpixel=0;fpixel<fpixels;++fpixel)
-        {
-            /* allow for just one part of detector to be rendered */
-            if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
-            {
-                continue;
-            }
-
-            /* position in pixel array */
-            imgidx = spixel*fpixels+fpixel;
-
-            /* allow for the use of a mask */
-            if(maskimage != NULL)
-            {
-                /* skip any flagged pixels in the mask */
-                if(maskimage[imgidx] == 0)
-                {
-                    continue;
-                }
-            }
-
-            /* reset uncorrected photon count for this pixel */
-            I = I_bg;
-
-            /* reset polarization factor, in case we want to cache it */
-            polar = 0.0;
-            if (nopolar) polar = 1.0;
-
-            /* reset pixel solid angle, in case we want to cache it */
-            omega_pixel = 0.0;
-
-            /* add this now to avoid problems with skipping later? */
-//            floatimage[imgidx] = I_bg;
-
-            /* loop over detector layers */
-            for(thick_tic=0;thick_tic<detector_thicksteps;++thick_tic)
-            {
-                /* assume "distance" is to the front of the detector sensor layer */
-                Odet = thick_tic*detector_thickstep;
-
-                /* reset capture fraction, in case we want to cache it */
-                capture_fraction = 0.0;
-                /* or if we are not modelling detector thickness */
-                if(detector_thick == 0.0) capture_fraction = 1.0;
-
-                /* loop over sub-pixels */
-                for(subS=0;subS<oversample;++subS)
-                {
-                    for(subF=0;subF<oversample;++subF)
-                    {
-                        /* absolute mm position on detector (relative to its origin) */
-                        Fdet = subpixel_size*(fpixel*oversample + subF ) + subpixel_size/2.0;
-                        Sdet = subpixel_size*(spixel*oversample + subS ) + subpixel_size/2.0;
-    //                  Fdet = pixel_size*fpixel;
-    //                  Sdet = pixel_size*spixel;
-
-                        /* construct detector subpixel position in 3D space */
-//                      pixel_X = distance;
-//                      pixel_Y = Sdet-Ybeam;
-//                      pixel_Z = Fdet-Xbeam;
-                        pixel_pos[1] = Fdet*fdet_vector[1]+Sdet*sdet_vector[1]+Odet*odet_vector[1]+pix0_vector[1];
-                        pixel_pos[2] = Fdet*fdet_vector[2]+Sdet*sdet_vector[2]+Odet*odet_vector[2]+pix0_vector[2];
-                        pixel_pos[3] = Fdet*fdet_vector[3]+Sdet*sdet_vector[3]+Odet*odet_vector[3]+pix0_vector[3];
-                        pixel_pos[0] = 0.0;
-                        if(curved_detector) {
-                            /* construct detector pixel that is always "distance" from the sample */
-                            vector[1] = distance*beam_vector[1];
-                            vector[2] = distance*beam_vector[2] ;
-                            vector[3] = distance*beam_vector[3];
-                            /* treat detector pixel coordinates as radians */
-                            rotate_axis(vector,newvector,sdet_vector,pixel_pos[2]/distance);
-                            rotate_axis(newvector,pixel_pos,fdet_vector,pixel_pos[3]/distance);
-//                          rotate(vector,pixel_pos,0,pixel_pos[3]/distance,pixel_pos[2]/distance);
-                        }
-                        /* construct the diffracted-beam unit vector to this sub-pixel */
-                        airpath = unitize(pixel_pos,diffracted);
-
-                        /* solid angle subtended by a pixel: (pix/airpath)^2*cos(2theta) */
-                        if(omega_pixel == 0.0 || oversample_omega)
-                        {
-                            /* this is either the first time for this pixel, or we are oversampling omega */
-                            omega_pixel = pixel_size*pixel_size/airpath/airpath*close_distance/airpath;
-                            /* option to turn off obliquity effect, inverse-square-law only */
-                            if(point_pixel) omega_pixel = 1.0/airpath/airpath;
-                        }
-                        /* keep track for final statistics */
-                        omega_sum += omega_pixel;
-
-                        /* now calculate detector thickness effects */
-                        if(capture_fraction == 0.0 || oversample_thick)
-                        {
-                            /* inverse of effective thickness increase */
-                            parallax = dot_product(diffracted,odet_vector);
-                            /* fraction of incoming photons absorbed by this detector layer */
-                            capture_fraction = exp(-thick_tic*detector_thickstep*detector_mu/parallax)
-                                              -exp(-(thick_tic+1)*detector_thickstep*detector_mu/parallax);
-                        }
-
-                        /* loop over sources now */
-                        for(source=0;source<sources;++source){
-
-                            /* retrieve stuff from cache */
-                            incident[1] = -source_X[source];
-                            incident[2] = -source_Y[source];
-                            incident[3] = -source_Z[source];
-                            lambda = source_lambda[source];
-
-                            /* construct the incident beam unit vector while recovering source distance */
-                            /* source arrays should already be unit vectors */
-//                            source_path = unitize(incident,incident);
-
-                            /* construct the scattering vector for this pixel */
-                            scattering[1] = (diffracted[1]-incident[1])/lambda;
-                            scattering[2] = (diffracted[2]-incident[2])/lambda;
-                            scattering[3] = (diffracted[3]-incident[3])/lambda;
-
-                            /* sin(theta)/lambda is half the scattering vector length */
-                            stol = 0.5*magnitude(scattering);
-
-                            /* rough cut to speed things up when we aren't using whole detector */
-                            if(dmin > 0.0 && stol > 0.0)
-                            {
-                                if(dmin > 0.5/stol)
-                                {
-                                    continue;
-                                }
-                            }
-
-                            /* we now have enough to fix the polarization factor */
-                            if (polar == 0.0 || oversample_polar)
-                            {
-                                /* need to compute polarization factor */
-                                polar = polarization_factor(polarization,incident,diffracted,polar_vector);
-                            }
-
-                            /* sweep over phi angles */
-                            for(phi_tic = 0; phi_tic < phisteps; ++phi_tic)
-                            {
-                                phi = phi0 + phistep*phi_tic;
-
-                                if( phi != 0.0 )
-                                {
-                                    /* rotate about spindle if neccesary */
-                                    rotate_axis(a0,ap,spindle_vector,phi);
-                                    rotate_axis(b0,bp,spindle_vector,phi);
-                                    rotate_axis(c0,cp,spindle_vector,phi);
-                                }
-
-                                /* enumerate mosaic domains */
-                                for(mos_tic=0;mos_tic<mosaic_domains;++mos_tic)
-                                {
-                                    /* apply mosaic rotation after phi rotation */
-                                    if( mosaic_spread > 0.0 )
-                                    {
-                                        rotate_umat(ap,a,&mosaic_umats[mos_tic*9]);
-                                        rotate_umat(bp,b,&mosaic_umats[mos_tic*9]);
-                                        rotate_umat(cp,c,&mosaic_umats[mos_tic*9]);
-                                    }
-                                    else
-                                    {
-                                        a[1]=ap[1];a[2]=ap[2];a[3]=ap[3];
-                                        b[1]=bp[1];b[2]=bp[2];b[3]=bp[3];
-                                        c[1]=cp[1];c[2]=cp[2];c[3]=cp[3];
-                                    }
-//                                  printf("%d %f %f %f\n",mos_tic,mosaic_umats[mos_tic*9+0],mosaic_umats[mos_tic*9+1],mosaic_umats[mos_tic*9+2]);
-//                                  printf("%d %f %f %f\n",mos_tic,mosaic_umats[mos_tic*9+3],mosaic_umats[mos_tic*9+4],mosaic_umats[mos_tic*9+5]);
-//                                  printf("%d %f %f %f\n",mos_tic,mosaic_umats[mos_tic*9+6],mosaic_umats[mos_tic*9+7],mosaic_umats[mos_tic*9+8]);
-
-                                    /* construct fractional Miller indicies */
-                                    h = dot_product(a,scattering);
-                                    k = dot_product(b,scattering);
-                                    l = dot_product(c,scattering);
-
-                                    /* round off to nearest whole index */
-                                    h0 = ceil(h-0.5);
-                                    k0 = ceil(k-0.5);
-                                    l0 = ceil(l-0.5);
-
-
-                                    /* structure factor of the lattice (paralelpiped crystal)
-                                        F_latt = sin(M_PI*Na*h)*sin(M_PI*Nb*k)*sin(M_PI*Nc*l)/sin(M_PI*h)/sin(M_PI*k)/sin(M_PI*l);
-                                    */
-                                    F_latt = 1.0;
-                                    if(xtal_shape == SQUARE)
-                                    {
-                                        /* xtal is a paralelpiped */
-                                        if(Na>1){
-                                            F_latt *= sincg(M_PI*h,Na);
-                                        }
-                                        if(Nb>1){
-                                            F_latt *= sincg(M_PI*k,Nb);
-                                        }
-                                        if(Nc>1){
-                                            F_latt *= sincg(M_PI*l,Nc);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        /* reciprocal-space distance */
-                                        double dx_star = (h-h0)*a_star[1] + (k-k0)*b_star[1] + (l-l0)*c_star[1];
-                                        double dy_star = (h-h0)*a_star[2] + (k-k0)*b_star[2] + (l-l0)*c_star[2];
-                                        double dz_star = (h-h0)*a_star[3] + (k-k0)*b_star[3] + (l-l0)*c_star[3];
-                                        rad_star_sqr = ( dx_star*dx_star + dy_star*dy_star + dz_star*dz_star )
-                                                       *Na*Na*Nb*Nb*Nc*Nc;
-                                    }
-                                    if(xtal_shape == ROUND)
-                                    {
-                                       /* radius in hkl space, squared */
-                                        hrad_sqr = (h-h0)*(h-h0)*Na*Na + (k-k0)*(k-k0)*Nb*Nb + (l-l0)*(l-l0)*Nc*Nc ;
-
-                                         /* use sinc3 for elliptical xtal shape,
-                                           correcting for sqrt of volume ratio between cube and sphere */
-                                        F_latt = Na*Nb*Nc*0.723601254558268*sinc3(M_PI*sqrt( hrad_sqr * fudge ) );
-                                    }
-                                    if(xtal_shape == GAUSS)
-                                    {
-                                        /* fudge the radius so that volume and FWHM are similar to square_xtal spots */
-                                        F_latt = Na*Nb*Nc*exp(-( rad_star_sqr / 0.63 * fudge ));
-                                    }
-                                    if(xtal_shape == TOPHAT)
-                                    {
-                                        /* make a flat-top spot of same height and volume as square_xtal spots */
-                                        F_latt = Na*Nb*Nc*(rad_star_sqr*fudge < 0.3969 );
-                                    }
-                                    /* no need to go further if result will be zero? */
-                                    if(F_latt == 0.0 && water_size == 0.0) continue;
-
-
-                                    /* find nearest point on Ewald sphere surface? */
-                                    if( integral_form )
-                                    {
-
-                                        if( phi != 0.0 || mos_tic > 0 )
-                                        {
-                                            /* need to re-calculate reciprocal matrix */
-
-                                            /* various cross products */
-                                            cross_product(a,b,a_cross_b);
-                                            cross_product(b,c,b_cross_c);
-                                            cross_product(c,a,c_cross_a);
-
-                                            /* new reciprocal-space cell vectors */
-                                            vector_scale(b_cross_c,a_star,1e20/V_cell);
-                                            vector_scale(c_cross_a,b_star,1e20/V_cell);
-                                            vector_scale(a_cross_b,c_star,1e20/V_cell);
-                                        }
-
-                                        /* reciprocal-space coordinates of nearest relp */
-                                        relp[1] = h0*a_star[1] + k0*b_star[1] + l0*c_star[1];
-                                        relp[2] = h0*a_star[2] + k0*b_star[2] + l0*c_star[2];
-                                        relp[3] = h0*a_star[3] + k0*b_star[3] + l0*c_star[3];
-//                                      d_star = magnitude(relp)
-
-                                        /* reciprocal-space coordinates of center of Ewald sphere */
-                                        Ewald0[1] = -incident[1]/lambda/1e10;
-                                        Ewald0[2] = -incident[2]/lambda/1e10;
-                                        Ewald0[3] = -incident[3]/lambda/1e10;
-//                                      1/lambda = magnitude(Ewald0)
-
-                                        /* distance from Ewald sphere in lambda=1 units */
-                                        vector[1] = relp[1]-Ewald0[1];
-                                        vector[2] = relp[2]-Ewald0[2];
-                                        vector[3] = relp[3]-Ewald0[3];
-                                        d_r = magnitude(vector)-1.0;
-
-                                        /* unit vector of diffracted ray through relp */
-                                        unitize(vector,diffracted0);
-
-                                        /* intersection with detector plane */
-                                        xd = dot_product(fdet_vector,diffracted0);
-                                        yd = dot_product(sdet_vector,diffracted0);
-                                        zd = dot_product(odet_vector,diffracted0);
-
-                                        /* where does the central direct-beam hit */
-                                        xd0 = dot_product(fdet_vector,incident);
-                                        yd0 = dot_product(sdet_vector,incident);
-                                        zd0 = dot_product(odet_vector,incident);
-
-                                        /* convert to mm coordinates */
-                                        Fdet0 = distance*(xd/zd) + Xbeam;
-                                        Sdet0 = distance*(yd/zd) + Ybeam;
-
-                                        //printf("GOTHERE %g %g   %g %g\n",Fdet,Sdet,Fdet0,Sdet0);
-                                        test = exp(-( (Fdet-Fdet0)*(Fdet-Fdet0)+(Sdet-Sdet0)*(Sdet-Sdet0) + d_r*d_r )/1e-8);
-                                    } // end of integral form
-
-
-                                    /* structure factor of the unit cell */
-                                    if(interpolate){
-                                        h0_flr = floor(h);
-                                        k0_flr = floor(k);
-                                        l0_flr = floor(l);
-
-
-                                        if ( ((h-h_min+3)>h_range) ||
-                                             (h-2<h_min)           ||
-                                             ((k-k_min+3)>k_range) ||
-                                             (k-2<k_min)           ||
-                                             ((l-l_min+3)>l_range) ||
-                                             (l-2<l_min)  ) {
-                                            if(babble){
-                                                babble=0;
-                                                printf ("WARNING: out of range for three point interpolation: h,k,l,h0,k0,l0: %g,%g,%g,%d,%d,%d \n", h,k,l,h0,k0,l0);
-                                                printf("WARNING: further warnings will not be printed! ");
-                                            }
-                                            F_cell = default_F;
-                                            interpolate=0;
-                                        }
-                                    }
-
-                                    /* only interpolate if it is safe */
-                                    if(interpolate){
-
-                                        /* integer versions of nearest HKL indicies */
-                                        h_interp[0]=h0_flr-1;
-                                        h_interp[1]=h0_flr;
-                                        h_interp[2]=h0_flr+1;
-                                        h_interp[3]=h0_flr+2;
-                                        k_interp[0]=k0_flr-1;
-                                        k_interp[1]=k0_flr;
-                                        k_interp[2]=k0_flr+1;
-                                        k_interp[3]=k0_flr+2;
-                                        l_interp[0]=l0_flr-1;
-                                        l_interp[1]=l0_flr;
-                                        l_interp[2]=l0_flr+1;
-                                        l_interp[3]=l0_flr+2;
-
-                                        /* polin function needs doubles */
-                                        h_interp_d[0] = (double) h_interp[0];
-                                        h_interp_d[1] = (double) h_interp[1];
-                                        h_interp_d[2] = (double) h_interp[2];
-                                        h_interp_d[3] = (double) h_interp[3];
-                                        k_interp_d[0] = (double) k_interp[0];
-                                        k_interp_d[1] = (double) k_interp[1];
-                                        k_interp_d[2] = (double) k_interp[2];
-                                        k_interp_d[3] = (double) k_interp[3];
-                                        l_interp_d[0] = (double) l_interp[0];
-                                        l_interp_d[1] = (double) l_interp[1];
-                                        l_interp_d[2] = (double) l_interp[2];
-                                        l_interp_d[3] = (double) l_interp[3];
-
-                                        /* now populate the "y" values (nearest four structure factors in each direction) */
-                                        for (i1=0;i1<4;i1++) {
-                                            for (i2=0;i2<4;i2++) {
-                                               for (i3=0;i3<4;i3++) {
-                                                      sub_Fhkl[i1][i2][i3]= Fhkl[h_interp[i1]-h_min][k_interp[i2]-k_min][l_interp[i3]-l_min];
-                                               }
-                                            }
-                                         }
-
-
-                                        /* run the tricubic polynomial interpolation */
-                                        polin3(h_interp_d,k_interp_d,l_interp_d,sub_Fhkl,h,k,l,&F_cell);
-                                    }
-
-                                    if(! interpolate)
-                                    {
-                                        if ( hkls && (h0<=h_max) && (h0>=h_min) && (k0<=k_max) && (k0>=k_min) && (l0<=l_max) && (l0>=l_min)  ) {
-                                            /* just take nearest-neighbor */
-                                            F_cell = Fhkl[h0-h_min][k0-k_min][l0-l_min];
-                                        }
-                                        else
-                                        {
-                                            F_cell = default_F;  // usually zero
-                                        }
-                                    }
-
-                                    /* now we have the structure factor for this pixel */
-
-                                    /* convert amplitudes into intensity (photons per steradian) */
-                                    I += F_cell*F_cell*F_latt*F_latt;
-                                    
-                                    /* only do this if we need to */
-                                    if(oversample_thick) I *= capture_fraction;
-                                    if(oversample_polar) I *= polar;
-                                    if(oversample_omega) I *= omega_pixel;
-                                }
-                                /* end of mosaic loop */
-                            }
-                            /* end of phi loop */
-                        }
-                        /* end of source loop */
-                    }
-                    /* end of sub-pixel y loop */
-                }
-                /* end of sub-pixel x loop */
-            }
-            /* end of detector thickness loop */
-
-            /* convert pixel intensity into photon units */
-            test = r_e_sqr*fluence*I/steps;
-
-            /* do the corrections now, if they haven't been applied already */
-            if(! oversample_thick) test *= capture_fraction;
-            if(! oversample_polar) test *= polar;
-            if(! oversample_omega) test *= omega_pixel;
-            floatimage[imgidx] += test;
-
-            /* now keep track of statistics */
-            if(floatimage[imgidx] > max_I) {
-                max_I = floatimage[imgidx];
-                max_I_x = Fdet;
-                max_I_y = Sdet;
-            }
-            sum += floatimage[imgidx];
-            sumsqr += floatimage[imgidx]*floatimage[imgidx];
-            ++sumn;
-
-            if( printout )
-            {
-                if((fpixel==printout_fpixel && spixel==printout_spixel) || printout_fpixel < 0)
-                {
-                    twotheta = atan2(sqrt(pixel_pos[2]*pixel_pos[2]+pixel_pos[3]*pixel_pos[3]),pixel_pos[1]);
-                    test = sin(twotheta/2.0)/(lambda0*1e10);
-                    printf("%4d %4d : stol = %g or %g\n", fpixel,spixel,stol,test);
-                    printf("at %g %g %g\n", pixel_pos[1],pixel_pos[2],pixel_pos[3]);
-                    printf("hkl= %f %f %f  hkl0= %d %d %d\n", h,k,l,h0,k0,l0);
-                    printf(" F_cell=%g  F_latt=%g   I = %g\n", F_cell,F_latt,I);
-                    printf("I/steps %15.10g\n", I/steps);
-                    printf("polar   %15.10g\n", polar);
-                    printf("omega   %15.10g\n", omega_pixel);
-                    printf("capfrac %15.10g\n", capture_fraction);
-                    printf("pixel   %15.10g\n", floatimage[imgidx]);
-                    printf("real-space cell vectors (Angstrom):\n");
-                    printf("     %-10s  %-10s  %-10s\n","a","b","c");
-                    printf("X: %11.8f %11.8f %11.8f\n",a[1]*1e10,b[1]*1e10,c[1]*1e10);
-                    printf("Y: %11.8f %11.8f %11.8f\n",a[2]*1e10,b[2]*1e10,c[2]*1e10);
-                    printf("Z: %11.8f %11.8f %11.8f\n",a[3]*1e10,b[3]*1e10,c[3]*1e10);
-                }
-            }
-            else
-            {
-                if(progress_meter && progress_pixels/100 > 0)
-                {
-                    if(progress_pixel % ( progress_pixels/20 ) == 0 ||
-                       ((10*progress_pixel<progress_pixels ||
-                         10*progress_pixel>9*progress_pixels) &&
-                        (progress_pixel % (progress_pixels/100) == 0)))
-                    {
-                        printf("%lu%% done\n",progress_pixel*100/progress_pixels);
-                        fflush(stdout);
-                    }
-                }
-            }
-
-            ++progress_pixel;
-        }
-    }
     printf("\n");
 
     printf("solid angle subtended by detector = %g steradian ( %g%% sphere)\n",omega_sum/steps,100*omega_sum/steps/4/M_PI);
@@ -3104,13 +2425,13 @@ if(! debug_printed_thread) {
         for(fpixel=0;fpixel<fpixels;++fpixel)
         {
             /* position in pixel array */
-            imgidx = spixel*fpixels+fpixel;
+            j = spixel*fpixels+fpixel;
 
             if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
             {
                 continue;
             }
-            test = floatimage[imgidx]-avg;
+            test = floatimage[j]-avg;
             sumsqr += test*test;
             ++sumn;
         }
@@ -3129,7 +2450,7 @@ if(! debug_printed_thread) {
     fclose(outfile);
 
     /* output as ints */
-    imgidx = 0;
+    j = 0;
     printf("max_I = %g  at %g %g\n",max_I,max_I_x,max_I_y);
     printf("mean= %g rms= %g rmsd= %g\n",avg,rms,rmsd);
     if(intfile_scale <= 0.0){
@@ -3147,13 +2468,13 @@ if(! debug_printed_thread) {
             }
 
             /* position in pixel array */
-            imgidx = spixel*fpixels+fpixel;
+            j = spixel*fpixels+fpixel;
 
-            test = floatimage[imgidx] *intfile_scale+adc_offset;
+            test = floatimage[j] *intfile_scale+adc_offset;
             if(test > 65535.0) test = 65535.0;
             if(test < 0.0) test = 0.0;
-            intimage[imgidx] = (unsigned short int) ( floorf(test+0.5) );
-//          printf("%d %d = %d\n",fpixel,spixel,intimage[imgidx]);
+            intimage[j] = (unsigned short int) ( floorf(test+0.5) );
+//          printf("%d %d = %d\n",fpixel,spixel,intimage[j]);
         }
     }
 
@@ -3187,26 +2508,26 @@ if(! debug_printed_thread) {
     if(write_pgm)
     {
         /* output as pgm */
-        imgidx = 0;
+        j = 0;
         if(pgm_scale <= 0.0){
             pgm_scale = intfile_scale;
             if(rmsd > 0.0) pgm_scale = 250.0/(5.0*rmsd);
         }
         printf("pgm_scale = %g\n",pgm_scale);
-        imgidx = 0;
+        j = 0;
         for(spixel=0;spixel<spixels;++spixel)
         {
             for(fpixel=0;fpixel<fpixels;++fpixel)
             {
                 if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
                 {
-                    ++imgidx; continue;
+                    ++j; continue;
                 }
-                test = floatimage[imgidx] * pgm_scale;
+                test = floatimage[j] * pgm_scale;
                 if(test > 255.0) test = 255.0;
-                pgmimage[imgidx] = (unsigned char) ( test );
-//              printf("%d %d = %d\n",fpixel,spixel,pgmimage[imgidx]);
-                ++imgidx;
+                pgmimage[j] = (unsigned char) ( test );
+//              printf("%d %d = %d\n",fpixel,spixel,pgmimage[j]);
+                ++j;
             }
         }
 
@@ -3230,7 +2551,7 @@ if(! debug_printed_thread) {
     }
 
     /* simulate Poisson noise */
-    imgidx = 0;
+    j = 0;
     sum = 0.0;
     overloads = 0;
     for(spixel=0;spixel<spixels;++spixel)
@@ -3239,9 +2560,9 @@ if(! debug_printed_thread) {
         {
             if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
             {
-                ++imgidx; continue;
+                ++j; continue;
             }
-            test = poidev( floatimage[imgidx], &seed );
+            test = poidev( floatimage[j], &seed );
             sum += test;
             test += adc_offset;
             if(test > 65535.0)
@@ -3249,9 +2570,9 @@ if(! debug_printed_thread) {
                 test = 65535.0;
                 ++overloads;
             }
-            intimage[imgidx] = (unsigned short int) test;
-//          printf("%d %d = %d\n",fpixel,spixel,intimage[imgidx]);
-            ++imgidx;
+            intimage[j] = (unsigned short int) test;
+//          printf("%d %d = %d\n",fpixel,spixel,intimage[j]);
+            ++j;
         }
     }
     printf("%.0f photons on noise image (%d overloads)\n",sum,overloads);
@@ -3284,128 +2605,6 @@ if(! debug_printed_thread) {
 
     return 0;
 }
-
-
-
-/* Fourier transform of a grating */
-double sincg(double x,double N) {
-    if(x==0.0) return N;
-
-    return sin(x*N)/sin(x);
-}
-
-/* Fourier transform of a sphere */
-double sinc3(double x) {
-    if(x==0.0) return 1.0;
-
-    return 3.0*(sin(x)/x-cos(x))/(x*x);
-}
-
-double sinc_conv_sinc3(double x) {
-    if(x==0.0) return 1.0;
-
-    return 3.0*(sin(x)-x*cos(x))/(x*x*x);
-}
-
-
-double *rotate(double *v, double *newv, double phix, double phiy, double phiz) {
-
-    double rxx,rxy,rxz,ryx,ryy,ryz,rzx,rzy,rzz;
-    double new_x,new_y,new_z,rotated_x,rotated_y,rotated_z;
-
-    new_x=v[1];
-    new_y=v[2];
-    new_z=v[3];
-
-    if(phix != 0){
-        /* rotate around x axis */
-        //rxx= 1;         rxy= 0;         rxz= 0;
-        ryx= 0;         ryy= cos(phix); ryz=-sin(phix);
-        rzx= 0;         rzy= sin(phix); rzz= cos(phix);
-
-        rotated_x = new_x;
-        rotated_y = new_y*ryy + new_z*ryz;
-        rotated_z = new_y*rzy + new_z*rzz;
-        new_x = rotated_x; new_y = rotated_y; new_z = rotated_z;
-    }
-
-    if(phiy != 0) {
-        /* rotate around y axis */
-        rxx= cos(phiy); rxy= 0;         rxz= sin(phiy);
-        //ryx= 0;         ryy= 1;         ryz= 0;
-        rzx=-sin(phiy); rzy= 0;         rzz= cos(phiy);
-
-        rotated_x = new_x*rxx + new_y*rxy + new_z*rxz;
-        rotated_y = new_y;
-        rotated_z = new_x*rzx + new_y*rzy + new_z*rzz;
-        new_x = rotated_x; new_y = rotated_y; new_z = rotated_z;
-    }
-
-    if(phiz != 0){
-        /* rotate around z axis */
-        rxx= cos(phiz); rxy=-sin(phiz); rxz= 0;
-        ryx= sin(phiz); ryy= cos(phiz); ryz= 0;
-        //rzx= 0;         rzy= 0;         rzz= 1;
-
-        rotated_x = new_x*rxx + new_y*rxy ;
-        rotated_y = new_x*ryx + new_y*ryy;
-        rotated_z = new_z;
-        new_x = rotated_x; new_y = rotated_y; new_z = rotated_z;
-    }
-
-    newv[1]=new_x;
-    newv[2]=new_y;
-    newv[3]=new_z;
-
-    return newv;
-}
-
-
-
-/* rotate a point about a unit vector axis */
-double *rotate_axis(double *v, double *newv, double *axis, double phi) {
-
-    double sinphi = sin(phi);
-    double cosphi = cos(phi);
-    double dot = (axis[1]*v[1]+axis[2]*v[2]+axis[3]*v[3])*(1.0-cosphi);
-    double temp[4];
-
-    temp[1] = axis[1]*dot+v[1]*cosphi+(-axis[3]*v[2]+axis[2]*v[3])*sinphi;
-    temp[2] = axis[2]*dot+v[2]*cosphi+(+axis[3]*v[1]-axis[1]*v[3])*sinphi;
-    temp[3] = axis[3]*dot+v[3]*cosphi+(-axis[2]*v[1]+axis[1]*v[2])*sinphi;
-    newv[1]=temp[1]; newv[2]=temp[2]; newv[3]=temp[3];
-
-    return newv;
-}
-
-
-
-/* rotate a vector using a 9-element unitary matrix */
-double *rotate_umat(double *v, double *newv, double umat[9]) {
-
-    double uxx,uxy,uxz,uyx,uyy,uyz,uzx,uzy,uzz;
-
-    /* for convenience, assign matrix x-y coordinate */
-    uxx = umat[0];
-    uxy = umat[1];
-    uxz = umat[2];
-    uyx = umat[3];
-    uyy = umat[4];
-    uyz = umat[5];
-    uzx = umat[6];
-    uzy = umat[7];
-    uzz = umat[8];
-
-    /* rotate the vector (x=1,y=2,z=3) */
-    newv[1] = uxx*v[1] + uxy*v[2] + uxz*v[3];
-    newv[2] = uyx*v[1] + uyy*v[2] + uyz*v[3];
-    newv[3] = uzx*v[1] + uzy*v[2] + uzz*v[3];
-
-    return newv;
-}
-
-
-
 
 /* returns a unit vector in a random direction in arguments dx,dy,dz */
 /* also returns a random magnitude within the unit sphere as a return value */
@@ -3611,8 +2810,6 @@ double *umat2misset(double umat[9],double *missets)
     return missets;
 }
 
-
-
 float poidev(float xm, long *idum)
 {
     float gammln(float xx);
@@ -3756,9 +2953,6 @@ float gammln(float xx)
 }
 
 
-
-
-
 /* returns a uniform random deviate between 0 and 1 */
 #define IA 16807
 #define IM 2147483647
@@ -3804,46 +2998,6 @@ float ran1(long *idum)
 }
 
 
-void polint(double *xa, double *ya, double x, double *y)
-{
-        double x0,x1,x2,x3;
-        x0 = (x-xa[1])*(x-xa[2])*(x-xa[3])*ya[0]/((xa[0]-xa[1])*(xa[0]-xa[2])*(xa[0]-xa[3]));
-        x1 = (x-xa[0])*(x-xa[2])*(x-xa[3])*ya[1]/((xa[1]-xa[0])*(xa[1]-xa[2])*(xa[1]-xa[3]));
-        x2 = (x-xa[0])*(x-xa[1])*(x-xa[3])*ya[2]/((xa[2]-xa[0])*(xa[2]-xa[1])*(xa[2]-xa[3]));
-        x3 = (x-xa[0])*(x-xa[1])*(x-xa[2])*ya[3]/((xa[3]-xa[0])*(xa[3]-xa[1])*(xa[3]-xa[2]));
-        *y = x0+x1+x2+x3;
-}
-
-
-
-void polin2(double *x1a, double *x2a, double **ya, double x1, double x2, double *y)
-{
-        void polint(double *xa, double *ya, double x, double *y);
-        int j;
-        double ymtmp[4];
-        for (j=1;j<=4;j++) {
-                polint(x2a,ya[j-1],x2,&ymtmp[j-1]);
-        }
-        polint(x1a,ymtmp,x1,y);
-}
-
-
-void polin3(double *x1a, double *x2a, double *x3a, double ***ya, double x1,
-        double x2, double x3, double *y)
-{
-        void polint(double *xa, double ya[], double x, double *y);
-        void polin2(double *x1a, double *x2a, double **ya, double x1,double x2, double *y);
-        void polin1(double *x1a, double *ya, double x1, double *y);
-        int j;
-        double ymtmp[4];
-
-        for (j=1;j<=4;j++) {
-            polin2(x2a,x3a,&ya[j-1][0],x2,x3,&ymtmp[j-1]);
-        }
-        polint(x1a,ymtmp,x1,y);
-}
-
-
 /* FWHM = integral = 1 */
 double ngauss2D(double x,double y)
 {
@@ -3853,14 +3007,6 @@ double ngauss2Dinteg(double x,double y)
 {
     return 0.125*(erf(2.*x*sqrt(log(2.)))*erf(y*sqrt(log(16.)))*sqrt(log(16.)/log(2.)));
 }
-
-
-
-
-
-
-
-
 
 /* read in multi-column text file to list of double arrays */
 /* provide address of undeclared arrays on command line */
@@ -3873,7 +3019,7 @@ size_t read_text_file(char *filename, size_t nargs, ... )
     const char numberstuf[] = "0123456789-+.EGeg";
 
     unsigned long line,lines;
-    unsigned long i,j;
+    unsigned long i,j,m;
     double value;
     double *data;
     double **pointer;
@@ -3966,135 +3112,6 @@ size_t read_text_file(char *filename, size_t nargs, ... )
     return lines;
 }
 
-
-
-/* measure magnitude of provided vector */
-double magnitude(double *vector) {
-
-    /* measure the magnitude */
-    vector[0] = sqrt(vector[1]*vector[1]+vector[2]*vector[2]+vector[3]*vector[3]);
-
-    return vector[0];
-}
-
-/* make provided vector a unit vector */
-double unitize(double *vector, double *new_unit_vector) {
-    double mag;
-
-    /* measure the magnitude */
-    mag = magnitude(vector);
-
-    if(mag != 0.0){
-        /* normalize it */
-        new_unit_vector[1]=vector[1]/mag;
-        new_unit_vector[2]=vector[2]/mag;
-        new_unit_vector[3]=vector[3]/mag;
-    }
-    else
-    {
-        /* can't normalize, report zero vector */
-        new_unit_vector[0] = 0.0;
-        new_unit_vector[1] = 0.0;
-        new_unit_vector[2] = 0.0;
-        new_unit_vector[3] = 0.0;
-    }
-    return mag;
-}
-
-/* scale magnitude of provided vector */
-double vector_scale(double *vector, double *new_vector, double scale) {
-
-    new_vector[1] = scale*vector[1];
-    new_vector[2] = scale*vector[2];
-    new_vector[3] = scale*vector[3];
-
-    return magnitude(new_vector);
-}
-
-/* enforce magnitude of provided vector */
-double vector_rescale(double *vector, double *new_vector, double new_magnitude) {
-    double oldmag;
-
-    oldmag = magnitude(vector);
-    if(oldmag <= 0.0) oldmag = 1.0;
-    new_vector[1] = new_magnitude/oldmag*vector[1];
-    new_vector[2] = new_magnitude/oldmag*vector[2];
-    new_vector[3] = new_magnitude/oldmag*vector[3];
-
-    return magnitude(new_vector);
-}
-
-/* difference between two given vectors */
-double vector_diff(double *vector, double *origin_vector, double *new_vector) {
-
-    new_vector[1] = vector[1]-origin_vector[1];
-    new_vector[2] = vector[2]-origin_vector[2];
-    new_vector[3] = vector[3]-origin_vector[3];
-    return magnitude(new_vector);
-}
-
-
-/* vector cross product where vector magnitude is 0th element */
-double *cross_product(double *x, double *y, double *z) {
-    z[1] = x[2]*y[3] - x[3]*y[2];
-    z[2] = x[3]*y[1] - x[1]*y[3];
-    z[3] = x[1]*y[2] - x[2]*y[1];
-    z[0] = 0.0;
-
-    return z;
-}
-/* vector inner product where vector magnitude is 0th element */
-double dot_product(double *x, double *y) {
-    return x[1]*y[1]+x[2]*y[2]+x[3]*y[3];
-}
-
-
-/* polarization factor */
-double polarization_factor(double kahn_factor, double *incident, double *diffracted, double *axis)
-{
-    double cos2theta,cos2theta_sqr,sin2theta_sqr;
-    double psi=0;
-    double E_in[4];
-    double B_in[4];
-    double E_out[4];
-    double B_out[4];
-
-    unitize(incident,incident);
-    unitize(diffracted,diffracted);
-    unitize(axis,axis);
-
-    /* component of diffracted unit vector along incident beam unit vector */
-    cos2theta = dot_product(incident,diffracted);
-    cos2theta_sqr = cos2theta*cos2theta;
-    sin2theta_sqr = 1-cos2theta_sqr;
-
-    if(kahn_factor != 0.0){
-        /* tricky bit here is deciding which direciton the E-vector lies in for each source
-           here we assume it is closest to the "axis" defined above */
-
-        /* cross product to get "vertical" axis that is orthogonal to the cannonical "polarization" */
-        cross_product(axis,incident,B_in);
-        /* make it a unit vector */
-        unitize(B_in,B_in);
-
-        /* cross product with incident beam to get E-vector direction */
-        cross_product(incident,B_in,E_in);
-        /* make it a unit vector */
-        unitize(E_in,E_in);
-
-        /* get components of diffracted ray projected onto the E-B plane */
-        E_out[0] = dot_product(diffracted,E_in);
-        B_out[0] = dot_product(diffracted,B_in);
-
-        /* compute the angle of the diffracted ray projected onto the incident E-B plane */
-        psi = -atan2(B_out[0],E_out[0]);
-    }
-
-    /* correction for polarized incident beam */
-    return 0.5*(1.0 + cos2theta_sqr - kahn_factor*cos(2*psi)*sin2theta_sqr);
-}
-
-
 char *get_byte_order()
 {
     static char *byte_order;
@@ -4126,7 +3143,7 @@ SMVinfo GetFrame(char *filename)
     char *string;
     SMVinfo frame;
     char *byte_order = get_byte_order();
-//    unsigned short int tempint;
+    unsigned short int tempint;
 
     /* try to open the file... */
     frame.handle = fopen(filename, "rb");
@@ -4207,7 +3224,6 @@ SMVinfo GetFrame(char *filename)
             if(frame.mmapdata == NULL)
             {
                 perror("calloc:");
-                exit(9);
             }
             fseek(frame.handle,0,SEEK_SET);
             printf("reading %s\n",frame.filename);
