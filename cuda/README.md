@@ -6,6 +6,8 @@ nanoBraggCUDA is a perfect-lattice nanocrystal diffraction simulator. This adapt
 
 The CUDA kernel is optimized for Kepler and Pascal architectures. nanoBraggCUDA is in the process of being updated to modern hardware and has been built and tested using CUDA 12.9 on the Rocky Linux 9 OS with an RTX 5090 GPU.
 
+**Conda / site-specific installs:** For a pinned **CUDA 12.2** conda environment (`nanobragg_cuda`), `CUDA_PATH`, linker layout (`lib` vs `lib64`), and host **GCC 12** requirements, see the repo root [INSTALL.md](../INSTALL.md).
+
 ## Executing Pre-Built Binaries
 After being built, the executable can be copied to other machines that have an NVIDIA GPU with NVIDIA drivers installed. While it is possible to install just the drivers, general practice is to follow the install instructions for the cuda-toolkit which include instructions for the nvidia-driver module. See NVIDIA CUDA Toolkit below.
 
@@ -14,8 +16,8 @@ Before building nanoBragg, ensure the following prerequisites are installed:
 
 ### NVIDIA CUDA Toolkit and Drivers
 - Required for GPU acceleration.
-- Download and installation instructions: [CUDA Downloads](https://developer.nvidia.com/cuda-downloads), or [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive) for older versions. 
-- Minimum version: CUDA 12.9.
+- Download and installation instructions: [CUDA Downloads](https://developer.nvidia.com/cuda-downloads), or [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive) for older versions.
+- **Version:** This document’s default `CUDA_PATH` uses **CUDA 12.9** as one reference setup. Your driver must support the toolkit you install (see `nvidia-smi` **CUDA Version**). Other setups (e.g. **CUDA 12.2** via conda on S3DF Ampere) are documented in [INSTALL.md](../INSTALL.md).
 - Ensure you have an NVIDIA GPU with CUDA support (Compute Capability 5.0 or higher)
 
 ### GCC/G++ Compiler
@@ -30,8 +32,8 @@ The project uses a Makefile for building debug and release versions.
 
 ### Common Steps
 1. Clone or download the repository.
-2. Ensure `CUDA_PATH` in the Makefile points to your CUDA installation (default: `/usr/local/cuda-12.9`). Edit if necessary.
-3. Run `make` commands from the project root.
+2. Ensure `CUDA_PATH` in the Makefile points to your CUDA installation (default: `/usr/local/cuda-12.9`), or export `CUDA_PATH` (e.g. to `$CONDA_PREFIX` for conda toolchains—see [INSTALL.md](../INSTALL.md)). Edit if necessary.
+3. Run `make` commands from the **`cuda/`** directory (the directory that contains this `Makefile`), not the git repository root unless you invoke `make -C cuda`.
    - For both debug and release: `make all`
    - Debug only: `make debug` (outputs to `build/debug/nanoBraggCUDA`)
    - Release only: `make release` (outputs to `build/release/nanoBraggCUDA`)

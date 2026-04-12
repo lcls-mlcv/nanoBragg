@@ -24,6 +24,10 @@ presumed to be surrounding the nanocrystal.  The diameter of this droplet in mic
 with the "-water" option, and assumes a forward-scattering structure factor of 2.57 electrons.
 The default value for this option is zero.
 
+This repository contains two implementations: the classic **C** program ([nanoBragg.c](nanoBragg.c)), documented in the **C reference implementation** section below, and a **PyTorch** reimplementation with a compatible CLI and automatic differentiation. For conda envs, install steps, and GPU PyTorch wheels, see [INSTALL.md](INSTALL.md). Usage, tests, and troubleshooting for the Python package are under **PyTorch implementation** below; a longer design-oriented guide lives in [docs/pytorch_guide.md](docs/pytorch_guide.md).
+
+## C reference implementation
+
 ## source
 
 source code: [nanoBragg.c](nanoBragg.c) (49k).
@@ -33,6 +37,8 @@ source code: [nanoBragg.c](nanoBragg.c) (49k).
 ```
 gcc -O -O -o nanoBragg nanoBragg.c -lm -static
 ```
+
+For reproducible **conda** compiler environments, the **CUDA** build under [`cuda/`](cuda/), and **PyTorch** packaging, see [INSTALL.md](INSTALL.md).
 
 ## useful auxillary programs
 
@@ -594,6 +600,77 @@ manually set the random number seed. Default:
 ***-mosaic_seed***
 
 different random number seed for mosaic domain generation. Default: 
+
+## PyTorch implementation
+
+The PyTorch port (`import nanobrag_torch`) provides a **drop-in CLI** (`nanoBragg` or `python -m nanobrag_torch`) aligned with the C program, plus **differentiable** simulation for optimization and inverse problems. Conceptual notes (vectorization vs C loops, autograd, gradcheck) are in [docs/pytorch_guide.md](docs/pytorch_guide.md).
+
+### Install
+
+Create the **`nanobragg_torch`** conda environment, install a **PyTorch** build (CPU or CUDA matching your driver), then install this repo in editable mode. Full commands: [INSTALL.md](INSTALL.md) § *PyTorch (`nanobragg_torch` conda environment)*.
+
+```bash
+export KMP_DUPLICATE_LIB_OK=TRUE   # recommended; avoids MKL/OpenMP clashes with PyTorch
+pip install -e .                   # from repository root, env activated
+```
+
+### Basic CLI
+
+```bash
+nanoBragg -h
+# or
+python -m nanobrag_torch -h
+```
+
+Minimal example (cell parameters, uniform structure factor):
+
+```bash
+python -m nanobrag_torch -cell 100 100 100 90 90 90 \
+  -default_F 100 -lambda 1.0 -distance 100 -detpixels 256 -floatfile output.bin
+```
+
+More examples (cubic, triclinic, HKL files, conventions) are in [docs/pytorch_guide.md](docs/pytorch_guide.md#common-examples).
+
+### Tests
+
+Set at least **`KMP_DUPLICATE_LIB_OK=TRUE`** before `pytest`.
+
+**Session infrastructure gate** ([`tests/conftest.py`](tests/conftest.py)): at the start of a test session, pytest checks for a usable **C `nanoBragg` binary** (`NB_C_BIN`, or `./golden_suite_generator/nanoBragg`, or `./nanoBragg`), **`scaled.hkl`** at the repo root, and **`reports/2025-10-cli-flags/phase_h/implementation/pix0_expected.json`**. If any check fails, the session aborts unless you bypass the gate:
+
+```bash
+export NB_SKIP_INFRA_GATE=1   # local/dev only; skips CI-style infrastructure checks
+```
+
+**C↔PyTorch comparison tests** often require:
+
+```bash
+export NB_RUN_PARALLEL=1
+# optional explicit C binary:
+# export NB_C_BIN=/path/to/nanoBragg
+```
+
+**Slurm / GPU cluster:** to run the parity matrix on an allocated GPU node without GitHub Actions, see [`scripts/cluster/run_parity_matrix.sh`](scripts/cluster/run_parity_matrix.sh) and the **Cluster / Slurm** subsection in [INSTALL.md](INSTALL.md).
+
+Run tests:
+
+```bash
+pytest tests/ -v
+# faster iteration:
+pytest tests/ -m "not slow" -v --tb=line
+# by area:
+pytest tests/test_at_parallel_*.py -v
+pytest tests/test_at_geo_*.py -v
+pytest tests/test_gradients.py -v
+```
+
+**Key groups:** AT-PARALLEL (C vs PyTorch equivalence), AT-GEO (geometry), AT-STR / AT-IO (structure factors and I/O), gradient tests in `tests/test_gradients.py`.
+
+### Troubleshooting (PyTorch)
+
+- **MKL / OpenMP:** `export KMP_DUPLICATE_LIB_OK=TRUE`
+- **C binary not found:** `export NB_C_BIN=./golden_suite_generator/nanoBragg` or build `make -C golden_suite_generator` (see C section above).
+
+---
 
 [adxv]: https://www.scripps.edu/tainer/arvai/adxv.html
 [mosflm]: http://www.mrc-lmb.cam.ac.uk/harry/mosflm/

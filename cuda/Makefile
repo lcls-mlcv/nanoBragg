@@ -10,7 +10,8 @@ RELEASE_DIR = $(BUILD_DIR)/release
 
 COMMON_CFLAGS = -I$(SRC_DIR) -I$(CUDA_PATH)/include
 
-COMMON_LDFLAGS = -L$(CUDA_PATH)/lib64/stubs -L$(CUDA_PATH)/lib64
+# lib64: typical system CUDA layout; lib: conda-installed toolkit (e.g. nanobragg_cuda)
+COMMON_LDFLAGS = -L$(CUDA_PATH)/lib64/stubs -L$(CUDA_PATH)/lib64 -L$(CUDA_PATH)/lib/stubs -L$(CUDA_PATH)/lib
 CUDALIB_LDFLAGS = -lcudadevrt -lcudart_static
 CLIB_LDFLAGS = -lrt -lpthread -ldl -lm
 
@@ -18,15 +19,13 @@ LDFLAGS = $(CUDALIB_LDFLAGS) $(CLIB_LDFLAGS) $(COMMON_LDFLAGS)
 
 STATIC_LDFLAGS = -static-libstdc++ -static-libgcc
 
-# Architectures
+# Architectures (sm_100/sm_120 require newer CUDA than 12.2; omit for conda toolkit 12.2)
 ARCH_FLAGS = \
 	--generate-code=arch=compute_61,code=[compute_61,sm_61] \
 	--generate-code=arch=compute_70,code=[compute_70,sm_70] \
 	--generate-code=arch=compute_80,code=[compute_80,sm_80] \
 	--generate-code=arch=compute_89,code=[compute_89,sm_89] \
-	--generate-code=arch=compute_90,code=[compute_90,sm_90] \
-	--generate-code=arch=compute_100,code=[compute_100,sm_100] \
-	--generate-code=arch=compute_120,code=[compute_120,sm_120]
+	--generate-code=arch=compute_90,code=[compute_90,sm_90]
 	
 NVCC_FLAGS = -forward-unknown-to-host-compiler -maxrregcount=40 -std=c++17 $(ARCH_FLAGS) -x cu
 
