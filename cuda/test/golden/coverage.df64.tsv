@@ -2,10 +2,11 @@
 # Committed source-of-truth (lockfile-style): each cell -> EXPECTED PASS/FAIL under
 # the uniform gate (corr>=0.9999 AND sum_ratio in [0.999,1.001]) plus its seed
 # corr/sum_ratio. df64 is the clean parity baseline: it matches the CPU oracle on
-# every cell EXCEPT curved_stress. cov_curved_det_on PASSES (a trailing zero-arg
-# -curved_det is now honored by both sides). curved_stress FAILS on a short-lambda
-# geometry-input precision edge: geometry is exact (corr 0.9999988) but sum_ratio
-# ~0.997 sits just past the flux gate -- NOT a curved-detector geometry defect.
+# ALL 74 cells. cov_curved_det_on PASSES (a trailing zero-arg -curved_det is
+# honored by both sides). curved_stress -- a short-lambda curved-detector case that
+# previously sat just past the flux gate (sum_ratio ~0.997) -- now PASSES: the df64
+# curved path carries the detector rotation angle and its sin/cos in df pairs,
+# restoring the flux into the gate (sum_ratio ~1.0005).
 # A verdict FLIP vs this file is the regression signal; regenerate deliberately.
 # cell	verdict	corr	sum_ratio
 baseline	PASS	1.0000000	1.000000
@@ -72,7 +73,7 @@ offbeam	PASS	1.0000000	1.000001
 custom_basis	PASS	1.0000000	1.000000
 powder	PASS	1.0000000	1.000000
 flat_control	PASS	1.0000000	0.999931
-curved_stress	FAIL	0.9999988	0.997352
+curved_stress	PASS	1.0000000	1.000461
 cancellation	PASS	0.9999999	1.000170
 extreme_geom	PASS	1.0000000	1.000057
 thick_main	PASS	1.0000000	0.999593
