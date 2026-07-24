@@ -2,7 +2,7 @@
   "detpixels": 2048,
   "flux": 1e18,
   "beamsize_mm": 1.0,
-  "data_root": "cuda/workbench",
+  "data_root": "cuda/testdata",
   "base_flags": ["-nonoise", "-nointerpolate", "-nopgm"],
   "base_geometry_dims": ["distance", "lambda", "pixel"],
   "beam_center_rule": "Xbeam = Ybeam = detpixels * pixel / 2 (recomputed per cell when pixel varies)",

@@ -4,43 +4,59 @@ A permanent, in-repo parity harness. Point it at a GPU kernel binary and read
 PASS/FAIL. The test corpus is *compiled* from a compact source spec, so coverage
 is countable and reproducible.
 
-## Two-zone layout (strict)
+## Four-part layout
 
-Committed source — pristine, read-only. Nothing built or run ever lands here:
+**Committed source** — `cuda/test/`, pristine; the only committed part:
 
     cuda/test/
       run.sh            entrypoint / orchestrator
       gen_cpu.sh        builds + behaviorally verifies the CPU reference
-      Makefile          OUT-OF-SOURCE build (binaries go to the workbench)
-      src/gen_cells.c   the compiler   (spec -> cells)
+      Makefile          out-of-source build (-> cuda/test/build/)
+      src/gen_suites.c   the compiler   (spec -> cells)
       src/metrics.c     the comparator (float32 image pair -> corr/sum_ratio/…)
       spec/             base.json, dimensions.jsonl, groups.json, plan.json
-      cells/            compiled + LOCKED cells (committed source-of-truth)
+      suites/            compiled + LOCKED cells (committed source-of-truth)
 
-Ephemeral build + run — gitignored, disposable:
+**Build output** — `cuda/test/build/`, gitignored compiled tools:
 
-    cuda/workbench/testrun/
-      bin/            compiled binaries: gen_cells, metrics
-      cpu/            CPU reference images (cached, keyed by cpu_args hash)
-      out/            transient GPU output images
-      cpu_build/      from-source CPU-reference build scratch
-      results.tsv     run output
+    cuda/test/build/
+      gen_suites, metrics   compiled C tools
+      .devprobe            device-assertion probe (built on demand)
+
+**Run output** — `cuda/testrun/`, gitignored and disposable:
+
+    cuda/testrun/
+      cpu/             CPU reference images (cached, keyed by cpu_args hash)
+      out/             transient GPU output images
+      scratch/         per-render isolated working dirs + logs
+      frozen/          persistent baked/deathstar oracles (never auto-deleted)
+      cpu_build/       from-source CPU-reference build scratch
+      results.tsv      run output
       cpu_manifest.txt CPU-reference provenance
 
-`make` compiles `src/*.c` into `cuda/workbench/testrun/bin/`. `run.sh` reads
-`spec/` + `cells/`, invokes the binaries, and writes cpu/out/results into the
-workbench. The ONLY thing that ever writes into `cuda/test/` is a deliberate
-`gen_cells` regeneration of `cells/`, reviewed and committed like a lockfile.
+**Data inputs** — `cuda/testdata/`, gitignored and machine-local:
+
+    cuda/testdata/
+      crystals/*.hkl     crystal structure factors
+      A.mat, scaled.hkl  MOSFLM-matrix inputs
+      nanoBragg_root     the CPU oracle binary
+      dummy.stol         amorphous-table stub (guards suite)
+
+`make` compiles `src/*.c` into `cuda/test/build/`. `run.sh` reads `spec/` +
+`suites/`, invokes the tools, resolves each cell's `{data_root}` inputs against
+`cuda/testdata/`, and writes cpu/out/results into `cuda/testrun/`. The only thing
+that ever writes into the committed `cuda/test/` is a deliberate `gen_suites`
+regeneration of `suites/`, reviewed and committed like a lockfile.
 
 ## The compile model
 
-`spec/` is SOURCE. `gen_cells` is the COMPILER. `cells/*.jsonl` are the COMPILED,
+`spec/` is SOURCE. `gen_suites` is the COMPILER. `suites/*.jsonl` are the COMPILED,
 LOCKED output — regenerate deliberately and review the diff. A cell is a scenario:
 an exact GPU/CPU CLI plus id/axes/tags/gate/cost metadata. Different plans compile
 to different suites.
 
-    make                                                  # build tools -> testrun/bin
-    testrun/bin/gen_cells grid320 spec cells/grid320.jsonl # compile the 320-suite
+    make                                                   # build tools -> cuda/test/build
+    build/gen_suites grid320 spec suites/grid320.jsonl       # compile the 320-suite
 
 `plan.json` names the suites:
 
@@ -64,7 +80,7 @@ Untested axes needing external data files (documented gaps, not yet cells):
 
     ./gen_cpu.sh                                   # establish/verify the CPU reference
     ./run.sh grid320 <gpu-kernel-binary>           # render, compare, gate, TSV
-    column -t < ../workbench/testrun/results.tsv   # human-readable view
+    column -t < ../testrun/results.tsv             # human-readable view
 
 `run.sh <suite> <kernel-binary> [workdir]` asserts the device before rendering a
 single pixel (see below), builds the C tools out-of-source, and for each cell:
@@ -139,7 +155,7 @@ binary built from source (`main` + both branch diffs applied to `nanoBragg.c`) o
 every invocation. Building gold from source makes the check non-circular (it
 trusts no cached image) and self-adapting: if the fixes are already merged into
 `main` the diffs are empty and gold == main, so the check still passes and the
-eventual PR merge needs no edits here. If `cuda/workbench/nanoBragg_root` already
+eventual PR merge needs no edits here. If `cuda/testdata/nanoBragg_root` already
 reproduces gold on both canaries it is reused; otherwise the freshly built gold is
 installed. Provenance is recorded in `testrun/cpu_manifest.txt`. A parity result
 measured against a reference that lacks either fix is invalid.
@@ -165,14 +181,14 @@ and appends nothing.
 bake**: `metrics` is compiled with `-DNB_BUILD_COMMIT=<HEAD at compile time>`
 (see `Makefile`) and reports it via `metrics --build-commit`, rather than
 re-reading `git HEAD` at render time. Since `run.sh` runs `make` on every
-invocation, this equals HEAD-at-render on a stable branch; `gen_cells` itself
+invocation, this equals HEAD-at-render on a stable branch; `gen_suites` itself
 stays commit-agnostic (its output is reviewed by diff, not stamped).
 
 ## Data
 
-Uses the existing local `.hkl`/`.mat` inputs under `{data_root}` (repo-relative
-`cuda/workbench`): the crystals at `{data_root}/crystals/*.hkl` and the AMAT inputs
-at `{data_root}/A.mat` (105 B) and `{data_root}/scaled.hkl`. These large inputs are
-gitignored and already present on the owner's box; this harness commits no crystal
-data and touches no PDB. `run.sh` resolves `{data_root}` to an absolute path at run
-time.
+Uses local `.hkl`/`.mat` inputs under `{data_root}` (repo-relative `cuda/testdata`):
+the crystals at `{data_root}/crystals/*.hkl` and the AMAT inputs at `{data_root}/A.mat`
+(105 B) and `{data_root}/scaled.hkl`. These large inputs are gitignored and populated
+per-box (symlinks or copies); this harness commits no crystal data and touches no PDB.
+Cells name only the `{data_root}` token — never a machine-specific path — and `run.sh`
+resolves it to an absolute path at run time.

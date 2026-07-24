@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# gen_cpu.sh -- establish + verify the CPU reference (cuda/workbench/nanoBragg_root).
+# gen_cpu.sh -- establish + verify the CPU reference (cuda/testdata/nanoBragg_root).
 #
 # The CPU oracle MUST be main + fix/phi0-stale-rotation + fix/subpixel-oversampling.
 # Provenance is BEHAVIORAL, not by branch name: two canary cells whose output only
@@ -18,27 +18,26 @@
 #
 # Self-adapt / reuse:
 #   - build gold (and main, for a merged-status diagnostic) into <workdir>/cpu_build
-#   - if cuda/workbench/nanoBragg_root exists and reproduces gold on BOTH canaries
+#   - if cuda/testdata/nanoBragg_root exists and reproduces gold on BOTH canaries
 #     -> reuse it (do not overwrite)
 #   - otherwise install the freshly built gold binary as nanoBragg_root
 #
 # A manifest (binary md5 + canary hashes + provenance) is written to
 # <workdir>/cpu_manifest.txt. CPU reference images stay gitignored.
 #
-#   Usage: gen_cpu.sh [workdir]     (workdir defaults to cuda/workbench/testrun)
+#   Usage: gen_cpu.sh [workdir]     (workdir defaults to cuda/testrun)
 #          NB_FORCE_BUILD=1  install the freshly built gold even if root passes
 # =============================================================================
 set -u
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"     # cuda/test
 REPO="$(cd "$TEST_DIR/../.." && pwd)"                         # repo root
-BENCH="$REPO/cuda/workbench"
-WORKDIR="${1:-$BENCH/testrun}"
+WORKDIR="${1:-$REPO/cuda/testrun}"
 BUILD="$WORKDIR/cpu_build"
 RUNDIR="$BUILD/run"
 MANIFEST="$WORKDIR/cpu_manifest.txt"
-ROOT_BIN="$BENCH/nanoBragg_root"
-CRYST="$BENCH/crystals"
+ROOT_BIN="$REPO/cuda/testdata/nanoBragg_root"
+CRYST="$REPO/cuda/testdata/crystals"
 SRC_FILE="nanoBragg.c"                                        # the root CPU oracle source
 FIX_BRANCHES=(fix/phi0-stale-rotation fix/subpixel-oversampling fix/curved-det-flag-guard)
 

@@ -1,10 +1,10 @@
-/* gen_cells.c -- the parity-suite compiler.
+/* gen_suites.c -- the parity-suite compiler.
  *
  * Reads the JSON spec (base.json, dimensions.jsonl, groups.json, plan.json) and
  * emits one compiled cell per line to <suite>.jsonl. A cell is a scenario: an
  * exact GPU/CPU CLI plus id/axes/tags/gate/cost metadata.
  *
- *   Usage: gen_cells <suite> <spec_dir> [out_file]
+ *   Usage: gen_suites <suite> <spec_dir> [out_file]
  *          out_file defaults to stdout.
  *
  * Suites (from plan.json):
@@ -40,7 +40,7 @@ typedef struct jval {
     int n;                 /* element count */
 } jval;
 
-static void die(const char *msg) { fprintf(stderr, "gen_cells: %s\n", msg); exit(2); }
+static void die(const char *msg) { fprintf(stderr, "gen_suites: %s\n", msg); exit(2); }
 
 static char *xstrndup(const char *p, size_t n) {
     char *r = (char *)malloc(n + 1);
@@ -198,7 +198,7 @@ static jval *jget(const jval *o, const char *key) {
 
 static char *read_file(const char *path) {
     FILE *f = fopen(path, "rb");
-    if (!f) { fprintf(stderr, "gen_cells: cannot open %s\n", path); exit(2); }
+    if (!f) { fprintf(stderr, "gen_suites: cannot open %s\n", path); exit(2); }
     fseek(f, 0, SEEK_END); long sz = ftell(f); rewind(f);
     char *buf = (char *)malloc((size_t)sz + 1);
     if (!buf) die("OOM");
@@ -269,29 +269,19 @@ static void tl_set(toklist *t, const char *flag, const char *val) {
     tl_push(t, flag); tl_push(t, val);
 }
 
-/* Substitute every occurrence of {data_root} in src, returning a new string. */
+/* Location-agnostic cells: emit the {data_root} token verbatim rather than baking
+   a data directory into the cell. run.sh resolves {data_root} to an absolute path
+   at run time, so a cell names no machine-specific location. (data_root is retained
+   in the signature for the call sites; it is intentionally not consulted here.) */
 static char *subst_data_root(const char *src, const char *data_root) {
-    const char *ph = "{data_root}";
-    size_t phlen = strlen(ph), drlen = strlen(data_root);
-    size_t cap = strlen(src) + 1, len = 0;
-    /* grow generously */
-    cap += drlen * 4 + 16;
-    char *out = (char *)malloc(cap); if (!out) die("OOM");
-    const char *p = src;
-    while (*p) {
-        if (strncmp(p, ph, phlen) == 0) {
-            if (len + drlen + 1 >= cap) { cap = len + drlen + 32; out = (char *)realloc(out, cap); if (!out) die("OOM"); }
-            memcpy(out + len, data_root, drlen); len += drlen; p += phlen;
-        } else {
-            if (len + 2 >= cap) { cap += 32; out = (char *)realloc(out, cap); if (!out) die("OOM"); }
-            out[len++] = *p++;
-        }
-    }
-    out[len] = 0;
+    (void)data_root;
+    size_t n = strlen(src) + 1;
+    char *out = (char *)malloc(n); if (!out) die("OOM");
+    memcpy(out, src, n);
     return out;
 }
 
-/* Append a group's args[] (with {data_root} substituted) to a token list. */
+/* Append a group's args[] to a token list ({data_root} passed through verbatim). */
 static void push_args(toklist *t, const jval *group, const char *data_root) {
     jval *args = jget(group, "args");
     if (!args || args->t != JARR) return;
@@ -407,7 +397,7 @@ static void check_collisions(const toklist *t, const char *cell_id) {
         if (!(a[0] == '-' && isalpha((unsigned char)a[1]))) continue; /* value, not a flag */
         for (int k = i + 1; k < t->n; k++) {
             if (strcmp(a, t->tok[k]) == 0) {
-                fprintf(stderr, "gen_cells: FLAG COLLISION in cell %s: '%s' set twice\n", cell_id, a);
+                fprintf(stderr, "gen_suites: FLAG COLLISION in cell %s: '%s' set twice\n", cell_id, a);
                 exit(3);
             }
         }
@@ -799,7 +789,7 @@ int main(int argc, char **argv) {
     S.data_root = dr->s;
 
     FILE *out = outpath ? fopen(outpath, "wb") : stdout;
-    if (!out) { fprintf(stderr, "gen_cells: cannot write %s\n", outpath); return 2; }
+    if (!out) { fprintf(stderr, "gen_suites: cannot write %s\n", outpath); return 2; }
 
     int count;
     if (strcmp(suite, "grid320") == 0)       count = build_grid320(&S, out);
@@ -807,9 +797,9 @@ int main(int argc, char **argv) {
     else if (strcmp(suite, "guards") == 0)   count = build_scenarios(&S, out, "guards");
     else if (strcmp(suite, "perf") == 0)     count = build_scenarios(&S, out, "perf");
     else if (strcmp(suite, "pairwise") == 0) count = build_scenarios(&S, out, "pairwise");
-    else { fprintf(stderr, "gen_cells: unknown suite '%s'\n", suite); if (outpath) fclose(out); return 2; }
+    else { fprintf(stderr, "gen_suites: unknown suite '%s'\n", suite); if (outpath) fclose(out); return 2; }
 
     if (outpath) fclose(out);
-    fprintf(stderr, "gen_cells: suite=%s cells=%d -> %s\n", suite, count, outpath ? outpath : "(stdout)");
+    fprintf(stderr, "gen_suites: suite=%s cells=%d -> %s\n", suite, count, outpath ? outpath : "(stdout)");
     return 0;
 }

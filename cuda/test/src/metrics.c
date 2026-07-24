@@ -1,6 +1,6 @@
 /* metrics.c -- parity comparator for two float32 nanoBragg images.
  *
- * Verbatim behavioral port of cuda/workbench/crystal_sweep/metrics_ext.py.
+ * The corr/sum_ratio definitions are fixed by the harness gate; keep them exact.
  *
  *   Usage: metrics <gpu_float32.bin> <cpu_float32.bin>
  *          metrics --build-commit    (print the commit HEAD was at when this

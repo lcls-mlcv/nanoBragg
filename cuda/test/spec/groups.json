@@ -1,10 +1,12 @@
 {
+  "note": "A group is a reusable, named bundle of CLI flags carrying a 'class'. Groups serve two purposes: they are the building blocks the plan crosses to form the grid320 suite (crystal x crystal_size x grid320 x orientation), and they are coherent multi-flag units a scenario reuses whole (e.g. detector_thickness = -detector_thick + -detector_thicksteps + -detector_abs + the -oversample_thick cpu_extra). Use a group when several flags must travel together or take part in a Cartesian crossing. A single-axis knob tested one-at-a-time (distance, pixel, convention, curved_det, ...) belongs in dimensions.jsonl, NOT here. 'class' names the crossing axis or the bundle kind; class 'override' is inert to grid320 crossings.",
+
   "groups": [
 
     {"group":"xtal_2plv","class":"crystal","label":"2PLV","args":["-hkl","{data_root}/crystals/2PLV.hkl","-cell","322.940","358.040","380.150","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"high","status":"unaudited"},"note":"large orthorhombic cell -> big Fhkl table"},
     {"group":"xtal_193l","class":"crystal","label":"193L","args":["-hkl","{data_root}/crystals/193L.hkl","-cell","78.540","78.540","37.770","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"med","status":"unaudited"}},
     {"group":"xtal_3nir","class":"crystal","label":"3NIR","args":["-hkl","{data_root}/crystals/3NIR.hkl","-cell","22.329","18.471","40.769","90","90.55","90"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"}},
-    {"group":"xtal_amat","class":"crystal","label":"AMAT","args":["-hkl","{data_root}/scaled.hkl","-mat","{data_root}/A.mat"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"orientation+cell via MOSFLM matrix; uses cuda/workbench/A.mat (105 B), NOT cuda/test/A.mat"},
+    {"group":"xtal_amat","class":"crystal","label":"AMAT","args":["-hkl","{data_root}/scaled.hkl","-mat","{data_root}/A.mat"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"orientation+cell via MOSFLM matrix; uses {data_root}/A.mat (105 B), NOT the tracked cuda/test/A.mat"},
 
     {"group":"xtal_none","class":"override","label":"none","args":[],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"class 'override' is inert to grid320's crossings; a crystal-free placeholder for scenarios that supply their own -cell + -default_F (no hkl file)"},
 

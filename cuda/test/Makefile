@@ -1,38 +1,36 @@
 # Out-of-source build for the nanoBragg parity harness.
 #
-# Compiles src/*.c into the workbench, never into this committed tree:
-#   cuda/test/src/gen_cells.c  -> $(BINDIR)/gen_cells
+# Compiles src/*.c into the gitignored build dir cuda/test/build/:
+#   cuda/test/src/gen_suites.c  -> $(BINDIR)/gen_suites
 #   cuda/test/src/metrics.c    -> $(BINDIR)/metrics
 #
-# BINDIR defaults to the ephemeral workbench run dir and may be overridden
-# (run.sh points it at its workdir). No object files or binaries ever land
-# under cuda/test/.
+# BINDIR defaults to cuda/test/build/ and may be overridden (run.sh points it
+# there explicitly). Build output is gitignored; only src/ is committed.
 
 CC      ?= cc
 CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
 LDLIBS  ?= -lm
 
-# This Makefile lives in cuda/test/; '..' is cuda/, so the default target is
-# cuda/workbench/testrun/bin.
+# This Makefile lives in cuda/test/, so the default build dir is cuda/test/build.
 HERE    := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-BINDIR  ?= $(abspath $(HERE)../workbench/testrun/bin)
+BINDIR  ?= $(abspath $(HERE)build)
 
 # Build-time commit bake (Layer-2 ledger provenance): metrics is stamped with the
 # commit HEAD was at when it was last compiled, queried at runtime via
-# `metrics --build-commit`. gen_cells stays commit-agnostic -- its output is
+# `metrics --build-commit`. gen_suites stays commit-agnostic -- its output is
 # reviewed by diff, not stamped.
 BUILD_COMMIT := $(shell git -C $(HERE) rev-parse HEAD 2>/dev/null || echo unknown)
 
-BINS := $(BINDIR)/gen_cells $(BINDIR)/metrics
+BINS := $(BINDIR)/gen_suites $(BINDIR)/metrics
 
-.PHONY: all clean gen_cells metrics
+.PHONY: all clean gen_suites metrics
 all: $(BINS)
 
-# Convenience aliases so 'make metrics' / 'make gen_cells' work regardless of BINDIR.
-gen_cells: $(BINDIR)/gen_cells
+# Convenience aliases so 'make metrics' / 'make gen_suites' work regardless of BINDIR.
+gen_suites: $(BINDIR)/gen_suites
 metrics:   $(BINDIR)/metrics
 
-$(BINDIR)/gen_cells: src/gen_cells.c | $(BINDIR)
+$(BINDIR)/gen_suites: src/gen_suites.c | $(BINDIR)
 	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
 
 $(BINDIR)/metrics: src/metrics.c | $(BINDIR)

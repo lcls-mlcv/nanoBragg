@@ -4,11 +4,11 @@ floatimage.bin
 intimage.img
 image.pgm
 
-# Parity harness (cuda/test): ephemeral build+run tree and machine-local data.
-# The crystal .hkl, AMAT inputs, and CPU oracle are large/local and symlinked in
-# per box; testrun/ is disposable build+render scratch. Never commit these.
-cuda/workbench/testrun/
-cuda/workbench/crystals/
-cuda/workbench/A.mat
-cuda/workbench/scaled.hkl
-cuda/workbench/nanoBragg_root
+# oh-my-claudecode session state.
+.omc/
+
+# Parity harness (cuda/test): gitignored build output, run output, and
+# machine-local data inputs. Only cuda/test/ source is committed.
+cuda/test/build/
+cuda/testrun/
+cuda/testdata/
