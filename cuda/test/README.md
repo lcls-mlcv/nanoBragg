@@ -3,7 +3,9 @@
 A permanent, in-repo parity harness. Point `nbrunsuite` at a candidate binary (a
 CUDA `nanoBraggCUDA` build) and it renders each case against a trusted reference
 binary (the CPU `nanoBragg`), compares images, applies a per-suite gate, and
-reports PASS/FAIL/REJECT plus any flips against a committed baseline. The test
+reports PASS/FAIL/REJECT plus any flips against a committed baseline. Build the
+candidate with `cuda/build.sh` so its `-version` — and the ledger row — identify
+exactly which binary was tested. The test
 corpus is *compiled* from a compact JSON spec, so coverage is countable and
 reproducible.
 

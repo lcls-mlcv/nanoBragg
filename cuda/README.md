@@ -26,15 +26,16 @@ Before building nanoBragg, ensure the following prerequisites are installed:
 
 ## Build Instructions
 
-The project uses a Makefile for building debug and release versions.
+`build.sh` (recommended) wraps the Makefile and stamps the git version into the binary; the `make` targets remain available directly.
 
 ### Common Steps
 1. Clone or download the repository.
 2. Ensure `CUDA_PATH` in the Makefile points to your CUDA installation (default: `/usr/local/cuda-12.9`). Edit if necessary.
-3. Run `make` commands from the project root.
+3. Recommended: from `cuda/`, run `./build.sh release` — it builds the release binary (`build/release/nanoBraggCUDA`) and stamps the git commit/branch/date into `-version`. To target specific hardware, pass `ARCH_FLAGS`, e.g. `./build.sh release ARCH_FLAGS='--generate-code=arch=compute_120,code=[compute_120,sm_120]'` (sm_120 / RTX 5090).
+4. Fallback: run `make` directly.
    - For both debug and release: `make all`
    - Debug only: `make debug` (outputs to `build/debug/nanoBraggCUDA`)
-   - Release only: `make release` (outputs to `build/release/nanoBraggCUDA`)
+   - Release only: `make release` (outputs to `build/release/nanoBraggCUDA`) — the same binary, but `-version` reports `unknown (built without version info)`.
    - Clean: `make clean`
 
 ## Run Tests
