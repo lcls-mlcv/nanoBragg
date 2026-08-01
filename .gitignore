@@ -7,6 +7,9 @@ image.pgm
 # oh-my-claudecode session state.
 .omc/
 
+# Editor / IDE config, at any directory level.
+.vscode/
+
 # Parity harness (cuda/test): gitignored build output, run output, reference
 # binary, and machine-local render inputs. Only cuda/test/ source is committed.
 cuda/test/build/
