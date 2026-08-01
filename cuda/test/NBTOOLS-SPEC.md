@@ -1,7 +1,8 @@
 # nb\* tool family — design spec (v1)
 
-**Status:** TARGET design, not yet built. This is a **fresh** harness: `run.sh` is **not** a
-reference and is not something to reproduce — it is retired/deleted. The validated `golden/*.tsv`
+**Status:** IMPLEMENTED — this document describes the harness **as built** (all tools, libs,
+suites, and `expected/` exist; the Makefile builds them). This is a **fresh** harness: `run.sh` is
+**not** a reference and is not something to reproduce — it is retired/deleted. The validated `golden/*.tsv`
 are **migrated** to `expected/` (same FP32 gate → verdicts carry); `--seed` is for deliberate
 re-baselining, guarded by the reference canary (§6). Features that are designed but not
 in the first cut are collected in **§ Phase 2**.
@@ -38,7 +39,7 @@ Shared logic is linked source (no standalone binaries, no `.so`):
 |---|---|---|
 | `argkey.{c,h}` | canonicalize an arg list → stable-hash input (was `canon`) | libc |
 | `case_core.{c,h}` | parse `base.json` + `suites/*.jsonl` (cases, cost, gate header) | libc |
-| `cache_core.{c,h}` | image-cache path assembly + gc + eviction + status + config | libmd + argkey |
+| `cache_core.{c,h}` | image-cache path assembly + gc + eviction + status + config | json-c + libmd |
 
 `case_core` is the shared parser all three consuming tools link — the one place `base.json` +
 `suites/*.jsonl` are read, so no tool re-implements it.
@@ -94,9 +95,8 @@ the same one `nvidia-smi` wraps — never `nvidia-smi` and never the CUDA runtim
    `CUDA_DEVICE_ORDER=PCI_BUS_ID` + `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (order-independent — a UUID pins
    exactly one physical card).
 
-`--skip-device` bypasses selection (CPU-mock pipeline testing). Optional settings.json nickname
-(`desktop` → UUID). Resolution is by UUID/name, so it is immune to the CUDA-runtime index inversion —
-only the printed `index` label tracks NVML's order.
+`--skip-device` bypasses selection (CPU-mock pipeline testing). Resolution is by UUID/name, so it is
+immune to the CUDA-runtime index inversion — only the printed `index` label tracks NVML's order.
 
 ---
 
@@ -115,6 +115,9 @@ only the printed `index` label tracks NVML's order.
 | `--keep-candidate-images` / `--keep-reference-images` | off | retain images in the workdir |
 | `--refresh-cache` / `--no-cache` | off | overwrite the cache / bypass it |
 | `--cache-dir PATH` / `--budget-gb N` | XDG / 20 | image-cache location / size budget |
+| `--build-commit` | — | print the git HEAD baked at build time and exit |
+| `--ledger-dir DIR` *(test hook)* | `<harness-root>/ledger` | write the appended ledger under DIR instead of the default |
+| `--canary-fast` *(test hook)* | off | shrink the `--seed` canary geometry (detpixels/N/steps) so the build+render+refuse plumbing verifies in seconds |
 
 Cache use is via `cache_core`: `cache_gc()` at suite start, `cache_lookup()`/`cache_store()` per
 case (keyed on the **baked** `args_hash` — `nbrunsuite` reads it, never recomputes). No `--vs`
@@ -174,7 +177,7 @@ shows (fp32 compute error ≪ FP16 ε except under large-N accumulation drift).
 bootstrap from env/flag, not the config file. Machine-global, shared across worktrees, outlives
 any project.
 
-**Config (`settings.json`):** JSON, parsed by `case_core`. Holds `budget_gb`
+**Config (`settings.json`):** JSON, parsed by `cache_core`. Holds `budget_gb`
 (flag > settings > default 20 GB). Written by `nbcache --set-…`.
 
 **Layout:**
@@ -251,7 +254,7 @@ cuda/test/
 │   ├── crystals/    193L.hkl · 2PLV.hkl · 3NIR.hkl · scaled.hkl      (-hkl)
 │   ├── matrix/      amat.mat                                          (-mat)
 │   └── dummy.stol   flat table for the -stol/-4stol/-Q reject guards
-├── reference/       nanoBragg_root + cpu_manifest.txt · UNTRACKED
+├── reference/       nanoBragg_root · UNTRACKED
 ├── workdir/         per-run candidate images + results.tsv · UNTRACKED (conventional --workdir)
 ├── expected/        <suite>.<precision>.tsv verdict baselines · COMMITTED
 ├── ledger/          curated run data · COMMITTED (opt-in)
@@ -301,9 +304,12 @@ string* (not write stdout) for the md5 consumer — with no standalone binary.
 
 ## 13. Build sequence
 
+*Retrospective: this records the build order that was followed to produce the harness as it now
+stands — it is the history of how the pieces landed, not an open to-do list.*
+
 0. **Reorg** (one-time, before any tool work) — restructure to the §11 layout:
    `cuda/testdata/` → `cuda/test/inputs/` (dereference every symlink to a real file; crystals under
-   `crystals/`, `A.mat` → `matrix/amat.mat`, `dummy.stol` at root); `nanoBragg_root` (+ manifest) →
+   `crystals/`, `A.mat` → `matrix/amat.mat`, `dummy.stol` at root); `nanoBragg_root` →
    `cuda/test/reference/`; establish `cuda/test/workdir/` (old `cuda/testrun/` outputs discarded —
    transient); `.gitignore` `inputs/ reference/ workdir/ build/`. Rename `data_root`→`input_root` and
    the `{data_root}`→`{input_root}` token across `base.json`, `suites/*.jsonl`, and the resolver

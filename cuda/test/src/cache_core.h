@@ -36,7 +36,8 @@
 char *cache_dir_resolve(const char *flag_override);
 
 /* budget_gb from <cache_dir>/settings.json, or -1 if the file or key is absent.
- * Guards a missing file so json.c's exit-on-open-error cannot fire. */
+ * Checks the file exists (access) before parsing, so an absent settings.json
+ * returns -1 rather than surfacing a parser open error. */
 long cache_settings_budget_gb(const char *cache_dir);
 
 /* Effective budget (§9): flag_gb (>=0 wins) > settings.json > default 20. */

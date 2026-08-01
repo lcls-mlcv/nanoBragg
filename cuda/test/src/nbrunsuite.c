@@ -32,7 +32,7 @@
  * unless --force.
  *
  * nbmetrics is invoked as a subprocess (its FP32 stdout contract is stable);
- * cache_core / argkey / case_core / json are linked.
+ * cache_core / argkey / case_core are linked (plus the json-c system lib).
  *
  * TEST HOOKS (documented, harmless in production):
  *   --skip-device     skip NVML device selection, so the render->cache->metrics->
