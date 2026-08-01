@@ -3,3 +3,14 @@ Fdump.bin
 floatimage.bin
 intimage.img
 image.pgm
+
+# oh-my-claudecode session state.
+.omc/
+
+# Parity harness (cuda/test): gitignored build output, run output, reference
+# binary, and machine-local render inputs. Only cuda/test/ source is committed.
+cuda/test/build/
+cuda/test/inputs/
+cuda/test/reference/
+cuda/test/workdir/
+cuda/testrun/

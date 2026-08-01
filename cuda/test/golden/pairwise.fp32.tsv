@@ -1,0 +1,18 @@
+# golden expected-verdicts  suite=pairwise  precision=fp32
+# Pairwise covering array (12-run Plackett-Burman, strength-2) over 8 risky axes:
+# curved_det x N x lambda x pixel x oversample x thickness x misset x dispersion.
+# Every pair of factor levels co-occurs in >=1 run (112/112 pairs). verdict is the
+# gate; corr/sum_ratio seeded for drift. A FLIP vs this file is the regression signal.
+# cell	verdict	corr	sum_ratio
+pw01	PASS	1.0000000	1.000045
+pw02	PASS	1.0000000	0.999678
+pw03	PASS	0.9999996	1.000698
+pw04	PASS	0.9999980	0.999918
+pw05	PASS	0.9999999	0.999939
+pw06	PASS	1.0000000	0.999996
+pw07	PASS	1.0000000	0.999505
+pw08	PASS	1.0000000	0.999588
+pw09	PASS	1.0000000	1.000035
+pw10	PASS	1.0000000	0.999917
+pw11	PASS	0.9999981	0.999446
+pw12	PASS	1.0000000	0.999964
