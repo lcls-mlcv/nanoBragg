@@ -2,7 +2,9 @@
   "detpixels": 2048,
   "flux": 1e18,
   "beamsize_mm": 1.0,
-  "data_root": "cuda/testdata",
+  "input_root": "inputs",
+  "reference_fix_branches": ["fix/phi0-stale-rotation", "fix/subpixel-oversampling", "fix/curved-det-flag-guard"],
+  "cache_budget_gb": 20,
   "base_flags": ["-nonoise", "-nointerpolate", "-nopgm"],
   "base_geometry_dims": ["distance", "lambda", "pixel"],
   "beam_center_rule": "Xbeam = Ybeam = detpixels * pixel / 2 (recomputed per cell when pixel varies)",
@@ -11,7 +13,7 @@
     "sum_ratio_min": 0.999,
     "sum_ratio_max": 1.001,
     "metric": "Pearson corr + sum_ratio",
-    "applies_to": "all precisions (fp32/df64/fp64) identically"
+    "applies_to": "all precisions (fp32/df64) identically"
   },
-  "notes": "Detector locked at 2048x2048. Gate reproduces the 320 suite verbatim so the float ladder (184/320) stays comparable. Base geometry grounded from run_parity_suite_5090.sh. data_root is one root under which both the crystal .hkl (data_root/crystals/*.hkl) and the AMAT inputs (data_root/A.mat, data_root/scaled.hkl) live; it is repo-relative and resolved to an absolute path by run.sh. base_geometry_dims names the dimensions whose baseline values form the invariant BASE geometry (distance/lambda/pixel), matching run_parity_suite_5090.sh."
+  "notes": "Detector locked at 2048x2048. Gate reproduces the 320 suite verbatim so the float ladder (184/320) stays comparable. Base geometry grounded from run_parity_suite_5090.sh. input_root is the read-only render-INPUT root (large, untracked-in-git): the crystal structure-factor .hkl (inputs/crystals/*.hkl, up to ~126MB) and the AMAT inputs (inputs/matrix/amat.mat, inputs/crystals/scaled.hkl) that the binary reads, plus the default reference binary nanoBragg_root. It holds NO verdict/TSV data -- expected/ (verdicts) and ledger/ (run data) are committed separately. It is relative to the harness root (this file's own directory's parent, i.e. cuda/test/ -- so \"inputs\" means cuda/test/inputs) and resolved to an absolute path at run time from base.json's own location, independent of the process's working directory. Each case's stored args carry the literal {input_root} token (e.g. {input_root}/crystals/193L.hkl), expanded to this path per run; the tokenized form is what args_hash is computed over, keeping the cache key machine-independent. base_geometry_dims names the dimensions whose baseline values form the invariant BASE geometry (distance/lambda/pixel), matching run_parity_suite_5090.sh."
 }

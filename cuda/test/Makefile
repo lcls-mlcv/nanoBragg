@@ -1,43 +1,117 @@
-# Out-of-source build for the nanoBragg parity harness.
+# Out-of-source build for the nanoBragg parity harness nb* tool family
+# (NBTOOLS-SPEC.md §13/§14: argkey, case_core, cache_core are shared objects;
+# nbgensuite/nbcache/nbmetrics are the linked tools). Retired standalone tools
+# (canon, gen_suites, metrics) are not built here; canon.c stays on disk only to
+# build canon_ref, a test-only cross-check binary for test_argkey.
 #
-# Compiles src/*.c into the gitignored build dir cuda/test/build/:
-#   cuda/test/src/gen_suites.c  -> $(BINDIR)/gen_suites
-#   cuda/test/src/metrics.c    -> $(BINDIR)/metrics
+# Build prerequisites (system packages): gcc, json-c-devel (JSON parsing, via
+# <json-c/json.h> + -ljson-c), libmd-devel (md5, via <md5.h> + -lmd). The
+# harness may depend on system libraries; the nanoBragg binary itself does not.
 #
-# BINDIR defaults to cuda/test/build/ and may be overridden (run.sh points it
-# there explicitly). Build output is gitignored; only src/ is committed.
+# Objects-then-link, static, no .so. Build output goes to the gitignored
+# cuda/test/build/; only src/ is committed. BINDIR is resolved from this
+# Makefile's own path, so `make`, `make -C cuda/test`, and `cd cuda/test &&
+# make` all land in the same place regardless of invocation CWD.
 
-CC      ?= cc
-CFLAGS  ?= -O2 -std=c11 -Wall -Wextra
-LDLIBS  ?= -lm
+CC       ?= cc
+CFLAGS   ?= -std=c11 -O2 -Wall -Wextra
+DEPFLAGS  = -MMD -MP
+LDLIBS   ?= -lm
 
-# This Makefile lives in cuda/test/, so the default build dir is cuda/test/build.
-HERE    := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-BINDIR  ?= $(abspath $(HERE)build)
+HERE     := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+BINDIR   ?= $(abspath $(HERE)build)
+ROOT     := $(abspath $(HERE)../..)
 
-# Build-time commit bake (Layer-2 ledger provenance): metrics is stamped with the
-# commit HEAD was at when it was last compiled, queried at runtime via
-# `metrics --build-commit`. gen_suites stays commit-agnostic -- its output is
-# reviewed by diff, not stamped.
-BUILD_COMMIT := $(shell git -C $(HERE) rev-parse HEAD 2>/dev/null || echo unknown)
+# nbcache/nbmetrics bake the commit HEAD was at when last compiled, queried
+# at runtime via `<tool> --build-commit`.
+BUILD_COMMIT := $(shell git -C $(HERE) rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-BINS := $(BINDIR)/gen_suites $(BINDIR)/metrics
+TOOLS := $(BINDIR)/nbgensuite $(BINDIR)/nbcache $(BINDIR)/nbmetrics $(BINDIR)/nbrunsuite
+TESTS := $(BINDIR)/test_argkey $(BINDIR)/test_case_core $(BINDIR)/test_nbmetrics $(BINDIR)/test_cache_core
 
-.PHONY: all clean gen_suites metrics
-all: $(BINS)
+.PHONY: all clean test nbgensuite nbcache nbmetrics nbrunsuite
 
-# Convenience aliases so 'make metrics' / 'make gen_suites' work regardless of BINDIR.
-gen_suites: $(BINDIR)/gen_suites
-metrics:   $(BINDIR)/metrics
+all: $(TOOLS)
 
-$(BINDIR)/gen_suites: src/gen_suites.c | $(BINDIR)
-	$(CC) $(CFLAGS) -o $@ $< $(LDLIBS)
+# Convenience aliases so 'make nbcache' / 'make nbgensuite' work regardless
+# of BINDIR.
+nbgensuite: $(BINDIR)/nbgensuite
+nbcache:    $(BINDIR)/nbcache
+nbmetrics:  $(BINDIR)/nbmetrics
+nbrunsuite: $(BINDIR)/nbrunsuite
 
-$(BINDIR)/metrics: src/metrics.c | $(BINDIR)
-	$(CC) $(CFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -o $@ $< $(LDLIBS)
+# ---------------------------------------------------------------------------
+# Objects (generic rule; -MMD/-MP emit per-object .d files for header deps)
+# ---------------------------------------------------------------------------
+
+$(BINDIR)/%.o: src/%.c | $(BINDIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+# nbcache.o/nbmetrics.o need the commit bake, so they override the generic
+# rule above (an explicit rule for a given target always wins over a pattern
+# rule).
+$(BINDIR)/nbcache.o: src/nbcache.c | $(BINDIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -c -o $@ $<
+
+$(BINDIR)/nbmetrics.o: src/nbmetrics.c | $(BINDIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -c -o $@ $<
+
+$(BINDIR)/nbrunsuite.o: src/nbrunsuite.c | $(BINDIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -c -o $@ $<
+
+-include $(wildcard $(BINDIR)/*.d)
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+$(BINDIR)/nbgensuite: $(BINDIR)/nbgensuite.o $(BINDIR)/argkey.o $(BINDIR)/case_core.o
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c
+
+$(BINDIR)/nbcache: $(BINDIR)/nbcache.o $(BINDIR)/cache_core.o $(BINDIR)/argkey.o $(BINDIR)/case_core.o
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c
+
+$(BINDIR)/nbmetrics: $(BINDIR)/nbmetrics.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
+
+# nbrunsuite links the shared parity core (cache_core needs libmd) and drives
+# nbmetrics as a subprocess; -lm for the gate/metric arithmetic.
+$(BINDIR)/nbrunsuite: $(BINDIR)/nbrunsuite.o $(BINDIR)/cache_core.o $(BINDIR)/argkey.o $(BINDIR)/case_core.o
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c $(LDLIBS)
+
+# ---------------------------------------------------------------------------
+# Unit tests + the test-only canon_ref cross-check binary
+# ---------------------------------------------------------------------------
+
+$(BINDIR)/canon_ref: $(BINDIR)/canon.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BINDIR)/test_argkey: $(BINDIR)/test_argkey.o $(BINDIR)/argkey.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BINDIR)/test_case_core: $(BINDIR)/test_case_core.o $(BINDIR)/case_core.o
+	$(CC) $(CFLAGS) -o $@ $^ -ljson-c
+
+$(BINDIR)/test_nbmetrics: $(BINDIR)/test_nbmetrics.o
+	$(CC) $(CFLAGS) -o $@ $^
+
+$(BINDIR)/test_cache_core: $(BINDIR)/test_cache_core.o $(BINDIR)/cache_core.o $(BINDIR)/case_core.o $(BINDIR)/argkey.o
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c
 
 $(BINDIR):
 	mkdir -p $(BINDIR)
 
+# test_case_core and test_cache_core resolve "cuda/test/spec/base.json" as a
+# path relative to the worktree root, so they (and, for uniformity,
+# test_argkey) run with CWD = $(ROOT). test_nbmetrics takes the tool path as
+# argv[1] and uses /tmp for its fixtures, so it is CWD-independent.
+test: $(TESTS) $(BINDIR)/canon_ref $(BINDIR)/nbcache $(BINDIR)/nbmetrics
+	@status=0; \
+	echo "== test_argkey =="; (cd $(ROOT) && $(BINDIR)/test_argkey $(BINDIR)/canon_ref) || status=1; \
+	echo "== test_case_core =="; (cd $(ROOT) && $(BINDIR)/test_case_core) || status=1; \
+	echo "== test_nbmetrics =="; $(BINDIR)/test_nbmetrics $(BINDIR)/nbmetrics || status=1; \
+	echo "== test_cache_core =="; (cd $(ROOT) && $(BINDIR)/test_cache_core $(BINDIR)/nbcache) || status=1; \
+	exit $$status
+
 clean:
-	rm -f $(BINS)
+	rm -rf $(BINDIR)

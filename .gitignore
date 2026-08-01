@@ -7,8 +7,10 @@ image.pgm
 # oh-my-claudecode session state.
 .omc/
 
-# Parity harness (cuda/test): gitignored build output, run output, and
-# machine-local data inputs. Only cuda/test/ source is committed.
+# Parity harness (cuda/test): gitignored build output, run output, reference
+# binary, and machine-local render inputs. Only cuda/test/ source is committed.
 cuda/test/build/
+cuda/test/inputs/
+cuda/test/reference/
+cuda/test/workdir/
 cuda/testrun/
-cuda/testdata/

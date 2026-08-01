@@ -3,10 +3,10 @@
 
   "groups": [
 
-    {"group":"xtal_2plv","class":"crystal","label":"2PLV","args":["-hkl","{data_root}/crystals/2PLV.hkl","-cell","322.940","358.040","380.150","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"high","status":"unaudited"},"note":"large orthorhombic cell -> big Fhkl table"},
-    {"group":"xtal_193l","class":"crystal","label":"193L","args":["-hkl","{data_root}/crystals/193L.hkl","-cell","78.540","78.540","37.770","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"med","status":"unaudited"}},
-    {"group":"xtal_3nir","class":"crystal","label":"3NIR","args":["-hkl","{data_root}/crystals/3NIR.hkl","-cell","22.329","18.471","40.769","90","90.55","90"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"}},
-    {"group":"xtal_amat","class":"crystal","label":"AMAT","args":["-hkl","{data_root}/scaled.hkl","-mat","{data_root}/A.mat"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"orientation+cell via MOSFLM matrix; uses {data_root}/A.mat (105 B), NOT the tracked cuda/test/A.mat"},
+    {"group":"xtal_2plv","class":"crystal","label":"2PLV","args":["-hkl","{input_root}/crystals/2PLV.hkl","-cell","322.940","358.040","380.150","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"high","status":"unaudited"},"note":"large orthorhombic cell -> big Fhkl table"},
+    {"group":"xtal_193l","class":"crystal","label":"193L","args":["-hkl","{input_root}/crystals/193L.hkl","-cell","78.540","78.540","37.770","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"med","status":"unaudited"}},
+    {"group":"xtal_3nir","class":"crystal","label":"3NIR","args":["-hkl","{input_root}/crystals/3NIR.hkl","-cell","22.329","18.471","40.769","90","90.55","90"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"}},
+    {"group":"xtal_amat","class":"crystal","label":"AMAT","args":["-hkl","{input_root}/crystals/scaled.hkl","-mat","{input_root}/matrix/amat.mat"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"orientation+cell via MOSFLM matrix; uses {input_root}/matrix/amat.mat (105 B), NOT the tracked cuda/test/A.mat"},
 
     {"group":"xtal_none","class":"override","label":"none","args":[],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"class 'override' is inert to grid320's crossings; a crystal-free placeholder for scenarios that supply their own -cell + -default_F (no hkl file)"},
 
