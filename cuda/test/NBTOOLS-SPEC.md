@@ -77,21 +77,26 @@ payload on our command line ends option parsing with `--`: `nbcache --path -- <e
 
 ## 5. Device selection
 
-Two cards on this box differ by name/memory/UUID (desktop `NVIDIA GeForce RTX 5090`, 32607 MiB,
-`GPU-c5d63746-…`, pci `09:00.0`; laptop `…RTX 5090 Laptop GPU`, 24463 MiB, `GPU-62609c5d-…`, pci
-`01:00.0`). `nvidia-smi` orders by PCI (laptop index 0, desktop index 1). `nbrunsuite`:
+Two cards on this box differ by name/memory/UUID (desktop `NVIDIA GeForce RTX 5090`, 32 GiB,
+`GPU-c5d63746-…`, pci `09:00.0`; laptop `…RTX 5090 Laptop GPU`, 24 GiB, `GPU-62609c5d-…`, pci
+`01:00.0`). `nbrunsuite` handles devices through **NVML** — the NVIDIA driver's management library,
+the same one `nvidia-smi` wraps — never `nvidia-smi` and never the CUDA runtime (`cudart`):
 
-1. exports **`CUDA_DEVICE_ORDER=PCI_BUS_ID`** so CUDA's index == `nvidia-smi`'s.
-2. parses `nvidia-smi --query-gpu=index,name,uuid,pci.bus_id --format=csv,noheader` (libc
-   subprocess — no cudart), **trims** the leading space in each CSV field, resolves
-   `--gpu <index|exact-name|uuid>` by **exact** equality (never `strstr` — the desktop name is a
-   strict prefix of the laptop's), and sets `CUDA_VISIBLE_DEVICES` to the matched **UUID**
-   (order-independent). Refuses on no-match / multiple-match.
-3. after the first render, **confirms the device name the candidate binary itself prints** and
-   refuses on mismatch — restoring a runtime ground-truth check on top of the UUID pin.
+1. **Enumerate** — `nvmlInit_v2` → `nvmlDeviceGetCount_v2` → per device `nvmlDeviceGetName`,
+   `nvmlDeviceGetUUID` (the `GPU-…` string used verbatim as the pin), `nvmlDeviceGetCudaComputeCapability`,
+   `nvmlDeviceGetMemoryInfo`, `nvmlDeviceGetPciInfo_v3`. NVML sees every card with **no CUDA context
+   and no visibility pin**. `--list-gpus` prints this table (index · name · sm · memory · UUID · pci).
+2. **Resolve** — `--gpu <index|exact-name|uuid>` matches the enumeration by **exact** equality (never
+   `strstr` — the desktop name is a strict prefix of the laptop's). The matched device's name/UUID are
+   ground-truth from NVML, so there is **no separate post-render probe**. Refuses on no-match / multi-match.
+3. **Pin the child only** — `nbrunsuite`'s own process never sets `CUDA_VISIBLE_DEVICES` /
+   `CUDA_DEVICE_ORDER`. They are set **only in the nanoBragg child's environment** at fork/exec:
+   `CUDA_DEVICE_ORDER=PCI_BUS_ID` + `CUDA_VISIBLE_DEVICES=GPU-<uuid>` (order-independent — a UUID pins
+   exactly one physical card).
 
-Env vars are set once in `nbrunsuite` and inherited by every per-case subprocess. `--list-gpus`
-prints the table. Optional settings.json nickname (`desktop` → UUID).
+`--skip-device` bypasses selection (CPU-mock pipeline testing). Optional settings.json nickname
+(`desktop` → UUID). Resolution is by UUID/name, so it is immune to the CUDA-runtime index inversion —
+only the printed `index` label tracks NVML's order.
 
 ---
 
@@ -327,13 +332,18 @@ There is no "reproduce run.sh" step — run.sh is not a reference. `golden/` dat
 Objects-then-link; static; no `.so`. JSON is parsed/emitted with the **json-c** system library
 (`<json-c/json.h>`, `-ljson-c`), not a bundled parser. `argkey.o` (libc); `case_core.o` (`-ljson-c`);
 `cache_core.o` (`-ljson-c -lmd`). `nbgensuite`: `argkey.o` + `case_core.o` + `-ljson-c -lmd`.
-`nbcache`/`nbrunsuite`: `cache_core.o` + `argkey.o` + `case_core.o` + `-ljson-c -lmd`. `nbmetrics`:
-its own build (`-lm`).
+`nbcache`: `cache_core.o` + `argkey.o` + `case_core.o` + `-ljson-c -lmd`. `nbrunsuite`: the same
+**plus NVML** for device enumeration (`<nvml.h>`, `-lnvidia-ml`), built as a **separate CUDA-gated
+target** (needs the toolkit dir for `nvml.h` + the link stub; the CUDA-free core still builds without
+it). `nbmetrics`: its own build (`-lm`).
 
 **Build prerequisites** (system packages — the harness is deliberately *not* self-contained, unlike
 nanoBragg): a C compiler, **`json-c-devel`** (JSON) and **`libmd-devel`** (md5). A package being
 installed on one box is not proof the distro ships it by default, so these are listed as explicit
-install requirements. The GPU-running tools additionally need CUDA/nvcc (to build the candidate).
+install requirements. `nbrunsuite` also needs the CUDA toolkit dir for `nvml.h` + the `-lnvidia-ml`
+link stub, but at **runtime** only the NVIDIA driver's `libnvidia-ml.so` (not `cudart`); the candidate
+`nanoBragg` is built separately with `nvcc`. The CUDA-free core tools (`nbgensuite`/`nbcache`/`nbmetrics`)
+need none of this.
 
 ## 15. Invariants
 

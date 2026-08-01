@@ -7,6 +7,11 @@
 # Build prerequisites (system packages): gcc, json-c-devel (JSON parsing, via
 # <json-c/json.h> + -ljson-c), libmd-devel (md5, via <md5.h> + -lmd). The
 # harness may depend on system libraries; the nanoBragg binary itself does not.
+# nbrunsuite ADDITIONALLY needs the CUDA toolkit dir for NVML: <nvml.h> at compile
+# and the stub libnvidia-ml.so (-lnvidia-ml) at link; at runtime the NVIDIA driver's
+# libnvidia-ml.so.1 loads (no cudart at all). The toolkit dir is auto-detected and,
+# when absent, only nbrunsuite is skipped -- the CUDA-free core and `make test`
+# build with just gcc/json-c/libmd regardless.
 #
 # Objects-then-link, static, no .so. Build output goes to the gitignored
 # cuda/test/build/; only src/ is committed. BINDIR is resolved from this
@@ -26,7 +31,23 @@ ROOT     := $(abspath $(HERE)../..)
 # at runtime via `<tool> --build-commit`.
 BUILD_COMMIT := $(shell git -C $(HERE) rev-parse --short HEAD 2>/dev/null || echo unknown)
 
-TOOLS := $(BINDIR)/nbgensuite $(BINDIR)/nbcache $(BINDIR)/nbmetrics $(BINDIR)/nbrunsuite
+# CUDA detection (nbrunsuite only; the rest of the nb* family is CUDA-free). A
+# toolkit dir is resolved robustly -- $CUDA_HOME, then $CUDA_PATH, then the parent
+# of an nvcc on PATH, then /usr/local/cuda -- accepting the first that actually
+# carries <cuda_runtime.h>. When none is found, nbrunsuite drops out of the default
+# build and its alias errors, so `make` and `make test` still succeed on a CUDA-less
+# box with only gcc/json-c/libmd.
+NVCC_BIN := $(shell command -v nvcc 2>/dev/null)
+CUDA_DIR := $(firstword $(foreach d,$(CUDA_HOME) $(CUDA_PATH) \
+              $(if $(NVCC_BIN),$(abspath $(dir $(NVCC_BIN))/..)) /usr/local/cuda,\
+              $(if $(wildcard $(d)/include/cuda_runtime.h),$(d))))
+ifneq ($(CUDA_DIR),)
+CUDA_CFLAGS := -I$(CUDA_DIR)/include
+CUDA_LDLIBS := -L$(CUDA_DIR)/lib64/stubs -lnvidia-ml
+endif
+
+CORE_TOOLS := $(BINDIR)/nbgensuite $(BINDIR)/nbcache $(BINDIR)/nbmetrics
+TOOLS      := $(CORE_TOOLS) $(if $(CUDA_DIR),$(BINDIR)/nbrunsuite)
 TESTS := $(BINDIR)/test_argkey $(BINDIR)/test_case_core $(BINDIR)/test_nbmetrics $(BINDIR)/test_cache_core
 
 .PHONY: all clean test nbgensuite nbcache nbmetrics nbrunsuite
@@ -38,7 +59,14 @@ all: $(TOOLS)
 nbgensuite: $(BINDIR)/nbgensuite
 nbcache:    $(BINDIR)/nbcache
 nbmetrics:  $(BINDIR)/nbmetrics
+ifneq ($(CUDA_DIR),)
 nbrunsuite: $(BINDIR)/nbrunsuite
+else
+nbrunsuite:
+	@echo "nbrunsuite needs the CUDA toolkit dir for NVML (nvml.h + stub libnvidia-ml.so); none found." >&2
+	@echo "Set CUDA_HOME or put nvcc on PATH. The rest of the nb* family builds without it." >&2
+	@exit 1
+endif
 
 # ---------------------------------------------------------------------------
 # Objects (generic rule; -MMD/-MP emit per-object .d files for header deps)
@@ -57,7 +85,7 @@ $(BINDIR)/nbmetrics.o: src/nbmetrics.c | $(BINDIR)
 	$(CC) $(CFLAGS) $(DEPFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -c -o $@ $<
 
 $(BINDIR)/nbrunsuite.o: src/nbrunsuite.c | $(BINDIR)
-	$(CC) $(CFLAGS) $(DEPFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -c -o $@ $<
+	$(CC) $(CFLAGS) $(CUDA_CFLAGS) $(DEPFLAGS) -DNB_BUILD_COMMIT='"$(BUILD_COMMIT)"' -c -o $@ $<
 
 -include $(wildcard $(BINDIR)/*.d)
 
@@ -74,10 +102,11 @@ $(BINDIR)/nbcache: $(BINDIR)/nbcache.o $(BINDIR)/cache_core.o $(BINDIR)/argkey.o
 $(BINDIR)/nbmetrics: $(BINDIR)/nbmetrics.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
 
-# nbrunsuite links the shared parity core (cache_core needs libmd) and drives
+# nbrunsuite links the shared parity core (cache_core needs libmd), NVML for GPU
+# enumeration (-lnvidia-ml, driver's management lib -- no cudart), and drives
 # nbmetrics as a subprocess; -lm for the gate/metric arithmetic.
 $(BINDIR)/nbrunsuite: $(BINDIR)/nbrunsuite.o $(BINDIR)/cache_core.o $(BINDIR)/argkey.o $(BINDIR)/case_core.o
-	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c $(LDLIBS)
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c $(CUDA_LDLIBS) $(LDLIBS)
 
 # ---------------------------------------------------------------------------
 # Unit tests + the test-only canon_ref cross-check binary

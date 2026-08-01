@@ -9,12 +9,15 @@
  *
  *   nbrunsuite --suite NAME --candidate PATH --gpu "NAME|index|uuid" --workdir PATH
  *
- * Device selection (§5): CUDA_DEVICE_ORDER=PCI_BUS_ID is exported so CUDA's index
- * matches nvidia-smi's; the GPU table is parsed from nvidia-smi (no cudart), and
- * --gpu is resolved by EXACT equality on index / name / uuid (never strstr -- the
- * desktop name is a strict prefix of the laptop's). CUDA_VISIBLE_DEVICES is set to
- * the matched UUID. After the first candidate render the device name the binary
- * prints is confirmed against the resolved name (a runtime ground-truth check).
+ * Device selection (§5): GPUs are enumerated via NVML (the driver's management
+ * library -- what nvidia-smi wraps; no nvidia-smi parsing, no cudart, no CUDA
+ * context, no visibility pin), and --gpu is resolved by EXACT equality on index /
+ * name / uuid (never strstr -- the desktop name is a strict prefix of the laptop's).
+ * NVML reports each device's own UUID/name, which ARE the ground-truth identity, so
+ * there is no pin-then-reprobe. The parent process keeps a clean environment; only
+ * the render child (do_render) gets CUDA_DEVICE_ORDER=PCI_BUS_ID and
+ * CUDA_VISIBLE_DEVICES=GPU-<uuid> so the candidate renders on exactly the resolved
+ * card. Refuses (exit 4) on no-match / ambiguous match.
  *
  * Cache (§9): reference images only, keyed on the case's BAKED args_hash (read,
  * never recomputed). cache_gc() runs at suite start; cache_lookup is a .bin
@@ -32,8 +35,7 @@
  * cache_core / argkey / case_core / json are linked.
  *
  * TEST HOOKS (documented, harmless in production):
- *   --skip-device     skip nvidia-smi device selection AND the post-render
- *                     device-name confirmation, so the render->cache->metrics->
+ *   --skip-device     skip NVML device selection, so the render->cache->metrics->
  *                     gate->flip pipeline can be exercised with a CPU stand-in
  *                     candidate on a box with no eligible GPU. --gpu is not
  *                     required under --skip-device.
@@ -64,6 +66,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+
+#include <nvml.h>   /* GPU enumeration via the driver management lib; links -lnvidia-ml */
 
 #ifndef NB_BUILD_COMMIT
 #define NB_BUILD_COMMIT "unknown"
@@ -119,9 +123,21 @@ static void av_push_split(argv_t *a, const char *s) {
  * device selection (§5)
  * ========================================================================= */
 
-typedef struct { int index; char name[256]; char uuid[128]; char pci[64]; } gpu_dev;
+typedef struct {
+    int index;
+    char name[256];
+    char uuid[128];             /* NVML "GPU-..." string; this IS the pin value */
+    char pci[64];
+    unsigned long long mem_total;   /* total device memory, bytes */
+    int cc_major, cc_minor;         /* CUDA compute capability -> sm_XY */
+} gpu_dev;
 
-/* Trim leading/trailing spaces of a CSV field in place; returns the start. */
+/* Resolved "GPU-<uuid>" pin for the render child's environment (§5). Empty under
+   --skip-device; set once after resolve_gpu so each render fork inherits
+   CUDA_VISIBLE_DEVICES while this parent process's own environment stays clean. */
+static char g_child_cvd[128] = "";
+
+/* Trim leading/trailing spaces of a field in place; returns the start. */
 static char *trim(char *s) {
     while (*s == ' ' || *s == '\t') s++;
     size_t n = strlen(s);
@@ -129,36 +145,37 @@ static char *trim(char *s) {
     return s;
 }
 
-/* Parse `nvidia-smi --query-gpu=index,name,uuid,pci.bus_id --format=csv,noheader`.
+/* Enumerate GPUs via NVML (the driver's management library -- what nvidia-smi
+   wraps). No CUDA context and no CUDA_VISIBLE_DEVICES pin, so NVML sees every card.
    Returns count; *out receives a malloc'd array (caller frees). -1 on failure. */
 static int query_gpus(gpu_dev **out) {
-    FILE *p = popen("nvidia-smi --query-gpu=index,name,uuid,pci.bus_id --format=csv,noheader 2>/dev/null", "r");
-    if (!p) return -1;
-    int cap = 8, n = 0;
-    gpu_dev *d = (gpu_dev *)malloc((size_t)cap * sizeof(gpu_dev));
-    if (!d) { pclose(p); return -1; }
-    char line[1024];
-    while (fgets(line, sizeof line, p)) {
-        /* split on commas into up to 4 fields */
-        char *f[4] = {0}; int nf = 0;
-        char *s = line;
-        while (nf < 4) {
-            f[nf++] = s;
-            char *comma = strchr(s, ',');
-            if (!comma) break;
-            *comma = '\0';
-            s = comma + 1;
+    if (nvmlInit_v2() != NVML_SUCCESS) return -1;
+    unsigned int count = 0;
+    if (nvmlDeviceGetCount_v2(&count) != NVML_SUCCESS) { nvmlShutdown(); return -1; }
+    gpu_dev *d = (gpu_dev *)malloc((size_t)(count ? count : 1) * sizeof(gpu_dev));
+    if (!d) { nvmlShutdown(); return -1; }
+    int n = 0;
+    for (unsigned int i = 0; i < count; i++) {
+        nvmlDevice_t h;
+        if (nvmlDeviceGetHandleByIndex_v2(i, &h) != NVML_SUCCESS) continue;
+        memset(&d[n], 0, sizeof d[n]);
+        d[n].index = (int)i;
+        if (nvmlDeviceGetName(h, d[n].name, sizeof d[n].name) != NVML_SUCCESS)
+            snprintf(d[n].name, sizeof d[n].name, "unknown");
+        if (nvmlDeviceGetUUID(h, d[n].uuid, sizeof d[n].uuid) != NVML_SUCCESS)
+            snprintf(d[n].uuid, sizeof d[n].uuid, "unknown");   /* "GPU-..." string */
+        nvmlMemory_t mem;
+        if (nvmlDeviceGetMemoryInfo(h, &mem) == NVML_SUCCESS) d[n].mem_total = mem.total;
+        int major = 0, minor = 0;
+        if (nvmlDeviceGetCudaComputeCapability(h, &major, &minor) == NVML_SUCCESS) {
+            d[n].cc_major = major; d[n].cc_minor = minor;
         }
-        if (nf < 4) continue;
-        for (int i = 0; i < 4; i++) f[i] = trim(f[i]);
-        if (n == cap) { cap *= 2; d = (gpu_dev *)realloc(d, (size_t)cap * sizeof(gpu_dev)); if (!d) { pclose(p); return -1; } }
-        d[n].index = (int)strtol(f[0], NULL, 10);
-        snprintf(d[n].name, sizeof d[n].name, "%s", f[1]);
-        snprintf(d[n].uuid, sizeof d[n].uuid, "%s", f[2]);
-        snprintf(d[n].pci,  sizeof d[n].pci,  "%s", f[3]);
+        nvmlPciInfo_t pci;
+        if (nvmlDeviceGetPciInfo_v3(h, &pci) == NVML_SUCCESS)
+            snprintf(d[n].pci, sizeof d[n].pci, "%s", pci.busId);
         n++;
     }
-    pclose(p);
+    nvmlShutdown();
     *out = d;
     return n;
 }
@@ -166,11 +183,14 @@ static int query_gpus(gpu_dev **out) {
 static void list_gpus(void) {
     gpu_dev *d = NULL;
     int n = query_gpus(&d);
-    if (n < 0) { fprintf(stderr, "nbrunsuite: nvidia-smi unavailable\n"); free(d); return; }
-    printf("# %d GPU(s) (CUDA_DEVICE_ORDER=PCI_BUS_ID -> index matches nvidia-smi)\n", n);
-    printf("%-6s %-34s %-42s %s\n", "index", "name", "uuid", "pci.bus_id");
-    for (int i = 0; i < n; i++)
-        printf("%-6d %-34s %-42s %s\n", d[i].index, d[i].name, d[i].uuid, d[i].pci);
+    if (n < 0) { fprintf(stderr, "nbrunsuite: NVML unavailable\n"); free(d); return; }
+    printf("# %d GPU(s) via NVML\n", n);
+    printf("%-6s %-34s %-7s %-9s %-42s %s\n", "index", "name", "sm", "mem", "uuid", "pci.bus_id");
+    for (int i = 0; i < n; i++) {
+        char sm[16];  snprintf(sm,  sizeof sm,  "sm_%d%d", d[i].cc_major, d[i].cc_minor);
+        char mem[16]; snprintf(mem, sizeof mem, "%.1fGiB", (double)d[i].mem_total / (1024.0*1024.0*1024.0));
+        printf("%-6d %-34s %-7s %-9s %-42s %s\n", d[i].index, d[i].name, sm, mem, d[i].uuid, d[i].pci);
+    }
     free(d);
 }
 
@@ -179,8 +199,8 @@ static void list_gpus(void) {
 static void resolve_gpu(const char *sel, gpu_dev *match) {
     gpu_dev *d = NULL;
     int n = query_gpus(&d);
-    if (n < 0) die("nvidia-smi unavailable (need --gpu resolution; use --skip-device for a no-GPU test run)");
-    if (n == 0) die("no GPUs reported by nvidia-smi");
+    if (n < 0) die("NVML unavailable (need --gpu resolution; use --skip-device for a no-GPU test run)");
+    if (n == 0) die("no GPUs reported by NVML");
 
     /* is sel an integer index? */
     int is_index = 1;
@@ -225,6 +245,13 @@ static int do_render(const char *bin, argv_t *av, const char *scratch,
     if (pid < 0) { *secs = 0.0; return -1; }
     if (pid == 0) {
         if (chdir(scratch) != 0) _exit(126);
+        /* Pin the CUDA device in the CHILD's environment only (§5): the parent
+           never sets these, so NVML enumeration stays context-free. g_child_cvd is
+           empty under --skip-device, and the CPU reference oracle ignores it. */
+        if (g_child_cvd[0]) {
+            setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+            setenv("CUDA_VISIBLE_DEVICES", g_child_cvd, 1);
+        }
         int fd = open(logpath, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
         execv(bin, av->v);
@@ -668,19 +695,21 @@ int main(int argc, char **argv) {
     if (!gpu && !skip_device) die("--gpu required (or --skip-device for a no-GPU test run)");
 
     /* ---- device selection (§5): resolved (and refused) before any suite work,
-       so a bad --gpu never renders. CUDA_DEVICE_ORDER=PCI_BUS_ID makes CUDA's
-       index match nvidia-smi's; the match's UUID pins CUDA_VISIBLE_DEVICES. */
-    setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+       so a bad --gpu never renders. NVML enumerates every card with no CUDA context
+       and no visibility pin, so this parent process keeps a CLEAN environment; the
+       resolved device's own NVML UUID/name ARE the ground-truth identity (no
+       pin-then-reprobe). The "GPU-<uuid>" pin is applied only in each render child's
+       environment (do_render), never on this process. */
     gpu_dev match; memset(&match, 0, sizeof match);
     int have_device = 0;
     if (!skip_device) {
         resolve_gpu(gpu, &match);
-        setenv("CUDA_VISIBLE_DEVICES", match.uuid, 1);
+        snprintf(g_child_cvd, sizeof g_child_cvd, "%s", match.uuid);
         have_device = 1;
-        fprintf(stderr, "# device: index=%d name=\"%s\" uuid=%s -> CUDA_VISIBLE_DEVICES=%s\n",
-                match.index, match.name, match.uuid, match.uuid);
+        fprintf(stderr, "# device: index=%d name=\"%s\" uuid=%s -> child CUDA_VISIBLE_DEVICES=%s\n",
+                match.index, match.name, match.uuid, g_child_cvd);
     } else {
-        fprintf(stderr, "# --skip-device: no GPU selected (test pipeline; post-render name check disabled)\n");
+        fprintf(stderr, "# --skip-device: no GPU selected (test pipeline)\n");
     }
 
     /* base.json anchors the harness root and gate defaults (§11). Resolve it from
@@ -805,7 +834,6 @@ int main(int argc, char **argv) {
     printf("%-34s %-11s %-10s %-9s %-8s %s\n", "cell", "corr", "sum_ratio", "ms", "verdict", "note");
 
     results_t R; res_init(&R);
-    int first_render_done = 0;
 
     /* ---- per-case loop ---------------------------------------------------- */
     for (int idx = 0; idx < S->n; idx++) {
@@ -914,24 +942,6 @@ int main(int argc, char **argv) {
             printf("%-34s %-11s %-10s %-9.1f %-8s %s\n", out->id, "-", "-", out->ms, out->verdict, out->note);
             if (!keep_cand) unlink(gout);
             free(cand_args); free(ref_args); continue;
-        }
-
-        /* post-render device-name confirmation (§5.3): fires only under a real
-           device selection (the hook is a no-op under --skip-device). */
-        if (have_device && !first_render_done) {
-            first_render_done = 1;
-            FILE *lf = fopen(candlog, "rb");
-            int name_seen = 0;
-            if (lf) {
-                char buf[8192]; size_t got = fread(buf, 1, sizeof buf - 1, lf); buf[got] = '\0';
-                if (strstr(buf, match.name)) name_seen = 1;
-                fclose(lf);
-            }
-            if (!name_seen) {
-                fprintf(stderr, "nbrunsuite: REFUSED -- candidate did not print the resolved device name \"%s\" (see %s)\n", match.name, candlog);
-                fclose(rf);
-                return 4;
-            }
         }
 
         /* ---- compare + gate ---------------------------------------------- */
