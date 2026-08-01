@@ -4,7 +4,7 @@
 #
 # This is a sanity check that a built (or deployed) binary runs end-to-end and
 # emits a non-trivial diffraction image. It is deliberately independent of the
-# parity harness in ../ : no -hkl, no -matrix, no external data files at all.
+# parity harness in ../test/ : no -hkl, no -matrix, no external data files at all.
 # The crystal is described entirely on the command line with an inline -cell
 # and a flat -default_F structure factor, so the only input is the binary.
 #
@@ -16,22 +16,15 @@ set -u
 
 # Resolve the binary: explicit $1, else the release build relative to this script.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="${1:-$SCRIPT_DIR/../../build/release/nanoBraggCUDA}"
+BIN="${1:-$SCRIPT_DIR/../build/release/nanoBraggCUDA}"
 
 fail() { echo "SMOKE FAIL: $*"; exit 1; }
 
 [ -x "$BIN" ] || fail "binary not found or not executable: $BIN"
 
-# Report which GPU will be used. The binary does not print a device name, so we
-# resolve CUDA_VISIBLE_DEVICES (when it is a UUID) via nvidia-smi purely for
-# visibility -- the render itself honors whatever CUDA_VISIBLE_DEVICES selects.
-gpu_name=""
-if command -v nvidia-smi >/dev/null 2>&1; then
-    gpu_name="$(nvidia-smi --query-gpu=uuid,name --format=csv,noheader 2>/dev/null \
-        | awk -F', ' -v want="${CUDA_VISIBLE_DEVICES:-}" '$1==want{print $2}')"
-    [ -n "$gpu_name" ] || gpu_name="$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -n1)"
-fi
-echo "GPU in use: ${gpu_name:-unknown}  (CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>})"
+# The binary does not report a device name; show the selector only. The render
+# honors whatever CUDA_VISIBLE_DEVICES selects (unset = the CUDA default device).
+echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "binary: $BIN"
 
 # Render inside a throwaway dir so no intimage.img / floatimage.bin / Fdump.bin
