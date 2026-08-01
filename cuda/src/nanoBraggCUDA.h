@@ -21,7 +21,7 @@ void nanoBraggSpotsCUDA_single(int spixels, int fpixels, int roi_xmin, int roi_x
 		double water_MW, double r_e_sqr, double fluence, double Avogadro, int integral_form, double default_F, int interpolate, double *** Fhkl, int h_min,
 		int h_max, int h_range, int k_min, int k_max, int k_range, int l_min, int l_max, int l_range, int hkls, int nopolar, double polar_vector[4],
 		double polarization, double fudge, int unsigned short * maskimage, float * floatimage /*out*/, double * omega_sum/*out*/, int * sumn /*out*/,
-		double * sum /*out*/, double * sumsqr /*out*/, double * max_I/*out*/, double * max_I_x/*out*/, double * max_I_y /*out*/);
+		double * sum /*out*/, double * sumsqr /*out*/, double * max_I/*out*/, double * max_I_x/*out*/, double * max_I_y /*out*/, int progress_meter);
 void nanoBraggSpotsCUDA_double(int spixels, int fpixels, int roi_xmin, int roi_xmax, int roi_ymin, int roi_ymax, int oversample, int point_pixel, double pixel_size,
 		double subpixel_size, int steps, double detector_thickstep, int detector_thicksteps, double detector_thick, double detector_mu, double sdet_vector[4],
 		double fdet_vector[4], double odet_vector[4], double pix0_vector[4], int curved_detector, double distance, double close_distance, double beam_vector[4],
@@ -31,7 +31,7 @@ void nanoBraggSpotsCUDA_double(int spixels, int fpixels, int roi_xmin, int roi_x
 		double water_MW, double r_e_sqr, double fluence, double Avogadro, int integral_form, double default_F, int interpolate, double *** Fhkl, int h_min,
 		int h_max, int h_range, int k_min, int k_max, int k_range, int l_min, int l_max, int l_range, int hkls, int nopolar, double polar_vector[4],
 		double polarization, double fudge, int unsigned short * maskimage, float * floatimage /*out*/, double * omega_sum/*out*/, int * sumn /*out*/,
-		double * sum /*out*/, double * sumsqr /*out*/, double * max_I/*out*/, double * max_I_x/*out*/, double * max_I_y /*out*/);
+		double * sum /*out*/, double * sumsqr /*out*/, double * max_I/*out*/, double * max_I_x/*out*/, double * max_I_y /*out*/, int progress_meter);
 
 #ifdef __cplusplus
 }

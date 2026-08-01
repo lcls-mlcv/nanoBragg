@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>   /* usleep for the host poll cadence */
 #include <driver_types.h>
 #include "nanotypes.h"
 #include "nanoBraggCUDA.h"
@@ -156,14 +157,14 @@ struct crystalParams {
     float default_F;
     float dmin;
     shapetype xtal_shape;
-    short mosaic_domains;
+    int mosaic_domains;
     structureFactorParams fhklParams;
 };
 
 struct goniometerParams {
     float phi0;
     float phistep;
-    short phisteps;
+    int phisteps;
     float spindle_vector[VECTOR_SIZE];
 };
 
@@ -172,13 +173,19 @@ struct goniometerParams {
 static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ detectorPtr, const beamParams * __restrict__ beamPtr, const goniometerParams * __restrict__ goniometerPtr, const sampleParams * __restrict__ samplePtr,
         const crystalParams * crystalPtr, const constParams * __restrict__ constantsPtr, const beamSource * __restrict__ beam_sources, const float * __restrict__ Fhkl,
         const Real * __restrict__ phi_mos_a, const Real * __restrict__ phi_mos_b, const Real * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
-        float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap);
+        float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap, unsigned int * progress,
+        unsigned int * progress_pub, int progress_meter);
 
 /* vector cross product where vector magnitude is 0th element */
 __device__ static float *cross_product(const float * x, const float * y, float * z);
 __device__ __inline__ float norm3d_fma_rn(float v1, float v2, float v3);
 /* rotate a 3-vector about a unit vector axis */
 __device__ static float *rotate_axis(const float * __restrict__ v, float *newv, const float * __restrict__ axis, const float phi);
+/* compensated-pair rotate: the angle is carried as a (hi, lo) pair and its sin/cos are
+   rebuilt in df arithmetic (see df_sincos), keeping both above single precision */
+__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float2 phi);
+/* sin and cos of a compensated-pair angle, returned as compensated pairs, float-only */
+__device__ __inline__ static void df_sincos(float2 phi, float2 * sinphi, float2 * cosphi);
 __device__ __inline__ static long flatten3dindex(short x, short y, short z, short x_range, short y_range, short z_range);
 __device__ __inline__ float quickFcell_ldg(short hkls, short h0, short h_max, short h_min, short k0, short k_max, short k_min, short l0, short l_max,
         short l_min, short h_range,
@@ -355,9 +362,14 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
         int interpolate, double *** Fhkl, int h_min, int h_max, int h_range, int k_min, int k_max, int k_range, int l_min, int l_max, int l_range, int hkls,
         int nopolar, double polar_vector[4], double polarization, double fudge, int unsigned short * maskimage, float * floatimage /*out*/,
         double * omega_sum/*out*/, int * sumn /*out*/, double * sum /*out*/, double * sumsqr /*out*/, double * max_I/*out*/, double * max_I_x/*out*/,
-        double * max_I_y /*out*/) {
+        double * max_I_y /*out*/, int progress_meter) {
 
     int total_pixels = spixels * fpixels;
+
+    /* Enable host-mapped (zero-copy) allocations for the progress scalar. Must be the first CUDA
+       runtime call here, before any context-creating alloc, or cudaHostAlloc(...Mapped) later fails
+       with cudaErrorSetOnActiveProcess. */
+    CUDA_CHECK_RETURN(cudaSetDeviceFlags(cudaDeviceMapHost));
 
     bool * rangemap = (bool*) calloc(total_pixels, sizeof(bool));
     float * omega_reduction = (float*) calloc(total_pixels, sizeof(float));
@@ -626,27 +638,84 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     dim3 threadsPerBlock(THREADS_PER_BLOCK_X, THREADS_PER_BLOCK_Y);
     dim3 numBlocks(smCount * 32, 1);
 
+    unsigned int * cu_progress = NULL;                                      /* device-global fine counter */
+    CUDA_CHECK_RETURN(cudaMalloc((void **)&cu_progress, sizeof(unsigned int)));
+    CUDA_CHECK_RETURN(cudaMemset(cu_progress, 0, sizeof(unsigned int)));     /* per-launch reset */
+
+    unsigned int * h_progress = NULL;                                       /* host-mapped pinned scalar */
+    unsigned int * d_progress = NULL;                                       /* its device-side pointer */
+    CUDA_CHECK_RETURN(cudaHostAlloc((void **)&h_progress, sizeof(unsigned int), cudaHostAllocMapped));
+    *h_progress = 0;                                                        /* host-init: first read is a clean 0 */
+    CUDA_CHECK_RETURN(cudaHostGetDevicePointer((void **)&d_progress, h_progress, 0));
+
+    cudaStream_t kernelStream;
+    CUDA_CHECK_RETURN(cudaStreamCreate(&kernelStream));                     /* blocking; no poll stream needed */
+
     /* Time the kernel launch and print "KERNEL_MS <ms>" to stderr as a stable,
        machine-parseable token (host-side timing only, does not affect the image). */
     cudaEvent_t nb_kern_start, nb_kern_stop;
     CUDA_CHECK_RETURN(cudaEventCreate(&nb_kern_start));
     CUDA_CHECK_RETURN(cudaEventCreate(&nb_kern_stop));
-    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_start));
+    CUDA_CHECK_RETURN(cudaDeviceSynchronize());   /* MANDATORY: drain all H2D copies + the counter memset */
+    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_start, kernelStream));
 
-    nanoBraggSpotsCUDAKernel<<<numBlocks, threadsPerBlock>>>(cu_detector, cu_beam, cu_goniometer, cu_sample, cu_crystal, cu_constants, cu_beam_sources, cu_Fhkl,
-            cu_phi_mos_a, cu_phi_mos_b, cu_phi_mos_c, cu_maskimage, cu_floatimage /*out*/, cu_omega_reduction/*out*/, cu_max_I_x_reduction/*out*/, cu_max_I_y_reduction /*out*/, cu_rangemap /*out*/);
+    nanoBraggSpotsCUDAKernel<<<numBlocks, threadsPerBlock, 0, kernelStream>>>(cu_detector, cu_beam, cu_goniometer, cu_sample, cu_crystal, cu_constants, cu_beam_sources, cu_Fhkl,
+            cu_phi_mos_a, cu_phi_mos_b, cu_phi_mos_c, cu_maskimage, cu_floatimage /*out*/, cu_omega_reduction/*out*/, cu_max_I_x_reduction/*out*/, cu_max_I_y_reduction /*out*/, cu_rangemap /*out*/, cu_progress, d_progress, progress_meter);
 
-    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_stop));
+    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_stop, kernelStream));
     CUDA_CHECK_RETURN(cudaPeekAtLastError());
-    CUDA_CHECK_RETURN(cudaEventSynchronize(nb_kern_stop));
+
+    if (!progress_meter) {
+        /* -noprogress: baseline path -- the kernel issued no atomics/stores; just join, no prints
+           (no 0%, no 1-99%, no 100%). */
+        CUDA_CHECK_RETURN(cudaStreamSynchronize(kernelStream));
+    } else {
+        /* Parent-owned bookend: print 0% once, right before entering the poll loop. */
+        printf("%lu%% done\n", 0UL);
+        fflush(stdout);
+
+        unsigned int  running_max = 0;   /* host-side monotone max over torn/laggy mapped reads */
+        unsigned long last_pct    = 0;   /* highest integer percent already printed */
+        /* cudaStreamQuery is used RAW here -- NEVER wrapped in CUDA_CHECK_RETURN, which would exit(1)
+           on the normal, expected cudaErrorNotReady. It is NON-BLOCKING and touches no copy queue. */
+        while (cudaStreamQuery(kernelStream) == cudaErrorNotReady) {
+            /* ZERO-COPY read of the host-mapped scalar through its HOST pointer -- the kernel's
+               __threadfence_system() store is directly visible. HARD RULE: no cudaMemcpy /
+               cudaMemcpyAsync / cudaStreamSynchronize in this loop. On WSL2 there is no copy/execute
+               overlap, so any blocking copy/sync here re-serializes the whole loop behind the kernel
+               and the meter degrades to one poll at the end. */
+            unsigned int v = *(volatile unsigned int *)h_progress;
+            if (v > running_max) running_max = v;
+            unsigned long pct = (total_pixels > 0)                  /* guard total_pixels == 0 */
+                    ? (unsigned long)running_max * 100UL / (unsigned long)total_pixels
+                    : 0UL;
+            if (pct > 99UL) pct = 99UL;         /* the loop owns only 1-99%; 0% and 100% are the parent's */
+            /* CPU-reference cadence (nanoBraggCPU meter): emit every crossed print-worthy percent,
+               not just the newest, so a poll that jumps several percent stays faithful. Print-worthy
+               = a multiple of 5, or inside the first 10% (p < 10) or last 10% (p > 90): 1% steps at
+               the ends, 5% steps through the middle -> 0,1..9,10,15..90,91..99,100. */
+            for (unsigned long p = last_pct + 1UL; p <= pct; ++p) {
+                if (p % 5UL == 0UL || p < 10UL || p > 90UL) {
+                    printf("%lu%% done\n", p);
+                    fflush(stdout);                     /* stream live even when stdout is a pipe */
+                }
+            }
+            last_pct = pct;
+            usleep(50000);   /* ~50 ms cadence */
+        }
+        CUDA_CHECK_RETURN(cudaStreamSynchronize(kernelStream));   /* final join before any result output */
+        printf("%lu%% done\n", 100UL);                            /* parent-owned bookend: meter ends at 100% */
+        fflush(stdout);   /* emitted immediately after the join, before KERNEL_MS and all other output */
+    }
+
     {
         float nb_kernel_ms = 0.0f;
         CUDA_CHECK_RETURN(cudaEventElapsedTime(&nb_kernel_ms, nb_kern_start, nb_kern_stop));
         fprintf(stderr, "KERNEL_MS %f\n", nb_kernel_ms);
     }
+
     CUDA_CHECK_RETURN(cudaEventDestroy(nb_kern_start));
     CUDA_CHECK_RETURN(cudaEventDestroy(nb_kern_stop));
-    CUDA_CHECK_RETURN(cudaDeviceSynchronize());
 
     CUDA_CHECK_RETURN(cudaMemcpy(floatimage, cu_floatimage, sizeof(*cu_floatimage) * total_pixels, cudaMemcpyDeviceToHost));
     CUDA_CHECK_RETURN(cudaMemcpy(omega_reduction, cu_omega_reduction, sizeof(*cu_omega_reduction) * total_pixels, cudaMemcpyDeviceToHost));
@@ -671,6 +740,9 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     CUDA_CHECK_RETURN(cudaFree(cu_max_I_y_reduction));
     CUDA_CHECK_RETURN(cudaFree(cu_maskimage));
     CUDA_CHECK_RETURN(cudaFree(cu_rangemap));
+    CUDA_CHECK_RETURN(cudaFree(cu_progress));           /* device-global counter */
+    CUDA_CHECK_RETURN(cudaFreeHost(h_progress));        /* host-mapped pinned scalar (NOT cudaFree) */
+    CUDA_CHECK_RETURN(cudaStreamDestroy(kernelStream));
 
     *max_I = 0;
     *max_I_x = 0;
@@ -716,7 +788,8 @@ static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restric
         const crystalParams * crystal, const constParams * __restrict__ constants, const beamSource * __restrict__ beam_sources, const float * __restrict__ Fhkl,
         const Real * __restrict__ phi_mos_a, const Real * __restrict__ phi_mos_b, const Real * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/,
-        float * max_I_y_reduction /*out*/, bool * rangemap) {
+        float * max_I_y_reduction /*out*/, bool * rangemap, unsigned int * progress,
+        unsigned int * progress_pub, int progress_meter) {
 
     __shared__ float s_Na, s_Nb, s_Nc;
 
@@ -739,6 +812,21 @@ static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restric
     const float I_bg = water_bg(sample->water_F, constants->r_e_sqr, beam->fluence, constants->r_e_sqr_fluence, sample->water_size, constants->Avogadro, sample->water_MW);
 
     for (long pixIdx = (blockDim.y * blockIdx.y + threadIdx.y) * fstride + blockDim.x * blockIdx.x + threadIdx.x; pixIdx < total_pixels; pixIdx += stride) {
+        /* progress: threadIdx.x == 0 of each row adds this wave's assigned pixels to the device-global
+           fine counter (before the ROI skip, so it counts assigned pixels), then PUBLISHES the running
+           total to the host-mapped scalar so the host can read it copy-free. __threadfence_system()
+           pushes the mapped store out to host visibility; a plain store + this fence is sufficient
+           (atomicAdd_system not required). progress_meter is warp-uniform (a scalar kernel arg), so
+           with -noprogress neither the atomic nor the publish is issued -- the path is bit-for-bit
+           baseline. The count stays correct for any block shape: the blockDim.y threads with
+           threadIdx.x == 0 each add blockDim.x, summing to the block's per-wave pixel count. The
+           atomicAdd and the mapped store + fence both run every wave so the published counter stays
+           exact and current. */
+        if (progress_meter && threadIdx.x == 0) {
+            unsigned int published = atomicAdd(progress, blockDim.x) + blockDim.x;
+            *(volatile unsigned int *)progress_pub = published;
+            __threadfence_system();
+        }
         const short fpixel = pixIdx % detector->fpixels;
         const short spixel = pixIdx / detector->fpixels;
 
@@ -897,10 +985,10 @@ static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restric
                         }
 
                         /* sweep over phi angles */
-                        for (short phi_tic = 0; phi_tic < goniometer->phisteps; ++phi_tic) {
+                        for (int phi_tic = 0; phi_tic < goniometer->phisteps; ++phi_tic) {
 
                             /* enumerate mosaic domains */
-                            for (short mos_tic = 0; mos_tic < crystal->mosaic_domains; ++mos_tic) {
+                            for (int mos_tic = 0; mos_tic < crystal->mosaic_domains; ++mos_tic) {
 
                                 /* Outputs of the lattice-shape block below, all single precision:
                                    the Miller indices h,k,l (the round crystal shapes need their
@@ -1413,17 +1501,58 @@ __device__ __inline__ static float parallax(const float2 * __restrict__ odet, co
     return real_to_float(__ldg(&odet[1])) * diffracted_f[1] + real_to_float(__ldg(&odet[2])) * diffracted_f[2] + real_to_float(__ldg(&odet[3])) * diffracted_f[3];
 }
 
+/* sin and cos of a compensated-pair angle, returned as compensated pairs, computed with
+   float-only arithmetic. The hardware sinf/cosf carry ~1 ulp of rounding error; that error,
+   though tiny, shifts a sharp interference fringe enough to redistribute a fraction of a
+   percent of the total flux on a curved detector at fine reciprocal-space sampling. Rebuilding
+   the trig in df arithmetic keeps the low word the hardware call would discard.
+
+   Cody-Waite range reduction folds phi into [-pi/4, pi/4] by subtracting k*(pi/2) with pi/2
+   held as a (hi, lo) pair, then Horner polynomials evaluated entirely in df pick up sin/cos of
+   the reduced angle; the quadrant k selects and signs the two results. Coefficients are the
+   Taylor terms carried as pairs so their low words survive too; four terms beyond the constant
+   drive the polynomial truncation error below the ~1 ulp the hardware call loses. */
+__device__ __inline__ static void df_sincos(float2 phi, float2 * sinphi, float2 * cosphi) {
+    const float2 PIO2 = make_float2(1.570796371e+00f, -4.371138829e-08f);
+    const float  TWO_OVER_PI = 6.366197467e-01f;
+    /* reduce phi to r in [-pi/4, pi/4]; k tracks the quadrant */
+    const float kf = rintf(phi.x * TWO_OVER_PI);
+    const float2 r = df_sub(phi, df_mul_f(PIO2, kf));
+    const float2 r2 = df_mul(r, r);
+    /* sin(r) = r * (1 + r2*(c1 + r2*(c2 + r2*(c3 + r2*c4)))) */
+    float2 s = make_float2(2.755731884e-06f, 3.793571224e-14f);
+    s = df_add(df_mul(s, r2), make_float2(-1.984127011e-04f, 2.725596875e-12f));
+    s = df_add(df_mul(s, r2), make_float2( 8.333333768e-03f, -4.346172033e-10f));
+    s = df_add(df_mul(s, r2), make_float2(-1.666666716e-01f,  4.967053879e-09f));
+    s = df_add_f(df_mul(s, r2), 1.0f);
+    const float2 sin_r = df_mul(r, s);
+    /* cos(r) = 1 + r2*(d1 + r2*(d2 + r2*(d3 + r2*d4))) */
+    float2 c = make_float2(2.480158764e-05f, -3.406996094e-13f);
+    c = df_add(df_mul(c, r2), make_float2(-1.388888923e-03f,  3.363109444e-11f));
+    c = df_add(df_mul(c, r2), make_float2( 4.166666791e-02f, -1.241763470e-09f));
+    c = df_add(df_mul(c, r2), make_float2(-5.000000000e-01f,  0.000000000e+00f));
+    const float2 cos_r = df_add_f(df_mul(c, r2), 1.0f);
+    /* quadrant fold: q = k mod 4 in {0,1,2,3} */
+    const int q = ((int) kf) & 3;
+    const float2 neg_sin = make_float2(-sin_r.x, -sin_r.y);
+    const float2 neg_cos = make_float2(-cos_r.x, -cos_r.y);
+    if (q == 0)      { *sinphi = sin_r;   *cosphi = cos_r; }
+    else if (q == 1) { *sinphi = cos_r;   *cosphi = neg_sin; }
+    else if (q == 2) { *sinphi = neg_sin; *cosphi = neg_cos; }
+    else             { *sinphi = neg_cos; *cosphi = sin_r; }
+}
+
 /* compensated-pair form of the axis rotation: rotate the (hi, lo) vector v about the
-   (hi, lo) unit axis by angle phi, writing the (hi, lo) result into newv. The trig
-   constants sin(phi)/cos(phi) are single-precision scalars (one sin and one cos, as in
-   the float rotate_axis); every vector product and sum is carried as a compensated pair
-   so the rotated position keeps its low word instead of collapsing to float. Mirrors the
-   float rotate_axis term for term:
+   (hi, lo) unit axis by the (hi, lo) angle phi, writing the (hi, lo) result into newv.
+   sin(phi)/cos(phi) are rebuilt as compensated pairs by df_sincos, so the rotation angle
+   stays above single precision through the trig term as well as the vector algebra; every
+   vector product and sum is carried as a compensated pair so the rotated position keeps its
+   low word instead of collapsing to float. Mirrors the float rotate_axis term for term:
        newv = v*cos + (axis x v)*sin + axis*(axis . v)*(1 - cos)
    4-element convention, element 0 (magnitude) left untouched. */
-__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float phi) {
-    const float sinphi = sin(phi);
-    const float cosphi = cos(phi);
+__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float2 phi) {
+    float2 sinphi, cosphi;
+    df_sincos(phi, &sinphi, &cosphi);
     const float2 a1 = axis[1];
     const float2 a2 = axis[2];
     const float2 a3 = axis[3];
@@ -1431,24 +1560,28 @@ __device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, flo
     const float2 v2 = v[2];
     const float2 v3 = v[3];
     float2 dot = df_add(df_add(df_mul(a1, v1), df_mul(a2, v2)), df_mul(a3, v3));
-    dot = df_mul_f(dot, 1.0f - cosphi);
+    dot = df_mul(dot, df_sub(make_float2(1.0f, 0.0f), cosphi));
 
-    newv[1] = df_add(df_add(df_mul(a1, dot), df_mul_f(v1, cosphi)),
-                     df_mul_f(df_sub(df_mul(a2, v3), df_mul(a3, v2)), sinphi));
-    newv[2] = df_add(df_add(df_mul(a2, dot), df_mul_f(v2, cosphi)),
-                     df_mul_f(df_sub(df_mul(a3, v1), df_mul(a1, v3)), sinphi));
-    newv[3] = df_add(df_add(df_mul(a3, dot), df_mul_f(v3, cosphi)),
-                     df_mul_f(df_sub(df_mul(a1, v2), df_mul(a2, v1)), sinphi));
+    newv[1] = df_add(df_add(df_mul(a1, dot), df_mul(v1, cosphi)),
+                     df_mul(df_sub(df_mul(a2, v3), df_mul(a3, v2)), sinphi));
+    newv[2] = df_add(df_add(df_mul(a2, dot), df_mul(v2, cosphi)),
+                     df_mul(df_sub(df_mul(a3, v1), df_mul(a1, v3)), sinphi));
+    newv[3] = df_add(df_add(df_mul(a3, dot), df_mul(v3, cosphi)),
+                     df_mul(df_sub(df_mul(a1, v2), df_mul(a2, v1)), sinphi));
 }
 
 /* curved-detector pixel rotation: construct a detector pixel that is always "distance"
    from the sample by rotating pixel_pos about sdet_vector then fdet_vector. The float
    form is the base kernel's exact rotation, operating directly on pixel_pos. The df64
-   form carries the rotation in the compensated pair representation: the rotation angles
-   are the same single-precision pixel_pos[2]/distance and pixel_pos[3]/distance the float
-   form uses (and the sin/cos are single-precision scalars inside rotate_axis), but the
-   vector being rotated and the sdet/fdet basis stay (hi, lo) pairs, so the rotated pixel
-   position keeps its low word rather than collapsing to float across the rotation. */
+   form carries the rotation angle AND its sin/cos above single precision: the angle is
+   pixel_pos[k]/distance formed as a compensated pair, and rotate_axis rebuilds sin/cos in df
+   (via df_sincos) so neither the angle's low bits nor the trig rounding collapse to float. At
+   short wavelength and large crystals the reciprocal-space sampling is so fine that a
+   single-precision angle and single-precision sin/cos shift the rotated pixel a fraction of a
+   lattice fringe, redistributing a fraction of a percent of the total flux versus the double
+   CPU reference; carrying both in df closes that gap with float-only arithmetic. The
+   distance*beam vector rotated below keeps single precision -- its storage precision was
+   measured not to affect the result. */
 __device__ __inline__ static void curved_position(const float * sdet_vector, const float * fdet_vector, float distance,
         const float * dbvector, float * pixel_pos) {
     float newvector[4];
@@ -1457,10 +1590,11 @@ __device__ __inline__ static void curved_position(const float * sdet_vector, con
 }
 __device__ __inline__ static void curved_position(const float2 * sdet_vector, const float2 * fdet_vector, float distance,
         const float * dbvector, float2 * pixel_pos) {
-    /* rotation angles from the high word of the compensated pixel position, matching the
-       float form's pixel_pos[2]/distance and pixel_pos[3]/distance exactly. */
-    const float phi_s = real_to_float(pixel_pos[2]) / distance;
-    const float phi_f = real_to_float(pixel_pos[3]) / distance;
+    /* rotation angles = pixel offset / distance, formed as compensated pairs so their low
+       words survive; distance is exact as a float, so a df divide by (distance, 0) suffices. */
+    const float2 dist_pair = make_float2(distance, 0.0f);
+    const float2 phi_s = df_div(pixel_pos[2], dist_pair);
+    const float2 phi_f = df_div(pixel_pos[3], dist_pair);
     /* dbvector is the single-precision sample->distance * beam_vector input; widen it to
        compensated pairs so the whole rotation runs in the pair representation. sdet_vector
        and fdet_vector are already Real (float2) here, so they enter the rotation as pairs

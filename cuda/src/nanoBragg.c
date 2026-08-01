@@ -65,6 +65,19 @@ so detector distances should always be much larger than the crystal size
 #include "nanoBraggCPU.h"
 #include "nanoBraggCUDA.h"
 
+#ifndef NB_GIT_COMMIT
+#define NB_GIT_COMMIT ""
+#endif
+#ifndef NB_GIT_BRANCH
+#define NB_GIT_BRANCH ""
+#endif
+#ifndef NB_GIT_TAG
+#define NB_GIT_TAG ""
+#endif
+#ifndef NB_GIT_DATE
+#define NB_GIT_DATE ""
+#endif
+
 #ifndef NAN
 #define NAN strtod("NAN",NULL)
 #endif
@@ -135,6 +148,24 @@ double ValueOf( const char *keyword, SMVinfo smvfile);
 char *get_byte_order();
 unsigned char *read_pgm5_bytes(char *filename,unsigned int *returned_width,unsigned int *returned_height);
 
+
+/* print the build banner; full=1 adds the individual git commit/branch/tag lines */
+static void print_version_banner(int full)
+{
+    const char *gc = NB_GIT_COMMIT, *gb = NB_GIT_BRANCH, *gt = NB_GIT_TAG, *gd = NB_GIT_DATE;
+    char datesfx[32] = "";
+    if(gd[0]) snprintf(datesfx, sizeof datesfx, " (%s)", gd);
+    printf("nanoBragg nanocrystal diffraction simulator - James Holton and Ken Frankel\n");
+    printf("nanoBraggCUDA optimized by Giles Mullen\n");
+    if(gt[0])      printf("version %s%s\n", gt, datesfx);
+    else if(gc[0]) printf("version %s%s%s%s\n", gb, gb[0] ? "@" : "", gc, datesfx);
+    else           printf("version: unknown (built without version info)\n");
+    if(full) {
+        if(gc[0]) printf("  git commit: %s\n", gc);
+        if(gb[0]) printf("  git branch: %s\n", gb);
+        if(gt[0]) printf("  git tag:    %s\n", gt);
+    }
+}
 
 
 int main(int argc, char** argv)
@@ -355,6 +386,16 @@ int main(int argc, char** argv)
     int write_pgm = 1;
 
 
+
+    /* -version: print the build banner and exit before any work */
+    for(i=1; i<argc; ++i)
+    {
+        if(0==strcmp(argv[i], "-version"))
+        {
+            print_version_banner(1);
+            return 0;
+        }
+    }
 
     /* check argument list */
     for(i=1; i<argc; ++i)
@@ -1231,7 +1272,7 @@ int main(int argc, char** argv)
     unitize(vert_vector,vert_vector);
 
 
-    printf("nanoBragg nanocrystal diffraction simulator - James Holton and Ken Frankel 5-17-17\n");
+    print_version_banner(0);
 
     if(hklfilename == NULL)
     {
@@ -2528,14 +2569,14 @@ int main(int argc, char** argv)
 		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
 		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,
 		interpolate, Fhkl, h_min, h_max, h_range, k_min, k_max, k_range, l_min, l_max, l_range, hkls, nopolar, polar_vector, polarization, fudge, maskimage,
-		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/);
+		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/, progress_meter);
 	else
 	nanoBraggSpotsCUDA_single(spixels, fpixels, roi_xmin, roi_xmax, roi_ymin, roi_ymax, oversample, point_pixel, pixel_size, subpixel_size, steps, detector_thickstep,
 		detector_thicksteps, detector_thick, detector_mu, sdet_vector, fdet_vector, odet_vector, pix0_vector, curved_detector, distance, close_distance, beam_vector,
 		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
 		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,
 		interpolate, Fhkl, h_min, h_max, h_range, k_min, k_max, k_range, l_min, l_max, l_range, hkls, nopolar, polar_vector, polarization, fudge, maskimage,
-		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/);
+		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/, progress_meter);
 
     printf("\n");
 

@@ -2,6 +2,13 @@ CUDA_PATH ?= /usr/local/cuda-12.9
 NVCC = $(CUDA_PATH)/bin/nvcc
 CC = gcc
 
+# Optional build provenance, normally supplied by build.sh; empty when make is run directly.
+GIT_COMMIT ?=
+GIT_BRANCH ?=
+GIT_TAG    ?=
+GIT_DATE   ?=
+GIT_DEFS = -DNB_GIT_COMMIT='"$(GIT_COMMIT)"' -DNB_GIT_BRANCH='"$(GIT_BRANCH)"' -DNB_GIT_TAG='"$(GIT_TAG)"' -DNB_GIT_DATE='"$(GIT_DATE)"'
+
 SRC_DIR = src
 BUILD_DIR = build
 
@@ -41,7 +48,7 @@ RELEASE_NVCC_FLAGS = -lineinfo -O3 -v $(NVCC_FLAGS)
 all: debug release
 
 debug: | $(DEBUG_DIR)
-	$(CC) $(DEBUG_CFLAGS) -c $(SRC_DIR)/nanoBragg.c -o $(DEBUG_DIR)/nanoBragg.o
+	$(CC) $(DEBUG_CFLAGS) $(GIT_DEFS) -c $(SRC_DIR)/nanoBragg.c -o $(DEBUG_DIR)/nanoBragg.o
 	$(CC) $(DEBUG_CFLAGS) -c $(SRC_DIR)/nanoBraggCPU.c -o $(DEBUG_DIR)/nanoBraggCPU.o
 	# kernel compiled once per device precision; both objects link into the binary
 	$(NVCC) $(DEBUG_NVCC_FLAGS) -DNB_PRECISION=1 -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(DEBUG_DIR)/nanoBraggCUDA_single.cu.o $(COMMON_CFLAGS)
@@ -49,7 +56,7 @@ debug: | $(DEBUG_DIR)
 	g++ $(STATIC_LDFLAGS) $(DEBUG_DIR)/nanoBragg.o $(DEBUG_DIR)/nanoBraggCPU.o $(DEBUG_DIR)/nanoBraggCUDA_single.cu.o $(DEBUG_DIR)/nanoBraggCUDA_double.cu.o -o $(DEBUG_DIR)/nanoBraggCUDA $(LDFLAGS)
 
 release: | $(RELEASE_DIR)
-	$(CC) $(RELEASE_CFLAGS) -c $(SRC_DIR)/nanoBragg.c -o $(RELEASE_DIR)/nanoBragg.o
+	$(CC) $(RELEASE_CFLAGS) $(GIT_DEFS) -c $(SRC_DIR)/nanoBragg.c -o $(RELEASE_DIR)/nanoBragg.o
 	$(CC) $(RELEASE_CFLAGS) -c $(SRC_DIR)/nanoBraggCPU.c -o $(RELEASE_DIR)/nanoBraggCPU.o
 	# kernel compiled once per device precision; both objects link into the binary
 	$(NVCC) $(RELEASE_NVCC_FLAGS) -DNB_PRECISION=1 -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(RELEASE_DIR)/nanoBraggCUDA_single.cu.o $(COMMON_CFLAGS)
