@@ -102,11 +102,11 @@ immune to the CUDA-runtime index inversion — only the printed `index` label tr
 
 ## 6. `nbrunsuite`
 
-**Required:** `--suite NAME` · `--candidate PATH` (`-c`) · `--gpu "NAME|index|uuid"` · `--workdir PATH`.
+**Required:** `--suite NAME` · `--candidate PATH` (`-c`) · `--reference PATH` · `--gpu "NAME|index|uuid"` · `--workdir PATH`.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--reference PATH` | `reference/nanoBragg_root` (harness-root-relative, §11) | trusted binary |
+| `--reference PATH` | — (required, no default) | trusted CPU oracle binary (see INPUTS.md) |
 | `--precision fp32\|df64` | `fp32` | candidate path → `-precision single\|double`; selects `expected` baseline (`fp64` dropped — df64 *is* double) |
 | `--cases N-M` | all | run only cases N–M (1-based, inclusive) — batching; results accumulate in the workdir, only the final batch (`hi ≥ n_total`) computes the tier verdict |
 | `--seed [--force]` | off | (re-)baseline `expected` (deliberate); **refuses** to change any verdict without `--force`; gated by the reference canary (below) |
@@ -250,10 +250,9 @@ The harness is self-contained under `cuda/test/`:
 
 ```
 cuda/test/
-├── inputs/          render feedstock — real files, NO symlinks · UNTRACKED
+├── inputs/          render inputs — real files, NO symlinks · UNTRACKED
 │   ├── crystals/    193L.hkl · 2PLV.hkl · 3NIR.hkl · scaled.hkl      (-hkl)
-│   ├── matrix/      amat.mat                                          (-mat)
-│   └── dummy.stol   flat table for the -stol/-4stol/-Q reject guards
+│   └── matrix/      amat.mat                                          (-mat)
 ├── reference/       nanoBragg_root · UNTRACKED
 ├── workdir/         per-run candidate images + results.tsv · UNTRACKED (conventional --workdir)
 ├── expected/        <suite>.<precision>.tsv verdict baselines · COMMITTED
@@ -267,7 +266,7 @@ cuda/test/
 `.gitignore` covers the four generated/large dirs (`inputs/ reference/ workdir/ build/`). The image
 cache is NOT under the repo — it is machine-global `~/.cache/nanobragg` (§9).
 
-**Path anchoring.** Harness-relative paths (`input_root`, the `--reference` default, `expected/`,
+**Path anchoring.** Harness-relative paths (`input_root`, `expected/`,
 `ledger/`, `suites/`) are relative to the **harness root** `cuda/test/`, discovered from `base.json`'s
 own on-disk location (`dirname²(realpath(base.json))`) — never the process CWD. So `base.json` stores
 `input_root = "inputs"` (= `cuda/test/inputs`), and the tools run from any working directory.
@@ -309,7 +308,7 @@ stands — it is the history of how the pieces landed, not an open to-do list.*
 
 0. **Reorg** (one-time, before any tool work) — restructure to the §11 layout:
    `cuda/testdata/` → `cuda/test/inputs/` (dereference every symlink to a real file; crystals under
-   `crystals/`, `A.mat` → `matrix/amat.mat`, `dummy.stol` at root); `nanoBragg_root` →
+   `crystals/`, `A.mat` → `matrix/amat.mat`); `nanoBragg_root` →
    `cuda/test/reference/`; establish `cuda/test/workdir/` (old `cuda/testrun/` outputs discarded —
    transient); `.gitignore` `inputs/ reference/ workdir/ build/`. Rename `data_root`→`input_root` and
    the `{data_root}`→`{input_root}` token across `base.json`, `suites/*.jsonl`, and the resolver

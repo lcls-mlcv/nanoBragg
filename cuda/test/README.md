@@ -31,7 +31,7 @@ an arg list for hashing), `case_core.{c,h}` (parses `base.json` + `suites/*.json
 
 ```
 cuda/test/
-├── inputs/     render feedstock (crystals/*.hkl, matrix/amat.mat, dummy.stol) — untracked, real files
+├── inputs/     render inputs (crystals/*.hkl, matrix/amat.mat) — untracked, obtained via INPUTS.md
 ├── reference/  the CPU oracle binary (nanoBragg_root) — untracked
 ├── workdir/    per-run candidate images + results.tsv — untracked (--workdir target)
 ├── expected/   <suite>.<precision>.tsv verdict baselines — committed
@@ -44,14 +44,26 @@ cuda/test/
 ```
 
 `inputs/`, `reference/`, `workdir/`, and `build/` are gitignored and machine-local
-(a fresh clone needs them populated before the harness can render anything). All
-harness-relative paths (`input_root`, `expected/`, `ledger/`, the default
-`reference/nanoBragg_root`) are resolved from `base.json`'s own on-disk location,
-not the process's working directory, so the tools run correctly from any CWD.
+(a fresh clone needs them populated before the harness can render anything — see
+INPUTS.md for how to obtain the render inputs and build the trusted CPU oracle). All
+harness-relative paths (`input_root`, `expected/`, `ledger/`) are resolved from
+`base.json`'s own on-disk location, not the process's working directory, so the
+tools run correctly from any CWD. `--reference` is required — there is no default.
 
 A case's stored CLI carries the literal `{input_root}` token (e.g.
 `{input_root}/crystals/193L.hkl`); it is expanded to an absolute path at run
 time, keeping `suites/*.jsonl` and the cache key machine-independent.
+
+## Inputs
+
+Before any suite can render, two untracked trees must be populated (neither is in
+git) — **see [INPUTS.md](INPUTS.md)**:
+
+- `inputs/` — the render inputs (crystal `.hkl` tables + the orientation matrix),
+  downloaded from a versioned release asset.
+- `reference/nanoBragg_root` — the trusted CPU oracle, built from source.
+
+`INPUTS.md` carries the exact download/build steps and an md5 manifest to verify them.
 
 ## Building
 
@@ -107,6 +119,7 @@ Compiled suites, each with a gate type baked into its header:
 ```
 build/nbrunsuite --suite grid320 \
     --candidate /path/to/nanoBraggCUDA \
+    --reference reference/nanoBragg_root \
     --gpu "NVIDIA GeForce RTX 5090" \
     --precision fp32 \
     --workdir workdir
@@ -129,9 +142,9 @@ check against the baseline, not a bare pass count.
 `nbrunsuite` full flag reference (`--help`):
 
 ```
-usage: nbrunsuite --suite NAME --candidate PATH --gpu "NAME|index|uuid" --workdir PATH
+usage: nbrunsuite --suite NAME --candidate PATH --reference PATH --gpu "NAME|index|uuid" --workdir PATH
   options:
-    --reference PATH        trusted binary (default reference/nanoBragg_root)
+    --reference PATH        REQUIRED trusted CPU oracle binary, no default (see INPUTS.md)
     --precision fp32|df64   candidate -precision single|double; selects expected baseline
     --cases N-M             run only cases N..M (1-based inclusive)
     --seed [--force]        re-baseline expected/ (canary-gated; refuses verdict flips)
@@ -161,7 +174,7 @@ index  name                               sm      mem       uuid                
 0      NVIDIA GeForce RTX 5090 Laptop GPU sm_120  23.9GiB   GPU-62609c5d-...                            00000000:01:00.0
 1      NVIDIA GeForce RTX 5090            sm_120  31.8GiB   GPU-c5d63746-...                            00000000:09:00.0
 
-$ build/nbrunsuite --suite grid320 --candidate ... --gpu GPU-c5d63746-6d55-532a-7d24-9dff88db9873 ...
+$ build/nbrunsuite --suite grid320 --candidate ... --reference reference/nanoBragg_root --gpu GPU-c5d63746-6d55-532a-7d24-9dff88db9873 ...
 ```
 
 `--skip-device` bypasses NVML device selection entirely (`--gpu` becomes

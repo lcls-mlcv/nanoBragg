@@ -603,9 +603,9 @@ static loaded_t load_results(const char *path) {
 
 static void usage(void) {
     fprintf(stderr,
-        "usage: nbrunsuite --suite NAME --candidate PATH --gpu \"NAME|index|uuid\" --workdir PATH\n"
+        "usage: nbrunsuite --suite NAME --candidate PATH --reference PATH --gpu \"NAME|index|uuid\" --workdir PATH\n"
         "  options:\n"
-        "    --reference PATH        trusted binary (default reference/nanoBragg_root)\n"
+        "    --reference PATH        REQUIRED trusted CPU oracle binary, no default (see INPUTS.md)\n"
         "    --precision fp32|df64   candidate -precision single|double; selects expected baseline\n"
         "    --cases N-M             run only cases N..M (1-based inclusive)\n"
         "    --seed [--force]        re-baseline expected/ (canary-gated; refuses verdict flips)\n"
@@ -692,6 +692,7 @@ int main(int argc, char **argv) {
     if (!suite)     die("--suite NAME required");
     if (!candidate) die("--candidate PATH (-c) required");
     if (!workdir)   die("--workdir PATH required");
+    if (!reference_flag) die("--reference PATH required (see INPUTS.md)");
     if (!gpu && !skip_device) die("--gpu required (or --skip-device for a no-GPU test run)");
 
     /* ---- device selection (§5): resolved (and refused) before any suite work,
@@ -728,10 +729,10 @@ int main(int argc, char **argv) {
     if (!base) die("cannot load spec/base.json (expected beside the build dir)");
     const char *harness_root = base->harness_root_abs;
 
-    /* reference default: <harness_root>/reference/nanoBragg_root */
+    /* reference: required, no default (validated above). See INPUTS.md for what
+       the trusted CPU oracle must be. */
     char reference[4096];
-    if (reference_flag) snprintf(reference, sizeof reference, "%s", reference_flag);
-    else snprintf(reference, sizeof reference, "%s/reference/nanoBragg_root", harness_root);
+    snprintf(reference, sizeof reference, "%s", reference_flag);
 
     /* Binaries must be ABSOLUTE: every render runs in an isolated cwd (do_render
        chdir's to the scratch dir), so a relative --candidate/--reference would not
