@@ -42,7 +42,9 @@ DEBUG_CFLAGS = $(COMMON_CFLAGS) -g -v
 RELEASE_CFLAGS = $(COMMON_CFLAGS) -O3 -v
 
 DEBUG_NVCC_FLAGS = -g -G -v $(NVCC_FLAGS) # Debug symbols for CUDA + verbose
-RELEASE_NVCC_FLAGS = -lineinfo -O3 -v $(NVCC_FLAGS)
+# Set NB_LINEINFO=-lineinfo to add Nsight/autotune source-line info to the release build. Off by default:
+# keeps the release thin and its .nv_fatbin path-free/reproducible. -lineinfo is codegen-neutral (keeps -O3).
+RELEASE_NVCC_FLAGS = $(NB_LINEINFO) -O3 -v $(NVCC_FLAGS)
 
 # Default target: build both debug and release
 all: debug release
