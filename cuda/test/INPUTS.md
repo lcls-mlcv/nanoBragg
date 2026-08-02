@@ -93,8 +93,3 @@ against `reference/nanoBragg_root` (md5 `bd647dbabb172780ae623e390cc49751`). Tha
 md5 is also the image cache's top-level subdirectory key
 (`<reference_md5>/<args_hash>`), so a different oracle binary keys into a separate
 cache namespace and would need its own re-baseline.
-
-> TODO / owner-review: a separate oracle build (md5 `b6a565d9…`) exists per the
-> project's North Star; the canonical choice of oracle should be confirmed. This
-> document records only that the committed `expected/` baselines used
-> `reference/nanoBragg_root` (`bd647dba…`).
