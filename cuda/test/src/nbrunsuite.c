@@ -20,13 +20,15 @@
  * card. Refuses (exit 4) on no-match / ambiguous match.
  *
  * Cache (§9): reference images only, keyed on the case's BAKED args_hash (read,
- * never recomputed). cache_gc() runs at suite start; cache_lookup is a .bin
- * existence test; a miss renders the reference and cache_store + cache_write_meta.
+ * never recomputed). cache_gc() runs at suite start with this suite's declared
+ * hashes protected, and its unlinks are handed to a detached background process
+ * so they overlap the renders; cache_lookup is a .bin existence test; a miss
+ * renders the reference and cache_store + cache_write_meta.
  *
  * --seed (§6): re-baseline expected/. Guarded by the reference canary -- a
  * from-source "gold" (main + base.json reference_fix_branches applied to
  * nanoBragg.c) is built and the three fix-sensitive canaries (phi0/subpixel/
- * curved, ported from the retired gen_cpu.sh) are rendered with gold and with
+ * curved) are rendered with gold and with
  * --reference; seeding is REFUSED unless --reference reproduces gold on all three.
  * It then refuses to change any existing verdict (prints flips, nonzero exit)
  * unless --force.
@@ -40,8 +42,8 @@
  *                     candidate on a box with no eligible GPU. --gpu is not
  *                     required under --skip-device.
  *   --expected-dir D  read/write the expected baseline under D instead of
- *                     <harness_root>/expected (the committed expected/ tree does
- *                     not exist until the golden migration, §13.7).
+ *                     <harness_root>/expected, so a test can seed and re-read a
+ *                     throwaway baseline without touching the committed tree.
  *   --canary-fast     shrink the --seed canary geometry (detpixels/N/steps) so the
  *                     canary build+render+refuse PLUMBING can be verified in
  *                     seconds; the physics-faithful canary needs the full 2048^2
@@ -334,7 +336,7 @@ static case_result *res_add(results_t *R) {
 }
 
 /* =========================================================================
- * canary (--seed reference correctness gate, §6/§15)
+ * canary (--seed reference correctness gate, §6/§14)
  * ========================================================================= */
 
 /* Run a plain command (argv NULL-terminated) with stdout/stderr -> logpath,
@@ -361,8 +363,7 @@ static int file_md5(const char *path, char out[33]) { return cache_reference_md5
 
 /* Build the from-source gold binary: main:nanoBragg.c + each reference_fix_branch
    diff applied, compiled with gcc -O3 -fopenmp. Writes it to gold_out. Returns 0
-   on success, nonzero on failure (message on stderr). Mirrors the retired
-   gen_cpu.sh logic (not its script). */
+   on success, nonzero on failure (message on stderr). */
 static int build_gold(const cc_base *base, const char *harness_root,
                       const char *build_dir, const char *gold_out) {
     char main_src[4096], gold_src[4096], tmp_src[4096], patch_path[4096], log[4096];
@@ -792,7 +793,7 @@ int main(int argc, char **argv) {
     /* ---- cache setup (§9) -------------------------------------------------- */
     char *cache_dir = cache_dir_resolve(cache_dir_flag);
     if (!cache_dir) die("cannot resolve cache dir");
-    long budget_gb = cache_budget_resolve(cache_dir, flag_budget >= 0 ? flag_budget : base->cache_budget_gb);
+    long budget_gb = cache_budget_resolve(cache_dir, flag_budget);
 
     char ref_md5[33];
     if (cache_reference_md5(reference, ref_md5) != 0) {
@@ -805,24 +806,64 @@ int main(int argc, char **argv) {
         return 2;
     }
 
-    /* cache_gc at suite start over this suite's live set (§6). */
+    /* cache_gc at suite start; the hashes this suite declares are protected (§9).
+       The victims are exactly the non-declared entries, disjoint from the images
+       this run reads, so their unlinks can run concurrently with the renders
+       instead of delaying the first one. Double-fork: the intermediate child
+       exits at once and is reaped here, so the worker is reparented to init and
+       is never a child of this process -- it cannot linger as a zombie and
+       cannot be seen by the targeted waitpid() in do_render() or the pclose()
+       in run_metrics(). The worker gets the same protect set the parent
+       computed, so the disjointness holds. */
     if (!no_cache) {
-        int nlive = S->n;
-        const char **live = malloc((size_t)nlive * sizeof(char *));
-        long *live_k = malloc((size_t)nlive * sizeof(long));
-        int lc = 0;
+        const char **protect = malloc((size_t)S->n * sizeof(char *));
+        int np = 0;
         for (int i = 0; i < S->n; i++)
-            if (S->cases[i].args_hash && strlen(S->cases[i].args_hash) == CACHE_HEXLEN) {
-                live[lc] = S->cases[i].args_hash; live_k[lc] = S->cases[i].K; lc++;
-            }
-        int n;
-        cache_entry *e = cache_scan(cache_dir, live, live_k, lc, &n);
+            if (S->cases[i].args_hash && strlen(S->cases[i].args_hash) == CACHE_HEXLEN)
+                protect[np++] = S->cases[i].args_hash;
+        int n, rank_by_mtime;
+        cache_entry *e = cache_scan(cache_dir, &n, &rank_by_mtime);
         if (e) {
-            int oe, be;
-            cache_gc(cache_dir, e, n, (long long)budget_gb << 30, time(NULL), 1, &oe, &be);
+            cache_weights w;
+            cache_weights_resolve(cache_dir, &w);
+            long gc_now = (long)time(NULL);
+            int deferred = 0;
+            pid_t mid = fork();
+            if (mid == 0) {
+                pid_t worker = fork();
+                if (worker == 0) {
+                    /* The worker outlives this run's output, so it must not keep
+                       the caller's stdout/stderr open: a caller reading through a
+                       pipe would see EOF only when the trim ends, giving back the
+                       concurrency the detach just bought. The worker prints
+                       nothing, so /dev/null loses no message; if the reopen fails,
+                       trimming still matters more than the redirect. */
+                    int devnull = open("/dev/null", O_WRONLY);
+                    if (devnull >= 0) {
+                        dup2(devnull, 1);
+                        dup2(devnull, 2);
+                        if (devnull > 2) close(devnull);
+                    }
+                    cache_gc(cache_dir, e, n, (long long)budget_gb << 30, protect, np,
+                             &w, gc_now, rank_by_mtime, 1);
+                    _exit(0);   /* no atexit handler, no second stdio flush */
+                }
+                _exit(worker < 0 ? 1 : 0);
+            }
+            if (mid > 0) {
+                int mst = 0;
+                while (waitpid(mid, &mst, 0) < 0 && errno == EINTR) {}
+                deferred = WIFEXITED(mst) && WEXITSTATUS(mst) == 0;
+            }
+            /* A fork that never produced a worker must not mean the cache stops
+               being trimmed: do it inline. e[] is untouched by the children
+               (separate address spaces), so it is still the scan result. */
+            if (!deferred)
+                cache_gc(cache_dir, e, n, (long long)budget_gb << 30, protect, np, &w,
+                         gc_now, rank_by_mtime, 1);
             free(e);
         }
-        free(live); free(live_k);
+        free(protect);
     }
 
     /* ---- results.tsv header ----------------------------------------------- */
@@ -907,7 +948,7 @@ int main(int argc, char **argv) {
                     void *buf = malloc((size_t)sz);
                     if (buf && fread(buf, 1, (size_t)sz, bf) == (size_t)sz) {
                         cache_write_atomic(cachebin, buf, (size_t)sz);
-                        cache_write_meta(cache_dir, ref_md5, cs->args_hash, cs->K, secs);
+                        cache_write_meta(cache_dir, ref_md5, cs->args_hash, secs);
                     }
                     free(buf); fclose(bf);
                 }

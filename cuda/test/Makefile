@@ -1,8 +1,7 @@
 # Out-of-source build for the nanoBragg parity harness nb* tool family
-# (NBTOOLS-SPEC.md §13/§14: argkey, case_core, cache_core are shared objects;
-# nbgensuite/nbcache/nbmetrics are the linked tools). Retired standalone tools
-# (canon, gen_suites, metrics) are not built here; canon.c stays on disk only to
-# build canon_ref, a test-only cross-check binary for test_argkey.
+# (NBTOOLS-SPEC.md §13: argkey, case_core, cache_core are shared objects;
+# nbgensuite/nbcache/nbmetrics are the linked tools). canon.c is built only as
+# canon_ref, a test-only cross-check binary for test_argkey.
 #
 # Build prerequisites (system packages): gcc, json-c-devel (JSON parsing, via
 # <json-c/json.h> + -ljson-c), libmd-devel (md5, via <md5.h> + -lmd). The
@@ -96,8 +95,10 @@ $(BINDIR)/nbrunsuite.o: src/nbrunsuite.c | $(BINDIR)
 $(BINDIR)/nbgensuite: $(BINDIR)/nbgensuite.o $(BINDIR)/argkey.o $(BINDIR)/case_core.o
 	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c
 
-$(BINDIR)/nbcache: $(BINDIR)/nbcache.o $(BINDIR)/cache_core.o $(BINDIR)/argkey.o $(BINDIR)/case_core.o
-	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c
+# nbcache drives cache_core only (which keys through argkey); it does not read
+# base.json or the suites, so case_core is not linked.
+$(BINDIR)/nbcache: $(BINDIR)/nbcache.o $(BINDIR)/cache_core.o $(BINDIR)/argkey.o
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c $(LDLIBS)
 
 $(BINDIR)/nbmetrics: $(BINDIR)/nbmetrics.o
 	$(CC) $(CFLAGS) -o $@ $^ $(LDLIBS)
@@ -125,7 +126,7 @@ $(BINDIR)/test_nbmetrics: $(BINDIR)/test_nbmetrics.o
 	$(CC) $(CFLAGS) -o $@ $^
 
 $(BINDIR)/test_cache_core: $(BINDIR)/test_cache_core.o $(BINDIR)/cache_core.o $(BINDIR)/case_core.o $(BINDIR)/argkey.o
-	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c
+	$(CC) $(CFLAGS) -o $@ $^ -lmd -ljson-c $(LDLIBS)
 
 $(BINDIR):
 	mkdir -p $(BINDIR)

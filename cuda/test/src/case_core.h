@@ -3,13 +3,13 @@
  * Every consuming tool (nbgensuite / nbcache / nbrunsuite) links this module so
  * the spec schema is read in exactly one place. Built on the json-c library.
  *
- * Vocabulary (NBTOOLS-SPEC §3): candidate = binary under test (was "gpu"),
- * reference = trusted binary / truth (was "cpu"). K = cost.compute, the
- * wall-time proxy (NOT cost.precision).
+ * Vocabulary (NBTOOLS-SPEC §3): candidate = binary under test, reference =
+ * trusted binary / truth. K = cost.compute, the wall-time proxy (NOT
+ * cost.precision).
  *
  * Args carry the literal {input_root} token; cc_resolve_input_root() expands it
- * to an absolute path (single source of truth for token resolution -- the job
- * the retired run.sh used to do). The tokenized form is what args_hash keys on,
+ * to an absolute path (the single source of truth for token resolution). The
+ * tokenized form is what args_hash keys on,
  * so the cache key stays machine-independent. base.json's input_root is
  * harness-root-relative (harness root = dirname of base.json's own dir,
  * i.e. the dir containing spec/); cc_input_root_abs() anchors it there via
@@ -40,8 +40,6 @@ typedef struct {
     double corr_min;                      /* Pearson corr floor                */
     double sum_ratio_min;                 /* sum_ratio lower bound             */
     double sum_ratio_max;                 /* sum_ratio upper bound             */
-
-    long cache_budget_gb;                 /* image-cache size budget           */
 
     const char **reference_fix_branches;  /* branches the oracle must carry    */
     int n_reference_fix_branches;

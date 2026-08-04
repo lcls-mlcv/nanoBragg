@@ -5,16 +5,24 @@
  * about the cache on disk; the nbcache tool and nbrunsuite drive it.
  *
  * Layout (§9):
+ *   <cache-dir>/settings.json                          budget + eviction weights
  *   <cache-dir>/<reference_md5>/<AB>/<args_hash>.bin   image, evictable
- *   <cache-dir>/<reference_md5>/<AB>/<args_hash>.meta  {"k","actual_seconds"}, survives eviction
+ *   <cache-dir>/<reference_md5>/<AB>/<args_hash>.meta  {"cost":{"actual":S}}
  * <AB> = first 2 hex of args_hash (shard). reference_md5 = md5 of the reference
  * binary FILE (a directory level, so reference versions coexist as siblings).
  * args_hash = md5(argkey_canonicalize(reference_args in {input_root}-token form)),
  * the SAME baked key nbgensuite writes and nbrunsuite looks up (§9 invariant).
+ * The .meta records the measured render time and survives eviction of its .bin.
  *
  * Location & budget bootstrap from env/flag, NOT the config file (§9): the cache
  * dir is $XDG_CACHE_HOME/nanobragg (default ~/.cache/nanobragg) or --cache-dir;
- * budget_gb resolves flag > <cache-dir>/settings.json > default 20.
+ * budget_gb resolves flag > <cache-dir>/settings.json > CACHE_DEFAULT_BUDGET_GB.
+ *
+ * Eviction (§9) fires only under budget pressure and ranks by
+ *   score = cost.actual^a / (stale + s0)^b
+ * so cheap-and-long-unread images go first; the hashes a run declares are
+ * protected. Only the .bin is unlinked. The weights a/b/s0 are compile defaults
+ * overridable solely by hand-editing settings.json -- no CLI, never written back.
  *
  * Every write is <name>.tmp.<pid> then rename(2), so a reader never sees a
  * partial file; .bin content is deterministic (racing writers write identical
@@ -25,8 +33,14 @@
 
 #include <stddef.h>
 
-#define CACHE_DEFAULT_BUDGET_GB 20L
+#define CACHE_DEFAULT_BUDGET_GB 11L
 #define CACHE_HEXLEN 32              /* md5 hex digest length (no NUL) */
+
+/* Eviction weight defaults (§9): exponent on cost, exponent on staleness, and
+ * the grace floor added to staleness (days in settings.json, seconds here). */
+#define CACHE_DEFAULT_COST_WEIGHT 1.8
+#define CACHE_DEFAULT_DECAY       1.2
+#define CACHE_DEFAULT_GRACE_DAYS  30.0
 
 /* ---- location & config (bootstrap from env/flag, never the config file) ---- */
 
@@ -40,11 +54,33 @@ char *cache_dir_resolve(const char *flag_override);
  * returns -1 rather than surfacing a parser open error. */
 long cache_settings_budget_gb(const char *cache_dir);
 
-/* Effective budget (§9): flag_gb (>=0 wins) > settings.json > default 20. */
+/* Effective budget (§9): flag_gb (>=0 wins) > settings.json > compile default. */
 long cache_budget_resolve(const char *cache_dir, long flag_gb);
 
-/* Write {"budget_gb":N} to <cache_dir>/settings.json atomically. 0 ok, -1 err. */
+/* Set budget_gb in <cache_dir>/settings.json atomically, read-merge-write: every
+ * other key in the file (the hand-edited eviction weights) is preserved verbatim.
+ * A missing or unparseable file starts from an empty object. 0 ok, -1 err. */
 int cache_set_budget_gb(const char *cache_dir, long budget_gb);
+
+/* ---- eviction weights & score ---- */
+
+typedef struct {
+    double cost_weight;      /* a -- exponent on cost.actual                    */
+    double decay;            /* b -- exponent on staleness                      */
+    double grace_seconds;    /* s0 -- grace floor added to staleness            */
+} cache_weights;
+
+/* Resolve the weights: compile defaults, overridden by the settings.json keys
+ * evict_cost_weight / evict_decay / evict_grace_days (days -> seconds). A key of
+ * the wrong JSON type, non-finite, or <= 0 falls back to its own default and
+ * leaves the others alone. Always yields a usable set. */
+void cache_weights_resolve(const char *cache_dir, cache_weights *out);
+
+/* score = cost_actual^a / (stale + s0)^b, stale = max(0, now - last_use) so a
+ * future timestamp from clock skew cannot invert the rank. Low score evicts
+ * first; a cost_actual of 0 (no .meta) scores 0. Size-independent (§9). */
+double cache_score(double cost_actual, long last_use, long now,
+                   const cache_weights *w);
 
 /* ---- keys & path assembly ---- */
 
@@ -69,34 +105,33 @@ char *cache_entry_path(const char *cache_dir, const char *ref_md5,
  * created. 0 ok, -1 err. */
 int cache_write_atomic(const char *path, const void *buf, size_t len);
 
-/* Record the .meta {"k":K,"actual_seconds":S} beside the entry, atomically. */
+/* Record the .meta {"cost":{"actual":S}} beside the entry, atomically. S is the
+ * measured render time in seconds, at ~microsecond resolution. */
 int cache_write_meta(const char *cache_dir, const char *ref_md5,
-                     const char *args_hash, long k, double actual_seconds);
+                     const char *args_hash, double cost_actual);
 
 /* ---- scan / status / gc ---- */
 
 typedef struct {
-    char ref_md5[CACHE_HEXLEN + 1];   /* owning reference dir */
-    char args_hash[CACHE_HEXLEN + 1]; /* entry key */
-    long mtime;                        /* recency (.bin st_mtime) */
-    long long size;                    /* .bin bytes */
-    long k;                            /* cost: live-set K if live, else .meta k */
-    int orphan;                        /* 1 = args_hash not in the live set */
+    char ref_md5[CACHE_HEXLEN + 1];   /* owning reference dir                   */
+    char args_hash[CACHE_HEXLEN + 1]; /* entry key                              */
+    long atime;                       /* .bin st_atime -- last use              */
+    long mtime;                       /* .bin st_mtime -- ranks under noatime   */
+    long long size;                   /* .bin bytes                             */
+    double cost_actual;               /* .meta measured render seconds, else 0  */
 } cache_entry;
 
-/* Scan every <ref_md5>/<AB>/<hash>.bin under cache_dir. live[]/live_k[] are the baked
- * args_hashes of current cases and their K (parallel arrays, nlive long; pass
- * NULL/0 to treat every entry as an orphan). A live entry takes K from live_k[];
- * an orphan from its .meta if present, else 0. Returns a malloc'd array (caller
- * frees) with *n set, or NULL if cache_dir cannot be opened (no cache yet). */
-cache_entry *cache_scan(const char *cache_dir,
-                        const char *const *live, const long *live_k, int nlive,
-                        int *n);
+/* Scan every <ref_md5>/<AB>/<hash>.bin under cache_dir, reading cost.actual from
+ * each sibling .meta (absent or unparseable -> 0, which ranks lowest).
+ * *out_rank_by_mtime is set to 1 when the cache filesystem is mounted noatime --
+ * atime never advances there, so gc must rank on mtime (age-since-written); the
+ * scan warns once on stderr when it detects this. Returns a malloc'd array
+ * (caller frees) with *n set, or NULL if cache_dir cannot be opened. */
+cache_entry *cache_scan(const char *cache_dir, int *n, int *out_rank_by_mtime);
 
 typedef struct {
     long long total_bytes;
     int n_entries;
-    int n_orphans;
     long budget_gb;
     long long budget_bytes;
 } cache_status;
@@ -104,15 +139,19 @@ typedef struct {
 void cache_compute_status(const cache_entry *e, int n, long budget_gb,
                           cache_status *out);
 
-/* Plan (do_apply=0) or apply (do_apply=1) gc under budget_bytes (a negative
- * budget disables the budget phase, leaving orphan removal). run_start protects
- * entries younger than the run in progress: an entry with mtime >= run_start is
- * never evicted (§9). Apply order: (1) orphans -> unlink .bin AND .meta; (2) if
- * still over budget, live entries cheapest-then-coldest -> unlink .bin only (the
- * .meta survives for calibration); (3) prune emptied <AB> and <ref_md5> dirs.
- * Returns the number of .bin entries evicted; *out_orphans / *out_budget receive
- * the split. Entry sizes are zeroed in place as they are evicted. */
+/* Plan (do_apply=0) or apply (do_apply=1) eviction. Evicts only while the total
+ * .bin footprint exceeds budget_bytes; under budget, or with a negative budget,
+ * nothing is evicted. Candidates are the entries whose args_hash is NOT in
+ * protect[0..nprotect) -- the run's declared hashes are never victims -- removed
+ * in ascending cache_score() (ties by args_hash then ref_md5, so runs are
+ * reproducible) until within budget or exhausted. Only the .bin is unlinked; the
+ * .meta survives. rank_by_mtime picks mtime over atime as the last-use timestamp
+ * (see cache_scan). Emptied <AB> and <ref_md5> dirs are pruned. An apply zeroes
+ * each evicted entry's size in e[]; a plan leaves e[] untouched, so the same
+ * array can be handed straight to the applying call. Returns the number of .bin
+ * evicted -- the same count either way. */
 int cache_gc(const char *cache_dir, cache_entry *e, int n, long long budget_bytes,
-             long run_start, int do_apply, int *out_orphans, int *out_budget);
+             const char *const *protect, int nprotect, const cache_weights *w,
+             long now, int rank_by_mtime, int do_apply);
 
 #endif /* NB_CACHE_CORE_H */

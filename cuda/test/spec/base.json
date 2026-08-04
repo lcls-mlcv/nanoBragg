@@ -4,7 +4,6 @@
   "beamsize_mm": 1.0,
   "input_root": "inputs",
   "reference_fix_branches": ["fix/phi0-stale-rotation", "fix/subpixel-oversampling", "fix/curved-det-flag-guard"],
-  "cache_budget_gb": 20,
   "base_flags": ["-nonoise", "-nointerpolate", "-nopgm"],
   "base_geometry_dims": ["distance", "lambda", "pixel"],
   "beam_center_rule": "Xbeam = Ybeam = detpixels * pixel / 2 (recomputed per cell when pixel varies)",

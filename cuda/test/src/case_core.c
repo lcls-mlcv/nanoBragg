@@ -122,8 +122,6 @@ cc_base *cc_load_base(const char *path) {
     b->sum_ratio_min = jnum(jget(gate, "sum_ratio_min"), 0.999);
     b->sum_ratio_max = jnum(jget(gate, "sum_ratio_max"), 1.001);
 
-    b->cache_budget_gb = jnum_l(jget(root, "cache_budget_gb"), 20);
-
     b->reference_fix_branches =
         jstr_array(jget(root, "reference_fix_branches"), &b->n_reference_fix_branches);
     b->base_flags =
@@ -281,7 +279,7 @@ char *cc_input_root_abs(const cc_base *base) {
 
     /* Join harness_root_abs + "/" + input_root, then realpath() to canonicalize
        and confirm existence. Both operands are already fixed strings (not CWD),
-       so the result no longer depends on the caller's working directory. */
+       so the result does not depend on the caller's working directory. */
     size_t hlen = strlen(base->harness_root_abs);
     size_t ilen = strlen(base->input_root);
     char *joined = (char *)malloc(hlen + 1 + ilen + 1);
