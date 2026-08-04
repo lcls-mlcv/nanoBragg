@@ -3,77 +3,44 @@
  * The cache stores rendered REFERENCE images, machine-global and shared across
  * worktrees (NBTOOLS-SPEC §9). This tool is a thin CLI over cache_core:
  *
- *   nbcache --status                    report size / entry count vs budget
- *   nbcache --gc                        evict orphans + over-budget entries
+ *   nbcache --status                    report size / budget / eviction weights
+ *   nbcache --gc                        trim the cache back to its budget
  *   nbcache --path -- <exe> <params...> print the cache path for a reference render
  *   nbcache --set-budget-gb N           write the budget to settings.json
  *   nbcache --build-commit              print the git HEAD this was built at
  *
- *   options: --cache-dir DIR  --budget-gb N  --input-root ABS  --suites-dir DIR
+ *   options: --cache-dir DIR  --budget-gb N  --input-root ABS
  *
- * --status / --gc need the live set (which args_hashes current cases reference):
- * it is read from the baked args_hash of every case in --suites-dir via
- * case_core, never recomputed -- the same hash nbgensuite baked and nbrunsuite
- * looks up (the §9 invariant). --path recomputes the key from a reference command
- * line handed in {input_root}-token form (or absolute form + --input-root to
- * re-tokenize), proving bake and lookup agree.
+ * --status reports what is in effect: entry count and footprint against the
+ * resolved budget, the three eviction weights with where each came from, the
+ * timestamp axis the ranking uses, and a dry-run victim count.
  *
- * gc is correctness-neutral: an evicted image simply re-renders on next use, so a
- * wrong eviction costs time, never a wrong verdict.
+ * --gc is pure score-to-budget: it evicts only while the cache exceeds the
+ * budget, lowest score first. It has no run in flight, so nothing is protected
+ * and every entry is a candidate; under budget it deletes nothing.
+ *
+ * --path recomputes the key from a reference command line handed in
+ * {input_root}-token form (or absolute form + --input-root to re-tokenize),
+ * proving bake and lookup agree -- the same hash nbgensuite baked and nbrunsuite
+ * looks up (the §9 invariant).
+ *
+ * Eviction is correctness-neutral: an evicted image simply re-renders on next
+ * use, so a wrong eviction costs time, never a wrong verdict.
  */
 #define _XOPEN_SOURCE 700
 #include "cache_core.h"
-#include "case_core.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-#include <dirent.h>
 #include <getopt.h>
 
 #ifndef NB_BUILD_COMMIT
 #define NB_BUILD_COMMIT "unknown"
 #endif
 
-#define DEFAULT_SUITES_DIR "cuda/test/suites"
-
 static void die(const char *m) { fprintf(stderr, "nbcache: %s\n", m); exit(2); }
-
-/* ---- live set ----------------------------------------------------------- */
-/* Collect the baked args_hash (+ K) of every case across all suites/<name>.jsonl
- * in suites_dir. Strings are strdup'd so the caller owns them independent of the
- * case_core DOM. Returns count; *hashes / *ks receive malloc'd parallel arrays. */
-static int build_live_set(const char *suites_dir, char ***hashes, long **ks) {
-    DIR *d = opendir(suites_dir);
-    if (!d) { *hashes = NULL; *ks = NULL; return 0; }
-
-    int cap = 512, n = 0;
-    char **h = malloc((size_t)cap * sizeof *h);
-    long *k = malloc((size_t)cap * sizeof *k);
-    struct dirent *e;
-    char path[4096];
-    while ((e = readdir(d))) {
-        size_t nl = strlen(e->d_name);
-        if (nl < 6 || strcmp(e->d_name + nl - 6, ".jsonl")) continue;
-        snprintf(path, sizeof path, "%s/%s", suites_dir, e->d_name);
-        cc_suite *s = cc_load_suite(path, NULL);   /* base only feeds gate defaults */
-        if (!s) continue;
-        for (int i = 0; i < s->n; i++) {
-            const char *ah = s->cases[i].args_hash;
-            if (!ah || strlen(ah) != CACHE_HEXLEN) continue;
-            if (n == cap) { cap *= 2; h = realloc(h, (size_t)cap * sizeof *h);
-                            k = realloc(k, (size_t)cap * sizeof *k); }
-            h[n] = strdup(ah);
-            k[n] = s->cases[i].K;
-            n++;
-        }
-        cc_suite_free(s);
-    }
-    closedir(d);
-    *hashes = h; *ks = k;
-    return n;
-}
 
 /* ---- --path re-tokenize ------------------------------------------------- */
 /* Replace every occurrence of `abs` in `tok` with the {input_root} token, so an
@@ -99,16 +66,32 @@ static char *retokenize(const char *tok, const char *abs) {
 
 /* ---- modes -------------------------------------------------------------- */
 
-static int do_status(const char *cache_dir, long budget_gb,
-                     const char *suites_dir) {
-    char **live; long *live_k;
-    int nlive = build_live_set(suites_dir, &live, &live_k);
+/* The three eviction weights, each tagged with where its effective value came
+ * from (§9: compile default, overridable only by hand-editing settings.json).
+ * The tag is decided by comparing against the compile default, so a hand-edited
+ * value that equals the default reads as "compile default" -- the two are
+ * indistinguishable on disk and identical in effect. Grace is reported in days,
+ * the unit settings.json takes. */
+static void print_weights(const cache_weights *w) {
+    double grace_days = w->grace_seconds / 86400.0;
+    printf("# evict_cost_weight: %g (%s)\n", w->cost_weight,
+           w->cost_weight == CACHE_DEFAULT_COST_WEIGHT ? "compile default" : "settings.json");
+    printf("# evict_decay: %g (%s)\n", w->decay,
+           w->decay == CACHE_DEFAULT_DECAY ? "compile default" : "settings.json");
+    printf("# evict_grace_days: %g (%s)\n", grace_days,
+           grace_days == CACHE_DEFAULT_GRACE_DAYS ? "compile default" : "settings.json");
+}
 
-    int n;
-    cache_entry *e = cache_scan(cache_dir, (const char *const *)live, live_k, nlive, &n);
+static int do_status(const char *cache_dir, long budget_gb) {
+    cache_weights w;
+    cache_weights_resolve(cache_dir, &w);
+
+    int n, rank_by_mtime;
+    cache_entry *e = cache_scan(cache_dir, &n, &rank_by_mtime);
     if (!e) {
         printf("# cache: %s -- no cache yet; budget %ld GB\n", cache_dir, budget_gb);
-        goto done;
+        print_weights(&w);
+        return 0;
     }
     cache_status st;
     cache_compute_status(e, n, budget_gb, &st);
@@ -116,49 +99,38 @@ static int do_status(const char *cache_dir, long budget_gb,
     printf("# entries: %d (%.3f GB) / budget %ld GB%s\n",
            st.n_entries, (double)st.total_bytes / (double)(1LL << 30), budget_gb,
            st.total_bytes > st.budget_bytes ? "  [OVER BUDGET]" : "");
-    printf("# live: %d  orphan: %d\n", st.n_entries - st.n_orphans, st.n_orphans);
+    print_weights(&w);
+    /* Which timestamp ranks victims: atime normally, mtime where the cache
+     * filesystem is mounted noatime and atime can never advance. */
+    printf("# ranking: %s\n", rank_by_mtime
+           ? "mtime (age-since-written) -- cache filesystem is mounted noatime"
+           : "atime (last use)");
 
-    int oe, be;
-    cache_gc(cache_dir, e, n, (long long)budget_gb << 30, time(NULL), 0, &oe, &be);
-    printf("# would evict: %d (orphans=%d + over-budget=%d); dry run -- nbcache --gc to apply\n",
-           oe + be, oe, be);
+    int would = cache_gc(cache_dir, e, n, (long long)budget_gb << 30, NULL, 0, &w,
+                         (long)time(NULL), rank_by_mtime, 0);
+    printf("# would evict: %d; dry run -- nbcache --gc to apply\n", would);
     free(e);
-done:
-    for (int i = 0; i < nlive; i++) free(live[i]);
-    free(live); free(live_k);
     return 0;
 }
 
-static int do_gc(const char *cache_dir, long budget_gb, const char *suites_dir) {
-    char **live; long *live_k;
-    int nlive = build_live_set(suites_dir, &live, &live_k);
-
-    /* Safety guard: an empty live set means the suites failed to parse; refuse to
-     * delete (every entry would look like an orphan). */
-    if (nlive == 0) {
-        fprintf(stderr, "# cache: ABORT -- live set empty (suites parse failure "
-                        "in %s?); cache untouched\n", suites_dir);
-        free(live); free(live_k);
-        return 0;
-    }
-
-    int n;
-    cache_entry *e = cache_scan(cache_dir, (const char *const *)live, live_k, nlive, &n);
+/* Score-to-budget only: no run is in flight, so the protect set is empty and
+ * every entry is a candidate. Under budget this deletes nothing. */
+static int do_gc(const char *cache_dir, long budget_gb) {
+    int n, rank_by_mtime;
+    cache_entry *e = cache_scan(cache_dir, &n, &rank_by_mtime);
     if (!e) {
         printf("# cache: %s -- no cache yet; nothing to gc\n", cache_dir);
-        for (int i = 0; i < nlive; i++) free(live[i]);
-        free(live); free(live_k);
         return 0;
     }
 
-    int oe, be;
-    int total = cache_gc(cache_dir, e, n, (long long)budget_gb << 30, time(NULL), 1, &oe, &be);
-    printf("# cache: %s -- scanned %d, evicted %d (orphans=%d, over-budget=%d); budget %ld GB\n",
-           cache_dir, n, total, oe, be, budget_gb);
+    cache_weights w;
+    cache_weights_resolve(cache_dir, &w);
+    int total = cache_gc(cache_dir, e, n, (long long)budget_gb << 30, NULL, 0, &w,
+                         (long)time(NULL), rank_by_mtime, 1);
+    printf("# cache: %s -- scanned %d, evicted %d; budget %ld GB\n",
+           cache_dir, n, total, budget_gb);
 
     free(e);
-    for (int i = 0; i < nlive; i++) free(live[i]);
-    free(live); free(live_k);
     return 0;
 }
 
@@ -204,7 +176,7 @@ static void usage(void) {
         "usage: nbcache <mode> [options]\n"
         "  modes:  --status | --gc | --path -- <exe> <params...>\n"
         "          --set-budget-gb N | --build-commit\n"
-        "  options: --cache-dir DIR  --budget-gb N  --input-root ABS  --suites-dir DIR\n");
+        "  options: --cache-dir DIR  --budget-gb N  --input-root ABS\n");
 }
 
 int main(int argc, char **argv) {
@@ -212,10 +184,9 @@ int main(int argc, char **argv) {
     int mode = M_NONE;
     long set_budget = 0, flag_budget = -1;
     const char *cache_dir_flag = NULL, *input_root = NULL;
-    const char *suites_dir = DEFAULT_SUITES_DIR;
 
     enum { OPT_STATUS = 1000, OPT_GC, OPT_PATH, OPT_SETBUDGET, OPT_BUILDCOMMIT,
-           OPT_CACHEDIR, OPT_BUDGET, OPT_INPUTROOT, OPT_SUITES, OPT_HELP };
+           OPT_CACHEDIR, OPT_BUDGET, OPT_INPUTROOT, OPT_HELP };
     static struct option lo[] = {
         {"status",        no_argument,       0, OPT_STATUS},
         {"gc",            no_argument,       0, OPT_GC},
@@ -225,7 +196,6 @@ int main(int argc, char **argv) {
         {"cache-dir",     required_argument, 0, OPT_CACHEDIR},
         {"budget-gb",     required_argument, 0, OPT_BUDGET},
         {"input-root",    required_argument, 0, OPT_INPUTROOT},
-        {"suites-dir",    required_argument, 0, OPT_SUITES},
         {"help",          no_argument,       0, OPT_HELP},
         {0, 0, 0, 0}
     };
@@ -242,7 +212,6 @@ int main(int argc, char **argv) {
             case OPT_CACHEDIR:     cache_dir_flag = optarg; break;
             case OPT_BUDGET:       flag_budget = strtol(optarg, NULL, 10); break;
             case OPT_INPUTROOT:    input_root = optarg; break;
-            case OPT_SUITES:       suites_dir = optarg; break;
             case OPT_HELP:         usage(); return 0;
             default:               usage(); return 2;
         }
@@ -262,8 +231,8 @@ int main(int argc, char **argv) {
         rc = do_path(cache_dir, input_root, argv + optind, argc - optind);
     } else {
         long budget_gb = cache_budget_resolve(cache_dir, flag_budget);
-        if (mode == M_STATUS) rc = do_status(cache_dir, budget_gb, suites_dir);
-        else                  rc = do_gc(cache_dir, budget_gb, suites_dir);
+        if (mode == M_STATUS) rc = do_status(cache_dir, budget_gb);
+        else                  rc = do_gc(cache_dir, budget_gb);
     }
 
     free(cache_dir);

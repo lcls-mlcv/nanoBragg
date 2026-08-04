@@ -1,15 +1,9 @@
 # nb\* tool family — design spec (v1)
 
-**Status:** IMPLEMENTED — this document describes the harness **as built** (all tools, libs,
-suites, and `expected/` exist; the Makefile builds them). This is a **fresh** harness: `run.sh` is
-**not** a reference and is not something to reproduce — it is retired/deleted. The validated `golden/*.tsv`
-are **migrated** to `expected/` (same FP32 gate → verdicts carry); `--seed` is for deliberate
-re-baselining, guarded by the reference canary (§6). Features that are designed but not
-in the first cut are collected in **§ Phase 2**.
-
 **Scope:** a legible C tool family that renders a candidate binary and a trusted reference binary
 per case, compares the images, applies a per-suite gate, and reports. v1 is single-axis (absolute
-vs the reference) with an FP32 gate; the FP16 view is reported, not gated.
+vs the reference) with an FP32 gate; the FP16 view is reported, not gated. Features that are
+designed but outside v1 are collected in **§ Phase 2**.
 
 ---
 
@@ -30,14 +24,14 @@ Any name with "cache" is images; any with "ledger" is data. They never mix.
 |---|---|
 | **`nbrunsuite`** | run a suite: render candidate, render/reuse reference, compare, gate, report |
 | **`nbcache`** | image cache: `--status` / `--gc` / `--path` / `--set-…` |
-| **`nbgensuite`** | compile a spec into suites (was `gen_suites`); bakes each case's `args_hash` |
+| **`nbgensuite`** | compile a spec into suites; bakes each case's `args_hash` |
 | **`nbmetrics`** | compare two float32 images → FP32 (gated) + FP16 (reported) metrics |
 
 Shared logic is linked source (no standalone binaries, no `.so`):
 
 | Module | Job | Links |
 |---|---|---|
-| `argkey.{c,h}` | canonicalize an arg list → stable-hash input (was `canon`) | libc |
+| `argkey.{c,h}` | canonicalize an arg list → stable-hash input | libc |
 | `case_core.{c,h}` | parse `base.json` + `suites/*.jsonl` (cases, cost, gate header) | libc |
 | `cache_core.{c,h}` | image-cache path assembly + gc + eviction + status + config | json-c + libmd |
 
@@ -48,19 +42,19 @@ Shared logic is linked source (no standalone binaries, no `.so`):
 
 ## 3. Vocabulary & schema
 
-| Use | Retired | Schema field |
-|---|---|---|
-| **candidate** — binary under test | "kernel" | `candidate_args` (was `gpu_args`) |
-| **reference** — trusted binary; output = truth | "oracle"/"cpu-bin" | `reference_args` (was `cpu_args`) |
-| **case** — one scenario (command line + expected result) | "cell" | — |
-| **suite** — a named group of cases, with a gate header | (kept) | — |
-| **expected** — recorded per-case verdict | "golden" | `expected/<suite>.<precision>.tsv` |
-| render cost (wall-time proxy) | — | **`K` ≡ `cost.compute`** (see §9) |
-| reference fingerprint | — | `reference_md5` (was `cpu_ref_md5`) |
+| Use | Schema field |
+|---|---|
+| **candidate** — binary under test | `candidate_args` |
+| **reference** — trusted binary; output = truth | `reference_args` |
+| **case** — one scenario (command line + expected result) | — |
+| **suite** — a named group of cases, with a gate header | — |
+| **expected** — recorded per-case verdict | `expected/<suite>.<precision>.tsv` |
+| render cost (wall-time proxy) | **`K` ≡ `cost.compute`** (see §7) |
+| reference fingerprint | `reference_md5` |
 
 The reference defaults to the CPU `nanoBragg` but the interface never assumes CPU. Its correctness
-is guarded by the `--seed` reference canary (§6, §15), built from `reference_fix_branches` in
-`base.json` — the logic of the retired `gen_cpu.sh`, not its script.
+is guarded by the `--seed` reference canary (§6, §14), built from `reference_fix_branches` in
+`base.json`.
 
 **`args_hash` keys on `reference_args`.** The cache stores *reference* images, so the key is the
 md5 of the canonical reference command line — **not** `candidate_args` (they differ, e.g.
@@ -107,14 +101,14 @@ immune to the CUDA-runtime index inversion — only the printed `index` label tr
 | Flag | Default | Meaning |
 |---|---|---|
 | `--reference PATH` | — (required, no default) | trusted CPU oracle binary (see INPUTS.md) |
-| `--precision fp32\|df64` | `fp32` | candidate path → `-precision single\|double`; selects `expected` baseline (`fp64` dropped — df64 *is* double) |
+| `--precision fp32\|df64` | `fp32` | candidate path → `-precision single\|double`; selects `expected` baseline (no `fp64` — df64 *is* double) |
 | `--cases N-M` | all | run only cases N–M (1-based, inclusive) — batching; results accumulate in the workdir, only the final batch (`hi ≥ n_total`) computes the tier verdict |
 | `--seed [--force]` | off | (re-)baseline `expected` (deliberate); **refuses** to change any verdict without `--force`; gated by the reference canary (below) |
 | `--append-to-ledger [--tag NAME]` | off | append this run's **data** to the curated ledger (opt-in) |
 | `--list-gpus` | — | print devices and exit |
 | `--keep-candidate-images` / `--keep-reference-images` | off | retain images in the workdir |
 | `--refresh-cache` / `--no-cache` | off | overwrite the cache / bypass it |
-| `--cache-dir PATH` / `--budget-gb N` | XDG / 20 | image-cache location / size budget |
+| `--cache-dir PATH` / `--budget-gb N` | XDG / 11 | image-cache location / size budget |
 | `--build-commit` | — | print the git HEAD baked at build time and exit |
 | `--ledger-dir DIR` *(test hook)* | `<harness-root>/ledger` | write the appended ledger under DIR instead of the default |
 | `--canary-fast` *(test hook)* | off | shrink the `--seed` canary geometry (detpixels/N/steps) so the build+render+refuse plumbing verifies in seconds |
@@ -157,7 +151,7 @@ canonical (`argkey`) `{input_root}`-token **`reference_args`**. Writes the **sui
   (not clamped), so they never NaN-contaminate.
 
 Input parsing → `getopt_long`; the FP32 stdout contract is stable (FP16 columns appended).
-`nbmetrics --build-commit` (git HEAD baked at build time) is retained for the ledger provenance.
+`nbmetrics --build-commit` (git HEAD baked at build time) supplies the ledger provenance.
 
 ---
 
@@ -177,14 +171,20 @@ shows (fp32 compute error ≪ FP16 ε except under large-N accumulation drift).
 bootstrap from env/flag, not the config file. Machine-global, shared across worktrees, outlives
 any project.
 
-**Config (`settings.json`):** JSON, parsed by `cache_core`. Holds `budget_gb`
-(flag > settings > default 20 GB). Written by `nbcache --set-…`.
+**Config (`settings.json`):** JSON, parsed by `cache_core`, validated/clamped on read — a bad or
+missing value falls back to its default. It holds the size `budget_gb` and the three eviction weights
+`evict_cost_weight`, `evict_decay`, `evict_grace_days` (below). `budget_gb` is the **only CLI-exposed
+setting**: it resolves **default (11 GB) → `settings.json` → CLI flag**, is written by `nbcache
+--set-budget-gb` — which rewrites **only** the `budget_gb` key, preserving any hand-added weight keys — and is reported by `nbcache --status`. The three weights are **fixed internal
+defaults**, overridable **only by hand-editing `settings.json`** — resolve chain **compile-default →
+`settings.json` (manual)**, no flag — and the tools never write them.
 
 **Layout:**
 
 ```
+<cache-dir>/settings.json                          (budget + eviction weights)
 <cache-dir>/<reference_md5>/<AB>/<args_hash>.bin   (image, evictable)
-<cache-dir>/<reference_md5>/<AB>/<args_hash>.meta  ({k, actual_seconds}, persists past eviction)
+<cache-dir>/<reference_md5>/<AB>/<args_hash>.meta  (cost.actual — measured render time, persists past eviction)
 ```
 
 `args_hash` = md5 of canonical (`argkey`) `{input_root}`-token **`reference_args`**, baked by
@@ -195,29 +195,63 @@ Reference versions coexist as sibling dirs.
 **Lookup:** `.bin` present → **hit** (load, skip render). Absent → **miss** (render, `cache_store`).
 Existence == a valid hit (`reference_md5` in the path).
 
-**`.meta` (recorder):** each render writes `{k, actual_seconds}` atomically. **`K` ≡
-`cost.compute`** (the wall-time-linear proxy; anchors from measured `compute_k`). Not
-`cost.precision` (= Na·Nb·Nc, which does *not* track render time). `.meta` **survives eviction**
-so the calibration dataset accumulates. In v1 it is *recorded only*; the estimator that consumes it
-is **Phase 2**.
+**`.meta` (recorder):** each render writes `cost.actual` (the measured wall-clock render time, a
+fractional double at ~microsecond resolution) atomically; it survives eviction so the record outlives
+the image.
 
-**Eviction:** automatic, **cost (`K`) + recency (mtime)**, under the budget — cheapest-and-coldest
-first, so **expensive references are the last evicted** ("live forever" in practice by cost rank).
-This is *not* a hard guarantee: under extreme budget pressure an expensive reference can still be
-evicted and then re-renders on next use (a `pin` for a hard guarantee is Phase 2). Orphan-gc drops
-entries no current case references; old `<reference_md5>` dirs age out by the same cost+mtime budget
-eviction (the args_hash live-set is reference-independent, so gc doesn't mark whole dirs dead — the
-budget caps disk). No wall-clock TTL. Dormant on today's all-cheap corpus (all cases `routine`,
-max `K` ≈ 1152 ≪ budget).
+**Eviction — score, under budget pressure.** Eviction fires **only when the cache exceeds its
+`budget_gb`**; under budget nothing is evicted. Every cached image carries a score
+
+```
+score = cost.actual^a / (stale + s0)^b
+```
+
+where `cost.actual` = its `.meta` measured render time and `stale = max(0, now − atime)` (seconds since the
+image was last read; clamped to ≥ 0 so a future `atime` from clock skew cannot invert the score). The score rises with `cost.actual` and falls with staleness. **Low score evicts
+first** — cheap to remake and long unread; **high score survives** — expensive and recently used. The
+score is **size-independent**: an image's byte footprint drives the budget arithmetic, never its rank.
+The exponents and floor are fixed internal defaults, hand-editable only in `settings.json`:
+
+| Key | Symbol | Default | Role |
+|---|---|---|---|
+| `evict_cost_weight` | `a` | 1.8 | exponent on `cost.actual` — how strongly render cost protects an image |
+| `evict_decay` | `b` | 1.2 | exponent on staleness — how fast an unread image decays |
+| `evict_grace_days` | `s0` | 30 days | grace floor added to `stale` — keeps a just-read image from spiking the score |
+
+`vis/evict-score.html` is an interactive view of the score: it plots score against staleness across
+a range of `cost.actual`, with sliders for the three weights, a keep/evict map, and the matching
+`settings.json` snippet.
+
+**What a run protects.** Eviction runs at the **start of a run** and on demand via `nbcache --gc`. A
+run **protects the images it will use**: the `args_hash`es its cases declare are **never evicted**.
+Only the **non-declared** images are candidates, removed in **ascending score** order until the cache
+is back under budget or the non-declared candidates are exhausted. Victims
+are **deleted in the background, concurrently with the run**; the evicted (non-declared) set and the
+run's working (declared) set are disjoint, so deletion never races a render. If the background
+worker cannot be started, the deletion runs **inline before the run proceeds** — the budget
+guarantee holds and the run is delayed, rather than the cache being left over budget.
+
+**Soft cap.** The budget is a **soft cap**. The images a run bakes push the cache transiently over
+budget, corrected at the next start-of-run eviction. If a single run's own declared images exceed the
+budget, the cache **overshoots** for that run and returns under budget afterward; if they exceed the
+disk itself, images are evicted as they are generated.
+
+**Correctness-neutral.** An evicted image is simply **re-rendered when next needed**, so a mis-rank
+costs one render, never a wrong verdict. The score reads `atime` from the filesystem — the OS
+maintains it, the tools never write it on reads, so `.meta` stays write-once-per-render. If the cache
+filesystem is mounted `noatime`, `atime` never advances; the cache detects this (via `statvfs`) and
+**warns once**, and eviction then ranks by age-since-written instead of last-use — still
+correctness-neutral. (`relatime`, the common default, is fine — its ~daily granularity is ample at the
+weeks-to-months scale the score decays over.)
+There is **no wall-clock TTL**: staleness only ranks victims once the budget is breached.
 
 **Concurrency:** every write is `<name>.tmp.<pid>` then `rename` (atomic), so a reader never sees a
 partial file. `.bin` content is deterministic (racing writers write identical bytes); `.meta`
-`actual_seconds` is not — it's harmless last-write-wins per entry (the dataset is the *set* of
-`.meta`, not accumulation within one). A race costs at most a redundant render, never a wrong
-result. `--gc` never evicts an entry younger than the run in progress.
+`cost.actual` is not — it's harmless last-write-wins per entry (the dataset is the *set* of
+`.meta`, not accumulation within one). A race costs at most a redundant render, never a wrong result.
 
-**No compression.** Measured ~1.1× on real reference images (float32 physical data is high-entropy);
-`.bin`s stored raw, disk managed by budget/gc.
+**No compression.** float32 reference images are high-entropy (compress only ~1.1×); `.bin`s stored
+raw, disk managed by budget/gc.
 
 ---
 
@@ -237,7 +271,8 @@ gate = `case ?? suite-header ?? base`.
 
 **Verdict & flips.** The FP32 gate → PASS/FAIL/REJECT per case; the suite verdict is **flip
 detection** vs `expected` (pass→fail / fail→pass / absent / missing / SKIP-not-a-flip / REJECT).
-`expected` is the migrated, validated golds; `--seed` (deliberate, canary-gated) re-baselines them.
+`expected` holds the committed per-case verdict baseline for that suite and precision; `--seed`
+(deliberate, canary-gated) re-baselines it.
 
 *(The `relative` gate type — reproduce the seed corr/sum_ratio within a tolerance, for an fp32
 "no-regression" gate — is **Phase 2**. v1 fp32 = `absolute` + flip.)*
@@ -260,6 +295,7 @@ cuda/test/
 ├── spec/            base.json + suite spec · COMMITTED
 ├── suites/          compiled *.jsonl · COMMITTED
 ├── src/ · build/    nb* sources (committed) · built binaries (UNTRACKED)
+├── vis/             self-contained interactive pages (eviction score) · COMMITTED
 └── Makefile · NBTOOLS-SPEC.md · README.md
 ```
 
@@ -276,14 +312,14 @@ own on-disk location (`dirname²(realpath(base.json))`) — never the process CW
 | reference images (FP32; FP16 derived) | image cache `~/.cache/nanobragg` | global, GC-bounded |
 | candidate images | workdir | transient (deleted unless `--keep-*`) |
 | this-run numbers (FP32 gated + FP16 reported, ms, verdict) + provenance trailer | `<workdir>/results.tsv` | ephemeral |
-| `expected` (verdict) | committed `expected/<suite>.<precision>.tsv` | versioned; migrated golds, re-baselined by `--seed` |
+| `expected` (verdict) | committed `expected/<suite>.<precision>.tsv` | versioned; re-baselined by `--seed` |
 | curated ledger (data) — tagged runs | `ledger/` | append-only, **opt-in** (`--append-to-ledger`) |
 
 Cache = images (auto). Ledger = data (opt-in). No session log / drift axis in v1 (§ Phase 2).
 
 ---
 
-## 12. `argkey` (was canon)
+## 12. `argkey`
 
 Canonicalizes an arg list so the cache key is order-independent, no arity table. A token is a
 **flag** iff it starts with `-`(+dashes) then a **letter** (`-cell`, `--misset`); everything else
@@ -295,52 +331,23 @@ can't collide (worst case a spurious re-render, never a wrong hit).
 **Caveat:** the `-`+letter rule treats a *digit-leading* flag (e.g. nanoBragg's `-4stol`) as a
 value. This is benign for keying (still deterministic, collision-free) and the only known such flag
 is used solely in `reject`/guard cases (no cached reference). The model matches nanoBragg's
-*value-carrying* flags; it is not claimed to classify every nanoBragg token. Built + tested as
-`canon.c`; the extraction into `argkey.{c,h}` is a **refactor** — `canonicalize()` must *return a
-string* (not write stdout) for the md5 consumer — with no standalone binary.
+*value-carrying* flags; it is not claimed to classify every nanoBragg token. `canonicalize()`
+**returns a string** (it does not write stdout) so the md5 consumer can hash it directly, and
+`argkey` ships as linked source with no standalone binary.
 
 ---
 
-## 13. Build sequence
-
-*Retrospective: this records the build order that was followed to produce the harness as it now
-stands — it is the history of how the pieces landed, not an open to-do list.*
-
-0. **Reorg** (one-time, before any tool work) — restructure to the §11 layout:
-   `cuda/testdata/` → `cuda/test/inputs/` (dereference every symlink to a real file; crystals under
-   `crystals/`, `A.mat` → `matrix/amat.mat`); `nanoBragg_root` →
-   `cuda/test/reference/`; establish `cuda/test/workdir/` (old `cuda/testrun/` outputs discarded —
-   transient); `.gitignore` `inputs/ reference/ workdir/ build/`. Rename `data_root`→`input_root` and
-   the `{data_root}`→`{input_root}` token across `base.json`, `suites/*.jsonl`, and the resolver
-   (`input_root` = `inputs`, anchored at the harness root `cuda/test/` from `base.json`'s location —
-   CWD-independent). The binary move is cache-safe (keyed on `reference_md5` content); the token
-   rename re-keys cache entries, free pre-build.
-1. **argkey** — refactor `canon.c` into `argkey.{c,h}` (`canonicalize()` returns a string, not
-   stdout); drop the standalone binary. **Rewrite the Makefile** for the object→link layout (§14).
-2. **case_core** — the shared `base.json` + `suites/*.jsonl` parser.
-3. **nbgensuite** — rename `gen_suites`; link `argkey` + `case_core` + libmd; bake `args_hash` over
-   `reference_args`; write suite gate headers; emit `K = cost.compute`; schema renames.
-4. **cache_core / nbcache** — path/gc/eviction (`K` + mtime, no pin) / status / config / `.meta`
-   recorder / atomic writes; cache at `~/.cache/nanobragg` with the `.bin`+`.meta` layout.
-5. **nbmetrics** — rename `metrics`; FP32 gated + FP16 reported (overflow-safe) + ULP-diff; getopt_long.
-6. **nbrunsuite** — device selection (§5), cache lookup, render, `nbmetrics`, typed per-suite gate
-   (absolute/reject/perf) + flips, `--seed`, `--append-to-ledger`, ledger trailer.
-7. **Migrate** the validated `golden/*.tsv` → `expected/` (rename + reformat; same FP32 gate, so
-   verdicts and seed numbers carry). Validate self-consistency (stable verdicts, cache hit-rate,
-   device assertion, `--seed` canary passes). **Delete `run.sh`.**
-
-There is no "reproduce run.sh" step — run.sh is not a reference. `golden/` data is kept (as
-`expected/`), not re-seeded from scratch.
-
-## 14. Build / link mechanics
+## 13. Build / link mechanics
 
 Objects-then-link; static; no `.so`. JSON is parsed/emitted with the **json-c** system library
 (`<json-c/json.h>`, `-ljson-c`), not a bundled parser. `argkey.o` (libc); `case_core.o` (`-ljson-c`);
 `cache_core.o` (`-ljson-c -lmd`). `nbgensuite`: `argkey.o` + `case_core.o` + `-ljson-c -lmd`.
-`nbcache`: `cache_core.o` + `argkey.o` + `case_core.o` + `-ljson-c -lmd`. `nbrunsuite`: the same
-**plus NVML** for device enumeration (`<nvml.h>`, `-lnvidia-ml`), built as a **separate CUDA-gated
-target** (needs the toolkit dir for `nvml.h` + the link stub; the CUDA-free core still builds without
-it). `nbmetrics`: its own build (`-lm`).
+`nbcache`: `cache_core.o` + `argkey.o` + `-ljson-c -lmd -lm` — it drives the cache only, never
+reads `base.json` or the suites, so `case_core` is not linked. `nbrunsuite`: `cache_core.o` +
+`argkey.o` + `case_core.o` + `-ljson-c -lmd -lm`, **plus NVML** for device enumeration
+(`<nvml.h>`, `-lnvidia-ml`), built as a **separate CUDA-gated target** (needs the toolkit dir for
+`nvml.h` + the link stub; the CUDA-free core still builds without it). `nbmetrics`: its own build
+(`-lm`).
 
 **Build prerequisites** (system packages — the harness is deliberately *not* self-contained, unlike
 nanoBragg): a C compiler, **`json-c-devel`** (JSON) and **`libmd-devel`** (md5). A package being
@@ -350,7 +357,7 @@ link stub, but at **runtime** only the NVIDIA driver's `libnvidia-ml.so` (not `c
 `nanoBragg` is built separately with `nvcc`. The CUDA-free core tools (`nbgensuite`/`nbcache`/`nbmetrics`)
 need none of this.
 
-## 15. Invariants
+## 14. Invariants
 
 - Detector 2048×2048.
 - Desktop RTX 5090 only; device selected by UUID and confirmed by name (§5), incl. the post-render
@@ -362,12 +369,12 @@ need none of this.
 - Inputs live under `cuda/test/inputs/` as **real files, never symlinks** (harness decoupled from any
   external data tree); the reference oracle lives under `cuda/test/reference/`.
 - The FP32 absolute gate (`corr ≥ 0.9999 AND sum_ratio ∈ [0.999, 1.001]`, per-suite overridable)
-  and the per-precision `expected` baselines (migrated validated golds).
+  and the per-precision `expected` baselines.
 - **Reference-oracle correctness:** the reference must reproduce a from-source gold built from
   `main` + `reference_fix_branches` (`base.json`) on the three fix-sensitive canaries; `--seed`
   enforces this (north-star check).
 
-## 16. Phase 2 (deferred — designed, not in v1)
+## 15. Phase 2 (deferred — designed, not in v1)
 
 - **`relative` gate type** — reproduce the seed corr/sum_ratio within a defined tolerance (fp32
   "no-regression"). Needs the tolerance pinned and the seed numbers stored in `expected`.
@@ -386,13 +393,11 @@ need none of this.
   - Stores: **session log** (auto, disposable, project-local) + **curated ledger** (opt-in,
     persistent). Both need schema/location pinned before build; the minimal v1-pullable slice is
     bare `--vs` (gold) + `--tag`/`--vs session:`.
-- **Cost estimator** — the `seconds_per_K` refit (robust median of `actual_seconds / K` over all
-  `.meta`) + `--reference-budget` skip + the `.bin`-gone/`.meta`-present "known miss" path. v1
+- **Cost estimator** — the `seconds_per_K` refit (robust median of `cost.actual / cost.compute`,
+  joining `.meta`'s `cost.actual` to the suite's `cost.compute` (`K`)) + `--reference-budget` skip +
+  the `.bin`-gone/`.meta`-present "known miss" path. v1
   records `.meta`; this consumes it, once an expensive reference actually exists.
 - **Input data-prep / download** — `inputs/` is untracked large feedstock, so a fresh clone lacks it.
   A committed "Preparing input data" doc (the §11 `inputs/` tree + a `filename → md5 + size`
   verification manifest + an acquisition source) is deferred; for now inputs are prepared manually.
-  The manifest also pins the canonical `amat.mat` (resolving the historical 369 B / 105 B `A.mat`
-  ambiguity).
-- **Retired** (not carried into the nb\* tools): `NB_DIFF` (two-candidate differential probe) and
-  `NB_SCORE_ONLY` (re-score without render).
+  The manifest also pins the canonical `amat.mat` (resolving the 369 B / 105 B `A.mat` ambiguity).

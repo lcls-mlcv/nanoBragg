@@ -197,9 +197,10 @@ oracle can't silently poison the baseline.
 
 Rendered reference images are cached machine-globally at
 `$XDG_CACHE_HOME/nanobragg` (default `~/.cache/nanobragg`), keyed by
-`<reference_md5>/<args_hash>`, evicted by cost (`K`) + recency under a
-20 GB default budget (`--budget-gb`, or `nbcache --set-budget-gb N`).
-`nbcache --status` reports size/entry/orphan counts; `--gc` applies eviction;
+`<reference_md5>/<args_hash>`, evicted by a `cost.actual` × recency score —
+expensive and recently-read images survive, cheap and long-unread images evict
+first — under an 11 GB default budget (`--budget-gb`, or `nbcache --set-budget-gb N`).
+`nbcache --status` reports size/entry counts against the budget; `--gc` applies eviction;
 `--path -- <exe> <args...>` (fed the `{input_root}`-token form) prints the
 cache path for a given reference invocation.
 

@@ -47,7 +47,6 @@ int main(void) {
     CHECK(deq(b->corr_min, 0.9999), "corr_min == 0.9999 (got %.6f)", b->corr_min);
     CHECK(deq(b->sum_ratio_min, 0.999), "sum_ratio_min == 0.999 (got %.6f)", b->sum_ratio_min);
     CHECK(deq(b->sum_ratio_max, 1.001), "sum_ratio_max == 1.001 (got %.6f)", b->sum_ratio_max);
-    CHECK(b->cache_budget_gb == 20, "cache_budget_gb == 20 (got %ld)", b->cache_budget_gb);
 
     CHECK(b->n_reference_fix_branches == 3, "reference_fix_branches count == 3 (got %d)",
           b->n_reference_fix_branches);

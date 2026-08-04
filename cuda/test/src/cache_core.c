@@ -1,6 +1,6 @@
 /* cache_core.c -- image-cache path assembly, config, atomic writes, scan, gc.
  * See cache_core.h. */
-#define _XOPEN_SOURCE 700   /* realpath / strdup under -std=c11 */
+#define _GNU_SOURCE   /* realpath / strdup under -std=c11; ST_NOATIME in statvfs */
 #include "cache_core.h"
 #include "argkey.h"
 #include <json-c/json.h>
@@ -9,10 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <math.h>
 #include <dirent.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <md5.h>
 
@@ -73,15 +75,37 @@ char *cache_dir_resolve(const char *flag_override) {
     return NULL;
 }
 
-long cache_settings_budget_gb(const char *cache_dir) {
+/* <cache_dir>/settings.json as a json-c object, or NULL when it is absent or not
+ * a JSON object. Checking access() first keeps an absent file from surfacing a
+ * parser open error. Caller json_object_put()s the result. */
+static struct json_object *settings_load(const char *cache_dir) {
     char path[4096];
     snprintf(path, sizeof path, "%s/settings.json", cache_dir);
-    if (access(path, R_OK) != 0) return -1;          /* absent settings.json */
+    if (access(path, R_OK) != 0) return NULL;
     struct json_object *root = json_object_from_file(path);
-    if (!root || !json_object_is_type(root, json_type_object)) {
-        if (root) json_object_put(root);
-        return -1;
+    if (root && !json_object_is_type(root, json_type_object)) {
+        json_object_put(root);
+        return NULL;
     }
+    return root;
+}
+
+/* One positive, finite number from settings.json, else `dflt` (§9: a bad value
+ * falls back to its own default without disturbing the other keys). */
+static double settings_pos_double(struct json_object *root, const char *key,
+                                  double dflt) {
+    struct json_object *v = NULL;
+    if (!root || !json_object_object_get_ex(root, key, &v) || !v) return dflt;
+    enum json_type t = json_object_get_type(v);
+    if (t != json_type_int && t != json_type_double) return dflt;
+    double d = json_object_get_double(v);
+    if (!isfinite(d) || d <= 0.0) return dflt;
+    return d;
+}
+
+long cache_settings_budget_gb(const char *cache_dir) {
+    struct json_object *root = settings_load(cache_dir);
+    if (!root) return -1;
     struct json_object *bv = NULL;
     long budget = -1;
     if (json_object_object_get_ex(root, "budget_gb", &bv) && bv) {
@@ -100,12 +124,41 @@ long cache_budget_resolve(const char *cache_dir, long flag_gb) {
     return CACHE_DEFAULT_BUDGET_GB;
 }
 
+void cache_weights_resolve(const char *cache_dir, cache_weights *out) {
+    struct json_object *root = settings_load(cache_dir);
+    out->cost_weight = settings_pos_double(root, "evict_cost_weight",
+                                           CACHE_DEFAULT_COST_WEIGHT);
+    out->decay       = settings_pos_double(root, "evict_decay",
+                                           CACHE_DEFAULT_DECAY);
+    out->grace_seconds = settings_pos_double(root, "evict_grace_days",
+                                             CACHE_DEFAULT_GRACE_DAYS) * 86400.0;
+    if (root) json_object_put(root);
+}
+
 int cache_set_budget_gb(const char *cache_dir, long budget_gb) {
     if (mkdirs(cache_dir) != 0) return -1;
-    char path[4096], json[128];
+    char path[4096];
     snprintf(path, sizeof path, "%s/settings.json", cache_dir);
-    int len = snprintf(json, sizeof json, "{\"budget_gb\":%ld}\n", budget_gb);
-    return cache_write_atomic(path, json, (size_t)len);
+
+    /* Read-merge-write: the hand-edited eviction weights live in this file and
+     * must survive a budget update (§9). */
+    struct json_object *root = settings_load(cache_dir);
+    if (!root) root = json_object_new_object();
+    json_object_object_add(root, "budget_gb", json_object_new_int64(budget_gb));
+
+    const char *txt = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    char buf[8192];
+    int len = snprintf(buf, sizeof buf, "%s\n", txt ? txt : "{}");
+    json_object_put(root);
+    if (len < 0 || (size_t)len >= sizeof buf) return -1;
+    return cache_write_atomic(path, buf, (size_t)len);
+}
+
+double cache_score(double cost_actual, long last_use, long now,
+                   const cache_weights *w) {
+    double stale = (double)(now - last_use);
+    if (!(stale > 0.0)) stale = 0.0;
+    return pow(cost_actual, w->cost_weight) / pow(stale + w->grace_seconds, w->decay);
 }
 
 /* ========================================================================= */
@@ -167,13 +220,14 @@ int cache_write_atomic(const char *path, const void *buf, size_t len) {
 }
 
 int cache_write_meta(const char *cache_dir, const char *ref_md5,
-                     const char *args_hash, long k, double actual_seconds) {
+                     const char *args_hash, double cost_actual) {
     char path[4096];
     if (!cache_entry_path(cache_dir, ref_md5, args_hash, ".meta", path, sizeof path))
         return -1;
+    /* Nested to mirror the suite schema's "cost":{"compute":...} shape (§9). */
     char json[128];
     int len = snprintf(json, sizeof json,
-                       "{\"k\":%ld,\"actual_seconds\":%.6f}\n", k, actual_seconds);
+                       "{\"cost\":{\"actual\":%.6f}}\n", cost_actual);
     return cache_write_atomic(path, json, (size_t)len);
 }
 
@@ -181,33 +235,46 @@ int cache_write_meta(const char *cache_dir, const char *ref_md5,
 /* scan / status / gc                                                        */
 /* ========================================================================= */
 
-/* Live-set lookup: returns the index into live[] or -1 (orphan). Linear -- the
- * live set is the full case corpus (a few hundred) scanned once per entry. */
-static int live_index(const char *const *live, int nlive, const char *hash) {
-    for (int i = 0; i < nlive; i++)
-        if (strcmp(live[i], hash) == 0) return i;
-    return -1;
-}
-
-/* Read "k" from a .meta (our fixed format), or 0 if unreadable. Leak-free (no
- * DOM): the recorder writes {"k":N,"actual_seconds":F}. */
-static long meta_k(const char *meta_path) {
+/* cost.actual from a .meta, or 0 when the file is absent, truncated, or not the
+ * {"cost":{"actual":S}} shape -- 0 ranks lowest and evicts first (§9). Scanned
+ * once per entry, so it reads the fixed shape directly instead of building a DOM. */
+static double meta_cost_actual(const char *meta_path) {
     FILE *f = fopen(meta_path, "r");
-    if (!f) return 0;
+    if (!f) return 0.0;
     char buf[256];
     size_t got = fread(buf, 1, sizeof buf - 1, f);
     fclose(f);
     buf[got] = 0;
-    const char *p = strstr(buf, "\"k\":");
-    if (!p) return 0;
-    return strtol(p + 4, NULL, 10);
+    const char *p = strstr(buf, "\"cost\"");
+    if (p) p = strstr(p, "\"actual\"");
+    if (p) p = strchr(p, ':');
+    if (!p) return 0.0;
+    char *end = NULL;
+    double v = strtod(p + 1, &end);
+    if (end == p + 1 || !isfinite(v) || v < 0.0) return 0.0;
+    return v;
 }
 
-cache_entry *cache_scan(const char *cache_dir,
-                        const char *const *live, const long *live_k, int nlive,
-                        int *n) {
+/* 1 when cache_dir sits on a noatime mount, where st_atime never advances. */
+static int mount_is_noatime(const char *cache_dir) {
+#ifdef ST_NOATIME
+    struct statvfs vfs;
+    if (statvfs(cache_dir, &vfs) == 0 && (vfs.f_flag & ST_NOATIME)) return 1;
+#else
+    (void)cache_dir;
+#endif
+    return 0;
+}
+
+cache_entry *cache_scan(const char *cache_dir, int *n, int *out_rank_by_mtime) {
     DIR *root = opendir(cache_dir);
-    if (!root) { *n = 0; return NULL; }
+    if (!root) { *n = 0; if (out_rank_by_mtime) *out_rank_by_mtime = 0; return NULL; }
+
+    int rank_by_mtime = mount_is_noatime(cache_dir);
+    if (rank_by_mtime)
+        fprintf(stderr, "# cache: %s is mounted noatime -- eviction ranks by "
+                        "age-since-written instead of last use\n", cache_dir);
+    if (out_rank_by_mtime) *out_rank_by_mtime = rank_by_mtime;
 
     int cap = 256, cnt = 0;
     cache_entry *ents = malloc((size_t)cap * sizeof *ents);
@@ -249,20 +316,14 @@ cache_entry *cache_scan(const char *cache_dir,
                 cache_entry *e = &ents[cnt++];
                 memcpy(e->ref_md5, rd->d_name, CACHE_HEXLEN + 1);
                 memcpy(e->args_hash, hash, CACHE_HEXLEN + 1);
+                e->atime = (long)st.st_atime;
                 e->mtime = (long)st.st_mtime;
                 e->size  = (long long)st.st_size;
 
-                int li = live_index(live, nlive, hash);
-                if (li >= 0) {
-                    e->orphan = 0;
-                    e->k = live_k ? live_k[li] : 0;
-                } else {
-                    e->orphan = 1;
-                    char metap[4096];
-                    snprintf(metap, sizeof metap, "%s/%s/%s/%.*s.meta",
-                             cache_dir, rd->d_name, sd->d_name, CACHE_HEXLEN, hash);
-                    e->k = meta_k(metap);
-                }
+                char metap[4096];
+                snprintf(metap, sizeof metap, "%s/%s/%s/%.*s.meta",
+                         cache_dir, rd->d_name, sd->d_name, CACHE_HEXLEN, hash);
+                e->cost_actual = meta_cost_actual(metap);
             }
             closedir(sdd);
         }
@@ -277,24 +338,33 @@ void cache_compute_status(const cache_entry *e, int n, long budget_gb,
                           cache_status *out) {
     out->total_bytes = 0;
     out->n_entries = n;
-    out->n_orphans = 0;
     out->budget_gb = budget_gb;
     out->budget_bytes = (long long)budget_gb << 30;
-    for (int i = 0; i < n; i++) {
-        out->total_bytes += e[i].size;
-        if (e[i].orphan) out->n_orphans++;
-    }
+    for (int i = 0; i < n; i++) out->total_bytes += e[i].size;
 }
 
-/* Cheapest-then-coldest: cost (K) ascending is primary so expensive references
- * are the last evicted ("live forever by cost rank", §9); mtime ascending
- * (coldest) breaks ties. */
-static int cmp_evict(const void *a, const void *b) {
-    const cache_entry *x = *(const cache_entry *const *)a;
-    const cache_entry *y = *(const cache_entry *const *)b;
-    if (x->k != y->k)         return (x->k < y->k) ? -1 : 1;
-    if (x->mtime != y->mtime) return (x->mtime < y->mtime) ? -1 : 1;
-    return strcmp(x->args_hash, y->args_hash);   /* stable, deterministic */
+/* An eviction candidate with its score resolved once, so the sort is a pure
+ * numeric comparison. */
+typedef struct { double score; cache_entry *e; } victim;
+
+/* Ascending score -- cheap and long unread first (§9); args_hash then ref_md5
+ * break ties so an eviction order is reproducible across runs. The same
+ * args_hash can exist under two reference dirs, which qsort (unstable) would
+ * otherwise order arbitrarily. */
+static int cmp_victim(const void *a, const void *b) {
+    const victim *x = (const victim *)a, *y = (const victim *)b;
+    if (x->score != y->score) return (x->score < y->score) ? -1 : 1;
+    int c = strcmp(x->e->args_hash, y->e->args_hash);
+    if (c) return c;
+    return strcmp(x->e->ref_md5, y->e->ref_md5);
+}
+
+/* args_hash is one of the run's declared (never-evicted) hashes. Linear -- the
+ * protect set is one suite's case corpus, a few hundred, per entry. */
+static int is_protected(const char *const *protect, int nprotect, const char *hash) {
+    for (int i = 0; i < nprotect; i++)
+        if (strcmp(protect[i], hash) == 0) return 1;
+    return 0;
 }
 
 /* rmdir any emptied <AB> and <ref_md5> dir under cache_dir (rmdir refuses a
@@ -324,55 +394,43 @@ static void prune_empty_dirs(const char *cache_dir) {
 }
 
 int cache_gc(const char *cache_dir, cache_entry *e, int n, long long budget_bytes,
-             long run_start, int do_apply, int *out_orphans, int *out_budget) {
-    /* running total of live .bin bytes still on disk */
+             const char *const *protect, int nprotect, const cache_weights *w,
+             long now, int rank_by_mtime, int do_apply) {
     long long total = 0;
     for (int i = 0; i < n; i++) total += e[i].size;
 
-    int evicted_orphan = 0, evicted_budget = 0;
-    char path[4096];
-
-    /* Phase 1 -- orphans: unlink .bin AND .meta (the case is gone; no calibration
-     * value). Never touch an entry younger than the run in progress. */
-    for (int i = 0; i < n; i++) {
-        if (!e[i].orphan || e[i].mtime >= run_start) continue;
-        if (do_apply) {
-            if (cache_entry_path(cache_dir, e[i].ref_md5, e[i].args_hash, ".bin",
-                                 path, sizeof path)) unlink(path);
-            if (cache_entry_path(cache_dir, e[i].ref_md5, e[i].args_hash, ".meta",
-                                 path, sizeof path)) unlink(path);
-        }
-        total -= e[i].size;
-        e[i].size = 0;          /* removed from the on-disk footprint */
-        evicted_orphan++;
-    }
-
-    /* Phase 2 -- budget: if still over, evict live .bin (keep .meta for the
-     * calibration dataset) cheapest-then-coldest until within budget. Protected
-     * (young) entries and orphans (already handled) are excluded. */
-    if (budget_bytes >= 0 && total > budget_bytes) {
-        const cache_entry **victims = malloc((size_t)n * sizeof *victims);
+    int evicted = 0;
+    /* Under budget the cache is left alone; only the dir prune runs (§9). */
+    if (budget_bytes >= 0 && total > budget_bytes && n > 0) {
+        victim *v = malloc((size_t)n * sizeof *v);
         int nv = 0;
-        for (int i = 0; i < n; i++)
-            if (!e[i].orphan && e[i].size > 0 && e[i].mtime < run_start)
-                victims[nv++] = &e[i];
-        qsort(victims, (size_t)nv, sizeof *victims, cmp_evict);
+        for (int i = 0; i < n; i++) {
+            if (e[i].size <= 0 || is_protected(protect, nprotect, e[i].args_hash))
+                continue;
+            long last_use = rank_by_mtime ? e[i].mtime : e[i].atime;
+            v[nv].score = cache_score(e[i].cost_actual, last_use, now, w);
+            v[nv].e = &e[i];
+            nv++;
+        }
+        qsort(v, (size_t)nv, sizeof *v, cmp_victim);
+
+        char path[4096];
         for (int i = 0; i < nv && total > budget_bytes; i++) {
-            cache_entry *v = (cache_entry *)victims[i];
+            cache_entry *ve = v[i].e;
+            /* The .meta survives: the measured render time outlives its image. */
             if (do_apply &&
-                cache_entry_path(cache_dir, v->ref_md5, v->args_hash, ".bin",
+                cache_entry_path(cache_dir, ve->ref_md5, ve->args_hash, ".bin",
                                  path, sizeof path))
                 unlink(path);
-            total -= v->size;
-            v->size = 0;
-            evicted_budget++;
+            total -= ve->size;
+            /* Only an apply rewrites the caller's array; a plan leaves it intact
+             * so the same entries can be replayed into the applying call. */
+            if (do_apply) ve->size = 0;   /* off the on-disk footprint */
+            evicted++;
         }
-        free(victims);
+        free(v);
     }
 
     if (do_apply) prune_empty_dirs(cache_dir);
-
-    if (out_orphans) *out_orphans = evicted_orphan;
-    if (out_budget)  *out_budget  = evicted_budget;
-    return evicted_orphan + evicted_budget;
+    return evicted;
 }
