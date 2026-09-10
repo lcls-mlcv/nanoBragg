@@ -1,0 +1,34 @@
+{
+  "note": "A group is a reusable, named bundle of CLI flags carrying a 'class'. Groups serve two purposes: they are the building blocks the plan crosses to form the grid320 suite (crystal x crystal_size x grid320 x orientation), and they are coherent multi-flag units a scenario reuses whole (e.g. detector_thickness = -detector_thick + -detector_thicksteps + -detector_abs + the -oversample_thick cpu_extra). Use a group when several flags must travel together or take part in a Cartesian crossing. A single-axis knob tested one-at-a-time (distance, pixel, convention, curved_det, ...) belongs in dimensions.jsonl, NOT here. 'class' names the crossing axis or the bundle kind; class 'override' is inert to grid320 crossings.",
+
+  "groups": [
+
+    {"group":"xtal_2plv","class":"crystal","label":"2PLV","args":["-hkl","{input_root}/crystals/2PLV.hkl","-cell","322.940","358.040","380.150","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"high","status":"unaudited"},"note":"large orthorhombic cell -> big Fhkl table"},
+    {"group":"xtal_193l","class":"crystal","label":"193L","args":["-hkl","{input_root}/crystals/193L.hkl","-cell","78.540","78.540","37.770","90","90","90"],"cost":{"compute":"base","precision":"base","memory":"med","status":"unaudited"}},
+    {"group":"xtal_3nir","class":"crystal","label":"3NIR","args":["-hkl","{input_root}/crystals/3NIR.hkl","-cell","22.329","18.471","40.769","90","90.55","90"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"}},
+    {"group":"xtal_amat","class":"crystal","label":"AMAT","args":["-hkl","{input_root}/crystals/scaled.hkl","-mat","{input_root}/matrix/amat.mat"],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"orientation+cell via MOSFLM matrix; uses {input_root}/matrix/amat.mat (105 B), NOT the tracked cuda/test/A.mat"},
+
+    {"group":"xtal_none","class":"override","label":"none","args":[],"cost":{"compute":"base","precision":"base","memory":"low","status":"unaudited"},"note":"class 'override' is inert to grid320's crossings; a crystal-free placeholder for scenarios that supply their own -cell + -default_F (no hkl file)"},
+
+    {"group":"size_30","class":"crystal_size","label":"30","args":["-Na","30","-Nb","30","-Nc","30"],"cost":{"compute":"base","precision":"low","memory":"base","status":"unaudited"}},
+    {"group":"size_100","class":"crystal_size","label":"100","args":["-Na","100","-Nb","100","-Nc","100"],"cost":{"compute":"base","precision":"med","memory":"base","status":"unaudited"}},
+    {"group":"size_300","class":"crystal_size","label":"300","args":["-Na","300","-Nb","300","-Nc","300"],"cost":{"compute":"base","precision":"high","memory":"base","status":"unaudited"}},
+    {"group":"size_1000","class":"crystal_size","label":"1000","args":["-Na","1000","-Nb","1000","-Nc","1000"],"cost":{"compute":"base","precision":"high","memory":"base","status":"unaudited"}},
+
+    {"group":"thick_off","class":"detector_thickness","label":"thick0","args":["-detector_thick","0"],"cost":{"compute":"base","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"thick_med","class":"detector_thickness","label":"thick100","args":["-detector_thick","100","-detector_thicksteps","8","-detector_abs","100"],"cpu_extra":["-oversample_thick"],"cost":{"compute":"med","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"thick_heavy","class":"detector_thickness","label":"thick320","args":["-detector_thick","320","-detector_thicksteps","10","-detector_abs","256"],"cpu_extra":["-oversample_thick"],"cost":{"compute":"high","precision":"base","memory":"base","status":"unaudited"},"note":"320um Si sensor, 256um attenuation @12.69keV"},
+
+    {"group":"regime_mono","class":"grid320","label":"mono","args":["-oversample","1","-phisteps","1"],"cost":{"compute":"base","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"regime_disp","class":"grid320","label":"disp","args":["-oversample","1","-dispersion","2","-dispsteps","9","-phisteps","1"],"cost":{"compute":"med","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"regime_mosaic","class":"grid320","label":"mosaic","args":["-oversample","1","-mosaic","0.5","-mosaic_domains","10","-phisteps","1"],"cost":{"compute":"med","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"regime_phi","class":"grid320","label":"phi","args":["-oversample","1","-osc","0.1","-phisteps","10"],"cost":{"compute":"med","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"regime_os4","class":"grid320","label":"os4","args":["-oversample","4","-phisteps","1"],"cost":{"compute":"high","precision":"base","memory":"base","status":"unaudited"}},
+
+    {"group":"ori_onaxis","class":"orientation","label":"onaxis","args":["-misset","0","0","0"],"cost":{"compute":"base","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"ori_cryoff","class":"orientation","label":"cryoff","args":["-misset","13","27","41"],"cost":{"compute":"base","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"ori_detoff","class":"orientation","label":"detoff","args":["-twotheta","20","-detector_rotx","3","-detector_roty","4","-detector_rotz","5"],"cost":{"compute":"base","precision":"base","memory":"base","status":"unaudited"}},
+    {"group":"ori_both","class":"orientation","label":"both","args":["-misset","13","27","41","-twotheta","20","-detector_rotx","3","-detector_roty","4","-detector_rotz","5"],"cost":{"compute":"base","precision":"base","memory":"base","status":"unaudited"}}
+
+  ]
+}

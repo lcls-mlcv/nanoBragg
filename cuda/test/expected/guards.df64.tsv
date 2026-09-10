@@ -1,0 +1,10 @@
+# expected verdicts  suite=guards  precision=df64  (migrated from golden/guards.df64.tsv)
+# cell	verdict	corr	sum_ratio
+guard_interpolate	REJECT	-	-
+guard_gauss	REJECT	-	-
+guard_tophat	REJECT	-	-
+guard_fudge	REJECT	-	-
+guard_stol	REJECT	-	-
+guard_4stol	REJECT	-	-
+guard_Q	REJECT	-	-
+guard_osthick0	REJECT	-	-
