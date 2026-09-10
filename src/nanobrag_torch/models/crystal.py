@@ -1147,7 +1147,11 @@ class Crystal:
         else:
             has_mosaic = config.mosaic_spread_deg > 0.0
 
-        if has_mosaic:
+        override = getattr(self, "mosaic_umats_override", None)
+        if override is not None:
+            # Explicit mosaic blocks (cctbx set_mosaic_blocks parity, see compat.cctbx)
+            mosaic_umats = override.to(device=a_phi.device, dtype=a_phi.dtype)
+        elif has_mosaic:
             mosaic_umats = self._generate_mosaic_rotations(config)
         else:
             # Identity matrices for no mosaicity
