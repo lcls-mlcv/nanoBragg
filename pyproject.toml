@@ -31,7 +31,9 @@ dependencies = [
     "numpy",
     "pytest",
     "matplotlib",
-    "scipy"
+    "scipy",
+    "pyyaml",
+    "psutil",
 ]
 
 [project.scripts]
@@ -49,6 +51,7 @@ test = [
 ]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "slow_gradient: marks gradient tests with extended runtime tolerance (900s default)",

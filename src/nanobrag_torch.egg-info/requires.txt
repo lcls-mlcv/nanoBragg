@@ -4,6 +4,8 @@ numpy
 pytest
 matplotlib
 scipy
+pyyaml
+psutil
 
 [dev]
 black

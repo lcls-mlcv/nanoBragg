@@ -1,4 +1,4 @@
-/* convert ideal pixel intensities into noisy pixels                                            -James Holton           6-9-17
+/* convert ideal pixel intensities into noisy pixels                                                -James Holton                 6-28-21
 
 example:
 
@@ -52,6 +52,7 @@ typedef struct _SMVinfo
 /* SMV image handling routines */
 SMVinfo GetFrame(char *filename);
 double ValueOf( const char *keyword, SMVinfo smvfile);
+char *get_byte_order();
 
 /* generate unit vector in random direction */
 float uniform3Ddev(float *dx, float *dy, float *dz, long *idum);
@@ -113,13 +114,15 @@ int main(int argc, char** argv)
     int psf_radius = 0;
     int x0,y0,x,y,dx,dy;
     float rsq,temp;
-
+       
     int n,i,j;
     float *floatimage,*photonimage,*psfimage,*spare;
     unsigned short int *int16image;
     unsigned int *int32image;
+    int intimage_bits = 16;
+    char *byte_order = get_byte_order();
     unsigned char *pgmimage;
-
+    
     double test,sum,photons,photons0,adu;
     double readout_noise=0.0, flicker_noise=0.0;
     double calibration_noise=0.03;
@@ -131,11 +134,11 @@ int main(int argc, char** argv)
     int write_pgm = 1;
 
     double phi0 = 0, osc = 1;
-
+    
     /* Thomson cross section */
     double r_e_sqr = 7.94079248018965e-30;
     /* incident x-ray fluence in photons/m^2   default equivalent to unity
-        that is, one electron will scatter 1 ph/SR after a fluence of 1.26e29 ph/m^2
+          that is, one electron will scatter 1 ph/SR after a fluence of 1.26e29 ph/m^2
         this places the input file on a photons/pixel scale */
     double fluence = 125932015286227086360700780544.0;
     /* arbitrary "photon scale" applied before calculating noise, default is unity */
@@ -144,17 +147,25 @@ int main(int argc, char** argv)
 
     double I;
     double max_I = 0.0;
-
+        
     long seed;
     long calib_seed = 123456789;
-
+    long badpix_seed = 1234;
+    long hotpix_seed = 5678;
+        
     seed = -time((time_t *)0);
 //    printf("GOTHERE seed = %u\n",seed);
-
-
+      
+        
     /* check argument list */
     for(i=1; i<argc; ++i)
     {
+       if(strstr(argv[i], "floatimage.bin"))
+        {
+            floatfilename = argv[i];
+            floatfile = fopen(floatfilename,"r");
+            continue;
+        }
         if(argv[i][0] == '-')
         {
             /* option specified */
@@ -209,7 +220,7 @@ int main(int argc, char** argv)
                 psftype = UNKNOWN;
                 if(strstr(argv[i+1],"gauss")) psftype = GAUSS;
                 if(strstr(argv[i+1],"fiber")) psftype = FIBER;
-                if(psftype == UNKNOWN) printf("WARNING: unknown psf type: %s\n",argv[i+1]);
+                if(psftype == UNKNOWN) printf("WARNING: unknown psf type: %s\n",argv[i+1]);                
             }
             if(strstr(argv[i], "-psf_rad") && (argc > (i+1)))
             {
@@ -239,6 +250,10 @@ int main(int argc, char** argv)
             if((strstr(argv[i], "-intfile") || strstr(argv[i], "-intimage")) && (argc > (i+1)))
             {
                 intfilename = argv[i+1];
+            }
+            if(strstr(argv[i], "-bits") && (argc > (i+1)))
+            {
+                intimage_bits = atoi(argv[i+1]);
             }
             if((strstr(argv[i], "-noisefile") || strstr(argv[i], "-noiseimage")) && (argc > (i+1)))
             {
@@ -277,6 +292,14 @@ int main(int argc, char** argv)
             {
                 calib_seed = -atoi(argv[i+1]);
             }
+            if(strstr(argv[i], "-badpix_seed") && (argc > (i+1)))
+            {
+                badpix_seed = -atoi(argv[i+1]);
+            }
+            if(strstr(argv[i], "-hotpix_seed") && (argc > (i+1)))
+            {
+                hotpix_seed = -atoi(argv[i+1]);
+            }
             if(strstr(argv[i], "-adc") && (argc > (i+1)))
             {
                 adc_offset = atof(argv[i+1]);
@@ -296,7 +319,7 @@ int main(int argc, char** argv)
         }
     }
 
-    printf("noisify - add noise to pixels - James Holton 2-16-16\n");
+    printf("noisify - add noise to pixels - James Holton 3-19-16\n");
 
     if(floatfile == NULL){
         printf("usage: noisify -floatfile floatimage.bin\n");
@@ -348,24 +371,24 @@ exit(9);
             detsize_y = pixel*ypixels;
             test = ValueOf("DISTANCE",headerfile);
             if(! isnan(test)) distance = test/1000.0;
-//          test = ValueOf("CLOSE_DISTANCE",headerfile);
-//          if(! isnan(test)) close_distance = test/1000.0;
+//            test = ValueOf("CLOSE_DISTANCE",headerfile);
+//            if(! isnan(test)) close_distance = test/1000.0;
             test = ValueOf("WAVELENGTH",headerfile);
             if(! isnan(test)) lambda = test/1e10;
             test = ValueOf("BEAM_CENTER_X",headerfile);
             if(! isnan(test)) Xbeam = test/1000.0;
             test = ValueOf("BEAM_CENTER_Y",headerfile);
             if(! isnan(test)) Ybeam = detsize_y - test/1000.0;
-//          test = ValueOf("ORGX",headerfile);
-//          if(! isnan(test)) ORGX = test;
-//          test = ValueOf("ORGY",headerfile);
-//          if(! isnan(test)) ORGY = test;
-//          test = ValueOf("PHI",headerfile);
-//          if(! isnan(test)) phi0 = test/RTD;
-//          test = ValueOf("OSC_RANGE",headerfile);
-//          if(! isnan(test)) osc = test/RTD;
-//          test = ValueOf("TWOTHETA",headerfile);
-//          if(! isnan(test)) twotheta = test/RTD;
+//            test = ValueOf("ORGX",headerfile);
+//            if(! isnan(test)) ORGX = test;
+//            test = ValueOf("ORGY",headerfile);
+//            if(! isnan(test)) ORGY = test;
+//            test = ValueOf("PHI",headerfile);
+//            if(! isnan(test)) phi0 = test/RTD;
+//            test = ValueOf("OSC_RANGE",headerfile);
+//            if(! isnan(test)) osc = test/RTD;
+//            test = ValueOf("TWOTHETA",headerfile);
+//            if(! isnan(test)) twotheta = test/RTD;
         }
     }
 
@@ -391,7 +414,7 @@ exit(9);
     if(! xpixels && ypixels) {
         xpixels = pixels/ypixels;
     }
-
+    
     /* finalize detector size */
     if(xpixels) {
         detsize_x = pixel*xpixels;
@@ -426,7 +449,7 @@ exit(9);
 
     /* default to middle of detector unless specified earlier */
     if(Xbeam <= -1e99) Xbeam = detsize_x/2.0;
-    if(Ybeam <= -1e99) Ybeam = detsize_y/2.0;
+    if(Ybeam <= -1e99) Ybeam = detsize_y/2.0;  
 
     if(calculate_noise == 0)
     {
@@ -449,7 +472,7 @@ exit(9);
     printf("  flicker_noise = %g %%\n",flicker_noise*100);
     printf("  quantum_gain = %g ADU/photon\n",quantum_gain);
     printf("  adc_offset = %g ADU\n",adc_offset);
-
+ 
 
     printf("\n");
 
@@ -476,47 +499,53 @@ exit(9);
         psfimage = apply_psf(photonimage, xpixels, ypixels, psftype, psf_fwhm/pixel, psf_radius);
 
         /* we won't be using photonimage data again. but what if apply_psf didn't calloc? */
-//      free(photonimage);
+//        free(photonimage);
         photonimage = psfimage;
-    }
+    }  
 
 
-    /* output noiseless image as ints */
+    /* output noiseless image as ints */   
     for(i=0;i<pixels;++i)
     {
         /* convert noiseless photons/pixel into area detector units */
         adu = photonimage[i]*quantum_gain+adc_offset;
+//        if(adu > 4294967295.0) adu = 4294967295.0;
+        if(adu > 2147483647.0) adu = 2147483647.0;
+        if(adu > 65535.0) adu = 65535.0;
+        int32image[i] = (unsigned int) ( adu );
         if(adu > 65535.0) adu = 65535.0;
         int16image[i] = (unsigned short int) ( adu );
         //printf("%.50g %d\n",adu,int16image[i]);
     }
-    printf("writing %s as %d %lu-byte integers\n",intfilename,pixels,sizeof(unsigned short int));
+    if(intimage_bits == 16) printf("writing %s as %d %lu-byte integers\n",intfilename,pixels,sizeof(unsigned short int));
+    if(intimage_bits == 32) printf("writing %s as %d %lu-byte integers\n",intfilename,pixels,sizeof(unsigned int));
     outfile = fopen(intfilename,"wb");
     if(headerfilename != NULL)
     {
-        /* use the provided header if possible */
+            /* use the provided header if possible */
         fwrite(headerfile.header,1,headerfile.header_size,outfile);
     }
     else
     {
-        /* make up our own header */
-        fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=little_endian;\nTYPE=unsigned_short;\n");
+            /* make up our own header */
+        if(intimage_bits == 16) fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=%s;\nTYPE=unsigned_short;\n",byte_order);
+        if(intimage_bits == 32) fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=%s;\nTYPE=long_integer;\n",byte_order);
         fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",xpixels,ypixels,pixel*1000.0,distance*1000.0);
         fprintf(outfile,"WAVELENGTH=%g;\nBEAM_CENTER_X=%g;\nBEAM_CENTER_Y=%g;\n",lambda,Xbeam*1000.0,(detsize_y-Ybeam)*1000);
         fprintf(outfile,"PHI=%g;\nOSC_START=%g;\nOSC_RANGE=%g;\n",phi0,phi0,osc);
-        fprintf(outfile,"TIME=%g;\n",osc);
         fprintf(outfile,"DETECTOR_SN=000;\n");
         fprintf(outfile,"BEAMLINE=fake;\n");
         fprintf(outfile,"}\f");
         while ( ftell(outfile) < 512 ){ fprintf(outfile," "); };
     }
-    fwrite(int16image,sizeof(unsigned short int),pixels,outfile);
+    if(intimage_bits == 16) fwrite(int16image,sizeof(unsigned short int),pixels,outfile);
+    if(intimage_bits == 32) fwrite(int32image,sizeof(unsigned int),pixels,outfile);
     fclose(outfile);
 
 
     if(write_pgm)
     {
-        /* output as pgm */
+        /* output as pgm */   
         for(i=0;i<pixels;++i){
             test = int16image[i];
             if(test > 255.0) test = 255.0;
@@ -570,11 +599,11 @@ exit(9);
         psfimage = apply_psf(photonimage, xpixels, ypixels, psftype, psf_fwhm/pixel, psf_radius);
 
         /* from now on, this is the "photonimage", or singal that is subject to read noise */
-//      free(photonimage);
+//        free(photonimage);
         photonimage = psfimage;
     }
-
-
+    
+    
     sum = 0;
     overloads = 0;
     for(i=0;i<pixels;++i){
@@ -588,36 +617,49 @@ exit(9);
             adu += readout_noise * gaussdev( &seed );
         }
 
+//        if(adu > 4294967295.0)
+//        {
+//            adu = 4294967295.0;
+//            if(intimage_bits == 32) ++overloads;
+//        }
+        if(adu > 2147483647.0)
+        {
+            adu = 2147483647.0;
+            if(intimage_bits == 32) ++overloads;
+        }
+        int32image[i] = (unsigned int) ( adu );
         if(adu > 65535.0) {
             adu = 65535.0;
-            ++overloads;
+            if(intimage_bits == 16) ++overloads;
         }
         int16image[i] = (unsigned short int) adu;
-//      printf("pixel %d = %d\n",i,int16image[i]);
+//        printf("pixel %d = %d\n",i,int16image[i]);
     }
     printf("%.0f photons on noise image (%d overloads)\n",sum,overloads);
 
-    printf("writing %s as %lu-byte integers\n",noisefilename,sizeof(unsigned short int));
+    if(intimage_bits == 16) printf("writing %s as %lu-byte integers\n",noisefilename,sizeof(unsigned short int));
+    if(intimage_bits == 32) printf("writing %s as %lu-byte integers\n",noisefilename,sizeof(unsigned int));
     outfile = fopen(noisefilename,"wb");
     if(headerfilename != NULL)
     {
-        /* use provided header if we have one */
+            /* use provided header if we have one */
         fwrite(headerfile.header,1,headerfile.header_size,outfile);
     }
     else
     {
-        /* make up our own header */
-        fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=little_endian;\nTYPE=unsigned_short;\n");
-        fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",xpixels,ypixels,pixel*1000.0,distance*1000.0);
+            /* make up our own header */
+        if(intimage_bits == 16) fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=%s;\nTYPE=unsigned_short;\n",byte_order);
+        if(intimage_bits == 32) fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=%s;\nTYPE=long_integer;\n",byte_order);
+         fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",xpixels,ypixels,pixel*1000.0,distance*1000.0);
         fprintf(outfile,"WAVELENGTH=%g;\nBEAM_CENTER_X=%g;\nBEAM_CENTER_Y=%g;\n",lambda,Xbeam*1000.0,(detsize_y-Ybeam)*1000);
         fprintf(outfile,"PHI=%g;\nOSC_START=%g;\nOSC_RANGE=%g;\n",phi0,phi0,osc);
-        fprintf(outfile,"TIME=%g;\n",osc);
         fprintf(outfile,"DETECTOR_SN=000;\n");
         fprintf(outfile,"BEAMLINE=fake;\n");
         fprintf(outfile,"}\f");
         while ( ftell(outfile) < 512 ){ fprintf(outfile," "); };
     }
-    fwrite(int16image,sizeof(unsigned short int),pixels,outfile);
+    if(intimage_bits == 16) fwrite(int16image,sizeof(unsigned short int),pixels,outfile);
+    if(intimage_bits == 32) fwrite(int32image,sizeof(unsigned int),pixels,outfile);
     fclose(outfile);
 
     return 0;
@@ -627,13 +669,13 @@ exit(9);
 /* 2D Gaussian integral=1 */
 double ngauss2D(double x, double y, double fwhm)
 {
-    return log(16.)/M_PI*fwhm*fwhm*exp(-log(16.)*((x*x+y*y)/(fwhm*fwhm) ));
+    return log(16)/M_PI*fwhm*fwhm*exp(-log(16)*((x*x+y*y)/(fwhm*fwhm) ));
 }
 
 /* integral of Gaussian fwhm=1 integral=1 */
 double ngauss2D_integ(double x, double y)
 {
-    return 0.125*(erf(2*x*sqrt(log(2.)))*erf(y*sqrt(log(16.)))*sqrt(log(16.)/log(2.)));
+    return 0.125*(erf(2*x*sqrt(log(2)))*erf(y*sqrt(log(16)))*sqrt(log(16)/log(2)));
 }
 
 /* unit volume integrated over a pixel, fwhm = 1 */
@@ -687,20 +729,20 @@ float *apply_psf(float *inimage, int xpixels, int ypixels, psf_type psftype, dou
     g = fwhm_pixels * 0.652383013252053;
 
     if(psftype == UNKNOWN)
-    {
+    {    
         printf("ERROR: unknown PSF type\n");
         return inimage;
     }
 
     pixels = xpixels*ypixels;
     if(pixels == 0)
-    {
+    {    
         printf("ERROR: apply_psf image has zero size\n");
         return inimage;
     }
 
     if(fwhm_pixels <= 0.0)
-    {
+    {    
         printf("WARNING: apply_psf function has zero size\n");
         return inimage;
     }
@@ -713,7 +755,7 @@ float *apply_psf(float *inimage, int xpixels, int ypixels, psf_type psftype, dou
     {
         /* auto-select radius */
 
-        /* preliminary stats */
+        /* preliminary stats */   
         max_I = 0.0;
         for(i=0;i<pixels;++i)
         {
@@ -736,7 +778,7 @@ float *apply_psf(float *inimage, int xpixels, int ypixels, psf_type psftype, dou
         if(psftype == GAUSS)
         {
             /* calculate the radius beyond which only 0.5 photons will fall */
-            psf_radius = 1+ceil( sqrt(-log(lost_photons/max_I)/log(4.)/2.)*fwhm_pixels );
+            psf_radius = 1+ceil( sqrt(-log(lost_photons/max_I)/log(4)/2)*fwhm_pixels );
             printf("  auto-selected psf_radius = %d pixels\n",psf_radius);
         }
         if(psftype == FIBER)
@@ -805,18 +847,18 @@ float *apply_psf(float *inimage, int xpixels, int ypixels, psf_type psftype, dou
 
             if(psftype == GAUSS)
             {
-                /* calculate the radius beyond which only 0.5 photons will fall
+                /* calculate the radius beyond which only 0.5 photons will fall 
                    r = sqrt(-log(lost_photons/total_photons)/log(4)/2)*fwhm */
-                psf_radius = 1+ceil( sqrt(-log(lost_photons/inimage[i])/log(16.))*fwhm_pixels );
-//              printf("  auto-selected psf_radius = %d pixels\n",psf_radius);
+                psf_radius = 1+ceil( sqrt(-log(lost_photons/inimage[i])/log(16))*fwhm_pixels );
+//                printf("  auto-selected psf_radius = %d pixels\n",psf_radius);
             }
             if(psftype == FIBER)
             {
-                /* calculate the radius beyond which only 0.5 photons will fall
-                   r = sqrt((g*(total_photons/lost_photons))**2-g**2)
+                /* calculate the radius beyond which only 0.5 photons will fall 
+                   r = sqrt((g*(total_photons/lost_photons))**2-g**2) 
                      ~ g*total_photons/lost_photons */
                 psf_radius = 1+ceil( g*(inimage[i]/lost_photons)  );
-//              printf("  (%d,%d) auto-selected psf_radius = %d pixels\n",x0,y0,psf_radius);
+//                printf("  (%d,%d) auto-selected psf_radius = %d pixels\n",x0,y0,psf_radius);
             }
         }
         if(psf_radius == 0) psf_radius = 1;
@@ -833,13 +875,13 @@ float *apply_psf(float *inimage, int xpixels, int ypixels, psf_type psftype, dou
             rsq = psf_radius;
             rsq = rsq/fwhm_pixels;
             rsq = rsq*rsq;
-            lost_photons = inimage[i]*exp(-log(16.)*rsq);
+            lost_photons = inimage[i]*exp(-log(16)*rsq);
         }
         if(psftype == FIBER)
         {
-            /* r ~ g*total_photons/lost_photons
+            /* r ~ g*total_photons/lost_photons 
                normalized integral from r=inf to "r" :  g/sqrt(g**2+r**2) */
-            lost_photons = inimage[i]*g/sqrt(g*g+psf_radius*psf_radius);
+            lost_photons = inimage[i]*g/sqrt(g*g+psf_radius*psf_radius);            
         }
         /* accumulate this so we can add it to the whole image */
         total_lost_photons += lost_photons;
@@ -873,9 +915,9 @@ float *apply_psf(float *inimage, int xpixels, int ypixels, psf_type psftype, dou
     printf("adding back %g lost photons\n",total_lost_photons);
     for(i=0;i<pixels;++i)
     {
-        outimage[i] += lost_photons;
+            outimage[i] += lost_photons;
     }
-
+    
     /* don't need kernel anymore. but should we always allocate outimage? */
     free(kernel);
     return outimage;
@@ -888,7 +930,7 @@ float uniform3Ddev(float *dx, float *dy, float *dz, long *seed)
 {
     float ran1(long *idum);
     float dr;
-
+    
     /* pick a random direction by cutting a sphere out of a cube */
     dr = 0;
     while(dr>1 || dr < 1e-2)
@@ -902,9 +944,9 @@ float uniform3Ddev(float *dx, float *dy, float *dz, long *seed)
     *dx/=dr;
     *dy/=dr;
     *dz/=dr;
-
+    
     /* dx,dy,dz should now be a random unit vector */
-
+    
     return dr;
 }
 
@@ -916,7 +958,7 @@ float poidev(float xm, long *idum)
     /* oldm is a flag for whether xm has changed since last call */
     static float sq,alxm,g,oldm=(-1.0);
     float em,t,y;
-
+    
     /* routine below locks up for > 1e6 photons? */
     if (xm > 1.0e6) {
         return xm+sqrt(xm)*gaussdev(idum);
@@ -942,25 +984,25 @@ float poidev(float xm, long *idum)
         if(xm != oldm) {
             /* xm has changed, pre-compute a few things... */
             oldm=xm;
-            sq=sqrtf(2.0*xm);
-            alxm=logf(xm);
+            sq=sqrt(2.0*xm);
+            alxm=log(xm);
             g=xm*alxm-gammln(xm+1.0);
         }
         do {
             do {
                 /* y is a deviate from a lorentzian comparison function */
-                y=tanf(M_PI*ran1(idum));
+                y=tan(M_PI*ran1(idum));
                 /* shift and scale */
                 em=sq*y+xm;
-            } while (em < 0.0);         /* there are no negative Poisson deviates */
+            } while (em < 0.0);                /* there are no negative Poisson deviates */
             /* round off to nearest integer */
             em=floor(em);
             /* ratio of Poisson distribution to comparison function */
             /* scale it back by 0.9 to make sure t is never > 1.0 */
-            t=0.9*(1.0+y*y)*expf(em*alxm-gammln(em+1.0)-g);
+            t=0.9*(1.0+y*y)*exp(em*alxm-gammln(em+1.0)-g);
         } while (ran1(idum) > t);
     }
-
+        
     return em;
 }
 
@@ -972,10 +1014,10 @@ float gaussdev(long *idum)
     static int iset=0;
     static float gset;
     float fac,rsq,v1,v2;
-
+        
     if (iset == 0) {
         /* no extra deviats handy ... */
-
+        
         /* so pick two uniform deviates on [-1:1] */
         do {
             v1=2.0*ran1(idum)-1.0;
@@ -983,11 +1025,11 @@ float gaussdev(long *idum)
             rsq=v1*v1+v2*v2;
         } while (rsq >= 1.0 || rsq == 0);
         /* restrained to the unit circle */
-
+        
         /* apply Box-Muller transformation to convert to a normal deviate */
-        fac=sqrtf(-2.0*logf(rsq)/rsq);
+        fac=sqrt(-2.0*log(rsq)/rsq);
         gset=v1*fac;
-        iset=1;         /* we now have a spare deviate */
+        iset=1;                /* we now have a spare deviate */
         return v2*fac;
     } else {
         /* there is an extra deviate in gset */
@@ -1000,7 +1042,7 @@ float gaussdev(long *idum)
 /* generate Lorentzian deviate with FWHM = 2 */
 float lorentzdev(long *seed) {
     float ran1(long *idum);
-
+ 
     return tan(M_PI*(ran1(seed)-0.5));
 }
 
@@ -1024,11 +1066,11 @@ float triangledev(long *seed) {
 float expdev(long *idum)
 {
     float dum;
-
+    
     do
     dum=ran1(idum);
     while( dum == 0.0);
-    return -logf(dum);
+    return -log(dum);
 }
 
 
@@ -1041,13 +1083,13 @@ float gammln(float xx)
     24.01409824083091,-1.231739572450155,
     0.1208650973866179e-2,-0.5395239384953e-5};
     int j;
-
+    
     y=x=xx;
     tmp=x+5.5;
     tmp -= (x+0.5)*log(tmp);
     ser = 1.000000000190015;
     for(j=0;j<=5;++j) ser += cof[j]/++y;
-
+    
     return -tmp+log(2.5066282746310005*ser/x);
 }
 
@@ -1073,12 +1115,12 @@ float ran1(long *idum)
     static long iy=0;
     static long iv[NTAB];
     float temp;
-
+    
     if (*idum <= 0 || !iy) {
         /* first time around.  don't want idum=0 */
         if(-(*idum) < 1) *idum=1;
         else *idum = -(*idum);
-
+        
         /* load the shuffle table */
         for(j=NTAB+7;j>=0;j--) {
             k=(*idum)/IQ;
@@ -1100,14 +1142,9 @@ float ran1(long *idum)
 }
 
 
-
-
-SMVinfo GetFrame(char *filename)
+char *get_byte_order()
 {
-    char *string;
-    SMVinfo frame;
-    char *byte_order;
-    unsigned short int tempint;
+    static char *byte_order;
 
     typedef union
     {
@@ -1116,7 +1153,7 @@ SMVinfo GetFrame(char *filename)
     } TWOBYTES;
     TWOBYTES twobytes;
     twobytes.integer = 24954;
-
+    
 
     /* determine byte order on this machine */
     if(0==strncmp((const char *) twobytes.string, "az", 2))
@@ -1127,6 +1164,16 @@ SMVinfo GetFrame(char *filename)
     {
         byte_order = "little_endian";
     }
+    return byte_order;
+}
+
+
+SMVinfo GetFrame(char *filename)
+{
+    char *string;
+    SMVinfo frame;
+    char *byte_order = get_byte_order();
+    unsigned short int tempint;
 
     /* try to open the file... */
     frame.handle = fopen(filename, "rb");
@@ -1155,7 +1202,7 @@ SMVinfo GetFrame(char *filename)
             printf("ERROR: %s does not look like an ADSC frame!\n", filename);
             /* skip this file */
             fclose(frame.handle);
-
+            
             frame.handle = NULL;
         }
         else
@@ -1173,7 +1220,7 @@ SMVinfo GetFrame(char *filename)
                     exit(9);
                 }
                 string = frame.header + frame.header_size;
-                *string = (char) 0;
+                *string = (char) 0;                
             }
 
             /* see if we will need to swap bytes */
@@ -1202,7 +1249,7 @@ SMVinfo GetFrame(char *filename)
                 frame.width = frame.height = (int) ValueOf("DETECTOR_DIMENSIONS",frame);
             }
 
-//          frame.mmapdata = mmap(NULL,2*frame.width*frame.height+frame.header_size,PROT_READ,MAP_SHARED,fileno(frame.handle),0);
+//            frame.mmapdata = mmap(NULL,2*frame.width*frame.height+frame.header_size,PROT_READ,MAP_SHARED,fileno(frame.handle),0);
             frame.mmapdata = calloc(2,frame.width*frame.height+frame.header_size);
             if(frame.mmapdata == NULL)
             {
@@ -1220,9 +1267,9 @@ SMVinfo GetFrame(char *filename)
     else
     {
         /* fopen() failed */
-        perror("nonBragg");
+        perror(filename);
     }
-
+    
     return frame;
 }
 
@@ -1255,3 +1302,7 @@ double ValueOf(const char *keyword, SMVinfo frame)
 
     return value;
 }
+
+
+
+

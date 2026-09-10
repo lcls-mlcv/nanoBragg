@@ -1,0 +1,33 @@
+{
+    "env": {
+        // This must be configured for VSCode, does not effect build toolchain.
+        "CUDA_PATH_LOCAL": "/usr/local/cuda-12.9/"
+    },
+    "configurations": [
+        {
+            "name": "Linux (CUDA)",
+            "includePath": [
+                "${workspaceFolder}/src",
+                "${CUDA_PATH_LOCAL}/include"
+            ],
+            // Constants such as M_PI and M_1_PI defined in math.h are not standard and must be enabled
+            // using _GNU_SOURCE for intellisense to work. This is only to get the VSCode editor to work.
+            // The build toolchain already handles this properly on linux systems.
+            // https://www.linuxtopia.org/online_books/an_introduction_to_gcc/gccintro_27.html
+            "defines": [
+                "_GNU_SOURCE"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "c11",
+            "cppStandard": "c++17",
+            "intelliSenseMode": "linux-gcc-x64",
+            "browse": {
+                "path": [
+                    "${workspaceFolder}/src",
+                    "${CUDA_PATH_LOCAL}/include"
+                ]
+            }
+        }
+    ],
+    "version": 4
+}

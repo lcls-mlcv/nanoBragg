@@ -1,4 +1,4 @@
-/* amorphous material diffraction simulator		-James Holton and Ken Frankel		9-12-15
+/* amorphous material diffraction simulator                -James Holton and Ken Frankel                4-22-18
 
 example:
 
@@ -30,6 +30,7 @@ so detector distances should always be much larger than the crystal size
 
  */
 
+#define _USE_MATH_DEFINES
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -124,14 +125,14 @@ typedef enum { SAMPLE, BEAM } pivot;
 /* frame handling routines */
 typedef struct _SMVinfo
 {
-	char *filename;
-	FILE *handle;
-	int swap_bytes;
-	int header_size;
-	int width;
-	int height;
-	char *header;
-	unsigned short int *mmapdata;
+        char *filename;
+        FILE *handle;
+        int swap_bytes;
+        int header_size;
+        int width;
+        int height;
+        char *header;
+        unsigned short int *mmapdata;
 } SMVinfo;
 
 /* SMV image handling routines */
@@ -148,7 +149,7 @@ int main(int argc, char** argv)
     int progress_meter=1;
     int babble=1;        
     int printout = 0;
-    int printout_ypixel,printout_xpixel=-1;
+    int printout_spixel,printout_fpixel=-1;
 //    int accumulate = 0;
 
     /* x-ray beam properties */
@@ -174,11 +175,11 @@ int main(int argc, char** argv)
     double flux=0.0,exposure=1.0,beamsize=1e-4;
 
     /* things needed to calculate the number of molecules */
-    double sample_x   = 1e-4;		/* m */
-    double sample_y   = 1e-4;		/* m */
-    double sample_z   = 1e-4;		/* m */
-    double density    = 1.0e6;		/* g/m^3 */
-    double molecular_weight = 18.0;	/* g/mol */
+    double sample_x   = 1e-4;                /* m */
+    double sample_y   = 1e-4;                /* m */
+    double sample_z   = 1e-4;                /* m */
+    double density    = 1.0e6;                /* g/m^3 */
+    double molecular_weight = 18.0;        /* g/mol */
     double volume=0.0,molecules = 0.0;
     /* scale factor = F^2*r_e_sqr*fluence*Avogadro*volume*density/molecular_weight 
                            m^2     ph/m^2  /mol      m^3   g/m^3    g/mol   */
@@ -186,13 +187,15 @@ int main(int argc, char** argv)
     /* detector stuff */
     double pixel_size = 0.1e-3;
     double pixel_pos[4];
-    int xpixel,ypixel,xpixels=0,ypixels=0,pixels;
+    int fpixel,spixel,fpixels=0,spixels=0,pixels;
     double distance = 100.0e-3;
     double detsize_x = 102.4e-3;
     double detsize_y = 102.4e-3;
-    double xdet_vector[4]  = {0,0,0,1};
-    double ydet_vector[4]  = {0,0,-1,0};
-    double zdet_vector[4]  = {0,1,0,0};
+    double detector_mu=0.0,detector_thick=0.0,detector_thickstep,parallax,capture_fraction;
+    int    detector_thicksteps=-1,thick_tic;
+    double fdet_vector[4]  = {0,0,0,1};
+    double sdet_vector[4]  = {0,0,-1,0};
+    double odet_vector[4]  = {0,1,0,0};
     double pix0_vector[4]  = {0,0,0,0};
     double detector_rotx=0.0,detector_roty=0.0,detector_rotz=0.0;
     double twotheta_axis[4] = {0,0,1,0};
@@ -201,11 +204,13 @@ int main(int argc, char** argv)
     double airpath,omega_pixel,omega_Rsqr_pixel,omega_sum;
     int curved_detector = 0;
     int point_pixel= 0;
+    int Fmap_pixel= 0;
     double Xbeam=NAN,Ybeam=NAN;
-    double Xdet,Ydet,Rdet;
-    double Xdet0,Ydet0;
+    double Fdet,Sdet,Odet;
+    double Fdet0,Sdet0;
     double Xclose=NAN,Yclose=NAN,close_distance=NAN;
     double ORGX=NAN,ORGY=NAN;
+    double quantum_gain = 1.0;
     double adc_offset = 40.0;
 
 
@@ -224,7 +229,7 @@ int main(int argc, char** argv)
     /* sampling */
     int steps;
     int roi_xmin=-1,roi_xmax=-1,roi_ymin=-1,roi_ymax=-1;
-    int oversample = -1,subx,suby;
+    int oversample = -1,subF,subS;
     double subpixel_size;
 
     /* spindle */
@@ -233,14 +238,14 @@ int main(int argc, char** argv)
     double spindle_vector[4] = {0,0,0,1};
 
     /* structure factor representation */
-    double F,F_bg,*stol_of,*F_of;
+    double F,Fbg,*stol_of,*Fbg_of;
     double F_highangle,F_lowangle;
     int stols,nearest=0;
     double stol_file_mult=1.0e10;
     double denom;
 
     /* intensity stats */
-    double I,I_bg,max_I = 0.0;
+    double I,Ibg,max_I = 0.0;
     double max_I_x = 0.0,max_I_y = 0.0;
     double intfile_scale = 0.0;
     double pgm_scale = 0.0;
@@ -288,7 +293,7 @@ int main(int argc, char** argv)
     int calculate_noise = 1;
     int output_pgm = 1;
     int reject_outliers = 0;
-
+    double reject_sigma = 6.0;
 
     /* check argument list */
     for(i=1; i<argc; ++i)
@@ -296,7 +301,7 @@ int main(int argc, char** argv)
         if(argv[i][0] == '-')
         {
             /* option specified */
-            if(strstr(argv[i], "-img") && (argc >= (i+1)))
+            if(strstr(argv[i], "-img") && (argc > (i+1)))
             {
                 imginfilename = argv[i+1];
             }
@@ -309,47 +314,47 @@ int main(int argc, char** argv)
     if(imginfilename != NULL)
     {
         /* frame handling routines */
-	imginfile = GetFrame(imginfilename);
-	if(imginfile.header_size > 0) {
-	    xpixels = imginfile.width;
-	    ypixels = imginfile.height;
-	    pixels = xpixels*ypixels;
-	    test = ValueOf("PIXEL_SIZE",imginfile);
-	    if(! isnan(test)) pixel_size = test/1000.0;
-	    detsize_x = pixel_size*xpixels;
-	    detsize_y = pixel_size*ypixels;
-	    test = ValueOf("DISTANCE",imginfile);
-	    if(! isnan(test)) distance = test/1000.0;
-	    test = ValueOf("CLOSE_DISTANCE",imginfile);
-	    if(! isnan(test)) close_distance = test/1000.0;
-	    test = ValueOf("WAVELENGTH",imginfile);
-	    if(! isnan(test)) lambda0 = test/1e10;
-	    test = ValueOf("BEAM_CENTER_X",imginfile);
-	    if(! isnan(test)) Xbeam = test/1000.0;
-	    test = ValueOf("BEAM_CENTER_Y",imginfile);
-	    if(! isnan(test)) Ybeam = detsize_y - test/1000.0;
-	    test = ValueOf("ORGX",imginfile);
-	    if(! isnan(test)) ORGX = test;
-	    test = ValueOf("ORGY",imginfile);
-	    if(! isnan(test)) ORGY = test;
-	    test = ValueOf("PHI",imginfile);
-	    if(! isnan(test)) phi0 = test/RTD;
-	    test = ValueOf("OSC_RANGE",imginfile);
-	    if(! isnan(test)) osc = test/RTD;
-	    test = ValueOf("TWOTHETA",imginfile);
-	    if(! isnan(test)) twotheta = test/RTD;
-	
-	    imginfileimage = calloc(pixels+10,sizeof(float));
-	    diffimage = calloc(2*pixels+10,sizeof(float));
+        imginfile = GetFrame(imginfilename);
+        if(imginfile.header_size > 0) {
+            fpixels = imginfile.width;
+            spixels = imginfile.height;
+            pixels = fpixels*spixels;
+            test = ValueOf("PIXEL_SIZE",imginfile);
+            if(! isnan(test)) pixel_size = test/1000.0;
+            detsize_x = pixel_size*fpixels;
+            detsize_y = pixel_size*spixels;
+            test = ValueOf("DISTANCE",imginfile);
+            if(! isnan(test)) distance = test/1000.0;
+            test = ValueOf("CLOSE_DISTANCE",imginfile);
+            if(! isnan(test)) close_distance = test/1000.0;
+            test = ValueOf("WAVELENGTH",imginfile);
+            if(! isnan(test)) lambda0 = test/1e10;
+            test = ValueOf("BEAM_CENTER_X",imginfile);
+            if(! isnan(test)) Xbeam = test/1000.0;
+            test = ValueOf("BEAM_CENTER_Y",imginfile);
+            if(! isnan(test)) Ybeam = detsize_y - test/1000.0;
+            test = ValueOf("ORGX",imginfile);
+            if(! isnan(test)) ORGX = test;
+            test = ValueOf("ORGY",imginfile);
+            if(! isnan(test)) ORGY = test;
+            test = ValueOf("PHI",imginfile);
+            if(! isnan(test)) phi0 = test/RTD;
+            test = ValueOf("OSC_RANGE",imginfile);
+            if(! isnan(test)) osc = test/RTD;
+            test = ValueOf("TWOTHETA",imginfile);
+            if(! isnan(test)) twotheta = test/RTD;
+        
+            imginfileimage = calloc(pixels+10,sizeof(float));
+            diffimage = calloc(2*pixels+10,sizeof(float));
             stolimage = calloc(pixels+10,sizeof(float));
             Fimage = calloc(pixels+10,sizeof(float));
 
-	    j = imginfile.header_size / sizeof(unsigned short int);
+            j = imginfile.header_size / sizeof(unsigned short int);
             for(i=0;i<pixels;++i){
-	        imginfileimage[i] = (float) imginfile.mmapdata[j];
-	         ++j;
-	    }
-	}
+                imginfileimage[i] = (float) imginfile.mmapdata[j];
+                 ++j;
+            }
+        }
     }
 
      
@@ -359,181 +364,181 @@ int main(int argc, char** argv)
         if(argv[i][0] == '-')
         {
             /* option specified */
-            if((strstr(argv[i], "-samplesize") || strstr(argv[i], "-sample_size")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-samplesize") || strstr(argv[i], "-sample_size")) && (argc > (i+1)))
             {
                 sample_x = atof(argv[i+1])/1000;
                 sample_y = atof(argv[i+1])/1000;
                 sample_z = atof(argv[i+1])/1000;
             }
-            if((strstr(argv[i], "-sample_thick") || strstr(argv[i], "-sample_x") || strstr(argv[i], "-thick")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-sample_thick") || strstr(argv[i], "-sample_x") || strstr(argv[i], "-thick")) && (argc > (i+1)))
             {
                 sample_x = atof(argv[i+1])/1000;
             }
-            if((strstr(argv[i], "-sample_width") || strstr(argv[i], "-sample_y")  || strstr(argv[i], "-width")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-sample_width") || strstr(argv[i], "-sample_y")  || strstr(argv[i], "-width")) && (argc > (i+1)))
             {
                 sample_y = atof(argv[i+1])/1000;
             }
-            if((strstr(argv[i], "-sample_heigh") || strstr(argv[i], "-sample_z")  || strstr(argv[i], "-heigh")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-sample_heigh") || strstr(argv[i], "-sample_z")  || strstr(argv[i], "-heigh")) && (argc > (i+1)))
             {
                 sample_z = atof(argv[i+1])/1000;
             }
-            if((strstr(argv[i], "-density") || strstr(argv[i], "-sample_den")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-density") || strstr(argv[i], "-sample_den")) && (argc > (i+1)))
             {
                 density = atof(argv[i+1])*1e6;
             }
-            if((strstr(argv[i], "-molecules") || strstr(argv[i], "-sample_molecules")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-molecules") || strstr(argv[i], "-sample_molecules")) && (argc > (i+1)))
             {
                 molecules = atof(argv[i+1]);
             }
-            if((0==strcmp(argv[i], "-MW") || strstr(argv[i], "-molecular")) && (argc >= (i+1)))
+            if((0==strcmp(argv[i], "-MW") || strstr(argv[i], "-molecular")) && (argc > (i+1)))
             {
                 molecular_weight = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-Xbeam") && (argc >= (i+1)))
+            if(strstr(argv[i], "-Xbeam") && (argc > (i+1)))
             {
                 Xbeam = atof(argv[i+1])/1000.0;
-		detector_pivot = BEAM;
+                detector_pivot = BEAM;
             }
-            if(strstr(argv[i], "-Ybeam") && (argc >= (i+1)))
+            if(strstr(argv[i], "-Ybeam") && (argc > (i+1)))
             {
                 Ybeam = atof(argv[i+1])/1000.0;
-		detector_pivot = BEAM;
+                detector_pivot = BEAM;
             }
-            if(strstr(argv[i], "-Xclose") && (argc >= (i+1)))
+            if(strstr(argv[i], "-Xclose") && (argc > (i+1)))
             {
                 Xclose = atof(argv[i+1])/1000.0;
-		detector_pivot = SAMPLE;
+                detector_pivot = SAMPLE;
             }
-            if(strstr(argv[i], "-Yclose") && (argc >= (i+1)))
+            if(strstr(argv[i], "-Yclose") && (argc > (i+1)))
             {
                 Yclose = atof(argv[i+1])/1000.0;
-		detector_pivot = SAMPLE;
+                detector_pivot = SAMPLE;
             }
-            if(strstr(argv[i], "-ORGX") && (argc >= (i+1)))
+            if(strstr(argv[i], "-ORGX") && (argc > (i+1)))
             {
                 ORGX = atof(argv[i+1]);
-		detector_pivot = SAMPLE;
+                detector_pivot = SAMPLE;
             }
-            if(strstr(argv[i], "-ORGY") && (argc >= (i+1)))
+            if(strstr(argv[i], "-ORGY") && (argc > (i+1)))
             {
                 ORGY = atof(argv[i+1]);
-		detector_pivot = SAMPLE;
+                detector_pivot = SAMPLE;
             }
-            if(strstr(argv[i], "-pivot") && (argc >= (i+1)))
+            if(strstr(argv[i], "-pivot") && (argc > (i+1)))
             {
                 if(strstr(argv[i+1], "sample")) detector_pivot = SAMPLE;
-		if(strstr(argv[i+1], "beam")) detector_pivot = BEAM;
+                if(strstr(argv[i+1], "beam")) detector_pivot = BEAM;
             }
-            if(strstr(argv[i], "-xdet_vector") && (argc >= (i+3)))
+            if(strstr(argv[i], "-fdet_vector") && (argc > (i+3)))
             {
-                xdet_vector[1] = atof(argv[i+1]);
-                xdet_vector[2] = atof(argv[i+2]);
-                xdet_vector[3] = atof(argv[i+3]);
+                fdet_vector[1] = atof(argv[i+1]);
+                fdet_vector[2] = atof(argv[i+2]);
+                fdet_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-ydet_vector") && (argc >= (i+3)))
+            if(strstr(argv[i], "-sdet_vector") && (argc > (i+3)))
             {
-                ydet_vector[1] = atof(argv[i+1]);
-                ydet_vector[2] = atof(argv[i+2]);
-                ydet_vector[3] = atof(argv[i+3]);
+                sdet_vector[1] = atof(argv[i+1]);
+                sdet_vector[2] = atof(argv[i+2]);
+                sdet_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-zdet_vector") && (argc >= (i+3)))
+            if(strstr(argv[i], "-odet_vector") && (argc > (i+3)))
             {
-                zdet_vector[1] = atof(argv[i+1]);
-                zdet_vector[2] = atof(argv[i+2]);
-                zdet_vector[3] = atof(argv[i+3]);
+                odet_vector[1] = atof(argv[i+1]);
+                odet_vector[2] = atof(argv[i+2]);
+                odet_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-beam_vector") && (argc >= (i+3)))
+            if(strstr(argv[i], "-beam_vector") && (argc > (i+3)))
             {
                 beam_vector[1] = atof(argv[i+1]);
                 beam_vector[2] = atof(argv[i+2]);
                 beam_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-polar_vector") && (argc >= (i+3)))
+            if(strstr(argv[i], "-polar_vector") && (argc > (i+3)))
             {
                 polar_vector[1] = atof(argv[i+1]);
                 polar_vector[2] = atof(argv[i+2]);
                 polar_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-spindle_axis") && (argc >= (i+3)))
+            if(strstr(argv[i], "-spindle_axis") && (argc > (i+3)))
             {
                 spindle_vector[1] = atof(argv[i+1]);
                 spindle_vector[2] = atof(argv[i+2]);
                 spindle_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-twotheta_axis") && (argc >= (i+3)))
+            if(strstr(argv[i], "-twotheta_axis") && (argc > (i+3)))
             {
                 twotheta_axis[1] = atof(argv[i+1]);
                 twotheta_axis[2] = atof(argv[i+2]);
                 twotheta_axis[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-pix0_vector") && (argc >= (i+3)))
+            if(strstr(argv[i], "-pix0_vector") && (argc > (i+3)))
             {
                 pix0_vector[0] = 1.0;
                 pix0_vector[1] = atof(argv[i+1]);
                 pix0_vector[2] = atof(argv[i+2]);
                 pix0_vector[3] = atof(argv[i+3]);
             }
-            if(strstr(argv[i], "-distance") && (argc >= (i+1)))
+            if(strstr(argv[i], "-distance") && (argc > (i+1)))
             {
                 distance = atof(argv[i+1])/1000.0;
-		detector_pivot = BEAM;
+                detector_pivot = BEAM;
             }
-            if(strstr(argv[i], "-close_distance") && (argc >= (i+1)))
+            if(strstr(argv[i], "-close_distance") && (argc > (i+1)))
             {
                 close_distance = atof(argv[i+1])/1000.0;
-		detector_pivot = SAMPLE;
+                detector_pivot = SAMPLE;
             }
-            if(strstr(argv[i], "-source_distance") && (argc >= (i+1)))
+            if(strstr(argv[i], "-source_distance") && (argc > (i+1)))
             {
-		source_distance = atof(argv[i+1])/1000.0;
+                source_distance = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-twotheta") && (argc >= (i+1)))
+            if(strstr(argv[i], "-twotheta") && (argc > (i+1)))
             {
                 detector_twotheta = atof(argv[i+1])/RTD;
-		detector_pivot = SAMPLE;
+                detector_pivot = SAMPLE;
             }
-            if(strstr(argv[i], "-detector_rotx") && (argc >= (i+1)))
+            if(strstr(argv[i], "-detector_rotx") && (argc > (i+1)))
             {
                 detector_rotx = atof(argv[i+1])/RTD;
             }
-            if(strstr(argv[i], "-detector_roty") && (argc >= (i+1)))
+            if(strstr(argv[i], "-detector_roty") && (argc > (i+1)))
             {
                 detector_roty = atof(argv[i+1])/RTD;
             }
-            if(strstr(argv[i], "-detector_rotz") && (argc >= (i+1)))
+            if(strstr(argv[i], "-detector_rotz") && (argc > (i+1)))
             {
                 detector_rotz = atof(argv[i+1])/RTD;
             }
-            if(strstr(argv[i], "-detsize") && (strlen(argv[i]) == 8) && (argc >= (i+1)))
+            if(strstr(argv[i], "-detsize") && (strlen(argv[i]) == 8) && (argc > (i+1)))
             {
                 detsize_x = atof(argv[i+1])/1000.0;
                 detsize_y = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-detsize_x") && (argc >= (i+1)))
+            if(strstr(argv[i], "-detsize_x") && (argc > (i+1)))
             {
                 detsize_x = atof(argv[i+1])/1000.0;
             }
-             if(strstr(argv[i], "-detsize_y") && (argc >= (i+1)))
+             if(strstr(argv[i], "-detsize_y") && (argc > (i+1)))
             {
                 detsize_y = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-detpixels") && (strlen(argv[i]) == 10) && (argc >= (i+1)))
+            if(strstr(argv[i], "-detpixels") && (strlen(argv[i]) == 10) && (argc > (i+1)))
             {
-                xpixels = ypixels = atoi(argv[i+1]);
+                fpixels = spixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-detpixels_x") && (argc >= (i+1)))
+            if((strstr(argv[i], "-detpixels_f") || strstr(argv[i], "-detpixels_x")) && (argc > (i+1)))
             {
-                xpixels = atoi(argv[i+1]);
+                fpixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-detpixels_y") && (argc >= (i+1)))
+            if((strstr(argv[i], "-detpixels_s") || strstr(argv[i], "-detpixels_y")) && (argc > (i+1)))
             {
-                ypixels = atoi(argv[i+1]);
+                spixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-curved_det") && (argc >= (i+1)))
+            if(strstr(argv[i], "-curved_det") && (argc > (i+1)))
             {
                 curved_detector = 1;
             }
-            if(strstr(argv[i], "-pixel") && (argc >= (i+1)))
+            if(strstr(argv[i], "-pixel") && (argc > (i+1)))
             {
                 pixel_size = atof(argv[i+1])/1000.0;
             }
@@ -541,180 +546,188 @@ int main(int argc, char** argv)
             {
                 point_pixel = 1;
             }
-            if(strstr(argv[i], "-polar") && (strlen(argv[i]) == 6) && (argc >= (i+1)))
+            if(strstr(argv[i], "-Fmap") )
+            {
+                Fmap_pixel = 1;
+            }
+            if(strstr(argv[i], "-polar") && (strlen(argv[i]) == 6) && (argc > (i+1)))
             {
                 polarization = atof(argv[i+1]);
-		nopolar = 0;
+                nopolar = 0;
             }
             if(strstr(argv[i], "-nopolar") )
             {
                 nopolar = 1;
             }
-            if(strstr(argv[i], "-oversample") && (argc >= (i+1)))
+            if(strstr(argv[i], "-oversample") && (argc > (i+1)))
             {
                 oversample = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-roi") && (argc >= (i+4)))
+            if(strstr(argv[i], "-roi") && (argc > (i+4)))
             {
                 roi_xmin = atoi(argv[i+1]);
                 roi_xmax = atoi(argv[i+2]);
                 roi_ymin = atoi(argv[i+3]);
                 roi_ymax = atoi(argv[i+4]);
             }
-            if((strstr(argv[i], "-lambda") || strstr(argv[i], "-wave")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-lambda") || strstr(argv[i], "-wave")) && (argc > (i+1)))
             {
                 lambda0 = atof(argv[i+1])/1.0e10;
             }
-            if(strstr(argv[i], "-energy") && (argc >= (i+1)))
+            if(strstr(argv[i], "-energy") && (argc > (i+1)))
             {
                 lambda0 = (12398.42/atof(argv[i+1]))/1.0e10;
             }
-            if(strstr(argv[i], "-fluence") && (argc >= (i+1)))
+            if(strstr(argv[i], "-fluence") && (argc > (i+1)))
             {
                 fluence = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-flux") && (argc >= (i+1)))
+            if(strstr(argv[i], "-flux") && (argc > (i+1)))
             {
                 flux = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-exposure") && (argc >= (i+1)))
+            if(strstr(argv[i], "-exposure") && (argc > (i+1)))
             {
                 exposure = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-beamsize") && (argc >= (i+1)))
+            if(strstr(argv[i], "-beamsize") && (argc > (i+1)))
             {
                 beamsize = atof(argv[i+1])/1000;
             }
-            if(strstr(argv[i], "-dispersion") && (argc >= (i+1)))
+            if(strstr(argv[i], "-dispersion") && (argc > (i+1)))
             {
                 dispersion = atof(argv[i+1])/100.0;
             }
-            if(strstr(argv[i], "-dispsteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-dispsteps") && (argc > (i+1)))
             {
                 dispsteps = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-divergence") && (argc >= (i+1)))
+            if(strstr(argv[i], "-divergence") && (argc > (i+1)))
             {
                 hdivrange = vdivrange = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-hdivrange") && (argc >= (i+1)))
+            if(strstr(argv[i], "-hdivrange") && (argc > (i+1)))
             {
                 hdivrange = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-vdivrange") && (argc >= (i+1)))
+            if(strstr(argv[i], "-vdivrange") && (argc > (i+1)))
             {
                 vdivrange = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-hdivstep") && (strlen(argv[i]) == 9) && (argc >= (i+1)))
+            if(strstr(argv[i], "-hdivstep") && (strlen(argv[i]) == 9) && (argc > (i+1)))
             {
                 hdivstep = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-hdivsteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-hdivsteps") && (argc > (i+1)))
             {
                 hdivsteps = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-vdivstep") && (strlen(argv[i]) == 9) && (argc >= (i+1)))
+            if(strstr(argv[i], "-vdivstep") && (strlen(argv[i]) == 9) && (argc > (i+1)))
             {
                 vdivstep = atof(argv[i+1])/1000.0;
             }
-            if(strstr(argv[i], "-vdivsteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-vdivsteps") && (argc > (i+1)))
             {
                 vdivsteps = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-divsteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-divsteps") && (argc > (i+1)))
             {
                 hdivsteps = vdivsteps = atoi(argv[i+1]);
             }
             if(strstr(argv[i], "-round_div") )
             {
-		/* cut to circle */
+                /* cut to circle */
                 round_div = 1;
             }
             if(strstr(argv[i], "-square_div") )
             {
-		/* just raster */
+                /* just raster */
                 round_div = 0;
             }
-            if(strstr(argv[i], "-adc") && (argc >= (i+1)))
+            if(strstr(argv[i], "-adc") && (argc > (i+1)))
             {
                 adc_offset = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-phi") && strlen(argv[i])==4 && (argc >= (i+1)))
+            if(strstr(argv[i], "-gain") && (argc > (i+1)))
+            {
+                quantum_gain = atof(argv[i+1]);
+            }
+            if(strstr(argv[i], "-phi") && strlen(argv[i])==4 && (argc > (i+1)))
             {
                 phi0 = atof(argv[i+1])/RTD;
             }
-            if(strstr(argv[i], "-osc") && (argc >= (i+1)))
+            if(strstr(argv[i], "-osc") && (argc > (i+1)))
             {
                 osc = atof(argv[i+1])/RTD;
             }
-            if(strstr(argv[i], "-phistep") && strlen(argv[i])==8 && (argc >= (i+1)))
+            if(strstr(argv[i], "-phistep") && strlen(argv[i])==8 && (argc > (i+1)))
             {
                 phistep = atof(argv[i+1])/RTD;
             }
-            if(strstr(argv[i], "-phisteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-phisteps") && (argc > (i+1)))
             {
                 phisteps = atoi(argv[i+1]);
             }
-//            if(strstr(argv[i], "-dmin") && (argc >= (i+1)))
+//            if(strstr(argv[i], "-dmin") && (argc > (i+1)))
 //            {
 //                dmin = atof(argv[i+1])*1e-10;
 //            }
-//            if(strstr(argv[i], "-mat") && (argc >= (i+1)))
+//            if(strstr(argv[i], "-mat") && (argc > (i+1)))
 //            {
 //                matfilename = argv[i+1];
 //            }
-//            if(strstr(argv[i], "-hkl") && (argc >= (i+1)))
+//            if(strstr(argv[i], "-hkl") && (argc > (i+1)))
 //            {
 //                hklfilename = argv[i+1];
 //            }
-            if(strstr(argv[i], "-img") && (argc >= (i+1)))
+            if(strstr(argv[i], "-img") && (argc > (i+1)))
             {
                 imginfilename = argv[i+1];
             }
-            if(strstr(argv[i], "-ignore") && (argc >= (i+1)))
+            if(strstr(argv[i], "-ignore") && (argc > (i+1)))
             {
                 ++ignore_values;
                 ignore_value[ignore_values] = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-stolout") && strlen(argv[i])>7 && (argc >= (i+1)))
+            if(strstr(argv[i], "-stolout") && strlen(argv[i])>7 && (argc > (i+1)))
             {
                 stoloutfilename = argv[i+1];
             }
-            if(strstr(argv[i], "-stol") && strlen(argv[i])==5 && (argc >= (i+1)))
+            if(strstr(argv[i], "-stol") && strlen(argv[i])==5 && (argc > (i+1)))
             {
                 stolfilename = argv[i+1];
-		stol_file_mult = 1e10;
+                stol_file_mult = 1e10;
             }
-            if(strstr(argv[i], "-4stol") && strlen(argv[i])==6 && (argc >= (i+1)))
+            if(strstr(argv[i], "-4stol") && strlen(argv[i])==6 && (argc > (i+1)))
             {
                 stolfilename = argv[i+1];
-		stol_file_mult = 1e10/4;
+                stol_file_mult = 1e10/4;
             }
-            if(strstr(argv[i], "-Q") && strlen(argv[i])==2 && (argc >= (i+1)))
+            if(strstr(argv[i], "-Q") && strlen(argv[i])==2 && (argc > (i+1)))
             {
                 stolfilename = argv[i+1];
-		stol_file_mult = 1e10/M_PI/4;
+                stol_file_mult = 1e10/M_PI/4;
             }
-            if(strstr(argv[i], "-sourcefile") && (argc >= (i+1)))
+            if(strstr(argv[i], "-sourcefile") && (argc > (i+1)))
             {
                 sourcefilename = argv[i+1];
             }
-            if((strstr(argv[i], "-floatfile") || strstr(argv[i], "-floatimage")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-floatfile") || strstr(argv[i], "-floatimage")) && (argc > (i+1)))
             {
                 floatfilename = argv[i+1];
             }
-            if((strstr(argv[i], "-intfile") || strstr(argv[i], "-intimage")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-intfile") || strstr(argv[i], "-intimage")) && (argc > (i+1)))
             {
                 intfilename = argv[i+1];
             }
-            if((strstr(argv[i], "-pgmfile") || strstr(argv[i], "-pgmimage")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-pgmfile") || strstr(argv[i], "-pgmimage")) && (argc > (i+1)))
             {
                 pgmfilename = argv[i+1];
             }
-            if((strstr(argv[i], "-noisefile") || strstr(argv[i], "-noiseimage")) && (argc >= (i+1)))
+            if((strstr(argv[i], "-noisefile") || strstr(argv[i], "-noiseimage")) && (argc > (i+1)))
             {
                 noisefilename = argv[i+1];
-		calculate_noise = 1;
+                calculate_noise = 1;
             }
             if(strstr(argv[i], "-nonoise") )
             {
@@ -731,54 +744,54 @@ int main(int argc, char** argv)
                 /* turn off outlier rejection */
                 reject_outliers = 0;
             }
-            if(strstr(argv[i], "-scale") && (argc >= (i+1)))
+            if(strstr(argv[i], "-scale") && (argc > (i+1)))
             {
-		/* specify the scale for the intfile */
+                /* specify the scale for the intfile */
                 intfile_scale = atof(argv[i+1]);
             }
-            if(strstr(argv[i], "-pgmscale") && (argc >= (i+1)))
+            if(strstr(argv[i], "-pgmscale") && (argc > (i+1)))
             {
-		/* specify the scale for the intfile */
+                /* specify the scale for the intfile */
                 pgm_scale = atof(argv[i+1]);
             }
             if(strstr(argv[i], "-coherent") )
             {
-		/* turn off incoherent addition */
+                /* turn off incoherent addition */
                 coherent = 1;
             }
             if(strstr(argv[i], "-printout") )
             {
-		/* turn on console printing */
+                /* turn on console printing */
                 printout = 1;
             }
             if(strstr(argv[i], "-noprogress") )
             {
-		/* turn off progress meter */
+                /* turn off progress meter */
                 progress_meter = 0;
             }
             if(strstr(argv[i], "-progress") )
             {
-		/* turn off progress meter */
+                /* turn off progress meter */
                 progress_meter = 1;
             }
-            if(strstr(argv[i], "-printout_pixel") && (argc >= (i+2)))
+            if(strstr(argv[i], "-printout_pixel") && (argc > (i+2)))
             {
-                printout_xpixel = atoi(argv[i+1]);
-                printout_ypixel = atoi(argv[i+2]);
+                printout_fpixel = atoi(argv[i+1]);
+                printout_spixel = atoi(argv[i+2]);
             }
-            if(strstr(argv[i], "-seed") && (argc >= (i+1)))
+            if(strstr(argv[i], "-seed") && (argc > (i+1)))
             {
                 seed = -atoi(argv[i+1]);
             }
         }
     }
 
-    printf("nonBragg amorphous material diffraction simulator - James Holton and Ken Frankel 3-20-15\n");
+    printf("nonBragg amorphous material diffraction simulator - James Holton and Ken Frankel 3-19-16\n");
 
     if(stolfilename == NULL){
-	printf("usage: nonBragg -stol water.stol\n");
-	printf("options:\n");\
-	printf("\t-stol filename.stol\ttext file containing sin(theta)/lambda and F for one molecule\n");
+        printf("usage: nonBragg -stol water.stol\n");
+        printf("options:\n");\
+        printf("\t-stol filename.stol\ttext file containing sin(theta)/lambda and F for one molecule\n");
         printf("\t-thickness\tthickness of the sample in mm\n");
         printf("\t-samplesize\tlinear dimension of the (cube shaped) sample in mm\n");
         printf("\t-density\tdensity of the sample in g/cm^3\n");
@@ -798,7 +811,7 @@ int main(int argc, char** argv)
         printf("\t-flux\t beam intensity in photons/s\n");
         printf("\t-exposure\t exposure time in s\n");
         printf("\t-beamsize\t linear dimension of the (square) beam profile in mm\n");
-	printf("\t-sourcefile filename.txt\ttext file containing source positions in mm\n");
+        printf("\t-sourcefile filename.txt\ttext file containing source positions in mm\n");
         printf("\t-floatfile\tname of binary output file (4-byte floats)\n");
         printf("\t-intfile\tname of smv-formatted output file (arbitrary scale)\n");
         printf("\t-pgmfile\tname of pgm-formatted output file (arbitrary scale)\n");
@@ -807,20 +820,20 @@ int main(int argc, char** argv)
         printf("\t-Ybeam\timage Y coordinate of direct-beam spot (mm)\n");
         printf("\t-printout\tprint pixel values out to the screen\n");
         printf("\t-noprogress\tturn off the progress meter\n");
-	exit(9);
+        exit(9);
     }
 
 
     /* allocate detector memory */
-    if(xpixels) {
-	detsize_x = pixel_size*xpixels;
+    if(fpixels) {
+        detsize_x = pixel_size*fpixels;
     }
-    if(ypixels) {
-	detsize_y = pixel_size*ypixels;
+    if(spixels) {
+        detsize_y = pixel_size*spixels;
     }
-    xpixels = ceil(detsize_x/pixel_size-0.5);
-    ypixels = ceil(detsize_y/pixel_size-0.5);
-    pixels = xpixels*ypixels;
+    fpixels = ceil(detsize_x/pixel_size);
+    spixels = ceil(detsize_y/pixel_size);
+    pixels = fpixels*spixels;
     floatimage = calloc(pixels+10,sizeof(float));
     //sinimage = calloc(pixels+10,2*sizeof(float));
     //cosimage = calloc(pixels+10,2*sizeof(float));
@@ -836,40 +849,40 @@ int main(int argc, char** argv)
     if(isnan(Xbeam)) Xbeam = Xclose;
     if(isnan(Ybeam)) Ybeam = Yclose;
     if(roi_xmin < 0) roi_xmin = 0;
-    if(roi_xmax < 0) roi_xmax = xpixels;
+    if(roi_xmax < 0) roi_xmax = fpixels;
     if(roi_ymin < 0) roi_ymin = 0;
-    if(roi_ymax < 0) roi_ymax = ypixels;
+    if(roi_ymax < 0) roi_ymax = spixels;
     progress_pixels = (roi_xmax-roi_xmin+1)*(roi_ymax-roi_ymin+1);
 
     
     if(flux != 0.0 && exposure > 0.0 && beamsize >= 0){
-    	fluence = flux*exposure/beamsize/beamsize;
+            fluence = flux*exposure/beamsize/beamsize;
     }
     if(beamsize >= 0){
-    	if(beamsize < sample_y){
-    	    printf("WARNING: clipping sample (%lg m high) with beam (%lg m)\n",sample_y,beamsize);
-    	    sample_y = beamsize;
-	}
-    	if(beamsize < sample_z){
-    	    printf("WARNING: clipping sample (%lg m wide) with beam (%lg m)\n",sample_z,beamsize);
-    	    sample_z = beamsize;
-	}
+            if(beamsize < sample_y){
+                printf("WARNING: clipping sample (%lg m high) with beam (%lg m)\n",sample_y,beamsize);
+                sample_y = beamsize;
+        }
+            if(beamsize < sample_z){
+                printf("WARNING: clipping sample (%lg m wide) with beam (%lg m)\n",sample_z,beamsize);
+                sample_z = beamsize;
+        }
     }
     
     /* straighten up sample properties */
     volume = sample_x*sample_y*sample_z;
     if(molecules!=0)
     {
-	density = molecules/volume/Avogadro*molecular_weight;
+        density = molecules/volume/Avogadro*molecular_weight;
     }
     molecules = volume*density*Avogadro/molecular_weight;
 
     /* straighten up vectors */
     unitize(beam_vector,beam_vector);
-    unitize(xdet_vector,xdet_vector);
-    unitize(ydet_vector,ydet_vector);
-    cross_product(xdet_vector,ydet_vector,zdet_vector);
-    unitize(zdet_vector,zdet_vector);
+    unitize(fdet_vector,fdet_vector);
+    unitize(sdet_vector,sdet_vector);
+    cross_product(fdet_vector,sdet_vector,odet_vector);
+    unitize(odet_vector,odet_vector);
     unitize(polar_vector,polar_vector);
     unitize(spindle_vector,spindle_vector);
     cross_product(beam_vector,polar_vector,vert_vector);
@@ -879,203 +892,253 @@ int main(int argc, char** argv)
     /* default sampling logic */
     if(phisteps < 0){
         /* auto-select number of phi steps */
-	if(osc < 0.0) {
+        if(osc < 0.0) {
             /* auto-select osc range */
             if(phistep <= 0.0) {
-	        /* user doesn't care about anything */
-	        phisteps = 1;
-		osc = 0.0;
-		phistep = 0.0;
-	    } else {
-		/* user doesn't care about osc or steps, but specified step */
-		osc = phistep;
-		phisteps = 2;
-	    }
-	} else {
-	    /* user-speficied oscillation */
-	    if(phistep <= 0.0) {
-	        /* osc specified, but nothing else */
+                /* user doesn't care about anything */
+                phisteps = 1;
+                osc = 0.0;
+                phistep = 0.0;
+            } else {
+                /* user doesn't care about osc or steps, but specified step */
+                osc = phistep;
+                phisteps = 2;
+            }
+        } else {
+            /* user-speficied oscillation */
+            if(phistep <= 0.0) {
+                /* osc specified, but nothing else */
                 phisteps = 2;
                 phistep = osc/2.0;
             } else {
                 /* osc and phi step specified */
                 phisteps = ceil(osc/phistep);
-	    }
-	}
+            }
+        }
     } else {
-	/* user-specified number of phi steps */
-	if(phisteps == 0) phisteps = 1;
-	if(osc < 0.0) {
+        /* user-specified number of phi steps */
+        if(phisteps == 0) phisteps = 1;
+        if(osc < 0.0) {
             /* auto-select osc range */
             if(phistep <= 0.0) {
-	        /* user cares only about number of steps */
-		osc = 1.0/RTD;
-		phistep = osc/phisteps;
-	    } else {
-		/* user doesn't care about osc, but specified step */
-		osc = phistep;
-		phisteps = 2;
-	    }
-	} else {
-	    /* user-speficied oscillation */
-	    if(phistep < 0.0) {
-	        /* osc and steps specified */
+                /* user cares only about number of steps */
+                osc = 1.0/RTD;
+                phistep = osc/phisteps;
+            } else {
+                /* user doesn't care about osc, but specified step */
+                osc = phistep;
+                phisteps = 2;
+            }
+        } else {
+            /* user-speficied oscillation */
+            if(phistep < 0.0) {
+                /* osc and steps specified */
                 phistep = osc/phisteps;
             } else {
                 /* everything specified */
-	    }
-	}
+            }
+        }
     }
 
     if(hdivsteps <= 0){
         /* auto-select number of steps */
-	if(hdivrange < 0.0) {
+        if(hdivrange < 0.0) {
             /* auto-select range */
             if(hdivstep <= 0.0) {
-	        /* user doesn't care about anything */
-	        hdivsteps = 1;
-		hdivrange = 0.0;
-		hdivstep = 0.0;
-	    } else {
-		/* user specified stepsize and nothing else */
-		hdivrange = hdivstep;
-		hdivsteps = 2;
-	    }
-	} else {
-	    /* user-speficied range */
-	    if(hdivstep <= 0.0) {
-	        /* range specified, but nothing else */
+                /* user doesn't care about anything */
+                hdivsteps = 1;
+                hdivrange = 0.0;
+                hdivstep = 0.0;
+            } else {
+                /* user specified stepsize and nothing else */
+                hdivrange = hdivstep;
+                hdivsteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(hdivstep <= 0.0) {
+                /* range specified, but nothing else */
                 hdivstep = hdivrange;
                 hdivsteps = 2;
             } else {
                 /* range and step specified, but not number of steps */
                 hdivsteps = ceil(hdivrange/hdivstep);
-	    }
-	}
+            }
+        }
     } else {
-	/* user-specified number of steps */
-	if(hdivrange < 0.0) {
+        /* user-specified number of steps */
+        if(hdivrange < 0.0) {
             /* auto-select range */
             if(hdivstep <= 0.0) {
-	        /* user cares only about number of steps */
-		hdivrange = 1.0;
-		hdivstep = hdivrange/hdivsteps;
-	    } else {
-		/* user doesn't care about range */
-		hdivrange = hdivstep;
-		hdivsteps = 2;
-	    }
-	} else {
-	    /* user-speficied range */
-	    if(hdivstep <= 0.0) {
-	        /* range and steps specified */
-		if(hdivsteps <=1 ) hdivsteps = 2;
+                /* user cares only about number of steps */
+                hdivrange = 1.0;
+                hdivstep = hdivrange/hdivsteps;
+            } else {
+                /* user doesn't care about range */
+                hdivrange = hdivstep;
+                hdivsteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(hdivstep <= 0.0) {
+                /* range and steps specified */
+                if(hdivsteps <=1 ) hdivsteps = 2;
                 hdivstep = hdivrange/(hdivsteps-1);
             } else {
                 /* everything specified */
-	    }
-	}
+            }
+        }
     }
 
     if(vdivsteps <= 0){
         /* auto-select number of steps */
-	if(vdivrange < 0.0) {
+        if(vdivrange < 0.0) {
             /* auto-select range */
             if(vdivstep <= 0.0) {
-	        /* user doesn't care about anything */
-	        vdivsteps = 1;
-		vdivrange = 0.0;
-		vdivstep = 0.0;
-	    } else {
-		/* user specified stepsize and nothing else */
-		vdivrange = vdivstep;
-		vdivsteps = 2;
-	    }
-	} else {
-	    /* user-speficied range */
-	    if(vdivstep <= 0.0) {
-	        /* range specified, but nothing else */
+                /* user doesn't care about anything */
+                vdivsteps = 1;
+                vdivrange = 0.0;
+                vdivstep = 0.0;
+            } else {
+                /* user specified stepsize and nothing else */
+                vdivrange = vdivstep;
+                vdivsteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(vdivstep <= 0.0) {
+                /* range specified, but nothing else */
                 vdivstep = vdivrange;
                 vdivsteps = 2;
             } else {
                 /* range and step specified, but not number of steps */
                 vdivsteps = ceil(vdivrange/vdivstep);
-	    }
-	}
+            }
+        }
     } else {
-	/* user-specified number of steps */
-	if(vdivrange < 0.0) {
+        /* user-specified number of steps */
+        if(vdivrange < 0.0) {
             /* auto-select range */
             if(vdivstep <= 0.0) {
-	        /* user cares only about number of steps */
-		vdivrange = 1.0;
-		vdivstep = vdivrange/vdivsteps;
-	    } else {
-		/* user doesn't care about range */
-		vdivrange = vdivstep;
-		vdivsteps = 2;
-	    }
-	} else {
-	    /* user-speficied range */
-	    if(vdivstep <= 0.0) {
-	        /* range and steps specified */
-		if(vdivsteps <=1 ) vdivsteps = 2;
+                /* user cares only about number of steps */
+                vdivrange = 1.0;
+                vdivstep = vdivrange/vdivsteps;
+            } else {
+                /* user doesn't care about range */
+                vdivrange = vdivstep;
+                vdivsteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(vdivstep <= 0.0) {
+                /* range and steps specified */
+                if(vdivsteps <=1 ) vdivsteps = 2;
                 vdivstep = vdivrange/(vdivsteps-1);
             } else {
                 /* everything specified */
-	    }
-	}
+            }
+        }
     }
     
 
     if(dispsteps <= 0){
         /* auto-select number of steps */
-	if(dispersion < 0.0) {
+        if(dispersion < 0.0) {
             /* auto-select range */
             if(dispstep <= 0.0) {
-	        /* user doesn't care about anything */
-	        dispsteps = 1;
-		dispersion = 0.0;
-		dispstep = 0.0;
-	    } else {
-		/* user specified stepsize and nothing else */
-		dispersion = dispstep;
-		dispsteps = 2;
-	    }
-	} else {
-	    /* user-speficied range */
-	    if(dispstep <= 0.0) {
-	        /* range specified, but nothing else */
+                /* user doesn't care about anything */
+                dispsteps = 1;
+                dispersion = 0.0;
+                dispstep = 0.0;
+            } else {
+                /* user specified stepsize and nothing else */
+                dispersion = dispstep;
+                dispsteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(dispstep <= 0.0) {
+                /* range specified, but nothing else */
                 dispstep = dispersion;
                 dispsteps = 2;
             } else {
                 /* range and step specified, but not number of steps */
                 dispsteps = ceil(dispersion/dispstep);
-	    }
-	}
+            }
+        }
     } else {
-	/* user-specified number of steps */
-	if(dispersion < 0.0) {
+        /* user-specified number of steps */
+        if(dispersion < 0.0) {
             /* auto-select range */
             if(dispstep <= 0.0) {
-	        /* user cares only about number of steps */
-		dispersion = 1.0;
-		dispstep = dispersion/dispsteps;
-	    } else {
-		/* user doesn't care about range */
-		dispersion = dispstep;
-		dispsteps = 2;
-	    }
-	} else {
-	    /* user-speficied range */
-	    if(dispstep <= 0.0) {
-	        /* range and steps specified */
-		if(dispsteps <=1 ) dispsteps = 2;
+                /* user cares only about number of steps */
+                dispersion = 1.0;
+                dispstep = dispersion/dispsteps;
+            } else {
+                /* user doesn't care about range */
+                dispersion = dispstep;
+                dispsteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(dispstep <= 0.0) {
+                /* range and steps specified */
+                if(dispsteps <=1 ) dispsteps = 2;
                 dispstep = dispersion/(dispsteps-1);
             } else {
                 /* everything specified */
-	    }
-	}
+            }
+        }
+    }
+
+    if(detector_thicksteps <= 0){
+        /* auto-select number of steps */
+        if(detector_thick < 0.0) {
+            /* auto-select range */
+            if(detector_thickstep <= 0.0) {
+                /* user doesn't care about anything */
+                detector_thicksteps = 1;
+                detector_thick = 0.0;
+                detector_thickstep = 0.0;
+            } else {
+                /* user specified stepsize and nothing else */
+                detector_thick = detector_thickstep;
+                detector_thicksteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(detector_thickstep <= 0.0) {
+                /* range specified, but nothing else */
+                detector_thicksteps = 2;
+                detector_thickstep = detector_thick/detector_thicksteps;
+            } else {
+                /* range and step specified, but not number of steps */
+                detector_thicksteps = ceil(detector_thick/detector_thickstep);
+            }
+        }
+    } else {
+        /* user-specified number of steps */
+        if(detector_thick < 0.0) {
+            /* auto-select range */
+            if(detector_thickstep <= 0.0) {
+                /* user cares only about number of steps */
+                detector_thick = 0.5e-6;
+                detector_thickstep = detector_thick/detector_thicksteps;
+            } else {
+                /* user doesn't care about range */
+                detector_thick = detector_thickstep;
+                detector_thicksteps = 2;
+            }
+        } else {
+            /* user-speficied range */
+            if(detector_thickstep <= 0.0) {
+                /* range and steps specified */
+                if(detector_thicksteps <=1 ) detector_thicksteps = 2;
+                detector_thickstep = detector_thick/(detector_thicksteps-1);
+            } else {
+                /* everything specified */
+            }
+        }
     }
         
     
@@ -1095,6 +1158,11 @@ int main(int argc, char** argv)
         dispersion = 0.0;
         dispstep = 0.0;
     }
+    if(detector_thick <= 0.0 || detector_thickstep <= 0.0 || detector_thicksteps <= 0) {
+        detector_thicksteps = 1;
+        detector_thick = 0.0;
+        detector_thickstep = 0.0;
+    }
 
    
     
@@ -1102,7 +1170,7 @@ int main(int argc, char** argv)
     /* there are two conventions here: mosflm and XDS */
 
     /* first off, what is the relationship between the two "beam centers"? */
-    rotate(zdet_vector,vector,detector_rotx,detector_roty,detector_rotz);
+    rotate(odet_vector,vector,detector_rotx,detector_roty,detector_rotz);
     ratio = dot_product(beam_vector,vector);
     if(ratio == 0.0) { ratio = DBL_MIN; }
     if(isnan(close_distance)) close_distance = ratio*distance;
@@ -1110,37 +1178,37 @@ int main(int argc, char** argv)
 
     if(detector_pivot == SAMPLE){
         printf("pivoting detector around sample\n");
-	/* initialize detector origin before rotating detector */
-        pix0_vector[1] = -Xclose*xdet_vector[1]-Yclose*ydet_vector[1]+close_distance*zdet_vector[1];
-        pix0_vector[2] = -Xclose*xdet_vector[2]-Yclose*ydet_vector[2]+close_distance*zdet_vector[2];
-        pix0_vector[3] = -Xclose*xdet_vector[3]-Yclose*ydet_vector[3]+close_distance*zdet_vector[3];
+        /* initialize detector origin before rotating detector */
+        pix0_vector[1] = -Xclose*fdet_vector[1]-Yclose*sdet_vector[1]+close_distance*odet_vector[1];
+        pix0_vector[2] = -Xclose*fdet_vector[2]-Yclose*sdet_vector[2]+close_distance*odet_vector[2];
+        pix0_vector[3] = -Xclose*fdet_vector[3]-Yclose*sdet_vector[3]+close_distance*odet_vector[3];
 
         /* now swing the detector origin around */
         rotate(pix0_vector,pix0_vector,detector_rotx,detector_roty,detector_rotz);
         rotate_axis(pix0_vector,pix0_vector,twotheta_axis,detector_twotheta);
     }
     /* now orient the detector plane */
-    rotate(xdet_vector,xdet_vector,detector_rotx,detector_roty,detector_rotz);
-    rotate(ydet_vector,ydet_vector,detector_rotx,detector_roty,detector_rotz);
-    rotate(zdet_vector,zdet_vector,detector_rotx,detector_roty,detector_rotz);
+    rotate(fdet_vector,fdet_vector,detector_rotx,detector_roty,detector_rotz);
+    rotate(sdet_vector,sdet_vector,detector_rotx,detector_roty,detector_rotz);
+    rotate(odet_vector,odet_vector,detector_rotx,detector_roty,detector_rotz);
 
     /* also apply orientation part of twotheta swing */
-    rotate_axis(xdet_vector,xdet_vector,twotheta_axis,detector_twotheta);
-    rotate_axis(ydet_vector,ydet_vector,twotheta_axis,detector_twotheta);
-    rotate_axis(zdet_vector,zdet_vector,twotheta_axis,detector_twotheta);
+    rotate_axis(fdet_vector,fdet_vector,twotheta_axis,detector_twotheta);
+    rotate_axis(sdet_vector,sdet_vector,twotheta_axis,detector_twotheta);
+    rotate_axis(odet_vector,odet_vector,twotheta_axis,detector_twotheta);
     
     /* make sure beam center is preserved */
     if(detector_pivot == BEAM){
         printf("pivoting detector around direct beam spot\n");
-        pix0_vector[1] = -Xbeam*xdet_vector[1]-Ybeam*ydet_vector[1]+distance*beam_vector[1];
-        pix0_vector[2] = -Xbeam*xdet_vector[2]-Ybeam*ydet_vector[2]+distance*beam_vector[2];
-        pix0_vector[3] = -Xbeam*xdet_vector[3]-Ybeam*ydet_vector[3]+distance*beam_vector[3];
+        pix0_vector[1] = -Xbeam*fdet_vector[1]-Ybeam*sdet_vector[1]+distance*beam_vector[1];
+        pix0_vector[2] = -Xbeam*fdet_vector[2]-Ybeam*sdet_vector[2]+distance*beam_vector[2];
+        pix0_vector[3] = -Xbeam*fdet_vector[3]-Ybeam*sdet_vector[3]+distance*beam_vector[3];
     }
 
     /* what is the point of closest approach between sample and detector? */
-    Xclose         = -dot_product(pix0_vector,xdet_vector);
-    Yclose         = -dot_product(pix0_vector,ydet_vector);
-    close_distance =  dot_product(pix0_vector,zdet_vector);
+    Xclose         = -dot_product(pix0_vector,fdet_vector);
+    Yclose         = -dot_product(pix0_vector,sdet_vector);
+    close_distance =  dot_product(pix0_vector,odet_vector);
 
     /* where is the direct beam now? */
     /* difference between beam impact vector and detector origin */
@@ -1148,43 +1216,43 @@ int main(int argc, char** argv)
     newvector[2] = close_distance/ratio*beam_vector[2]-pix0_vector[2];
     newvector[3] = close_distance/ratio*beam_vector[3]-pix0_vector[3];
     /* extract components along detector vectors */
-    Xbeam = dot_product(xdet_vector,newvector);
-    Ybeam = dot_product(ydet_vector,newvector);
+    Xbeam = dot_product(fdet_vector,newvector);
+    Ybeam = dot_product(sdet_vector,newvector);
     distance = close_distance/ratio;    
 
         
 
     /* now read in amorphous material structure factors */
     printf("reading %s\n",stolfilename);
-    stols = read_text_file(stolfilename,2,&stol_of,&F_of);
+    stols = read_text_file(stolfilename,2,&stol_of,&Fbg_of);
     if(stols == 0){
-    	perror("no data in input file");
-	exit(9);
+            perror("no data in input file");
+        exit(9);
     }
     /* add two values at either end for interpolation */
     stols += 4;
     F_highangle = NAN;
     for(i=stols-3;i>1;--i){
-	stol_of[i] = stol_of[i-2] * stol_file_mult;
-	F_of[i]    = F_of[i-2];
-	if(! isnan(F_of[i])) {
-	    F_lowangle = F_of[i];
-	    if(isnan(F_highangle)) {
-		F_highangle = F_of[i];
-	    }
-	}
-	else
-	{
-	    /* missing values are zero */
-	    F_of[i] = 0.0;
-	}
+        stol_of[i] = stol_of[i-2] * stol_file_mult;
+        Fbg_of[i]    = Fbg_of[i-2];
+        if(! isnan(Fbg_of[i])) {
+            F_lowangle = Fbg_of[i];
+            if(isnan(F_highangle)) {
+                F_highangle = Fbg_of[i];
+            }
+        }
+        else
+        {
+            /* missing values are zero */
+            Fbg_of[i] = 0.0;
+        }
     }
     stol_of[0] = -1e99;
     stol_of[1] = -1e98;
-    F_of[0] = F_of[1] = F_lowangle;
+    Fbg_of[0] = Fbg_of[1] = F_lowangle;
     stol_of[stols-2] = 1e98;
     stol_of[stols-1] = 1e99;
-    F_of[stols-1] = F_of[stols-2] = F_highangle;
+    Fbg_of[stols-1] = Fbg_of[stols-2] = F_highangle;
 
     /* allocate memory for counting how many of these get used */
     bin_start = calloc(stols,sizeof(float **));
@@ -1195,10 +1263,10 @@ int main(int argc, char** argv)
     sources = 0;
     if(sourcefilename != NULL) {
         sources = read_text_file(sourcefilename,5,&source_X,&source_Y,&source_Z,&source_I,&source_lambda);
-	if(sources == 0) {
-	    perror("reading source definition file");
-	    exit(9);
-	}
+        if(sources == 0) {
+            perror("reading source definition file");
+            exit(9);
+        }
         /* apply defaults to missing values */
         for(source=0;source<sources;++source){
             if(isnan(source_X[source])) {
@@ -1216,13 +1284,13 @@ int main(int argc, char** argv)
             if(isnan(source_lambda[source])) {
                 source_lambda[source] = lambda0;
             }
-	}
+        }
     }
    
    
     if(sources == 0)
     {
-    	/* generate generic list of sources */
+            /* generate generic list of sources */
     
         /* count divsteps sweep over solid angle of beam divergence */
         divsteps = 0;
@@ -1245,17 +1313,17 @@ int main(int argc, char** argv)
             lambda = lambda0 * ( 1.0 + dispstep * disp_tic - dispersion/2.0 ) ;
             printf("lambda%d = %.15g\n",disp_tic,lambda);
         }
-	
-	/* allocate enough space */
-	sources = divsteps*dispsteps;
-	source_X = calloc(sources+10,sizeof(double));
-	source_Y = calloc(sources+10,sizeof(double));
-	source_Z = calloc(sources+10,sizeof(double));
-	source_I = calloc(sources+10,sizeof(double));
-	source_lambda = calloc(sources+10,sizeof(double));
-	
-	/* now actually create the source entries */
-	sources = 0;
+        
+        /* allocate enough space */
+        sources = divsteps*dispsteps;
+        source_X = calloc(sources+10,sizeof(double));
+        source_Y = calloc(sources+10,sizeof(double));
+        source_Z = calloc(sources+10,sizeof(double));
+        source_I = calloc(sources+10,sizeof(double));
+        source_lambda = calloc(sources+10,sizeof(double));
+        
+        /* now actually create the source entries */
+        sources = 0;
         for(hdiv_tic=0;hdiv_tic<hdivsteps;++hdiv_tic){
             for(vdiv_tic=0;vdiv_tic<vdivsteps;++vdiv_tic){
                 hdiv = hdivstep * hdiv_tic - hdivrange/2.0 ;
@@ -1265,40 +1333,40 @@ int main(int argc, char** argv)
                 test += (vdiv*vdiv-vdivstep*vdivstep/4.0*(1-vdivsteps%2))/vdivrange/vdivrange ;
                 if( round_div && test*4.0 > 1.1) continue;
 
-	        /* construct unit vector along "beam" */
-	        vector[1] = -source_distance*beam_vector[1];
-	        vector[2] = -source_distance*beam_vector[2];
-	        vector[3] = -source_distance*beam_vector[3];
-	        /* divergence is in angle space */
-		/* define "horizontal" as the E-vector of the incident beam */
+                /* construct unit vector along "beam" */
+                vector[1] = -source_distance*beam_vector[1];
+                vector[2] = -source_distance*beam_vector[2];
+                vector[3] = -source_distance*beam_vector[3];
+                /* divergence is in angle space */
+                /* define "horizontal" as the E-vector of the incident beam */
                 rotate_axis(vector,newvector,polar_vector,vdiv);
-        	rotate_axis(newvector,vector,vert_vector,hdiv);
+                rotate_axis(newvector,vector,vert_vector,hdiv);
 
-		/* one source at each position for each wavelength */
-	        for(disp_tic=0;disp_tic<dispsteps;++disp_tic){
-	            lambda = lambda0 * ( 1.0 + dispstep * disp_tic - dispersion/2.0 ) ;
+                /* one source at each position for each wavelength */
+                for(disp_tic=0;disp_tic<dispsteps;++disp_tic){
+                    lambda = lambda0 * ( 1.0 + dispstep * disp_tic - dispersion/2.0 ) ;
 
-		    source_X[sources] = vector[1];
-		    source_Y[sources] = vector[2];
-		    source_Z[sources] = vector[3];
-		    source_I[sources] = 1.0;
-		    source_lambda[sources] = lambda;
-		    ++sources;
-		}
-    	    }
-    	}
+                    source_X[sources] = vector[1];
+                    source_Y[sources] = vector[2];
+                    source_Z[sources] = vector[3];
+                    source_I[sources] = 1.0;
+                    source_lambda[sources] = lambda;
+                    ++sources;
+                }
+                }
+            }
     }
     printf("  created a total of %d sources:\n",sources);
     for(source=0;source<sources;++source){
 
-    	/* retrieve stuff from cache */
-	X = source_X[source];
-	Y = source_Y[source];
-	Z = source_Z[source];
-	I = source_I[source];
-	lambda = source_lambda[source];
+            /* retrieve stuff from cache */
+        X = source_X[source];
+        Y = source_Y[source];
+        Z = source_Z[source];
+        I = source_I[source];
+        lambda = source_lambda[source];
 
-    	printf("%g %g %g   %g %g\n",X,Y,Z,I,lambda);
+            printf("%g %g %g   %g %g\n",X,Y,Z,I,lambda);
     }
 
 
@@ -1314,14 +1382,15 @@ int main(int argc, char** argv)
            else { printf("  Kahn polarization factor: %f\n",polarization); }
     if(curved_detector) printf("  curved detector: all pixels same distance from origin\n");
     if(point_pixel) printf("  pixel obliquity effect disabled\n");
+    if(Fmap_pixel) printf("  Fmap mode: plotting structure factor at every pixel\n");
     printf("  incident fluence: %lg photons/m^2\n",fluence);
     printf("  sample is %lg m thick x %lg m high x %lg m wide, %lg g/cm^3 and %lg g/mol (%lg molecules)\n",
             sample_x,sample_y,sample_z,density/1e6,molecular_weight,molecules);
-    printf("  distance=%g detsize=%gx%g  pixel=%g meters (%dx%d pixels)\n",distance,detsize_x,detsize_y,pixel_size,xpixels,ypixels);
+    printf("  distance=%g detsize=%gx%g  pixel=%g meters (%dx%d pixels)\n",distance,detsize_x,detsize_y,pixel_size,fpixels,spixels);
     printf("  Xbeam=%g Ybeam=%g\n",Xbeam,Ybeam);
     printf("  detector origin: %g %g %g\n",pix0_vector[1],pix0_vector[2],pix0_vector[3]);
-    printf("  DIRECTION_OF_DETECTOR_X-AXIS= %g %g %g\n",xdet_vector[1],xdet_vector[2],xdet_vector[3]);
-    printf("  DIRECTION_OF_DETECTOR_Y-AXIS= %g %g %g\n",ydet_vector[1],ydet_vector[2],ydet_vector[3]);
+    printf("  DIRECTION_OF_DETECTOR_X-AXIS= %g %g %g\n",fdet_vector[1],fdet_vector[2],fdet_vector[3]);
+    printf("  DIRECTION_OF_DETECTOR_Y-AXIS= %g %g %g\n",sdet_vector[1],sdet_vector[2],sdet_vector[3]);
     printf("  INCIDENT_BEAM_DIRECTION= %g %g %g\n",beam_vector[1],beam_vector[2],beam_vector[3]);
     printf("  POLARIZATION_PLANE_NORMAL= %g %g %g\n",polar_vector[1],polar_vector[2],polar_vector[3]);
     printf("  roi: %d < x < %d && %d < y < %d\n",roi_xmin,roi_xmax,roi_ymin,roi_ymax);
@@ -1343,178 +1412,208 @@ int main(int argc, char** argv)
     progress_pixel = 0;
     valid_pixels = 0;
     omega_sum = 0.0;
-    for(ypixel=0;ypixel<ypixels;++ypixel){
-	for(xpixel=0;xpixel<xpixels;++xpixel){
+    for(spixel=0;spixel<spixels;++spixel)
+    {
+        for(fpixel=0;fpixel<fpixels;++fpixel)
+        {
 
-    	    /* allow for just one part of detector to be rendered */
-	    if(xpixel < roi_xmin || xpixel > roi_xmax || ypixel < roi_ymin || ypixel > roi_ymax) {
-		++invalid_pixel[j];
-		++j; continue;
-	    }
-
-	    /* reset photon count for this pixel */
-	    I = 0;
-
-	    /* loop over sub-pixels */
-	    for(suby=0;suby<oversample;++suby){
-		for(subx=0;subx<oversample;++subx){
-
-		    /* absolute mm position on detector (relative to its origin) */
-		    Xdet = subpixel_size*(xpixel*oversample + subx ) + subpixel_size/2.0;
-		    Ydet = subpixel_size*(ypixel*oversample + suby ) + subpixel_size/2.0;
-//		    Xdet = pixel_size*xpixel;
-//		    Ydet = pixel_size*ypixel;
-
-		    /* construct detector pixel position in 3D space */
-//		    pixel_X = distance;
-//		    pixel_Y = Ydet-Ybeam;
-//		    pixel_Z = Xdet-Xbeam;
-        	    pixel_pos[1] = Xdet*xdet_vector[1]+Ydet*ydet_vector[1]+pix0_vector[1];
-        	    pixel_pos[2] = Xdet*xdet_vector[2]+Ydet*ydet_vector[2]+pix0_vector[2];
-        	    pixel_pos[3] = Xdet*xdet_vector[3]+Ydet*ydet_vector[3]+pix0_vector[3];
-                    pixel_pos[0] = 0.0;
-		    if(curved_detector) {
-			/* construct detector pixel that is always "distance" from the sample */
-			vector[1] = distance*beam_vector[1]; vector[2]=distance*beam_vector[2] ; vector[3]=distance*beam_vector[3];
-			/* treat detector pixel coordinates as radians */
-        		rotate_axis(vector,newvector,ydet_vector,pixel_pos[2]/distance);
-        		rotate_axis(newvector,pixel_pos,xdet_vector,pixel_pos[3]/distance);
-// 	    		rotate(vector,pixel_pos,0,pixel_pos[3]/distance,pixel_pos[2]/distance);
-		    }
-		    /* construct the diffracted-beam unit vector to this pixel */
-		    airpath = unitize(pixel_pos,diffracted);
-
-		    /* solid angle subtended by a pixel: (pix/airpath)^2*cos(2theta) */
-		    omega_pixel = pixel_size*pixel_size/airpath/airpath*close_distance/airpath;
-		    /* option to turn off obliquity effect, inverse-square-law only */
-                    if(point_pixel) omega_pixel = 1.0/airpath/airpath;
-		    omega_sum += omega_pixel;
-
-		    /* loop over sources now */
-		    for(source=0;source<sources;++source){
-
-    	    	    	/* retrieve stuff from cache */
-			incident[1] = -source_X[source];
-			incident[2] = -source_Y[source];
-			incident[3] = -source_Z[source];
-			lambda = source_lambda[source];
-
-			/* construct the incident beam unit vector while recovering source distance */
-			source_path = unitize(incident,incident);
-
-			/* construct the scattering vector for this pixel */
-			scattering[1] = (diffracted[1]-incident[1])/lambda;
-			scattering[2] = (diffracted[2]-incident[2])/lambda;
-			scattering[3] = (diffracted[3]-incident[3])/lambda;
-
-    	    	    	/* sin(theta)/lambda is half the scattering vector length */
-			stol = 0.5*magnitude(scattering);
-
-			/* now we need to find the nearest four "stol file" points */
-			while(stol > stol_of[nearest] && nearest <= stols){++nearest; };
-			while(stol < stol_of[nearest] && nearest >= 2){--nearest; };
-
-			/* cubic spline interpolation */
-			polint(stol_of+nearest-1, F_of+nearest-1, stol, &F);
-//			if(F<0.0) F=0.0;
-			sign=1.0;
-			if(F<0.0) sign=-1.0;
-
-    	    	    	/* now we have the structure factor for this pixel */
-
-			/* polarization factor */
-			if(! nopolar){
-			    /* need to compute polarization factor */
-			    polar = polarization_factor(polarization,incident,diffracted,polar_vector);
-			}
-			else
-			{
-			    polar = 1.0;
-			}
-
-			/* accumulate unscaled pixel intensity from this */
-			I += sign*F*F*polar*omega_pixel*source_I[source];
-		    }
-		    /* end of source loop */
-		}
-		/* end of sub-pixel y loop */
+            /* allow for just one part of detector to be rendered */
+            if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
+            {
+                ++invalid_pixel[j];
+                ++j; continue;
             }
-	    /* end of sub-pixel x loop */
+
+            /* reset background photon count for this pixel */
+            Ibg = 0;
+
+            /* loop over sub-pixels */
+            for(subS=0;subS<oversample;++subS)
+            {
+                for(subF=0;subF<oversample;++subF)
+                {
+
+                    /* absolute mm position on detector (relative to its origin) */
+                    Fdet = subpixel_size*(fpixel*oversample + subF ) + subpixel_size/2.0;
+                    Sdet = subpixel_size*(spixel*oversample + subS ) + subpixel_size/2.0;
+//                    Fdet = pixel_size*fpixel;
+//                    Sdet = pixel_size*spixel;
+
+                    for(thick_tic=0;thick_tic<detector_thicksteps;++thick_tic)
+                    {
+                        /* assume "distance" is to the front of the detector sensor layer */
+                        Odet = thick_tic*detector_thickstep;
+
+                        /* construct detector pixel position in 3D space */
+    //                    pixel_X = distance;
+    //                    pixel_Y = Sdet-Ybeam;
+    //                    pixel_Z = Fdet-Xbeam;
+                        pixel_pos[1] = Fdet*fdet_vector[1]+Sdet*sdet_vector[1]+Odet*odet_vector[1]+pix0_vector[1];
+                        pixel_pos[2] = Fdet*fdet_vector[2]+Sdet*sdet_vector[2]+Odet*odet_vector[2]+pix0_vector[2];
+                        pixel_pos[3] = Fdet*fdet_vector[3]+Sdet*sdet_vector[3]+Odet*odet_vector[3]+pix0_vector[3];
+                        pixel_pos[0] = 0.0;
+                        if(curved_detector) {
+                            /* construct detector pixel that is always "distance" from the sample */
+                            vector[1] = distance*beam_vector[1]; vector[2]=distance*beam_vector[2] ; vector[3]=distance*beam_vector[3];
+                            /* treat detector pixel coordinates as radians */
+                            rotate_axis(vector,newvector,sdet_vector,pixel_pos[2]/distance);
+                            rotate_axis(newvector,pixel_pos,fdet_vector,pixel_pos[3]/distance);
+    //                             rotate(vector,pixel_pos,0,pixel_pos[3]/distance,pixel_pos[2]/distance);
+                        }
+                        /* construct the diffracted-beam unit vector to this pixel */
+                        airpath = unitize(pixel_pos,diffracted);
+
+                        /* solid angle subtended by a pixel: (pix/airpath)^2*cos(2theta) */
+                        omega_pixel = pixel_size*pixel_size/airpath/airpath*close_distance/airpath;
+                        /* option to turn off obliquity effect, inverse-square-law only */
+                        if(point_pixel) omega_pixel = 1.0/airpath/airpath;
+                        omega_sum += omega_pixel;
+
+                        /* now calculate detector thickness effects */
+                        if(detector_thick > 0.0)
+                        {
+                            /* inverse of effective thickness increase */
+                            parallax = dot_product(diffracted,odet_vector);
+                            capture_fraction = exp(-thick_tic*detector_thickstep*detector_mu/parallax)
+                                              -exp(-(thick_tic+1)*detector_thickstep*detector_mu/parallax);
+                        }
+                        else
+                        {
+                            capture_fraction = 1.0;
+                        }
+
+                        /* loop over sources now */
+                        for(source=0;source<sources;++source){
+
+                            /* retrieve stuff from cache */
+                            incident[1] = -source_X[source];
+                            incident[2] = -source_Y[source];
+                            incident[3] = -source_Z[source];
+                            lambda = source_lambda[source];
+
+                            /* construct the incident beam unit vector while recovering source distance */
+                            source_path = unitize(incident,incident);
+
+                            /* construct the scattering vector for this pixel */
+                            scattering[1] = (diffracted[1]-incident[1])/lambda;
+                            scattering[2] = (diffracted[2]-incident[2])/lambda;
+                            scattering[3] = (diffracted[3]-incident[3])/lambda;
+
+                            /* sin(theta)/lambda is half the scattering vector length */
+                            stol = 0.5*magnitude(scattering);
+
+                            /* now we need to find the nearest four "stol file" points */
+                            while(stol > stol_of[nearest] && nearest <= stols){++nearest; };
+                            while(stol < stol_of[nearest] && nearest >= 2){--nearest; };
+
+                            /* cubic spline interpolation */
+                            polint(stol_of+nearest-1, Fbg_of+nearest-1, stol, &Fbg);
+
+                            /* allow negative F values to yield negative intensities */
+                            sign=1.0;
+                            if(Fbg<0.0) sign=-1.0;
+
+                            /* now we have the structure factor for this pixel */
+
+                            /* polarization factor */
+                            if(! nopolar){
+                                /* need to compute polarization factor */
+                                polar = polarization_factor(polarization,incident,diffracted,polar_vector);
+                            }
+                            else
+                            {
+                                polar = 1.0;
+                            }
+
+                            /* accumulate unscaled pixel intensity from this */
+                            Ibg += sign*Fbg*Fbg*polar*omega_pixel*source_I[source]*capture_fraction;
+                        }
+                        /* end of source loop */
+                    }
+                    /* end of detector thickness loop */
+                }
+                /* end of sub-pixel y loop */
+            }
+            /* end of sub-pixel x loop */
 
 
-	    /* save photons/pixel (if fluence specified), or F^2/omega if no fluence given */
-	    floatimage[j]= I*r_e_sqr*fluence*molecules/steps;
-	    
-	    if(imginfilename != NULL) {
-		/* is the pixel valid on the input image? */
-		/* skip over any invalid values */
-		for(k=1;k<=ignore_values;++k)
-	        {
-		    if(imginfileimage[j]==ignore_value[k]){
-		        ++invalid_pixel[j];
-		    }
-	        }
-		
-		/* transform pixel intensity back to a structure factor */
-		deviate=imginfileimage[j]-adc_offset;
-		sign = 1.0;
-		if(deviate<0.0) sign = -1.0;
-		deviate = fabsf(deviate);
-	    	pixel_F = sign*sqrt(deviate/polar/omega_pixel/fluence/r_e_sqr/molecules*steps);
-		/* maintain F and stol images */
+            /* save photons/pixel (if fluence specified), or F^2/omega if no fluence given */
+            floatimage[j] += Ibg*r_e_sqr*fluence*molecules/steps;
+            
+            /* override: just plot F at every pixel, useful for making absorption masks */
+            if(Fmap_pixel) floatimage[j]= Fbg;
+            
+            /* extract stol vs F data from an input image? */
+            if(imginfilename != NULL) {
+                /* is the pixel valid on the input image? */
+                /* skip over any invalid values */
+                for(k=1;k<=ignore_values;++k)
+                {
+                    if(imginfileimage[j]==ignore_value[k]){
+                        ++invalid_pixel[j];
+                    }
+                }
+                
+                /* transform pixel intensity back to a structure factor */
+                deviate=(imginfileimage[j]-adc_offset)/quantum_gain;
+                sign = 1.0;
+                if(deviate<0.0) sign = -1.0;
+                deviate = fabsf(deviate);
+                    pixel_F = sign*sqrt(deviate/polar/omega_pixel/fluence/r_e_sqr/molecules*steps);
+                /* maintain F and stol images */
                 stolimage[j] = stol/stol_file_mult;
                 Fimage[j] = pixel_F;
-		bin = 0;
-	        if(! invalid_pixel[j])
-		{
-		    /* figure out which stol bin this pixel belongs to.  invalid pixels are in bin=0 */
-		    bin = nearest;
-		    if(stol > (stol_of[bin]+stol_of[bin+1])/2.0) ++bin;
-		    ++valid_pixels;
-		}
-		++pixels_in[bin];
-		bin_of[j]=bin;
-	    }
+                bin = 0;
+                if(! invalid_pixel[j])
+                {
+                    /* figure out which stol bin this pixel belongs to.  invalid pixels are in bin=0 */
+                    bin = nearest;
+                    if(stol > (stol_of[bin]+stol_of[bin+1])/2.0) ++bin;
+                    ++valid_pixels;
+                }
+                ++pixels_in[bin];
+                bin_of[j]=bin;
+            }
 
-	    if(floatimage[j] > max_I) {
-	        max_I = floatimage[j];
-	        max_I_x = Xdet;
-	        max_I_y = Ydet;
-	    }
-	    sum += floatimage[j];
+            if(floatimage[j] > max_I) {
+                max_I = floatimage[j];
+                max_I_x = Fdet;
+                max_I_y = Sdet;
+            }
+            sum += floatimage[j];
             sumsqr += floatimage[j]*floatimage[j];
             ++n;
-	    
-	    if( printout )
-	    {
-		if((xpixel==printout_xpixel && ypixel==printout_ypixel) || printout_xpixel < 0)
-		{
-		    twotheta = atan2(sqrt(pixel_pos[2]*pixel_pos[2]+pixel_pos[3]*pixel_pos[3]),pixel_pos[1]);
-		    test = sin(twotheta/2.0)/(lambda0*1e10);
-	    	    printf("%4d %4d : stol = %g or %g\n", xpixel,ypixel,stol,test);
-	    	    printf(" F=%g    I = %g\n", F,I);
-	    	    printf("I/steps %15.10g\n", I/steps);
-	    	    printf("polar   %15.10g\n", polar);
-	    	    printf("omega   %15.10g\n", omega_pixel);
-	    	    printf("pixel   %15.10g\n", floatimage[j]);
-		}
-	    }
-	    else
-	    {
-		if(progress_meter && progress_pixels/100 > 0)
-		{
-	            if(progress_pixel % ( progress_pixels/20 ) == 0 ||
+            
+            if( printout )
+            {
+                if((fpixel==printout_fpixel && spixel==printout_spixel) || printout_fpixel < 0)
+                {
+                    twotheta = atan2(sqrt(pixel_pos[2]*pixel_pos[2]+pixel_pos[3]*pixel_pos[3]),pixel_pos[1]);
+                    test = sin(twotheta/2.0)/(lambda0*1e10);
+                        printf("%4d %4d : stol = %g or %g\n", fpixel,spixel,stol,test);
+                        printf(" F=%g    I = %g\n", F,I);
+                        printf("I/steps %15.10g\n", I/steps);
+                        printf("polar   %15.10g\n", polar);
+                        printf("omega   %15.10g\n", omega_pixel);
+                        printf("pixel   %15.10g\n", floatimage[j]);
+                }
+            }
+            else
+            {
+                if(progress_meter && progress_pixels/100 > 0)
+                {
+                    if(progress_pixel % ( progress_pixels/20 ) == 0 ||
                        ((10*progress_pixel<progress_pixels ||
                          10*progress_pixel>9*progress_pixels) && 
                         (progress_pixel % (progress_pixels/100) == 0)))
-		    {
-			printf("%lu%% done\n",progress_pixel*100/progress_pixels);
-	            }
-		}
-	    	++progress_pixel;
-    	    }
-	    ++j;
-    	}
+                    {
+                        printf("%lu%% done\n",progress_pixel*100/progress_pixels);
+                    }
+                }
+                    ++progress_pixel;
+                }
+            ++j;
+            }
     }
     printf("\n");
 
@@ -1522,54 +1621,63 @@ int main(int argc, char** argv)
 
     if(imginfilename != NULL && stoloutfilename != NULL)
     {
-	outfile = fopen(stoloutfilename,"w");
-	if(outfile == NULL) {
-	    perror(stoloutfilename);
-	    exit(9);
-	}
+        outfile = fopen(stoloutfilename,"w");
+        if(outfile == NULL) {
+            perror(stoloutfilename);
+            exit(9);
+        }
     
-	/* set up pointers with enough space after each of them */
-	bin_start[0]=calloc(2*pixels+10*stols,sizeof(float));
+        /* set up pointers with enough space after each of them */
+        bin_start[0]=calloc(2*pixels+10*stols,sizeof(float));
         ++bin_start[0];
-	for(bin=1;bin<stols-1;++bin)
-	{
-	    /* each array must have 2*n values in it */
-	    bin_start[bin]=bin_start[bin-1]+2*pixels_in[bin-1]+2;
-	}
+        for(bin=1;bin<stols-1;++bin)
+        {
+            /* each array must have 2*n values in it */
+            bin_start[bin]=bin_start[bin-1]+2*pixels_in[bin-1]+2;
+        }
 
-	/* populate each bin with appropriate pixel values */
-	for(j=0;j<pixels;++j)
-	{
-	    bin = bin_of[j];
-	    *bin_start[bin] = Fimage[j];
-	    /* increment the pointer to the next value */
-	    ++bin_start[bin];
-	    /* we will reset the starting points in the next loop */
-	}
+        /* populate each bin with appropriate pixel values */
+        for(j=0;j<pixels;++j)
+        {
+            bin = bin_of[j];
+            *bin_start[bin] = Fimage[j];
+            /* increment the pointer to the next value */
+            ++bin_start[bin];
+            /* we will reset the starting points in the next loop */
+        }
 
         i=0;
-	for(bin=2;bin<stols-2;++bin)
-	{
-	    /* correct pointer drift */
-	    bin_start[bin] -= pixels_in[bin];
+        for(bin=2;bin<stols-2;++bin)
+        {
+            /* correct pointer drift */
+            bin_start[bin] -= pixels_in[bin];
 
-	    stol = stol_of[bin];
-	    /* this function looks at "input_n" elements, starting at 1 */
-	    median   = fmedian_with_rejection(pixels_in[bin],bin_start[bin]-1,6.0,&mad,&n);
-	    avg_arej = fmean_with_rejection(n,bin_start[bin],6.0,&rmsd_arej,&n);
-	    if(n>100)
-	    {
-//	  	fprintf(outfile,"%g %g %g  %d\n",stol/stol_file_mult,median,mad,n);
-		fprintf(outfile,"%g %g %g  %d\n",stol/stol_file_mult,avg_arej,rmsd_arej,n);
-		++i;
-	    }
-	    else
-	    {
-		printf("WARNING: not enough pixels in bin= %d n=%d stol= %g median= %g avg_arej= %g\n",bin,n,stol/stol_file_mult,median,avg_arej);
-	    }
-	}
-	printf("wrote %s as %d lines of text\n",stoloutfilename,i);
-	fclose(outfile);
+            stol = stol_of[bin];
+            if(reject_outliers)
+            {
+                /* this function looks at "input_n" elements, starting at 1 */
+                median   = fmedian_with_rejection(pixels_in[bin],bin_start[bin]-1,reject_sigma,&mad,&n);
+            }
+            else
+            {
+                /* effectively turn off rejection */
+                reject_sigma = 1e99;
+                n=pixels_in[bin];
+            }
+            avg_arej = fmean_with_rejection(n,bin_start[bin],reject_sigma,&rmsd_arej,&n);
+            if(n>100)
+            {
+//                  fprintf(outfile,"%g %g %g  %d\n",stol/stol_file_mult,median,mad,n);
+                fprintf(outfile,"%g %g %g   %g %g  %d\n",stol/stol_file_mult,avg_arej,rmsd_arej,median,mad,n);
+                ++i;
+            }
+            else
+            {
+                printf("WARNING: not enough pixels in bin= %d n=%d stol= %g median= %g avg_arej= %g\n",bin,n,stol/stol_file_mult,median,avg_arej);
+            }
+        }
+        printf("wrote %s as %d lines of text\n",stoloutfilename,i);
+        fclose(outfile);
     }
 
     /* do some stats? */
@@ -1579,18 +1687,18 @@ int main(int argc, char** argv)
     rms = sqrt(sumsqr/(n-1));
     sumsqr = 0.0;
     j = n = 0;
-    for(ypixel=0;ypixel<ypixels;++ypixel)
+    for(spixel=0;spixel<spixels;++spixel)
     {
-        for(xpixel=0;xpixel<xpixels;++xpixel)
+        for(fpixel=0;fpixel<fpixels;++fpixel)
         {
-	    ++j;
-            if(xpixel < roi_xmin || xpixel > roi_xmax || ypixel < roi_ymin || ypixel > roi_ymax)
+            ++j;
+            if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
             {
-		continue;
-	    }
-	    test = floatimage[j]-avg;
-	    sumsqr += test*test;
-	    ++n;
+                continue;
+            }
+            test = floatimage[j]-avg;
+            sumsqr += test*test;
+            ++n;
         }
     }
     if(n<=1) n=2;
@@ -1601,8 +1709,8 @@ int main(int argc, char** argv)
     outfile = fopen(floatfilename,"w");
     if(outfile == NULL)
     {
-	perror("ERROR: fopen");
-	exit(9);
+        perror("ERROR: fopen");
+        exit(9);
     }
     fwrite(floatimage,sizeof(float),pixels,outfile);
     fclose(outfile);
@@ -1612,24 +1720,24 @@ int main(int argc, char** argv)
     printf("max_I = %g  at %g %g\n",max_I,max_I_x,max_I_y);
     printf("mean= %g rms= %g rmsd= %g\n",avg,rms,rmsd);
     if(intfile_scale <= 0.0){
-	intfile_scale = 1.0;
-	if(max_I > 0.0) intfile_scale = 55000.0/max_I;
+        intfile_scale = 1.0;
+        if(max_I > 0.0) intfile_scale = 55000.0/max_I;
     }
     printf("intfile_scale = %g\n",intfile_scale);
-    for(ypixel=0;ypixel<ypixels;++ypixel)
+    for(spixel=0;spixel<spixels;++spixel)
     {
-        for(xpixel=0;xpixel<xpixels;++xpixel)
+        for(fpixel=0;fpixel<fpixels;++fpixel)
         {
-            if(xpixel < roi_xmin || xpixel > roi_xmax || ypixel < roi_ymin || ypixel > roi_ymax)
+            if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
             {
-	       ++j; continue;
+               ++j; continue;
             }
-	    test = floatimage[j] *intfile_scale+adc_offset;
-	    if(test > 65535.0) test = 65535.0;
-	    if(test < 0.0) test = 0.0;
-	    intimage[j] = (unsigned short int) ( floorf(test+0.5) );
-//	    printf("%d %d = %d\n",xpixel,ypixel,intimage[j]);
-	    ++j;
+            test = floatimage[j] *intfile_scale+adc_offset;
+            if(test > 65535.0) test = 65535.0;
+            if(test < 0.0) test = 0.0;
+            intimage[j] = (unsigned short int) ( floorf(test+0.5) );
+//            printf("%d %d = %d\n",fpixel,spixel,intimage[j]);
+            ++j;
         }
     }
 
@@ -1637,11 +1745,11 @@ int main(int argc, char** argv)
     outfile = fopen(intfilename,"w");
     if(outfile == NULL)
     {
-	    perror("ERROR: fopen");
-	    exit(9);
+            perror("ERROR: fopen");
+            exit(9);
     }
     fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=little_endian;\nTYPE=unsigned_short;\n");
-    fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",xpixels,ypixels,pixel_size*1000.0,distance*1000.0);
+    fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",fpixels,spixels,pixel_size*1000.0,distance*1000.0);
     fprintf(outfile,"WAVELENGTH=%g;\n",lambda0*1e10);
     fprintf(outfile,"BEAM_CENTER_X=%g;\nBEAM_CENTER_Y=%g;\n",Xbeam*1000.0,(detsize_y-Ybeam)*1000);
     fprintf(outfile,"ORGX=%g;\nORGY=%g;\n",Xclose/pixel_size,Yclose/pixel_size);
@@ -1659,28 +1767,28 @@ int main(int argc, char** argv)
     valid_pixels = 0;
     if(imginfilename != NULL)
     {
-	for(i=0;i<pixels;++i)
-	{
-	    if(! invalid_pixel[i])
-	    {
-		++valid_pixels;
-		deviate = imginfileimage[i] - floatimage[i];
-		diffimage[valid_pixels] = deviate;
-	    }
-	}
-	if(reject_outliers)
-	{
-	    median   = fmedian_with_rejection(valid_pixels,diffimage-1,6.0,&mad,&n);
-	    printf("difference from input image after outlier rejection: median= %g mad= %g ( %d pixels)\n",median,mad,n);
-	    avg_arej = fmean_with_rejection(n,diffimage-1,4.0,&rmsd_arej,&n);
-	    sumsqr=0.0;
-	    for(j=1;j<=n;++j)
-	    {
-	        sumsqr += diffimage[j]*diffimage[j];
-	    }
-	    rms_arej=sqrt(sumsqr/n);
-	    printf("difference from input image after outlier rejection: mean= %g rms= %g rmsd= %g ( %d pixels)\n",avg_arej,rms_arej,rmsd_arej,n);
-	}
+        for(i=0;i<pixels;++i)
+        {
+            if(! invalid_pixel[i])
+            {
+                ++valid_pixels;
+                deviate = imginfileimage[i] - floatimage[i];
+                diffimage[valid_pixels] = deviate;
+            }
+        }
+        if(reject_outliers)
+        {
+            median   = fmedian_with_rejection(valid_pixels,diffimage-1,6.0,&mad,&n);
+            printf("difference from input image after outlier rejection: median= %g mad= %g ( %d pixels)\n",median,mad,n);
+            avg_arej = fmean_with_rejection(n,diffimage-1,4.0,&rmsd_arej,&n);
+            sumsqr=0.0;
+            for(j=1;j<=n;++j)
+            {
+                sumsqr += diffimage[j]*diffimage[j];
+            }
+            rms_arej=sqrt(sumsqr/n);
+            printf("difference from input image after outlier rejection: mean= %g rms= %g rmsd= %g ( %d pixels)\n",avg_arej,rms_arej,rmsd_arej,n);
+        }
     }
 
 
@@ -1688,23 +1796,23 @@ int main(int argc, char** argv)
     j = 0;
     if(pgm_scale <= 0.0){
         pgm_scale = intfile_scale;
-	if(rmsd > 0.0) pgm_scale = 250.0/(5.0*rmsd);
+        if(rmsd > 0.0) pgm_scale = 250.0/(5.0*rmsd);
     }
     printf("pgm_scale = %g\n",pgm_scale);
     j = 0;
-    for(ypixel=0;ypixel<ypixels;++ypixel)
+    for(spixel=0;spixel<spixels;++spixel)
     {
-        for(xpixel=0;xpixel<xpixels;++xpixel)
+        for(fpixel=0;fpixel<fpixels;++fpixel)
         {
-            if(xpixel < roi_xmin || xpixel > roi_xmax || ypixel < roi_ymin || ypixel > roi_ymax)
+            if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax)
             {
                 ++j; continue;
             }
-	    test = floatimage[j] * pgm_scale;
-	    if(test > 255.0) test = 255.0;
-	    pgmimage[j] = (unsigned char) ( test );
-//	    printf("%d %d = %d\n",xpixel,ypixel,pgmimage[j]);
-	    ++j;
+            test = floatimage[j] * pgm_scale;
+            if(test > 255.0) test = 255.0;
+            pgmimage[j] = (unsigned char) ( test );
+//            printf("%d %d = %d\n",fpixel,spixel,pgmimage[j]);
+            ++j;
         }
     }
 
@@ -1712,10 +1820,10 @@ int main(int argc, char** argv)
     outfile = fopen(pgmfilename,"w");
     if(outfile == NULL)
     {
-	    perror("ERROR: fopen");
-	    exit(9);
+            perror("ERROR: fopen");
+            exit(9);
     }
-    fprintf(outfile, "P5\n%d %d\n", xpixels, ypixels);
+    fprintf(outfile, "P5\n%d %d\n", fpixels, spixels);
     fprintf(outfile, "# pixels scaled by %lg\n", pgm_scale);
     fprintf(outfile, "255\n");
     fwrite(pgmimage,sizeof(unsigned short int),pixels,outfile);
@@ -1723,32 +1831,32 @@ int main(int argc, char** argv)
 
 
     if(calculate_noise == 0){
-	return 0;
+        return 0;
     }
 
     /* simulate Poisson noise */
     j = 0;
     sum = 0.0;
     overloads = 0;
-    for(ypixel=0;ypixel<ypixels;++ypixel)
+    for(spixel=0;spixel<spixels;++spixel)
     {
-        for(xpixel=0;xpixel<xpixels;++xpixel)
+        for(fpixel=0;fpixel<fpixels;++fpixel)
         {
-            if(xpixel < roi_xmin || xpixel > roi_xmax || ypixel < roi_ymin || ypixel > roi_ymax) 
+            if(fpixel < roi_xmin || fpixel > roi_xmax || spixel < roi_ymin || spixel > roi_ymax) 
             {
                 ++j; continue;
             }
-	    test = poidev( floatimage[j], &seed );
-	    sum += test;
-	    test += adc_offset;
-	    if(test > 65535.0)
+            test = poidev( floatimage[j], &seed );
+            sum += test;
+            test += adc_offset;
+            if(test > 65535.0)
             {
-	        test = 65535.0;
-	        ++overloads;
-	    }
-	    intimage[j] = (unsigned short int) test;
-//	    printf("%d %d = %d\n",xpixel,ypixel,intimage[j]);
-	    ++j;
+                test = 65535.0;
+                ++overloads;
+            }
+            intimage[j] = (unsigned short int) test;
+//            printf("%d %d = %d\n",fpixel,spixel,intimage[j]);
+            ++j;
         }
     }
     printf("%.0f photons on noise image (%d overloads)\n",sum,overloads);
@@ -1757,11 +1865,11 @@ int main(int argc, char** argv)
     outfile = fopen(noisefilename,"w");
     if(outfile == NULL)
     {
-	    perror("ERROR: fopen");
-	    exit(9);
+            perror("ERROR: fopen");
+            exit(9);
     }
     fprintf(outfile,"{\nHEADER_BYTES=512;\nDIM=2;\nBYTE_ORDER=little_endian;\nTYPE=unsigned_short;\n");
-    fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",xpixels,ypixels,pixel_size*1000.0,distance*1000.0);
+    fprintf(outfile,"SIZE1=%d;\nSIZE2=%d;\nPIXEL_SIZE=%g;\nDISTANCE=%g;\n",fpixels,spixels,pixel_size*1000.0,distance*1000.0);
     fprintf(outfile,"WAVELENGTH=%g;\n",lambda0*1e10);
     fprintf(outfile,"BEAM_CENTER_X=%g;\nBEAM_CENTER_Y=%g;\n",Xbeam*1000.0,(detsize_y-Ybeam)*1000);
     fprintf(outfile,"ORGX=%g;\nORGY=%g;\n",Xclose/pixel_size,Yclose/pixel_size);
@@ -1839,10 +1947,12 @@ double *rotate_axis(double *v, double *new, double *axis, double phi) {
     double sinphi = sin(phi);
     double cosphi = cos(phi);
     double dot = (axis[1]*v[1]+axis[2]*v[2]+axis[3]*v[3])*(1.0-cosphi);
+    double temp[4];
 
-    new[1] = axis[1]*dot+v[1]*cosphi+(-axis[3]*v[2]+axis[2]*v[3])*sinphi;
-    new[2] = axis[2]*dot+v[2]*cosphi+(+axis[3]*v[1]-axis[1]*v[3])*sinphi;
-    new[3] = axis[3]*dot+v[3]*cosphi+(-axis[2]*v[1]+axis[1]*v[2])*sinphi;
+    temp[1] = axis[1]*dot+v[1]*cosphi+(-axis[3]*v[2]+axis[2]*v[3])*sinphi;
+    temp[2] = axis[2]*dot+v[2]*cosphi+(+axis[3]*v[1]-axis[1]*v[3])*sinphi;
+    temp[3] = axis[3]*dot+v[3]*cosphi+(-axis[2]*v[1]+axis[1]*v[2])*sinphi;
+    new[1]=temp[1]; new[2]=temp[2]; new[3]=temp[3];
 
     return new;
 }
@@ -1920,7 +2030,7 @@ float poidev(float xm, long *idum)
                 y=tan(M_PI*ran1(idum));
                 /* shift and scale */
                 em=sq*y+xm;
-            } while (em < 0.0);		/* there are no negative Poisson deviates */
+            } while (em < 0.0);                /* there are no negative Poisson deviates */
             /* round off to nearest integer */
             em=floor(em);
             /* ratio of Poisson distribution to comparison function */
@@ -1955,7 +2065,7 @@ float gaussdev(long *idum)
         /* apply Box-Muller transformation to convert to a normal deviate */
         fac=sqrt(-2.0*log(rsq)/rsq);
         gset=v1*fac;
-        iset=1;		/* we now have a spare deviate */
+        iset=1;                /* we now have a spare deviate */
         return v2*fac;
     } else {
         /* there is an extra deviate in gset */
@@ -2070,12 +2180,12 @@ float ran1(long *idum)
 
 void polint(double *xa, double *ya, double x, double *y)
 {
-	double x0,x1,x2,x3;
-	x0 = (x-xa[1])*(x-xa[2])*(x-xa[3])*ya[0]/((xa[0]-xa[1])*(xa[0]-xa[2])*(xa[0]-xa[3])); 
+        double x0,x1,x2,x3;
+        x0 = (x-xa[1])*(x-xa[2])*(x-xa[3])*ya[0]/((xa[0]-xa[1])*(xa[0]-xa[2])*(xa[0]-xa[3])); 
         x1 = (x-xa[0])*(x-xa[2])*(x-xa[3])*ya[1]/((xa[1]-xa[0])*(xa[1]-xa[2])*(xa[1]-xa[3]));
-	x2 = (x-xa[0])*(x-xa[1])*(x-xa[3])*ya[2]/((xa[2]-xa[0])*(xa[2]-xa[1])*(xa[2]-xa[3]));
-	x3 = (x-xa[0])*(x-xa[1])*(x-xa[2])*ya[3]/((xa[3]-xa[0])*(xa[3]-xa[1])*(xa[3]-xa[2]));
-	*y = x0+x1+x2+x3;
+        x2 = (x-xa[0])*(x-xa[1])*(x-xa[3])*ya[2]/((xa[2]-xa[0])*(xa[2]-xa[1])*(xa[2]-xa[3]));
+        x3 = (x-xa[0])*(x-xa[1])*(x-xa[2])*ya[3]/((xa[3]-xa[0])*(xa[3]-xa[1])*(xa[3]-xa[2]));
+        *y = x0+x1+x2+x3;
 }
 
 
@@ -2106,84 +2216,84 @@ size_t read_text_file(char *filename, size_t nargs, ... )
     
     infile = fopen(filename,"r");
     if(infile == NULL) {
-	perror("fopen()");
-	return 0;
+        perror("fopen()");
+        return 0;
     }
     lines=0;
     while ( fgets ( text, sizeof text, infile ) != NULL ) {
-	token = text;
-	token += strspn(token,delimiters);
-	if(strcmp(token,"\n")==0) {
-	    //printf("blank\n");
-	    continue;
-	}
-	++lines;
+        token = text;
+        token += strspn(token,delimiters);
+        if(strcmp(token,"\n")==0) {
+            //printf("blank\n");
+            continue;
+        }
+        ++lines;
     }
     rewind(infile);
 
     /* allocate memory for arrays */
     va_start( arglist, nargs);
     for(i=0;i<nargs;++i){
-	/* allocate the array */
-	data = malloc((lines+10)*sizeof(double));
-	/* initialize with missing number flags */
-	for(j=0;j<lines+10;++j) {
-	    data[j] = NAN;
-	}
-	/* get argument (pointer to pointer) */
-	pointer = va_arg(arglist, double **);
-	/* change the value of what the arg points to */
-	*pointer = data;
-	/* now the pointer provided as an argument points to
-	something */
+        /* allocate the array */
+        data = malloc((lines+10)*sizeof(double));
+        /* initialize with missing number flags */
+        for(j=0;j<lines+10;++j) {
+            data[j] = NAN;
+        }
+        /* get argument (pointer to pointer) */
+        pointer = va_arg(arglist, double **);
+        /* change the value of what the arg points to */
+        *pointer = data;
+        /* now the pointer provided as an argument points to
+        something */
     }
     va_end(arglist);
         
     line = 0;
     while ( fgets ( text, sizeof text, infile ) != NULL ) { /* read a line */
 
-	token = text;
-	token += strspn(token,delimiters);
-	if(strcmp(token,"\n")==0) {
-	    //printf("blank\n");
-	    continue;
-	}
-	i=0;
+        token = text;
+        token += strspn(token,delimiters);
+        if(strcmp(token,"\n")==0) {
+            //printf("blank\n");
+            continue;
+        }
+        i=0;
         va_start( arglist, nargs);
-	do
+        do
         {
-	    value=atof(token);
-	    /* get argument */
-	    pointer = va_arg(arglist, double **);
-	    /* retrieve data array's address */
-	    data = *pointer;
-	    data[line] = value;
+            value=atof(token);
+            /* get argument */
+            pointer = va_arg(arglist, double **);
+            /* retrieve data array's address */
+            data = *pointer;
+            data[line] = value;
 
-	    token += strspn(token,numberstuf);
-	    if (strcmp(token,"\n")==0) continue;
-	    token += strcspn(token,delimiters);
-	    token += strspn(token,delimiters);
-	    if (strcmp(token,"\n")==0) continue;
+            token += strspn(token,numberstuf);
+            if (strcmp(token,"\n")==0) continue;
+            token += strcspn(token,delimiters);
+            token += strspn(token,delimiters);
+            if (strcmp(token,"\n")==0) continue;
 
-	    ++i;
-	    if(i>=nargs) {
-	        break;
-	    }
-	}
-	while (strcmp(token,"\n")!=0) ;
-	va_end(arglist);
+            ++i;
+            if(i>=nargs) {
+                break;
+            }
+        }
+        while (strcmp(token,"\n")!=0) ;
+        va_end(arglist);
  
-//	printf("initializing:");
+//        printf("initializing:");
 //        va_start( arglist, nargs);
 //        for(i=0;i<nargs;++i){
-//	    pointer = va_arg(arglist, double **);
-//	    data = *pointer;
-//	    printf(" %g",data[line]);
+//            pointer = va_arg(arglist, double **);
+//            data = *pointer;
+//            printf(" %g",data[line]);
 //        }
 //        va_end(arglist);
-//	printf("\n");
+//        printf("\n");
 
-	++line;
+        ++line;
     }
     fclose(infile);
 
@@ -2209,18 +2319,18 @@ double unitize(double *vector, double *new_unit_vector) {
     mag = magnitude(vector);
 
     if(mag != 0.0){
-    	/* normalize it */
-	new_unit_vector[1]=vector[1]/mag;
-	new_unit_vector[2]=vector[2]/mag;
-	new_unit_vector[3]=vector[3]/mag;
+            /* normalize it */
+        new_unit_vector[1]=vector[1]/mag;
+        new_unit_vector[2]=vector[2]/mag;
+        new_unit_vector[3]=vector[3]/mag;
     }
     else
     {
-    	/* can't normalize, report zero vector */
-    	new_unit_vector[0] = 0.0;
-    	new_unit_vector[1] = 0.0;
-    	new_unit_vector[2] = 0.0;
-    	new_unit_vector[3] = 0.0;
+            /* can't normalize, report zero vector */
+            new_unit_vector[0] = 0.0;
+            new_unit_vector[1] = 0.0;
+            new_unit_vector[2] = 0.0;
+            new_unit_vector[3] = 0.0;
     }
     return mag;
 }
@@ -2297,12 +2407,12 @@ double polarization_factor(double kahn_factor, double *incident, double *diffrac
            here we assume it is closest to the "axis" defined above */
 
         /* cross product to get "vertical" axis that is orthogonal to the cannonical "polarization" */
-	cross_product(axis,incident,B_in);
+        cross_product(axis,incident,B_in);
         /* make it a unit vector */
         unitize(B_in,B_in);
 
         /* cross product with incident beam to get E-vector direction */
-	cross_product(incident,B_in,E_in);
+        cross_product(incident,B_in,E_in);
         /* make it a unit vector */
         unitize(E_in,E_in);
 
@@ -2330,8 +2440,8 @@ SMVinfo GetFrame(char *filename)
 
     typedef union
     {
-	unsigned char string[2];
-	unsigned short integer;
+        unsigned char string[2];
+        unsigned short integer;
     } TWOBYTES;
     TWOBYTES twobytes;
     twobytes.integer = 24954;
@@ -2340,11 +2450,11 @@ SMVinfo GetFrame(char *filename)
     /* determine byte order on this machine */
     if(0==strncmp((const char *) twobytes.string, "az", 2))
     {
-	byte_order = "big_endian";
+        byte_order = "big_endian";
     }
     else
     {
-	byte_order = "little_endian";
+        byte_order = "little_endian";
     }
 
     /* try to open the file... */
@@ -2353,97 +2463,97 @@ SMVinfo GetFrame(char *filename)
     {
         /* just assume header will be 512 bytes?... */
         frame.header = calloc(1024,sizeof(char));
-	if(! fread(frame.header, 512, 1, frame.handle))
-	{
-	    perror("SMV file header");
-	    exit(9);
-	}
-	string = frame.header + 512;
+        if(! fread(frame.header, 512, 1, frame.handle))
+        {
+            perror("SMV file header");
+            exit(9);
+        }
+        string = frame.header + 512;
         *string = (char) 0;
 
-	/* remember the file name */
-	frame.filename = calloc(strlen(filename)+10,sizeof(char));
-	strcpy(frame.filename,filename);
+        /* remember the file name */
+        frame.filename = calloc(strlen(filename)+10,sizeof(char));
+        strcpy(frame.filename,filename);
 
-	/* What kind of file is this? */
-	if(0!=strncmp(frame.header, "{\nHEADER_BYTES=  512;\nDIM=2;\nBYTE_ORDER=", 12))
-	{
-	    /* probably not an ADSC frame */
+        /* What kind of file is this? */
+        if(0!=strncmp(frame.header, "{\nHEADER_BYTES=  512;\nDIM=2;\nBYTE_ORDER=", 12))
+        {
+            /* probably not an ADSC frame */
 
-	    /* inform the user */
-	    printf("ERROR: %s does not look like an ADSC frame!\n", filename);
-	    /* skip this file */
-	    fclose(frame.handle);
-	    
-	    frame.handle = NULL;
-	}
-	else
-	{
-	    /* store the full header */
-	    frame.header_size = (int) ValueOf("HEADER_BYTES",frame);
-	    if(frame.header_size != 512)
-	    {
-		free(frame.header);
-		fseek(frame.handle,0,SEEK_SET);
-		frame.header = calloc(2*frame.header_size,sizeof(char));
-		if(! fread(frame.header, frame.header_size, 1, frame.handle))
-		{
-		    perror("SMV file fread");
-		    exit(9);
-		}
-		string = frame.header + frame.header_size;
-	        *string = (char) 0;		
-	    }
+            /* inform the user */
+            printf("ERROR: %s does not look like an ADSC frame!\n", filename);
+            /* skip this file */
+            fclose(frame.handle);
+            
+            frame.handle = NULL;
+        }
+        else
+        {
+            /* store the full header */
+            frame.header_size = (int) ValueOf("HEADER_BYTES",frame);
+            if(frame.header_size != 512)
+            {
+                free(frame.header);
+                fseek(frame.handle,0,SEEK_SET);
+                frame.header = calloc(2*frame.header_size,sizeof(char));
+                if(! fread(frame.header, frame.header_size, 1, frame.handle))
+                {
+                    perror("SMV file fread");
+                    exit(9);
+                }
+                string = frame.header + frame.header_size;
+                *string = (char) 0;                
+            }
 
-	    /* see if we will need to swap bytes */
-	    string = (char *) strstr(frame.header, "BYTE_ORDER=")+11;
-	    /* find last instance of keyword in the header */
-	    while ((char *) strstr(string, "BYTE_ORDER=") != NULL)
-	    {
-		string = (char *) strstr(string, "BYTE_ORDER=")+11;
-	    }
-	    if(0==strncmp(byte_order, string, 10))
-	    {
-		frame.swap_bytes = FALSE;
-	    }
-	    else
-	    {
-		frame.swap_bytes = TRUE;
-	    }
+            /* see if we will need to swap bytes */
+            string = (char *) strstr(frame.header, "BYTE_ORDER=")+11;
+            /* find last instance of keyword in the header */
+            while ((char *) strstr(string, "BYTE_ORDER=") != NULL)
+            {
+                string = (char *) strstr(string, "BYTE_ORDER=")+11;
+            }
+            if(0==strncmp(byte_order, string, 10))
+            {
+                frame.swap_bytes = FALSE;
+            }
+            else
+            {
+                frame.swap_bytes = TRUE;
+            }
 
-	    /* store a couple of things */
-	    frame.width  = (int) ValueOf("SIZE1",frame);
-	    frame.height = (int) ValueOf("SIZE2",frame);
+            /* store a couple of things */
+            frame.width  = (int) ValueOf("SIZE1",frame);
+            frame.height = (int) ValueOf("SIZE2",frame);
 
-	    if(frame.width == 0)
-	    {
-		/* try other formats? */
-		frame.width = frame.height = (int) ValueOf("DETECTOR_DIMENSIONS",frame);
-	    }
+            if(frame.width == 0)
+            {
+                /* try other formats? */
+                frame.width = frame.height = (int) ValueOf("DETECTOR_DIMENSIONS",frame);
+            }
 
-//	    frame.mmapdata = mmap(NULL,2*frame.width*frame.height+frame.header_size,PROT_READ,MAP_SHARED,fileno(frame.handle),0);
-	    frame.mmapdata = calloc(2,frame.width*frame.height+frame.header_size);
-	    if(frame.mmapdata == NULL)
-	    {
-		perror("calloc:");
-	    }
-	    fseek(frame.handle,0,SEEK_SET);
-	    printf("reading %s\n",frame.filename);
-	    if(! fread(frame.mmapdata,1,2*frame.width*frame.height+frame.header_size,frame.handle))
-	    {
-	        perror("SMV file fread");
-	        exit(9);
-	    }
+//            frame.mmapdata = mmap(NULL,2*frame.width*frame.height+frame.header_size,PROT_READ,MAP_SHARED,fileno(frame.handle),0);
+            frame.mmapdata = calloc(2,frame.width*frame.height+frame.header_size);
+            if(frame.mmapdata == NULL)
+            {
+                perror("calloc:");
+            }
+            fseek(frame.handle,0,SEEK_SET);
+            printf("reading %s\n",frame.filename);
+            if(! fread(frame.mmapdata,1,2*frame.width*frame.height+frame.header_size,frame.handle))
+            {
+                perror("SMV file fread");
+                exit(9);
+            }
 
-	    printf("mmap(%s) = %p\n",frame.filename,frame.mmapdata);
+            printf("mmap(%s) = %p\n",frame.filename,frame.mmapdata);
 
 
-	}
+        }
     }
     else
     {
-	/* fopen() failed */
-	perror("nonBragg");
+        /* fopen() failed */
+        perror("nonBragg");
     }
     
     return frame;
@@ -2465,7 +2575,7 @@ double ValueOf(const char *keyword, SMVinfo frame)
     /* find last instance of keyword in the header */
     while ((char *) strstr(string, keyword) != NULL)
     {
-	string = (char *) strstr(string, keyword)+keylen;
+        string = (char *) strstr(string, keyword)+keylen;
     }
     if(string == frame.header) return NAN;
 
@@ -2491,27 +2601,27 @@ unsigned char *read_pgm5_bytes(char *filename,unsigned int *returned_width,unsig
     if(handle)
     {
         if(! fread(test,512,1,handle))
-	{
-	    perror("PGM fread header");
-	    exit(9);
-	}
+        {
+            perror("PGM fread header");
+            exit(9);
+        }
         if(strstr((const char *) test,"P5"))
         {
             /* PGM header: "P5<whitespace>width<whitespace>height<whitespace>maxvalue<single whitespace character>" */
             fseek(handle,3,SEEK_SET);
             if(! fscanf(handle," %u %u %u",&width,&height,&maxvalue))
-	    {
-	        perror("PGM fscanf");
-	        exit(9);
-	    }
+            {
+                perror("PGM fscanf");
+                exit(9);
+            }
             /* skip final single whitespsce character (first pixel could have value of "20") */
             fseek(handle,1,SEEK_CUR);
             array = calloc(sizeof(unsigned char),width*height);
             if(! fread(array,width,height,handle))
-	    {
-	        perror("PGM fread");
-	        exit(9);
-	    }
+            {
+                perror("PGM fread");
+                exit(9);
+            }
         }
         fclose(handle);
     }
@@ -2558,44 +2668,44 @@ float fmedian(unsigned int n, float arr[])
 
     for(;;)
     {
-	if(ir <= l+1)
-	{
-	    if(ir == l+1 && arr[ir] < arr[l])
-	    {
-		SWAP(arr[l],arr[ir]);
-	    }
+        if(ir <= l+1)
+        {
+            if(ir == l+1 && arr[ir] < arr[l])
+            {
+                SWAP(arr[l],arr[ir]);
+            }
 //for(i=1;i<=n;++i) printf("arr[%d]=%f\n",i,arr[i]);
-	    return arr[k];
-	} else {
-	    mid=(l+ir) >> 1;
-	    SWAP(arr[mid],arr[l+1]);
-	    if(arr[l+1] > arr[ir])
-	    {
-		SWAP(arr[l+1],arr[ir]);
-	    }
-	    if(arr[l] > arr[ir])
-	    {
-		SWAP(arr[l],arr[ir]);
-	    }
-	    if(arr[l+1] > arr[l])
-	    {
-		SWAP(arr[l+1],arr[l]);
-	    }
-	    i=l+1;	// initialize pointers for partitioning
-	    j=ir;	
-	    a=arr[l];	// partitioning element
-	    for(;;)	// innermost loop
-	    {
-		do i++; while(arr[i]<a);	// scan up to find element > a
-		do j--; while(arr[j]>a);	// scan down to find element < a
-		if( j < i ) break;		// pointers crossed, median is in between
-		SWAP(arr[i],arr[j]);
-	    }
-	    arr[l]=arr[j];			// insert partitioning element
-	    arr[j]=a;
-	    if( j >= k ) ir=j-1;		// Keep partition that contains the median active
-	    if( j <= k ) l=i;
-	}
+            return arr[k];
+        } else {
+            mid=(l+ir) >> 1;
+            SWAP(arr[mid],arr[l+1]);
+            if(arr[l+1] > arr[ir])
+            {
+                SWAP(arr[l+1],arr[ir]);
+            }
+            if(arr[l] > arr[ir])
+            {
+                SWAP(arr[l],arr[ir]);
+            }
+            if(arr[l+1] > arr[l])
+            {
+                SWAP(arr[l+1],arr[l]);
+            }
+            i=l+1;        // initialize pointers for partitioning
+            j=ir;        
+            a=arr[l];        // partitioning element
+            for(;;)        // innermost loop
+            {
+                do i++; while(arr[i]<a);        // scan up to find element > a
+                do j--; while(arr[j]>a);        // scan down to find element < a
+                if( j < i ) break;                // pointers crossed, median is in between
+                SWAP(arr[i],arr[j]);
+            }
+            arr[l]=arr[j];                        // insert partitioning element
+            arr[j]=a;
+            if( j >= k ) ir=j-1;                // Keep partition that contains the median active
+            if( j <= k ) l=i;
+        }
     }
 }
 
@@ -2612,35 +2722,35 @@ float fmedian_with_rejection(unsigned int n, float arr[],float sigma_cutoff, flo
     done = 0;
     while(! done)
     {
-	/* compute the median (centroid) value */
-	median_value = fmedian(n,arr);
+        /* compute the median (centroid) value */
+        median_value = fmedian(n,arr);
 
-	/* now figure out what the mean absolute deviation from this value is */
-	mad = fmedian_absolute_deviation(n,arr,median_value);
-	//if(flag) printf("mad = %f\n",mad);
+        /* now figure out what the mean absolute deviation from this value is */
+        mad = fmedian_absolute_deviation(n,arr,median_value);
+        //if(flag) printf("mad = %f\n",mad);
 
-	done = 1;
-	/* reject all outliers */
-	for(i=1;i<=n;++i)
-	{
-	    /* reject positive and negative outliers */
-	    deviate = fabs(arr[i]-median_value);
-	    if(deviate > sigma_cutoff*mad)
-	    {
-	        /* needs to go */
-	        /* move value at the end of the array to this "reject" and then shorten the array */
-	        //if(flag) printf("rejecting arr[%d] = %f (%f)\n",i,arr[i],deviate);
-	        //arr[worst]+=10000;
-	        if(i != n)
-	        {
-		    //temp=arr[worst];
-		    arr[i] = arr[n];
-		    //arr[n]=temp;
-		}
-		--n;
-		done = 0;
-	    }
-	}
+        done = 1;
+        /* reject all outliers */
+        for(i=1;i<=n;++i)
+        {
+            /* reject positive and negative outliers */
+            deviate = fabs(arr[i]-median_value);
+            if(deviate > sigma_cutoff*mad)
+            {
+                /* needs to go */
+                /* move value at the end of the array to this "reject" and then shorten the array */
+                //if(flag) printf("rejecting arr[%d] = %f (%f)\n",i,arr[i],deviate);
+                //arr[worst]+=10000;
+                if(i != n)
+                {
+                    //temp=arr[worst];
+                    arr[i] = arr[n];
+                    //arr[n]=temp;
+                }
+                --n;
+                done = 0;
+            }
+        }
     }
 
     /* basically three return values */
@@ -2655,7 +2765,7 @@ float fmedian_absolute_deviation(unsigned int n, float arr[], float median_value
     int i;
     for(i=1;i<=n;++i)
     {
-	arr[i+n] = fabs(arr[i]-median_value);
+        arr[i+n] = fabs(arr[i]-median_value);
     }
 
     return fmedian(n,arr+n);
@@ -2680,33 +2790,33 @@ float fmean_with_rejection(unsigned int starting_points, float arr[], float sigm
         sum = sumd = 0.0;
         for(i=0;i<points;++i)
         {
-	    sum+=arr[i];
+            sum+=arr[i];
         }
         avg=sum/points;
-	worst=-1;
-	worst_deviate=0.0;
+        worst=-1;
+        worst_deviate=0.0;
         for(i=0;i<points;++i)
         {
-	    deviate=fabs(arr[i]-avg);
-	    if(deviate > worst_deviate)
-	    {
-		worst=i;
-		worst_deviate=deviate;
-	    }
-	    sumd+=deviate*deviate;
+            deviate=fabs(arr[i]-avg);
+            if(deviate > worst_deviate)
+            {
+                worst=i;
+                worst_deviate=deviate;
+            }
+            sumd+=deviate*deviate;
         }
         rmsd=sqrt(sumd/points);
 
-	rejection=0;
-	if(worst_deviate>sigma_cutoff*rmsd)
-	{
-	    /* we have a reject! */
-	    rejection=1;
+        rejection=0;
+        if(worst_deviate>sigma_cutoff*rmsd)
+        {
+            /* we have a reject! */
+            rejection=1;
 
-	    /* move it to end of the array and forget about it */
-	    SWAP(arr[worst],arr[points]);
-	    --points;
-	}
+            /* move it to end of the array and forget about it */
+            SWAP(arr[worst],arr[points]);
+            --points;
+        }
     }
 
     *final_rmsd = rmsd;
