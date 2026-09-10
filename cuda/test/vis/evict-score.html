@@ -1,0 +1,515 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Image-cache eviction score</title>
+<style>
+  :root{
+    --ground:#f5f7f9; --panel:#ffffff; --ink:#151a1f; --muted:#5e6a74; --line:#e3e8ec;
+    --accent:#1c6e8c; --keep:#2f7d5b; --evict:#c65b3a;
+    --screen:#fbfcfd; --screen-line:#dfe6eb; --screen-ink:#5c6771;
+    --shadow:0 1px 2px rgba(20,30,40,.05),0 4px 16px rgba(20,30,40,.05);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --ground:#0f1216; --panel:#171b20; --ink:#e7ecef; --muted:#98a1a9; --line:#272d34;
+      --accent:#4bb3d4; --keep:#4fb488; --evict:#e08a5a;
+      --screen:#12161a; --screen-line:#2b323a; --screen-ink:#9aa4ad;
+      --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 22px rgba(0,0,0,.35);
+    }
+  }
+  :root[data-theme="light"]{
+    --ground:#f5f7f9; --panel:#ffffff; --ink:#151a1f; --muted:#5e6a74; --line:#e3e8ec;
+    --accent:#1c6e8c; --keep:#2f7d5b; --evict:#c65b3a;
+    --screen:#fbfcfd; --screen-line:#dfe6eb; --screen-ink:#5c6771;
+    --shadow:0 1px 2px rgba(20,30,40,.05),0 4px 16px rgba(20,30,40,.05);
+  }
+  :root[data-theme="dark"]{
+    --ground:#0f1216; --panel:#171b20; --ink:#e7ecef; --muted:#98a1a9; --line:#272d34;
+    --accent:#4bb3d4; --keep:#4fb488; --evict:#e08a5a;
+    --screen:#12161a; --screen-line:#2b323a; --screen-ink:#9aa4ad;
+    --shadow:0 1px 2px rgba(0,0,0,.3),0 6px 22px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--ink);
+    font:14px/1.55 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1120px;margin:0 auto;padding:28px 22px 44px}
+  .mono{font-family:ui-monospace,SFMono-Regular,Menlo,"Cascadia Code",monospace;
+    font-variant-numeric:tabular-nums}
+  header h1{font-size:20px;font-weight:650;letter-spacing:-.01em;margin:0 0 3px;text-wrap:balance}
+  header p{color:var(--muted);margin:0 0 18px;font-size:13.5px;max-width:70ch}
+  .eq{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--panel);
+    border:1px solid var(--line);border-radius:10px;padding:13px 16px;margin-bottom:14px;
+    box-shadow:var(--shadow);font-size:16px}
+  .eq .lbl{font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);font-family:system-ui}
+  .eq b{color:var(--accent);font-weight:600}
+  .eq .note{color:var(--muted);font-size:12.5px;font-family:system-ui}
+  .rules{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px 20px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 16px;
+    margin-bottom:18px;box-shadow:var(--shadow);font-size:12.5px;color:var(--muted)}
+  .rules b{color:var(--ink);font-weight:620}
+  .controls{display:grid;grid-template-columns:repeat(auto-fit,minmax(215px,1fr));gap:16px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;
+    margin-bottom:18px;box-shadow:var(--shadow)}
+  .ctl label{display:flex;justify-content:space-between;align-items:baseline;font-weight:600;margin-bottom:6px}
+  .ctl .name{font-size:13px}
+  .ctl .val{color:var(--accent);font-size:13px}
+  .ctl .hint{color:var(--muted);font-size:11.5px;margin-top:5px;line-height:1.4}
+  input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer;height:20px}
+  input[type=range]:focus-visible{outline:2px solid var(--accent);outline-offset:3px;border-radius:4px}
+  .plots{display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:18px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 16px 14px;
+    box-shadow:var(--shadow);margin:0}
+  .card h2{font-size:13.5px;font-weight:620;margin:0 0 2px}
+  .card .cap{color:var(--muted);font-size:12px;margin:0 0 11px;line-height:1.45}
+  .screen{background:var(--screen);border:1px solid var(--screen-line);border-radius:7px;overflow:hidden;
+    position:relative}
+  canvas{display:block;width:100%}
+  .key{display:flex;gap:15px;flex-wrap:wrap;font-size:11.5px;margin-top:9px;color:var(--muted);
+    align-items:center;font-family:system-ui}
+  .key span{display:inline-flex;align-items:center;gap:6px}
+  .sw{width:20px;height:3px;border-radius:2px;display:inline-block}
+  .dot{width:11px;height:11px;border-radius:3px;display:inline-block}
+  .probe{margin-top:9px;font-size:12px;color:var(--muted);min-height:2.9em;line-height:1.5}
+  .probe b{color:var(--ink);font-weight:620}
+  .probe .kept{color:var(--keep);font-weight:620}
+  .probe .gone{color:var(--evict);font-weight:620}
+  .cfg{margin-top:18px;display:grid;grid-template-columns:minmax(240px,320px) 1fr;gap:18px;
+    background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 16px;
+    box-shadow:var(--shadow)}
+  .cfg h2{font-size:13.5px;font-weight:620;margin:0 0 8px}
+  .cfg pre{margin:0;background:var(--screen);border:1px solid var(--screen-line);border-radius:7px;
+    padding:12px 13px;font-size:12.5px;overflow-x:auto;color:var(--ink)}
+  .cfg p{margin:0 0 9px;font-size:12.5px;color:var(--muted);line-height:1.55}
+  .cfg p:last-child{margin-bottom:0}
+  .cfg code{font-family:ui-monospace,monospace;font-size:12px;color:var(--ink)}
+  .takeaway{font-size:13px;color:var(--muted);margin:18px 2px 0;line-height:1.65;max-width:80ch}
+  .takeaway b{color:var(--ink);font-weight:620}
+  .takeaway code{font-family:ui-monospace,monospace;color:var(--ink);font-size:12px}
+  @media (max-width:720px){ .cfg{grid-template-columns:1fr} }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1>Image-cache eviction score</h1>
+    <p>Every cached reference image carries a score. When the cache is over its byte budget, the
+       lowest scores are evicted until it is back under. Tune the three weights and watch which
+       images cross the line.</p>
+  </header>
+
+  <div class="eq mono">
+    <span class="lbl">score</span>
+    <span>=&nbsp; cost.actual<sup><b id="ea">1.8</b></sup> &nbsp;/&nbsp; (stale + <b id="es0">30</b>d)<sup><b id="eb">1.2</b></sup></span>
+    <span class="note">cost.actual = measured render seconds&nbsp;·&nbsp;stale = time since last read</span>
+  </div>
+
+  <div class="rules">
+    <div><b>Only over budget.</b> Under budget nothing is ever evicted. This is a ranking rule,
+      not a time-to-live — a cold image survives indefinitely while there is room.</div>
+    <div><b>Size-independent.</b> An image's byte footprint decides how much evicting it frees,
+      never where it ranks. Every reference image is the same 16 MB anyway.</div>
+    <div><b>Days here, seconds in the code.</b> This page works in days for legibility. Converting
+      both <code>stale</code> and <code>s₀</code> to days multiplies every score by the same
+      constant, so the ordering — the only thing eviction reads — is identical.</div>
+  </div>
+
+  <div class="controls">
+    <div class="ctl">
+      <label><span class="name">a — cost weight</span><span class="val mono" id="va">1.8</span></label>
+      <input type="range" id="a" min="0.3" max="3" step="0.1" value="1.8" aria-label="cost weight a">
+      <div class="hint"><code>evict_cost_weight</code> — how hard an expensive render is protected</div>
+    </div>
+    <div class="ctl">
+      <label><span class="name">b — staleness decay</span><span class="val mono" id="vb">1.2</span></label>
+      <input type="range" id="b" min="0.3" max="3" step="0.1" value="1.2" aria-label="staleness decay b">
+      <div class="hint"><code>evict_decay</code> — how fast value falls once an image goes unread</div>
+    </div>
+    <div class="ctl">
+      <label><span class="name">s₀ — recency grace</span><span class="val mono" id="vs0">30 d</span></label>
+      <input type="range" id="s0" min="0" max="365" step="1" value="30" aria-label="recency grace s0">
+      <div class="hint"><code>evict_grace_days</code> — anything read within s₀ counts as fresh</div>
+    </div>
+    <div class="ctl">
+      <label><span class="name">budget pressure</span><span class="val mono" id="vcut">50%</span></label>
+      <input type="range" id="cut" min="1" max="99" step="1" value="50" aria-label="budget pressure percentile">
+      <div class="hint">illustrative — how deep the cut reaches into a sampled corpus. Not a
+        <code>settings.json</code> key; real pressure comes from bytes over budget.</div>
+    </div>
+  </div>
+
+  <div class="plots">
+    <figure class="card">
+      <h2>Score relative to the eviction frontier</h2>
+      <p class="cap">One curve per render cost, divided by the frontier score. Above <b>1×</b> an image
+         is kept; below it, reclaimed. Hover to read the values at any age.</p>
+      <div class="screen"><canvas id="curves" aria-label="Score relative to eviction frontier, by render cost"></canvas></div>
+      <div class="key mono" id="legend"></div>
+      <p class="probe" id="probe"></p>
+    </figure>
+    <figure class="card">
+      <h2>Keep / evict map</h2>
+      <p class="cap">Every (age, cost) point — green survives, clay is reclaimed. The dark band is the
+         frontier itself, where a hair of extra staleness decides it.</p>
+      <div class="screen"><canvas id="heat" aria-label="Keep versus evict map over age and render cost"></canvas></div>
+      <div class="key">
+        <span><span class="dot" style="background:var(--keep)"></span>kept</span>
+        <span><span class="dot" style="background:var(--evict)"></span>evicted</span>
+        <span>↑ expensive&nbsp;&nbsp;·&nbsp;&nbsp;→ colder</span>
+      </div>
+    </figure>
+  </div>
+
+  <div class="cfg">
+    <div>
+      <h2>settings.json</h2>
+      <pre class="mono" id="snippet"></pre>
+    </div>
+    <div>
+      <p>These three keys live in <code>&lt;cache-dir&gt;/settings.json</code> and are
+         <b>hand-edited only</b>. There is no CLI flag for them and the tools never write them
+         back — a run reads them and leaves the file alone.</p>
+      <p><code>budget_gb</code> is the one setting with a CLI surface: it resolves compile-default
+         → <code>settings.json</code> → <code>--budget-gb</code>, and
+         <code>nbcache --set-budget-gb</code> rewrites that key alone, preserving whatever weights
+         you have hand-added here.</p>
+      <p>A mis-ranked image costs exactly one re-render, never a wrong verdict — which is why these
+         are tuned by judgement rather than measured to a decimal.</p>
+    </div>
+  </div>
+
+  <p class="takeaway" id="takeaway"></p>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+/* Representative render costs, in seconds. */
+const COST = [0.1, 1, 10, 100, 600];
+const COSTLBL = ['0.1 s', '1 s', '10 s', '100 s', '600 s'];
+/* Sequential ramp: cost is an ordered magnitude, so one hue walking light -> dark (light mode)
+   or dark -> light (dark mode), monotonic in lightness against its own surface. Identity is
+   carried by the direct labels, not by hue alone. */
+const RAMP_LIGHT = ['#86b6ef','#5598e7','#2a78d6','#1c5cab','#104281']; /* cheap -> expensive */
+const RAMP_DARK  = ['#2a5f85','#3f8fb8','#5cb8d8','#93d6ea','#d2ecf7'];
+
+const STALE_MIN = 0.01, STALE_MAX = 1000;   /* days: ~15 min .. ~3 yr */
+const COST_MIN  = 0.02, COST_MAX  = 1200;   /* seconds */
+const DECADES = 6;                          /* y range: 1e-6x .. 1e6x, wide enough that no
+                                               curve clips at the slider extremes */
+const EVICT_RGB = [198,91,58], KEEP_RGB = [47,125,91];
+
+let a = 1.8, b = 1.2, s0 = 30, cutPct = 50;
+let probeStale = null;
+
+const score = (cost, stale) => Math.pow(cost, a) / Math.pow(stale + s0, b);
+const log10 = Math.log10;
+const css = v => getComputedStyle(document.body).getPropertyValue(v).trim();
+const isDark = () => {
+  const t = document.documentElement.dataset.theme;
+  if (t === 'dark') return true;
+  if (t === 'light') return false;
+  return matchMedia('(prefers-color-scheme:dark)').matches;
+};
+const ramp = () => isDark() ? RAMP_DARK : RAMP_LIGHT;
+
+/* Size the backing store to the element's real box times devicePixelRatio, then draw in CSS
+   pixels. Without this the canvas is authored at a fixed width, squeezed into a narrower
+   column, and every label shrinks with it. */
+function fit(canvas, aspect) {
+  const box = canvas.parentElement.getBoundingClientRect();
+  const w = Math.max(220, Math.round(box.width));
+  const h = Math.round(w * aspect);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.style.height = h + 'px';
+  canvas.width = Math.round(w * dpr);
+  canvas.height = Math.round(h * dpr);
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { ctx, W: w, H: h, dpr };
+}
+
+/* The frontier is the cutPct percentile of the score distribution over a sampled (cost, age)
+   corpus — a stand-in for "how deep the byte budget cuts". */
+function frontierScore() {
+  const vals = [];
+  for (let i = 0; i < 40; i++) {
+    const c = COST_MIN * Math.pow(COST_MAX / COST_MIN, i / 39);
+    for (let j = 0; j < 40; j++) {
+      const s = STALE_MIN * Math.pow(STALE_MAX / STALE_MIN, j / 39);
+      vals.push(score(c, s));
+    }
+  }
+  vals.sort((x, y) => x - y);
+  return vals[Math.floor(cutPct / 100 * (vals.length - 1))];
+}
+
+function readControls() {
+  a = +$('a').value; b = +$('b').value; s0 = +$('s0').value; cutPct = +$('cut').value;
+  $('va').textContent = a.toFixed(1);
+  $('vb').textContent = b.toFixed(1);
+  $('vs0').textContent = s0 + ' d';
+  $('vcut').textContent = cutPct + '%';
+  $('ea').textContent = a.toFixed(1);
+  $('eb').textContent = b.toFixed(1);
+  $('es0').textContent = String(s0);
+  $('snippet').textContent =
+    '{\n  "evict_cost_weight": ' + a.toFixed(1) +
+    ',\n  "evict_decay": ' + b.toFixed(1) +
+    ',\n  "evict_grace_days": ' + s0 + '\n}';
+}
+
+const AGE_TICKS = [[0.0417,'1 hr'],[1,'1 d'],[7,'1 wk'],[30,'1 mo'],[365,'1 yr']];
+
+function drawCurves() {
+  const c = $('curves');
+  const { ctx, W, H } = fit(c, 0.68);
+  const L = 62, R = 62, T = 16, B = 40, pw = W - L - R, ph = H - T - B;
+  if (pw <= 10 || ph <= 10) return;
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = css('--screen'); ctx.fillRect(0, 0, W, H);
+
+  const fr = frontierScore();
+  const sx = st => L + (log10(st) - log10(STALE_MIN)) / (log10(STALE_MAX) - log10(STALE_MIN)) * pw;
+  const sy = r  => T + ph / 2 - log10(r) / DECADES * (ph / 2);   /* 1x sits dead centre */
+  const ink = css('--screen-ink'), lineC = css('--screen-line');
+
+  /* y gridlines: decades of "times the frontier" */
+  ctx.font = '12px system-ui'; ctx.lineWidth = 1;
+  for (let d = -DECADES; d <= DECADES; d += 2) {
+    const py = sy(Math.pow(10, d));
+    ctx.strokeStyle = lineC;
+    ctx.beginPath(); ctx.moveTo(L, py); ctx.lineTo(L + pw, py); ctx.stroke();
+    ctx.fillStyle = ink; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(d === 0 ? '1×' : '10' + (d < 0 ? '⁻' : '') + sup(Math.abs(d)) + '×', L - 8, py);
+  }
+  /* x gridlines: readable ages */
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  AGE_TICKS.forEach(([d, lab]) => {
+    if (d < STALE_MIN || d > STALE_MAX) return;
+    const px = sx(d);
+    ctx.strokeStyle = lineC;
+    ctx.beginPath(); ctx.moveTo(px, T); ctx.lineTo(px, T + ph); ctx.stroke();
+    ctx.fillStyle = ink; ctx.fillText(lab, px, T + ph + 17);
+  });
+
+  /* the frontier itself: fixed at 1x, because the curves are drawn relative to it */
+  const pyF = sy(1);
+  ctx.save();
+  ctx.setLineDash([6, 5]); ctx.strokeStyle = css('--evict'); ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(L, pyF); ctx.lineTo(L + pw, pyF); ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.fillStyle = css('--evict'); ctx.textAlign = 'left'; ctx.font = '600 12px system-ui';
+  ctx.fillText('evict below', L + 8, pyF - 7);
+  ctx.restore();
+
+  /* curves, clipped to the plot box */
+  const R5 = ramp();
+  ctx.save();
+  ctx.beginPath(); ctx.rect(L, T, pw, ph); ctx.clip();
+  const N = 200;
+  COST.forEach((cost, k) => {
+    ctx.strokeStyle = R5[k]; ctx.lineWidth = 2.6; ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const st = STALE_MIN * Math.pow(STALE_MAX / STALE_MIN, i / (N - 1));
+      const px = sx(st), py = sy(score(cost, st) / fr);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.stroke();
+  });
+  ctx.restore();
+
+  /* direct labels at the right edge, so identity is never colour alone */
+  ctx.font = '600 11.5px system-ui'; ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+  COST.forEach((cost, k) => {
+    const yEnd = sy(score(cost, STALE_MAX) / fr);
+    if (yEnd < T - 6 || yEnd > T + ph + 6) return;
+    ctx.fillStyle = R5[k];
+    ctx.fillText(COSTLBL[k], L + pw + 7, Math.max(T + 6, Math.min(T + ph - 6, yEnd)));
+  });
+
+  /* axis titles */
+  ctx.fillStyle = ink; ctx.font = '12px system-ui';
+  ctx.save(); ctx.translate(15, T + ph / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText('score ÷ frontier  (keep ↑)', 0, 0); ctx.restore();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('time since last read', L + pw / 2, H - 8);
+
+  /* hover crosshair */
+  if (probeStale !== null) {
+    const px = sx(probeStale);
+    ctx.save();
+    ctx.strokeStyle = css('--muted'); ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(px, T); ctx.lineTo(px, T + ph); ctx.stroke();
+    ctx.restore();
+    COST.forEach((cost, k) => {
+      const py = sy(score(cost, probeStale) / fr);
+      if (py < T || py > T + ph) return;
+      ctx.fillStyle = css('--screen'); ctx.beginPath(); ctx.arc(px, py, 5, 0, 7); ctx.fill();
+      ctx.fillStyle = R5[k]; ctx.beginPath(); ctx.arc(px, py, 3.5, 0, 7); ctx.fill();
+    });
+  }
+
+  /* mark where a curve actually falls through the frontier */
+  COST.forEach((cost, k) => {
+    const xa = crossAge(cost, fr);
+    if (xa === null) return;
+    const px = sx(xa), py = pyF;
+    ctx.fillStyle = css('--screen'); ctx.beginPath(); ctx.arc(px, py, 6, 0, 7); ctx.fill();
+    ctx.fillStyle = R5[k]; ctx.beginPath(); ctx.arc(px, py, 4, 0, 7); ctx.fill();
+  });
+
+  $('legend').innerHTML = COST.map((cost, k) => {
+    const xa = crossAge(cost, fr);
+    const note = xa !== null ? 'evicted after ' + fmtAge(xa)
+               : (score(cost, STALE_MIN) / fr >= 1 ? 'kept at any age' : 'below the line at any age');
+    return `<span><span class="sw" style="background:${R5[k]}"></span>${COSTLBL[k]} — ${note}</span>`;
+  }).join('');
+  $('curves').__sx = sx;
+  $('curves').__box = { L, R, T, B, pw, ph };
+}
+
+/* Age at which a cost's score falls through the frontier, or null if it is on one side for
+   every age in range. Bisected in log-age. */
+function crossAge(cost, fr) {
+  let lo = log10(STALE_MIN), hi = log10(STALE_MAX);
+  const above = s => score(cost, Math.pow(10, s)) / fr > 1;
+  if (!above(lo)) return null;          /* below the line even when freshly read */
+  if (above(hi))  return null;          /* still above it after the full age range */
+  for (let i = 0; i < 60; i++) { const m = (lo + hi) / 2; above(m) ? lo = m : hi = m; }
+  return Math.pow(10, (lo + hi) / 2);
+}
+
+function sup(n) {
+  const map = {0:'⁰',1:'¹',2:'²',3:'³',4:'⁴',5:'⁵',6:'⁶'};
+  return String(n).split('').map(d => map[d] || d).join('');
+}
+
+function heatColor(t) {
+  const m = i => Math.round(EVICT_RGB[i] + (KEEP_RGB[i] - EVICT_RGB[i]) * t);
+  return [m(0), m(1), m(2)];
+}
+
+function drawHeat() {
+  const c = $('heat');
+  const { ctx, W, H } = fit(c, 0.68);
+  const L = 62, R = 18, T = 16, B = 40, pw = W - L - R, ph = H - T - B;
+  if (pw <= 10 || ph <= 10) return;
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = css('--screen'); ctx.fillRect(0, 0, W, H);
+
+  const fr = frontierScore();
+  /* Build the field at CSS resolution on an offscreen canvas, then let drawImage scale it to
+     device pixels — the field is smooth, so interpolation costs nothing visible. */
+  const off = document.createElement('canvas');
+  off.width = Math.round(pw); off.height = Math.round(ph);
+  const octx = off.getContext('2d');
+  const img = octx.createImageData(off.width, off.height), d = img.data;
+  for (let py = 0; py < off.height; py++) {
+    const cost = COST_MIN * Math.pow(COST_MAX / COST_MIN, 1 - py / (off.height - 1));
+    for (let px = 0; px < off.width; px++) {
+      const st = STALE_MIN * Math.pow(STALE_MAX / STALE_MIN, px / (off.width - 1));
+      const ratio = log10(score(cost, st) / fr);
+      let t = 0.5 + ratio * 0.6; if (t < 0) t = 0; if (t > 1) t = 1;
+      const near = Math.abs(ratio) < 0.03;
+      const [r, g, bb] = heatColor(t);
+      const o = (py * off.width + px) * 4;
+      d[o] = near ? 30 : r; d[o+1] = near ? 34 : g; d[o+2] = near ? 40 : bb; d[o+3] = 255;
+    }
+  }
+  octx.putImageData(img, 0, 0);
+  ctx.drawImage(off, L, T, pw, ph);
+
+  const ink = css('--screen-ink');
+  ctx.fillStyle = ink; ctx.font = '12px system-ui';
+  const sx = st => L + (log10(st) - log10(STALE_MIN)) / (log10(STALE_MAX) - log10(STALE_MIN)) * pw;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  AGE_TICKS.forEach(([d0, lab]) => ctx.fillText(lab, sx(d0), T + ph + 17));
+  const sy = cost => T + ph - (log10(cost) - log10(COST_MIN)) / (log10(COST_MAX) - log10(COST_MIN)) * ph;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+  [[0.1,'0.1 s'],[1,'1 s'],[10,'10 s'],[100,'100 s'],[600,'600 s']]
+    .forEach(([cost, lab]) => ctx.fillText(lab, L - 8, sy(cost)));
+  ctx.strokeStyle = css('--screen-line'); ctx.lineWidth = 1; ctx.strokeRect(L, T, pw, ph);
+  ctx.save(); ctx.translate(15, T + ph / 2); ctx.rotate(-Math.PI / 2);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillStyle = ink; ctx.fillText('cost.actual  (expensive ↑)', 0, 0); ctx.restore();
+  ctx.textAlign = 'center'; ctx.textBaseline = 'alphabetic';
+  ctx.fillText('time since last read →', L + pw / 2, H - 8);
+}
+
+function fmtAge(d) {
+  if (d < 1/24) return (d * 24 * 60).toFixed(0) + ' min';
+  if (d < 1)    return (d * 24).toFixed(1) + ' hr';
+  if (d < 60)   return d.toFixed(1) + ' d';
+  if (d < 365)  return (d / 30.44).toFixed(1) + ' mo';
+  return (d / 365).toFixed(1) + ' yr';
+}
+
+function drawProbe() {
+  if (probeStale === null) {
+    $('probe').innerHTML = '<span style="opacity:.75">Hover the chart to read each cost’s ' +
+      'standing at a given age.</span>';
+    return;
+  }
+  const fr = frontierScore();
+  const parts = COST.map((cost, k) => {
+    const r = score(cost, probeStale) / fr;
+    const cls = r >= 1 ? 'kept' : 'gone';
+    const txt = r >= 1 ? 'kept' : 'evicted';
+    return `${COSTLBL[k]}: <b>${r >= 100 || r < 0.01 ? r.toExponential(1) : r.toPrecision(2)}×</b> <span class="${cls}">${txt}</span>`;
+  });
+  $('probe').innerHTML = `<b>Unread ${fmtAge(probeStale)}</b> — ` + parts.join(' · ');
+}
+
+function tell() {
+  $('takeaway').innerHTML =
+    '<b>Reading it:</b> in log space the score is <code>log(score) = a·log(cost.actual) − ' +
+    'b·log(stale + s₀)</code>. Cost enters only as a vertical offset, so the curves are ' +
+    '<b>exactly parallel and never cross one another</b> — <code>a</code> sets their spacing, ' +
+    '<code>b</code> their shared slope. They cross the <i>frontier</i>, not each other, and the ' +
+    'legend names the age where each one does.<br><br>' +
+    '<b>What that shows at the defaults:</b> most curves never cross at all — the cheap ones sit ' +
+    'below the line at every age and the expensive ones stay above it at every age. That is the ' +
+    'policy working as intended, not a flat chart: with cost weighted at <code>a</code> = 1.8, a ' +
+    '600 s render outranks a 1 s render no matter how long it has gone unread. Only the middle of ' +
+    'the cost range is genuinely contested. Widen the contest by lowering <code>a</code> — at ' +
+    '<code>a</code> = 0.5 four of the five costs cross within three years — or raise ' +
+    '<b>budget pressure</b>, which lifts the frontier through the whole family at once. ' +
+    '<code>b</code> and <code>s₀</code> move the crossing ages without changing who is contested.';
+}
+
+function redraw() { readControls(); drawCurves(); drawHeat(); drawProbe(); }
+
+['a','b','s0','cut'].forEach(id => $(id).addEventListener('input', redraw));
+
+const curvesEl = $('curves');
+curvesEl.addEventListener('mousemove', ev => {
+  const box = curvesEl.__box; if (!box) return;
+  const r = curvesEl.getBoundingClientRect();
+  const x = ev.clientX - r.left;
+  if (x < box.L || x > box.L + box.pw) { probeStale = null; }
+  else {
+    const f = (x - box.L) / box.pw;
+    probeStale = STALE_MIN * Math.pow(STALE_MAX / STALE_MIN, f);
+  }
+  drawCurves(); drawProbe();
+});
+curvesEl.addEventListener('mouseleave', () => { probeStale = null; drawCurves(); drawProbe(); });
+
+new ResizeObserver(() => redraw()).observe(document.querySelector('.plots'));
+matchMedia('(prefers-color-scheme:dark)').addEventListener('change', redraw);
+new MutationObserver(redraw).observe(document.documentElement,
+  { attributes: true, attributeFilter: ['data-theme'] });
+
+tell();
+redraw();
+</script>
+
+</body>
+</html>

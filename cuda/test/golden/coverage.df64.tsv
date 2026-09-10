@@ -1,0 +1,85 @@
+# golden expected-verdicts  suite=coverage  precision=df64
+# Committed source-of-truth (lockfile-style): each cell -> EXPECTED PASS/FAIL under
+# the uniform gate (corr>=0.9999 AND sum_ratio in [0.999,1.001]) plus its seed
+# corr/sum_ratio. df64 is the clean parity baseline: it matches the CPU oracle on
+# ALL 74 cells. cov_curved_det_on PASSES (a trailing zero-arg -curved_det is
+# honored by both sides). curved_stress -- a short-lambda curved-detector case that
+# previously sat just past the flux gate (sum_ratio ~0.997) -- now PASSES: the df64
+# curved path carries the detector rotation angle and its sin/cos in df pairs,
+# restoring the flux into the gate (sum_ratio ~1.0005).
+# A verdict FLIP vs this file is the regression signal; regenerate deliberately.
+# cell	verdict	corr	sum_ratio
+baseline	PASS	1.0000000	1.000000
+cov_Na_10	PASS	1.0000000	1.000000
+cov_Na_1000	PASS	1.0000000	1.000000
+cov_Nb_10	PASS	1.0000000	1.000000
+cov_Nb_1000	PASS	1.0000000	1.000000
+cov_Nc_10	PASS	1.0000000	1.000000
+cov_Nc_1000	PASS	1.0000000	0.999999
+cov_mosaic_0.5	PASS	1.0000000	1.000000
+cov_mosaic_1.0	PASS	1.0000000	1.000000
+cov_mosaic_90	PASS	1.0000000	1.000000
+cov_mosaic_domains_10	PASS	1.0000000	1.000000
+cov_mosaic_domains_20	PASS	1.0000000	1.000000
+cov_mosaic_domains_100	PASS	1.0000000	1.000000
+cov_default_F_100	PASS	1.0000000	1.000000
+cov_lambda_1.0	PASS	1.0000000	1.000000
+cov_lambda_1.1	PASS	1.0000000	1.000000
+cov_lambda_0.31	PASS	1.0000000	1.000000
+cov_polar_0.9	PASS	1.0000000	1.000000
+cov_polar_1.0	PASS	1.0000000	1.000000
+cov_dispersion_2	PASS	1.0000000	1.000000
+cov_dispersion_5	PASS	1.0000000	1.000000
+cov_dispsteps_9	PASS	1.0000000	1.000000
+cov_dispsteps_15	PASS	1.0000000	1.000000
+cov_hdivrange_40	PASS	1.0000000	1.000000
+cov_hdivrange_100	PASS	1.0000000	1.000000
+cov_vdivrange_40	PASS	1.0000000	1.000000
+cov_vdivrange_100	PASS	1.0000000	1.000000
+cov_hdivsteps_5	PASS	1.0000000	1.000000
+cov_hdivsteps_7	PASS	1.0000000	1.000000
+cov_vdivsteps_5	PASS	1.0000000	1.000000
+cov_vdivsteps_7	PASS	1.0000000	1.000000
+cov_dmin_1.3	PASS	1.0000000	1.000000
+cov_dmin_2.0	PASS	1.0000000	1.000000
+cov_oversample_4	PASS	1.0000000	0.999927
+cov_oversample_8	PASS	1.0000000	0.999935
+cov_phi_45	PASS	1.0000000	1.000000
+cov_phi_90	PASS	1.0000000	1.000000
+cov_osc_0.1	PASS	1.0000000	1.000000
+cov_osc_1.0	PASS	1.0000000	1.000000
+cov_phisteps_10	PASS	1.0000000	1.000000
+cov_phisteps_20	PASS	1.0000000	1.000000
+cov_distance_150	PASS	1.0000000	1.000000
+cov_distance_300	PASS	1.0000000	1.000000
+cov_pixel_0.075	PASS	1.0000000	1.000000
+cov_pixel_0.1	PASS	1.0000000	1.000000
+cov_twotheta_20	PASS	1.0000000	1.000000
+cov_twotheta_45	PASS	1.0000000	1.000000
+cov_water_1	PASS	1.0000000	1.000000
+cov_water_10	PASS	1.0000000	1.000000
+cov_shape_round	PASS	1.0000000	1.000013
+cov_convention_xds	PASS	1.0000000	1.000000
+cov_convention_adxv	PASS	1.0000000	1.000000
+cov_convention_denzo	PASS	1.0000000	1.000000
+cov_convention_dials	PASS	1.0000000	1.000000
+cov_pivot_sample	PASS	1.0000000	1.000000
+cov_point_pixel_on	PASS	1.0000000	1.000000
+cov_curved_det_on	PASS	0.9999999	0.999959
+cov_nopolar_off	PASS	1.0000000	1.000000
+cov_detector_rot_small	PASS	1.0000000	1.000000
+cov_detector_rot_large	PASS	1.0000000	1.000000
+offbeam	PASS	1.0000000	1.000001
+custom_basis	PASS	1.0000000	1.000000
+powder	PASS	1.0000000	1.000000
+flat_control	PASS	1.0000000	0.999931
+curved_stress	PASS	1.0000000	1.000461
+cancellation	PASS	0.9999999	1.000170
+extreme_geom	PASS	1.0000000	1.000057
+thick_main	PASS	1.0000000	0.999593
+feat_energy	PASS	1.0000000	1.000000
+feat_roi	PASS	1.0000000	1.000000
+feat_nonsquare	PASS	1.0000000	1.000000
+feat_xds_orgxy	PASS	1.0000000	1.000000
+feat_xyclose	PASS	1.0000000	1.000000
+feat_closedist	PASS	1.0000000	1.000000

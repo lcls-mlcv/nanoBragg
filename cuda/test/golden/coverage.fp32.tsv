@@ -1,0 +1,84 @@
+# golden expected-verdicts  suite=coverage  precision=fp32
+# Committed source-of-truth (lockfile-style): each cell -> EXPECTED PASS/FAIL under
+# the uniform gate (corr>=0.9999 AND sum_ratio in [0.999,1.001]) plus its seed
+# corr/sum_ratio. fp32 legitimately misses the gate on precision-heavy cells (large
+# N, short lambda, cancellation, the stress geometry). Curved detector: a trailing
+# zero-arg -curved_det is now honored, so cov_curved_det_on PASSES; curved_stress
+# FAILS on a short-lambda geometry-input precision edge (flux ~0.3% past the gate),
+# NOT a curved-detector geometry defect. A verdict FLIP vs this file is the
+# regression signal; regenerate deliberately and review the diff, like cells/.
+# cell	verdict	corr	sum_ratio
+baseline	PASS	0.9999993	0.999853
+cov_Na_10	PASS	0.9999999	1.000335
+cov_Na_1000	FAIL	0.9999992	0.996333
+cov_Nb_10	PASS	0.9999995	0.999818
+cov_Nb_1000	PASS	0.9999747	1.000313
+cov_Nc_10	PASS	0.9999993	0.999898
+cov_Nc_1000	PASS	0.9999990	0.999996
+cov_mosaic_0.5	PASS	0.9999999	1.000045
+cov_mosaic_1.0	PASS	0.9999999	0.999975
+cov_mosaic_90	PASS	1.0000000	1.000063
+cov_mosaic_domains_10	PASS	0.9999993	0.999853
+cov_mosaic_domains_20	PASS	0.9999993	0.999853
+cov_mosaic_domains_100	PASS	0.9999993	0.999853
+cov_default_F_100	PASS	0.9999998	0.999874
+cov_lambda_1.0	PASS	1.0000000	0.999858
+cov_lambda_1.1	PASS	0.9999999	1.000350
+cov_lambda_0.31	FAIL	0.9999958	0.998122
+cov_polar_0.9	PASS	0.9999992	0.999844
+cov_polar_1.0	PASS	0.9999992	0.999843
+cov_dispersion_2	PASS	1.0000000	1.000542
+cov_dispersion_5	PASS	1.0000000	0.999871
+cov_dispsteps_9	PASS	0.9999993	0.999853
+cov_dispsteps_15	PASS	0.9999993	0.999853
+cov_hdivrange_40	PASS	0.9999998	0.999002
+cov_hdivrange_100	PASS	0.9999999	1.000021
+cov_vdivrange_40	PASS	0.9999985	1.000093
+cov_vdivrange_100	PASS	1.0000000	0.999905
+cov_hdivsteps_5	PASS	0.9999999	0.999779
+cov_hdivsteps_7	PASS	0.9999983	1.000252
+cov_vdivsteps_5	PASS	0.9999998	1.000207
+cov_vdivsteps_7	PASS	0.9999997	0.999874
+cov_dmin_1.3	PASS	0.9999993	0.999853
+cov_dmin_2.0	PASS	0.9999989	0.999773
+cov_oversample_4	PASS	0.9999999	0.999959
+cov_oversample_8	PASS	1.0000000	0.999905
+cov_phi_45	PASS	1.0000000	1.000206
+cov_phi_90	PASS	0.9999993	0.999853
+cov_osc_0.1	PASS	0.9999996	0.999486
+cov_osc_1.0	PASS	1.0000000	0.999545
+cov_phisteps_10	PASS	0.9999998	0.999869
+cov_phisteps_20	PASS	0.9999998	0.999962
+cov_distance_150	PASS	1.0000000	1.000027
+cov_distance_300	PASS	1.0000000	1.000138
+cov_pixel_0.075	PASS	1.0000000	1.000018
+cov_pixel_0.1	PASS	0.9999993	0.999982
+cov_twotheta_20	PASS	0.9999999	0.999865
+cov_twotheta_45	PASS	0.9999999	1.000683
+cov_water_1	PASS	0.9999993	0.999853
+cov_water_10	PASS	0.9999993	0.999864
+cov_shape_round	PASS	0.9999998	0.999266
+cov_convention_xds	PASS	0.9999999	0.999810
+cov_convention_adxv	PASS	0.9999999	0.999810
+cov_convention_denzo	PASS	0.9999998	0.999843
+cov_convention_dials	PASS	0.9999999	0.999810
+cov_pivot_sample	PASS	0.9999993	0.999853
+cov_point_pixel_on	PASS	0.9999993	0.999865
+cov_curved_det_on	PASS	0.9999993	1.000139
+cov_nopolar_off	PASS	0.9999993	0.999864
+cov_detector_rot_small	PASS	0.9999998	0.999891
+cov_detector_rot_large	PASS	0.9999990	0.999490
+offbeam	PASS	1.0000000	0.999458
+custom_basis	PASS	0.9999998	0.999843
+powder	PASS	0.9999999	1.000031
+flat_control	FAIL	0.9825354	1.153570
+curved_stress	FAIL	0.9748349	0.959820
+cancellation	FAIL	0.9994239	0.993171
+extreme_geom	PASS	1.0000000	1.000051
+thick_main	PASS	0.9999996	0.999423
+feat_energy	PASS	1.0000000	0.999949
+feat_roi	PASS	0.9999989	0.999778
+feat_nonsquare	PASS	0.9999993	0.999853
+feat_xds_orgxy	PASS	0.9999996	0.999808
+feat_xyclose	PASS	0.9999993	0.999853
+feat_closedist	PASS	0.9999993	0.999853

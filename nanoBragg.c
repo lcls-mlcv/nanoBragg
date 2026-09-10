@@ -72,7 +72,7 @@ so detector distances should always be much larger than the crystal size
 /* read in text file into double arrays at provided addresses */
 size_t read_text_file(char *filename, size_t nargs, ... );
 
-/* cubic spline interpolation functions */
+/* cubic Lagrange polynomial interpolation functions (1D, 2D, 3D tensor product; not splines) */
 void polint(double *xa, double *ya, double x, double *y);
 void polin2(double *x1a, double *x2a, double **ya, double x1,double x2, double *y);
 void polin3(double *x1a, double *x2a, double *x3a, double ***ya, double x1,double x2, double x3, double *y);

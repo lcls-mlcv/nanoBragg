@@ -6,8 +6,6 @@ nanoBraggCUDA is a perfect-lattice nanocrystal diffraction simulator. This adapt
 
 The CUDA kernel is optimized for Kepler and Pascal architectures. nanoBraggCUDA is in the process of being updated to modern hardware and has been built and tested using CUDA 12.9 on the Rocky Linux 9 OS with an RTX 5090 GPU.
 
-**Conda / site-specific installs:** For a pinned **CUDA 12.2** conda environment (`nanobragg_cuda`), `CUDA_PATH`, linker layout (`lib` vs `lib64`), and host **GCC 12** requirements, see the repo root [INSTALL.md](../INSTALL.md).
-
 ## Executing Pre-Built Binaries
 After being built, the executable can be copied to other machines that have an NVIDIA GPU with NVIDIA drivers installed. While it is possible to install just the drivers, general practice is to follow the install instructions for the cuda-toolkit which include instructions for the nvidia-driver module. See NVIDIA CUDA Toolkit below.
 
@@ -16,9 +14,9 @@ Before building nanoBragg, ensure the following prerequisites are installed:
 
 ### NVIDIA CUDA Toolkit and Drivers
 - Required for GPU acceleration.
-- Download and installation instructions: [CUDA Downloads](https://developer.nvidia.com/cuda-downloads), or [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive) for older versions.
-- **Version:** This document’s default `CUDA_PATH` uses **CUDA 12.9** as one reference setup. Your driver must support the toolkit you install (see `nvidia-smi` **CUDA Version**). Other setups (e.g. **CUDA 12.2** via conda on S3DF Ampere) are documented in [INSTALL.md](../INSTALL.md).
-- Ensure you have an NVIDIA GPU with CUDA support (Compute Capability 5.0 or higher)
+- Download and installation instructions: [CUDA Downloads](https://developer.nvidia.com/cuda-downloads), or [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive) for older versions. 
+- Minimum version: CUDA 12.9. Your driver must support the toolkit you install (see `nvidia-smi` **CUDA Version**). Conda-based toolchains (e.g. CUDA 12.2 on S3DF Ampere, with `CUDA_PATH=$CONDA_PREFIX`) are documented in [INSTALL.md](../INSTALL.md).
+- Ensure you have an NVIDIA GPU with CUDA support (Compute Capability 6.1 or higher)
 
 ### GCC/G++ Compiler
 - Required for compiling C/C++ and CUDA code.
@@ -28,15 +26,16 @@ Before building nanoBragg, ensure the following prerequisites are installed:
 
 ## Build Instructions
 
-The project uses a Makefile for building debug and release versions.
+`build.sh` (recommended) wraps the Makefile and stamps the git version into the binary; the `make` targets remain available directly.
 
 ### Common Steps
 1. Clone or download the repository.
-2. Ensure `CUDA_PATH` in the Makefile points to your CUDA installation (default: `/usr/local/cuda-12.9`), or export `CUDA_PATH` (e.g. to `$CONDA_PREFIX` for conda toolchains—see [INSTALL.md](../INSTALL.md)). Edit if necessary.
-3. Run `make` commands from the **`cuda/`** directory (the directory that contains this `Makefile`), not the git repository root unless you invoke `make -C cuda`.
+2. Ensure `CUDA_PATH` in the Makefile points to your CUDA installation (default: `/usr/local/cuda-12.9`). Edit if necessary.
+3. Recommended: from `cuda/`, run `./build.sh release` — it builds the release binary (`build/release/nanoBraggCUDA`) and stamps the git commit/branch/date into `-version`. To target specific hardware, pass `ARCH_FLAGS`, e.g. `./build.sh release ARCH_FLAGS='--generate-code=arch=compute_120,code=[compute_120,sm_120]'` (sm_120 / RTX 5090).
+4. Fallback: run `make` directly.
    - For both debug and release: `make all`
    - Debug only: `make debug` (outputs to `build/debug/nanoBraggCUDA`)
-   - Release only: `make release` (outputs to `build/release/nanoBraggCUDA`)
+   - Release only: `make release` (outputs to `build/release/nanoBraggCUDA`) — the same binary, but `-version` reports `unknown (built without version info)`.
    - Clean: `make clean`
 
 ## Run Tests
@@ -53,7 +52,7 @@ Test the optimized release version: `sh ./test/test_release.sh`
 ### Additional Hardware
 nanoBraggCUDA can be built for different NVIDIA hardware, though most configurations have not been tested. Use the Hardware Compatibility Matrix below to identify the Compute Capability for the graphics card, then find a CUDA SDK version that supports it. Next determine if the CUDA SDK version is supported on the target Operating System by following the instructions above for installing the NVIDIA CUDA Toolkit. Update the CUDA_PATH and the ARCH_FLAGS in the Makefile accordingly.
 
-The original CUDA kernel for nanoBraggCUDA was developed on and optimized for Kepler (Compute Capability 3.5) and Pascal (Compute Capability 6.1). Though the kernel should run on other hardware, it is not optimized for it. Ideally, a dedicated kernel should be written for each targeted Compute Capability.
+Previous versions of the CUDA kernel were written for Kepler (Compute Capability 3.5) and Pascal (Compute Capability 6.1). The repository has since been updated to target modern architectures and operating systems: the minimum supported hardware is now Compute Capability 6.1 and the minimum CUDA toolkit is 12.9. Though the kernel should run on any supported hardware, it is not tuned for every architecture. Ideally, a dedicated kernel should be written for each targeted Compute Capability.
 
 ### NVIDIA Hardware Compatibility Matrix
 https://en.wikipedia.org/wiki/CUDA#GPUs_supported
