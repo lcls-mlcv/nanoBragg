@@ -321,12 +321,17 @@ def set_structure_factors(
     indices,
     amplitudes,
     default_F: Optional[float] = None,
+    F000: Optional[float] = 0.0,
 ) -> None:
     """
     Load a P1 (h,k,l,F) list into ``crystal.hkl_data`` as the dense
     [h-h_min][k-k_min][l-l_min] box nanoBragg uses. Missing reflections take
     ``default_F`` (defaults to the crystal config's default_F). No symmetry
     expansion is applied; do that upstream (see structure_factors_from_miller_array).
+
+    Like ``nanoBragg.Fhkl_tuple`` in cctbx, the (0,0,0) entry is overwritten with
+    ``F000`` (cctbx default 0) when the box contains it; pass ``F000=None`` to keep
+    the loaded or default value instead.
     """
     idx = np.asarray(indices, dtype=np.int64).reshape(-1, 3)
     amp = np.asarray(amplitudes, dtype=np.float64).reshape(-1)
@@ -342,6 +347,8 @@ def set_structure_factors(
     hmax, kmax, lmax = (int(x) for x in idx.max(axis=0))
     grid = np.full((hmax - hmin + 1, kmax - kmin + 1, lmax - lmin + 1), default_F, dtype=np.float64)
     grid[idx[:, 0] - hmin, idx[:, 1] - kmin, idx[:, 2] - lmin] = amp
+    if F000 is not None and hmin <= 0 <= hmax and kmin <= 0 <= kmax and lmin <= 0 <= lmax:
+        grid[-hmin, -kmin, -lmin] = float(F000)
     crystal.hkl_data = torch.as_tensor(grid, device=crystal.device, dtype=crystal.dtype)
     crystal.hkl_metadata = {
         "h_min": hmin, "h_max": hmax, "k_min": kmin, "k_max": kmax, "l_min": lmin, "l_max": lmax,
@@ -420,7 +427,9 @@ def beam_config_from_dxtbx(
 ) -> BeamConfig:
     """
     BeamConfig from a dxtbx Beam: wavelength, polarization fraction (used as the
-    Kahn factor, as nanoBragg.cpp does) and polarization normal.
+    Kahn factor, as nanoBragg.cpp does) and polarization E-vector. dxtbx stores
+    the polarization *normal* (along B); nanoBragg.cpp converts it to the E-vector
+    with polar_vector = beam_vector × normal, and so does this function.
 
     ``spectrum`` is an optional list of (wavelength_Å, flux) pairs like
     ``NBbeam.spectrum``; each entry becomes a source along −unit_s0. Note that
@@ -435,7 +444,8 @@ def beam_config_from_dxtbx(
         kwargs["polarization_factor"] = frac
         kwargs["nopolar"] = not (0.0 < frac <= 1.0)
     if hasattr(beam, "get_polarization_normal"):
-        kwargs["polarization_axis"] = _as_tuple3(_unit(beam.get_polarization_normal()))
+        normal = _unit(beam.get_polarization_normal())
+        kwargs["polarization_axis"] = _as_tuple3(_unit(np.cross(_unit(_s0_of(beam)), normal)))
     if fluence is not None:
         kwargs["fluence"] = float(fluence)
     if flux is not None:
@@ -479,6 +489,7 @@ def simulator_from_dxtbx(
     miller_array=None,
     structure_factors: Optional[Tuple] = None,
     default_F: float = 0.0,
+    F000: Optional[float] = 0.0,
     oversample: int = -1,
     fluence: Optional[float] = None,
     spot_scale: float = 1.0,
@@ -491,7 +502,9 @@ def simulator_from_dxtbx(
     ``structure_factors`` is an (indices, amplitudes) pair for P1 data; or pass a
     cctbx ``miller_array`` and it is expanded with
     :func:`structure_factors_from_miller_array`. ``umats`` (M,3,3) uses explicit
-    mosaic blocks instead of sampling.
+    mosaic blocks instead of sampling. ``F000`` replaces the (0,0,0) structure
+    factor as cctbx does (default 0), with or without structure factors; pass
+    ``F000=None`` to leave F(0,0,0) at the loaded or default value.
     """
     panel = detector[panel_id] if hasattr(detector, "__getitem__") else detector
     s0 = _s0_of(beam)
@@ -505,8 +518,12 @@ def simulator_from_dxtbx(
     crystal_model = Crystal(cry_cfg, beam_config=beam_cfg, device=device, dtype=dtype)
     if miller_array is not None:
         structure_factors = structure_factors_from_miller_array(miller_array)
+    if structure_factors is None and F000 is not None:
+        # nanoBragg.cpp starts from a one-entry Fhkl box holding F000, so even without a
+        # miller array F(0,0,0) = F000 and every other reflection takes default_F.
+        structure_factors = (np.zeros((1, 3), dtype=np.int64), np.array([float(F000)]))
     if structure_factors is not None:
-        set_structure_factors(crystal_model, *structure_factors, default_F=default_F)
+        set_structure_factors(crystal_model, *structure_factors, default_F=default_F, F000=F000)
     if umats is not None:
         set_mosaic_blocks(crystal_model, umats)
     detector_model = Detector(det_cfg, device=device, dtype=dtype)
@@ -536,6 +553,10 @@ def simulator_from_sim_data(SIM, *, panel_id: Optional[int] = None, device=None,
     D = getattr(SIM, "D", None)
     if D is not None:
         kw["default_F"] = float(D.default_F)
+        try:
+            kw["F000"] = float(D.F000)
+        except Exception:
+            pass
         try:
             kw["oversample"] = int(D.oversample)
         except Exception:
@@ -596,6 +617,8 @@ def to_raw_pixels(image: torch.Tensor):
     arr = np.ascontiguousarray(image.detach().cpu().numpy().astype(np.float64))
     try:
         from scitbx.array_family import flex  # type: ignore
-        return flex.double(arr)
-    except Exception:
+    except ImportError:
         return arr
+    raw = flex.double(arr.ravel())
+    raw.reshape(flex.grid(*arr.shape))
+    return raw

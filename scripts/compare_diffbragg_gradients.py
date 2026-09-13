@@ -9,9 +9,16 @@ script builds one SimData, renders it with diffBragg and with the torch port via
 ``nanobrag_torch.compat.cctbx.simulator_from_sim_data``, then compares:
 
   * the forward images (Pearson r, sum ratio);
-  * d(image)/d(RotX, RotY, RotZ)  — diffBragg ids 0, 1, 2 (radians, lab axes,
-    convention A' = Rx·Ry·Rz·A);
+  * d(image)/d(RotX, RotY, RotZ)  — diffBragg ids 0, 1, 2 (radians, lab axes).
+    diffBragg's rotX/Y/Z_manager matrices are transposes of right-handed
+    rotations applied to the real-space basis, so diffBragg RotX = θ turns the
+    crystal by −θ; torch is evaluated at rotate_A(A, −θ) so the signs agree;
   * d(image)/d(Ncells)            — diffBragg id 9 (isotropic Na=Nb=Nc).
+
+diffBragg's CPU kernel always uses a Gaussian lattice with the radius measured
+in hkl space, det(NABC)·exp(−|NABC·ΔH|²/0.63), whatever xtal_shape says. The
+default --shape is therefore gauss; it only matches once the torch GAUSS metric
+can be switched to hkl space (torch follows bl831's reciprocal-space rad_star).
 
 For each parameter the torch gradient is obtained with autograd on the summed
 image, and per-pixel with a finite difference of the torch model as a sanity
@@ -32,10 +39,11 @@ import numpy as np
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 os.environ.setdefault("NANOBRAGG_DISABLE_COMPILE", "1")
+# cctbx's OpenMP runtime and torch's deadlock in one process unless one side is single threaded
+os.environ.setdefault("OMP_NUM_THREADS", "1")
 
 
 def build_sim(args):
-    from simtbx.nanoBragg import shapetype
     from simtbx.nanoBragg.sim_data import SimData
     from simtbx.nanoBragg.nanoBragg_crystal import NBcrystal
     from scitbx.matrix import sqr
@@ -56,7 +64,9 @@ def build_sim(args):
     nb.mos_spread_deg = 0
     nb.thick_mm = 0.01
     nb.Ncells_abc = (args.ncells,) * 3
-    nb.xtal_shape = {"square": shapetype.Square, "round": shapetype.Round, "gauss": shapetype.Gauss}[args.shape]
+    nb.miller_array = None  # constant default_F on both sides
+    # NBcrystal's setter takes lower-case names; a shapetype enum silently becomes Tophat
+    nb.xtal_shape = args.shape
     SIM = SimData(use_default_crystal=True)
     SIM.detector = SimData.simple_detector(args.distance, args.pixel, (args.detpixels, args.detpixels))
     SIM.crystal = nb
@@ -74,8 +84,10 @@ def diffbragg_forward_and_derivs(SIM, param_ids):
         D.set_value(pid, 0.0)
     D.raw_pixels_roi *= 0
     D.add_diffBragg_spots()
-    img = D.raw_pixels_roi.as_numpy_array().copy()
-    derivs = {pid: D.get_derivative_pixels(pid).as_numpy_array().copy() for pid in param_ids}
+    fast, slow = SIM.detector[0].get_image_size()
+    # raw_pixels_roi and the derivative pixels are flat (slow-major) flex arrays
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+    derivs = {pid: D.get_derivative_pixels(pid).as_numpy_array().reshape(slow, fast).copy() for pid in param_ids}
     return img, derivs
 
 
@@ -83,6 +95,7 @@ def torch_forward_and_derivs(SIM, args):
     import torch
     from nanobrag_torch.compat.cctbx import (
         crystal_config_from_A, detector_config_from_dxtbx_panel, beam_config_from_dxtbx, rotate_A,
+        set_structure_factors,
     )
     from nanobrag_torch.models.crystal import Crystal as TCrystal
     from nanobrag_torch.models.detector import Detector as TDetector
@@ -99,13 +112,16 @@ def torch_forward_and_derivs(SIM, args):
     detector = TDetector(det_cfg, device=device, dtype=dtype)
 
     def image(rotx, roty, rotz, ncells):
-        A = rotate_A(A0, math.degrees(rotx) if not torch.is_tensor(rotx) else torch.rad2deg(rotx),
-                     math.degrees(roty) if not torch.is_tensor(roty) else torch.rad2deg(roty),
-                     math.degrees(rotz) if not torch.is_tensor(rotz) else torch.rad2deg(rotz))
+        # diffBragg's RotXYZ = θ is a −θ rotation in rotate_A's right-handed convention
+        A = rotate_A(A0, -math.degrees(rotx) if not torch.is_tensor(rotx) else -torch.rad2deg(rotx),
+                     -math.degrees(roty) if not torch.is_tensor(roty) else -torch.rad2deg(roty),
+                     -math.degrees(rotz) if not torch.is_tensor(rotz) else -torch.rad2deg(rotz))
         n = ncells if torch.is_tensor(ncells) else float(ncells)
         cfg = crystal_config_from_A(cell, A, Ncells_abc=(1, 1, 1), shape=args.shape, default_F=args.default_F)
         cfg.N_cells = (n, n, n)
         crystal = TCrystal(cfg, beam_config=beam_cfg, device=device, dtype=dtype)
+        # cctbx: F(0,0,0) = F000 (0), every other reflection default_F
+        set_structure_factors(crystal, np.zeros((1, 3), dtype=np.int64), [0.0], default_F=args.default_F)
         sim = Simulator(crystal, detector, crystal_config=cfg, beam_config=beam_cfg, device=device, dtype=dtype)
         return sim.run()
 
@@ -143,9 +159,9 @@ def report(name, ref, test, mask):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ucell", type=float, nargs=6, default=(70, 60, 50, 90.0, 110, 90.0))
-    p.add_argument("--symbol", default="C121")
+    p.add_argument("--symbol", default="P121")
     p.add_argument("--ncells", type=int, default=7)
-    p.add_argument("--shape", choices=["square", "round", "gauss"], default="square")
+    p.add_argument("--shape", choices=["square", "round", "gauss"], default="gauss")
     p.add_argument("--detpixels", type=int, default=256)
     p.add_argument("--pixel", type=float, default=0.1)
     p.add_argument("--distance", type=float, default=220.0)
@@ -168,7 +184,7 @@ def main():
 
     mask = db_img > 1e-3 * db_img.max()
     print("== forward image")
-    report("image", db_img, t_img, np.ones_like(mask))
+    report("image", db_img, t_img, np.ones_like(mask, dtype=bool))
     names = {0: "d/dRotX (rad)", 1: "d/dRotY (rad)", 2: "d/dRotZ (rad)", 9: "d/dNcells"}
     print("== per-pixel derivatives on Bragg pixels (torch central FD vs diffBragg analytic)")
     ok = True

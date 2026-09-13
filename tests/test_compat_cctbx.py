@@ -209,6 +209,10 @@ def test_structure_factor_box_lookup():
                                      torch.tensor([2.0, 0.0, 1.0, 5.0], dtype=torch.float64),
                                      torch.tensor([3.0, 4.0, 1.0, 5.0], dtype=torch.float64))
     assert F.tolist() == [10.0, 25.0, 7.0, 7.0]  # hit, hit, in-box gap -> default, out of box -> default
+    zero = torch.zeros(1, dtype=torch.float64)
+    assert crystal.get_structure_factor(zero, zero, zero).tolist() == [0.0]  # F000 = 0 like cctbx Fhkl_tuple
+    set_structure_factors(crystal, idx, amp, F000=None)
+    assert crystal.get_structure_factor(zero, zero, zero).tolist() == [7.0]
 
 
 def test_set_mosaic_blocks_is_used_and_counts_domains():
@@ -237,6 +241,8 @@ def test_beam_config_from_dxtbx_and_spectrum():
     cfg = beam_config_from_dxtbx(beam, spectrum=[(1.29, 0.5), (1.31, 1.5)], spot_scale=3.0)
     assert cfg.wavelength_A == pytest.approx(1.3)
     assert cfg.polarization_factor == pytest.approx(0.95)
+    # nanoBragg.cpp: E-vector = beam direction x dxtbx polarization normal
+    assert np.allclose(cfg.polarization_axis, (-1.0, 0.0, 0.0))
     assert cfg.spot_scale == 3.0
     assert cfg.source_directions.shape == (2, 3)
     assert np.allclose(cfg.source_directions.numpy(), [[0, 0, -1], [0, 0, -1]])  # sample -> source
@@ -261,7 +267,9 @@ def test_simulator_from_dxtbx_runs_and_spot_scale_is_linear():
     sim3 = simulator_from_dxtbx(det, beam, xtal, Ncells_abc=6, default_F=100.0, oversample=1, spot_scale=3.0)
     assert torch.allclose(sim3.run(), 3.0 * img)
     raw = to_raw_pixels(img)
-    assert np.asarray(raw).shape == (48, 64)
+    if hasattr(raw, "as_numpy_array"):  # scitbx flex.double when cctbx is importable
+        raw = raw.as_numpy_array()
+    assert raw.shape == (48, 64)
 
 
 def test_orientation_gradient_flows_through_rotate_A():
@@ -309,22 +317,40 @@ def test_multipanel_simulator_stacks_panels_and_shares_crystal():
 # --------------------------------------------------------------------------- #
 # real cctbx comparison (skipped unless cctbx/dxtbx importable)
 # --------------------------------------------------------------------------- #
-def test_against_simtbx_nanoBragg():
+_METRIC_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason="cctbx measures GAUSS/TOPHAT spot radius in hkl space; torch follows bl831's 2023 "
+           "reciprocal-space rad_star metric. Needs a spot-metric switch (audit Phase 3 item 13).",
+)
+
+
+@pytest.mark.parametrize(
+    "shape, ncells, mosaic, oversample, distance_mm",
+    [
+        ("square", (7, 7, 7), (1, 0.0), 1, 150.0),
+        ("round", (5, 9, 12), (1, 0.0), 1, 100.0),
+        ("square", (7, 7, 7), (10, 0.5), 1, 150.0),
+        ("square", (7, 7, 7), (1, 0.0), 3, 80.0),
+        pytest.param("gauss", (7, 7, 7), (1, 0.0), 1, 150.0, marks=_METRIC_XFAIL),
+        pytest.param("tophat", (7, 7, 7), (1, 0.0), 1, 150.0, marks=_METRIC_XFAIL),
+    ],
+)
+def test_against_simtbx_nanoBragg(shape, ncells, mosaic, oversample, distance_mm):
     pytest.importorskip("dxtbx", reason="cctbx/dxtbx not installed")
-    from simtbx.nanoBragg import nanoBragg, shapetype  # type: ignore
+    pytest.importorskip("simtbx.nanoBragg.sim_data", reason="simtbx not built in this cctbx")
     from simtbx.nanoBragg.sim_data import SimData  # type: ignore
     from simtbx.nanoBragg.nanoBragg_crystal import NBcrystal  # type: ignore
     from nanobrag_torch.compat.cctbx import simulator_from_sim_data
 
     nb = NBcrystal(init_defaults=True)
-    nb.n_mos_domains = 1
-    nb.mos_spread_deg = 0
-    nb.xtal_shape = shapetype.Square
-    nb.Ncells_abc = (7, 7, 7)
+    nb.n_mos_domains, nb.mos_spread_deg = mosaic
+    # NBcrystal's setter takes lower-case names; a shapetype enum silently becomes Tophat
+    nb.xtal_shape = shape
+    nb.Ncells_abc = ncells
     SIM = SimData(use_default_crystal=True)
-    SIM.detector = SimData.simple_detector(150, 0.1, (256, 256))
+    SIM.detector = SimData.simple_detector(distance_mm, 0.1, (256, 256))
     SIM.crystal = nb
-    SIM.instantiate_nanoBragg(oversample=1, verbose=0, interpolate=0, default_F=100.0)
+    SIM.instantiate_nanoBragg(oversample=oversample, verbose=0, interpolate=0, default_F=100.0)
     SIM.D.add_nanoBragg_spots()
     ref = SIM.D.raw_pixels.as_numpy_array()
 
@@ -332,5 +358,37 @@ def test_against_simtbx_nanoBragg():
     img = sim.run().numpy()
     assert img.shape == ref.shape
     corr = np.corrcoef(ref.ravel(), img.ravel())[0, 1]
-    assert corr > 0.999, corr
-    assert img.sum() == pytest.approx(ref.sum(), rel=2e-2)
+    assert corr > 0.99999, corr
+    assert img.sum() == pytest.approx(ref.sum(), rel=1e-4)
+
+
+def test_against_simtbx_nanoBragg_rotated_monoclinic_without_miller_array():
+    """Non-diagonal A, arbitrary U and no structure factors: cctbx still sets F(0,0,0) = F000."""
+    pytest.importorskip("dxtbx", reason="cctbx/dxtbx not installed")
+    pytest.importorskip("simtbx.nanoBragg.sim_data", reason="simtbx not built in this cctbx")
+    from cctbx import uctbx  # type: ignore
+    from dxtbx.model import Crystal as DxtbxCrystal  # type: ignore
+    from scitbx.matrix import col, sqr  # type: ignore
+    from simtbx.nanoBragg.sim_data import SimData  # type: ignore
+    from simtbx.nanoBragg.nanoBragg_crystal import NBcrystal  # type: ignore
+    from nanobrag_torch.compat.cctbx import simulator_from_sim_data
+
+    a, b, c = sqr(uctbx.unit_cell((70, 60, 50, 90, 110, 90)).orthogonalization_matrix()).transpose().as_list_of_lists()
+    xtal = DxtbxCrystal(a, b, c, "P121")
+    xtal.set_U(col((1, 2, 3)).normalize().axis_and_angle_as_r3_rotation_matrix(0.4))
+    nb = NBcrystal(init_defaults=True)
+    nb.dxtbx_crystal = xtal
+    nb.n_mos_domains, nb.mos_spread_deg = 1, 0.0
+    nb.xtal_shape = "square"
+    nb.Ncells_abc = (7, 7, 7)
+    nb.miller_array = None
+    SIM = SimData(use_default_crystal=True)
+    SIM.detector = SimData.simple_detector(150.0, 0.1, (256, 256))
+    SIM.crystal = nb
+    SIM.instantiate_nanoBragg(oversample=1, verbose=0, interpolate=0, default_F=1000.0)
+    SIM.D.add_nanoBragg_spots()
+    ref = SIM.D.raw_pixels.as_numpy_array()
+
+    img = simulator_from_sim_data(SIM, dtype=torch.float64).run().numpy()
+    assert np.corrcoef(ref.ravel(), img.ravel())[0, 1] > 0.99999
+    assert img.sum() == pytest.approx(ref.sum(), rel=1e-4)
