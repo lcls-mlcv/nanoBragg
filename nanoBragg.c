@@ -740,7 +740,7 @@ int main(int argc, char** argv)
 //            {
 //              source_distance = atof(argv[i+1])/1000.0;
 //            }
-            if(strstr(argv[i], "-detector_abs") && (argc >= (i+1)))
+            if(strstr(argv[i], "-detector_abs") && (argc > (i+1)))
             {
                 if(strstr(argv[i+1], "inf") || atof(argv[i+1]) == 0.0) {
                     detector_thick = 0.0;
@@ -749,15 +749,15 @@ int main(int argc, char** argv)
                     detector_mu = 1.0/(atof(argv[i+1])*1e-6);
                 }
             }
-            if(strstr(argv[i], "-detector_thick") && (strlen(argv[i]) == 15) && (argc >= (i+1)))
+            if(strstr(argv[i], "-detector_thick") && (strlen(argv[i]) == 15) && (argc > (i+1)))
             {
                  detector_thick = atof(argv[i+1])*1e-6;
             }
-            if(strstr(argv[i], "-detector_thicksteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-detector_thicksteps") && (argc > (i+1)))
             {
                 detector_thicksteps = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-thicksteps") && (argc >= (i+1)))
+            if(strstr(argv[i], "-thicksteps") && (argc > (i+1)))
             {
                 detector_thicksteps = atoi(argv[i+1]);
             }
@@ -803,7 +803,7 @@ int main(int argc, char** argv)
             {
                 spixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-curved_det") && (argc > (i+1)))
+            if(strstr(argv[i], "-curved_det"))
             {
                 curved_detector = 1;
             }
