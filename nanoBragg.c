@@ -3020,12 +3020,14 @@ if(! debug_printed_thread) {
                                     /* now we have the structure factor for this pixel */
 
                                     /* convert amplitudes into intensity (photons per steradian) */
-                                    I += F_cell*F_cell*F_latt*F_latt;
+                                    double I_contribution = F_cell*F_cell*F_latt*F_latt;
                                     
                                     /* only do this if we need to */
-                                    if(oversample_thick) I *= capture_fraction;
-                                    if(oversample_polar) I *= polar;
-                                    if(oversample_omega) I *= omega_pixel;
+                                    if(oversample_thick) I_contribution *= capture_fraction;
+                                    if(oversample_polar) I_contribution *= polar;
+                                    if(oversample_omega) I_contribution *= omega_pixel;
+
+                                    I += I_contribution;
                                 }
                                 /* end of mosaic loop */
                             }
