@@ -2787,6 +2787,16 @@ if(! debug_printed_thread) {
                                     rotate_axis(b0,bp,spindle_vector,phi);
                                     rotate_axis(c0,cp,spindle_vector,phi);
                                 }
+                                else
+                                {
+                                    /* phi==0: skip the (identity) rotation, but reset ap/bp/cp to the
+                                       unrotated cell vectors. They are firstprivate and persist across
+                                       pixels, so without this they reuse the previous iteration's rotated
+                                       values (a thread-order-dependent stale read). Mirrors the mosaic reset below. */
+                                    ap[1]=a0[1];ap[2]=a0[2];ap[3]=a0[3];
+                                    bp[1]=b0[1];bp[2]=b0[2];bp[3]=b0[3];
+                                    cp[1]=c0[1];cp[2]=c0[2];cp[3]=c0[3];
+                                }
 
                                 /* enumerate mosaic domains */
                                 for(mos_tic=0;mos_tic<mosaic_domains;++mos_tic)
