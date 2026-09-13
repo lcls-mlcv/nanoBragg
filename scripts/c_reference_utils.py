@@ -88,9 +88,12 @@ def build_nanobragg_command(
     cmd += ["-default_F", _fmm(cc.default_F)]
 
     if cc.misset_random:
-        cmd += ["-misset", "random"]
+        # -misset_seed must precede -misset random: nanoBragg.c matches flags with strstr(),
+        # so a later "-misset_seed N" also hits the "-misset" branch and replaces the random
+        # orientation with fixed angles (N, next arg, next-but-one arg).
         if cc.misset_seed is not None:
             cmd += ["-misset_seed", str(int(cc.misset_seed))]
+        cmd += ["-misset", "random"]
     else:
         mx, my, mz = cc.misset_deg
         if abs(mx) + abs(my) + abs(mz) > 0.0:
