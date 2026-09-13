@@ -437,6 +437,88 @@ def determine_beam_center_source(args: argparse.Namespace, config: Dict[str, Any
     return "auto"
 
 
+# The parts of nanoBragg.c's argv parser that touch detector_pivot or the
+# convention, in the order C tests them for each argument. C matches with
+# strstr(), so e.g. "-twotheta" also fires for "-twotheta_axis" and
+# "-pix0_vector" for "-pix0_vector_mm". Actions: ('pivot', P) sets the pivot
+# when a value follows, ('convention', C, P) sets both, ('custom',) switches to
+# the CUSTOM convention, ('pivot_flag',) reads the -pivot value.
+_C_PIVOT_PARSER = (
+    ('-Xbeam', ('pivot', 'BEAM')), ('-Ybeam', ('pivot', 'BEAM')),
+    ('-Xclose', ('pivot', 'SAMPLE')), ('-Yclose', ('pivot', 'SAMPLE')),
+    ('-ORGX', ('pivot', 'SAMPLE')), ('-ORGY', ('pivot', 'SAMPLE')),
+    ('-pivot', ('pivot_flag',)),
+    ('-mosflm', ('convention', 'MOSFLM', 'BEAM')), ('-xds', ('convention', 'XDS', 'SAMPLE')),
+    ('-adxv', ('convention', 'ADXV', 'BEAM')), ('-denzo', ('convention', 'DENZO', 'BEAM')),
+    ('-dials', ('convention', 'DIALS', 'BEAM')),
+    ('-fdet_vector', ('custom',)), ('-sdet_vector', ('custom',)), ('-odet_vector', ('custom',)),
+    ('-beam_vector', ('custom',)), ('-polar_vector', ('custom',)), ('-spindle_axis', ('custom',)),
+    ('-twotheta_axis', ('custom',)), ('-pix0_vector', ('custom',)),
+    ('-distance', ('pivot', 'BEAM')), ('-close_distance', ('pivot', 'SAMPLE')),
+    ('-twotheta', ('pivot', 'SAMPLE')),
+)
+_NAMESPACE_FLAG_ATTRS = {
+    '-Xbeam': 'Xbeam', '-Ybeam': 'Ybeam', '-Xclose': 'Xclose', '-Yclose': 'Yclose',
+    '-ORGX': 'ORGX', '-ORGY': 'ORGY', '-distance': 'distance', '-close_distance': 'close_distance',
+    '-twotheta': 'twotheta', '-twotheta_axis': 'twotheta_axis',
+    '-fdet_vector': 'fdet_vector', '-sdet_vector': 'sdet_vector', '-odet_vector': 'odet_vector',
+    '-beam_vector': 'beam_vector', '-polar_vector': 'polar_vector', '-spindle_axis': 'spindle_axis',
+    '-pix0_vector': 'pix0_vector', '-pix0_vector_mm': 'pix0_vector_mm',
+}
+
+
+def resolve_detector_pivot(args: argparse.Namespace) -> str:
+    """
+    Detector pivot exactly as nanoBragg.c chooses it.
+
+    C walks argv once and every pivot-affecting flag overwrites detector_pivot
+    (last one wins). After parsing, the convention block forces BEAM for MOSFLM,
+    DENZO and ADXV and SAMPLE for XDS and DIALS, so those flags (and -pivot)
+    only matter under the CUSTOM convention. For example
+    ``-twotheta 10 -pivot sample`` still pivots around the beam spot under the
+    default MOSFLM convention.
+
+    The argv order is taken from ``args._argv`` (set by main()); without it the
+    flags present in the namespace are replayed in a fixed order.
+    """
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        argv = ['-' + args.convention.lower()] if args.convention else []
+        for flag, attr in _NAMESPACE_FLAG_ATTRS.items():
+            if getattr(args, attr, None) is not None:
+                argv += [flag, '0']
+        if args.pivot:
+            argv += ['-pivot', args.pivot]
+
+    convention, pivot = 'MOSFLM', 'BEAM'
+    for i, token in enumerate(argv):
+        if not token.startswith('-'):
+            continue
+        value = argv[i + 1] if i + 1 < len(argv) else None
+        for flag, action in _C_PIVOT_PARSER:
+            if flag not in token:
+                continue
+            if action[0] == 'convention':
+                convention, pivot = action[1], action[2]
+            elif action[0] == 'custom':
+                convention = 'CUSTOM'
+            elif value is None:
+                continue
+            elif action[0] == 'pivot_flag':
+                if 'sample' in value:
+                    pivot = 'SAMPLE'
+                if 'beam' in value:
+                    pivot = 'BEAM'
+            else:
+                pivot = action[1]
+
+    if convention in ('MOSFLM', 'DENZO', 'ADXV'):
+        return 'BEAM'
+    if convention in ('XDS', 'DIALS'):
+        return 'SAMPLE'
+    return pivot
+
+
 def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     """Parse and validate command-line arguments into configuration."""
 
@@ -512,37 +594,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     else:
         config['convention'] = 'MOSFLM'  # Default
 
-    # Pivot mode precedence
-    # First set default pivot based on convention (per spec)
-    pivot = None
-    convention = config['convention']
-    if convention in ['MOSFLM', 'DENZO', 'ADXV']:
-        # These conventions default to BEAM pivot
-        pivot = 'BEAM'
-    elif convention in ['XDS', 'DIALS']:
-        # These conventions default to SAMPLE pivot
-        pivot = 'SAMPLE'
-
-    # Then apply flag-based overrides
-    if args.distance and not args.close_distance:
-        pivot = 'BEAM'
-    elif args.close_distance:
-        pivot = 'SAMPLE'
-
-    if args.Xbeam is not None or args.Ybeam is not None:
-        pivot = 'BEAM'
-    elif any([args.Xclose is not None, args.Yclose is not None,
-              args.ORGX is not None, args.ORGY is not None]):
-        pivot = 'SAMPLE'
-
-    # C-code line 786: -twotheta sets detector_pivot = SAMPLE (even if twotheta=0)
-    if args.twotheta is not None:
-        pivot = 'SAMPLE'
-
-    if args.pivot:  # Explicit override wins
-        pivot = args.pivot.upper()
-
-    config['pivot'] = pivot
+    config['pivot'] = resolve_detector_pivot(args)
 
     # Detector parameters
     config['pixel_size_mm'] = args.pixel if args.pixel else 0.1
@@ -881,6 +933,7 @@ def main():
     # Parse arguments
     parser = create_parser()
     args = parser.parse_args()
+    args._argv = sys.argv[1:]  # nanoBragg.c resolves the pivot from flag order
 
     try:
         # Parse dtype and device early (DTYPE-DEFAULT-001)

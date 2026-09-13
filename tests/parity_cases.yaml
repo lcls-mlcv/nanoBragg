@@ -591,3 +591,78 @@ cases:
           -distance 10000
           -pixel 0.2
           -detpixels 256
+
+  - id: PARITY-PIVOT-001
+    description: >-
+      Detector pivot selection and pre-twotheta beam·odet ratio (C ↔ PyTorch).
+      nanoBragg.c overwrites the pivot in argv order, then forces BEAM for MOSFLM/DENZO/ADXV
+      and SAMPLE for XDS/DIALS; only CUSTOM keeps the parsed pivot. ratio = beam·odet is
+      taken after rotx/y/z but before the twotheta swing (nanoBragg.c:1709-1713).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: mosflm-twotheta-beam-pivot
+        extra_args: >-
+          -distance 100
+          -twotheta 10
+      - name: mosflm-pivot-sample-ignored
+        extra_args: >-
+          -distance 100
+          -twotheta 10
+          -pivot sample
+      - name: mosflm-close-distance-twotheta-rotations
+        extra_args: >-
+          -close_distance 95
+          -detector_rotx 3
+          -detector_roty 2
+          -twotheta 12
+      - name: xds-twotheta-sample-pivot
+        extra_args: >-
+          -xds
+          -distance 100
+          -twotheta 10
+      - name: dials-pivot-beam-ignored
+        extra_args: >-
+          -dials
+          -distance 100
+          -detector_roty 4
+          -twotheta 8
+          -pivot beam
+      - name: custom-twotheta-last-sample
+        extra_args: >-
+          -fdet_vector 0 0 1
+          -sdet_vector 0 -1 0
+          -odet_vector 1 0 0
+          -beam_vector 1 0 0
+          -distance 100
+          -detector_rotz 3
+          -twotheta 10
+      - name: custom-distance-last-beam
+        extra_args: >-
+          -fdet_vector 0 0 1
+          -sdet_vector 0 -1 0
+          -odet_vector 1 0 0
+          -beam_vector 1 0 0
+          -twotheta 10
+          -detector_rotz 3
+          -distance 100
+      - name: custom-close-distance-twotheta
+        extra_args: >-
+          -fdet_vector 0 0 1
+          -sdet_vector 0 -1 0
+          -odet_vector 1 0 0
+          -beam_vector 1 0 0
+          -detector_rotx 5
+          -close_distance 95
+          -twotheta 12

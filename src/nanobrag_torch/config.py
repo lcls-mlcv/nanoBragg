@@ -248,21 +248,13 @@ class DetectorConfig:
         - If only distance_mm is provided (not close_distance_mm): pivot = BEAM
         - If only close_distance_mm is provided: pivot = SAMPLE
         - If detector_pivot is explicitly set: use that (explicit override wins)
+        - With custom basis vectors and no explicit pivot: SAMPLE
 
-        C-Code Implementation Reference (from nanoBragg.c, lines ~1690-1750):
-        When custom detector vectors or pix0 override are present, C code forces SAMPLE pivot:
-        ```c
-        // C code forces SAMPLE pivot when custom vectors are supplied
-        if (custom_fdet || custom_sdet || custom_odet || custom_beam || pix0_override) {
-            detector_pivot = SAMPLE;  // Force SAMPLE mode for custom geometry
-        }
-        ```
-        This ensures geometric consistency when detector orientation is overridden.
-        See docs/architecture/detector.md §5.2 and specs/spec-a-cli.md precedence rules.
+        nanoBragg.c itself has no custom-vector rule: flags overwrite the pivot in
+        argv order and the convention then forces BEAM (MOSFLM/DENZO/ADXV) or
+        SAMPLE (XDS/DIALS). The CLI reproduces that in
+        ``__main__.resolve_detector_pivot`` and passes the result explicitly.
         """
-        # CLI-FLAGS-003 Phase H6f: Force SAMPLE pivot when custom BASIS VECTORS present
-        # This matches nanoBragg.c behavior and ensures parity when custom geometry is supplied
-        # Note: pix0_override alone does NOT force SAMPLE; only custom detector basis vectors do
         has_custom_basis_vectors = (
             self.custom_fdet_vector is not None
             or self.custom_sdet_vector is not None
@@ -270,11 +262,14 @@ class DetectorConfig:
             or self.custom_beam_vector is not None
         )
 
-        if has_custom_basis_vectors:
-            # Custom detector basis vectors force SAMPLE pivot (matching C behavior)
-            # See reports/2025-10-cli-flags/phase_h6/pivot_parity.md for evidence
+        if self.detector_pivot is not None:
+            # Explicit pivot wins. nanoBragg.c keeps the parsed pivot under the CUSTOM
+            # convention (e.g. "-fdet_vector ... -distance 100" pivots around the beam),
+            # so custom vectors must not override it; the CLI resolves it C-style.
+            pass
+        elif has_custom_basis_vectors:
             self.detector_pivot = DetectorPivot.SAMPLE
-        elif self.detector_pivot is None:
+        else:
             # AT-GEO-002: Automatic pivot selection based on distance parameters
             # Only applies when no custom vectors are present
             if self.close_distance_mm is not None:
@@ -286,7 +281,6 @@ class DetectorConfig:
             else:
                 # Setup A: Only -distance provided -> pivot SHALL be BEAM
                 self.detector_pivot = DetectorPivot.BEAM
-        # Setup C: Explicit -pivot override is already set, keep it
 
         # Auto-calculate beam centers if not explicitly provided
         # This ensures beam centers scale correctly with detector size
