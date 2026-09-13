@@ -230,7 +230,9 @@ class DetectorConfig:
     # Detector absorption parameters (AT-ABS-001)
     detector_abs_um: Optional[Union[float, torch.Tensor]] = None  # Attenuation depth in micrometers
     detector_thick_um: Union[float, torch.Tensor] = 0.0  # Detector thickness in micrometers
-    detector_thicksteps: int = 1  # Number of thickness layers for absorption calculation
+    # Number of sensor layers (nanoBragg.c -thicksteps). None = not given (C then uses 2 layers,
+    # T/2 apart); see Detector.thickness_layers for how C turns (thick, thicksteps) into layers.
+    detector_thicksteps: Optional[int] = None
 
     # ROI (Region of Interest) parameters (AT-ROI-001)
     roi_xmin: Optional[int] = None  # Fast axis minimum pixel (inclusive, 0-based)
