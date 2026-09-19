@@ -1,3 +1,14 @@
+# Parity cases: the same CLI arguments are rendered by the C reference and the PyTorch
+# CLI, and the two float images compared (Pearson r, sum ratio, max abs difference).
+#
+# C reference ("the oracle"): bl831/main plus fix/phi0-stale-rotation,
+# fix/subpixel-oversampling and fix/curved-det-flag-guard, the three unmerged branches
+# bl831's own GPU harness uses as its CPU reference. Rebuild it with
+# scripts/oracle/build_oracle.sh, which pins the merged nanoBragg.c to
+# md5 0a8675a1ce4b19e0d0039542e1a2099d (bl831/main 0d24e6e, 2026-08-04) and builds with
+# -O2 -fno-fast-math -ffp-contract=off. Thresholds below were measured against that build;
+# if the checksum warning fires, re-measure before trusting them.
+#
 cases:
   - id: AT-PARALLEL-001
     description: Beam center scaling parity (C ↔ PyTorch)
