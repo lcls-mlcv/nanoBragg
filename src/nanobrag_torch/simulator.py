@@ -10,7 +10,7 @@ from typing import Optional, Callable
 import os
 import torch
 
-from .config import BeamConfig, CrystalConfig, CrystalShape
+from .config import BeamConfig, CrystalConfig, CrystalShape, SpotMetric
 from .models.crystal import Crystal
 from .models.detector import Detector
 from .utils.geometry import dot_product
@@ -41,6 +41,7 @@ def compute_physics_for_position(
     N_cells_c: int = 0,
     crystal_shape: CrystalShape = CrystalShape.SQUARE,
     crystal_fudge: float = 1.0,
+    spot_metric: SpotMetric = SpotMetric.RECIPROCAL,
     # Polarization parameters (PERF-PYTORCH-004 P3.0b)
     apply_polarization: bool = True,
     kahn_factor: float = 1.0,
@@ -89,6 +90,7 @@ def compute_physics_for_position(
         N_cells_a/b/c: Number of unit cells in each direction
         crystal_shape: Crystal shape enum for lattice structure factor calculation
         crystal_fudge: Fudge factor for lattice structure factor
+        spot_metric: Radius metric for GAUSS/TOPHAT (RECIPROCAL = bl831 C, HKL = cctbx)
         apply_polarization: Whether to apply Kahn polarization correction (default True)
         kahn_factor: Polarization factor for Kahn correction (0=unpolarized, 1=fully polarized)
         polarization_axis: Polarization axis unit vector (3,) or broadcastable shape
@@ -316,43 +318,37 @@ def compute_physics_for_position(
         F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(
             torch.pi * torch.sqrt(hrad_sqr * fudge)
         )
-    elif shape == CrystalShape.GAUSS:
+    elif shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT):
         h_frac = h - h0
         k_frac = k - k0
         l_frac = l - l0
-        if is_multi_source:
-            # Multi-source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, 1, N_phi, N_mos, 3)
-            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                          k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                          l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0).unsqueeze(0))
+        if spot_metric is SpotMetric.HKL:
+            # cctbx nanoBragg.cpp / diffBragg: radius measured in hkl space, as ROUND does
+            rad_sqr = (h_frac * h_frac * Na * Na +
+                       k_frac * k_frac * Nb * Nb +
+                       l_frac * l_frac * Nc * Nc)
         else:
-            # Single source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, N_phi, N_mos, 3)
-            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0) +
-                          k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0) +
-                          l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0))
-        rad_star_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
-        rad_star_sqr = rad_star_sqr * Na * Na * Nb * Nb * Nc * Nc
-        F_latt = Na * Nb * Nc * torch.exp(-(rad_star_sqr / 0.63) * fudge)
-    elif shape == CrystalShape.TOPHAT:
-        h_frac = h - h0
-        k_frac = k - k0
-        l_frac = l - l0
-        if is_multi_source:
-            # Multi-source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, 1, N_phi, N_mos, 3)
-            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                          k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                          l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0).unsqueeze(0))
+            # bl831 nanoBragg.c since 2023: "round in reciprocal space"
+            if is_multi_source:
+                # Multi-source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, 1, N_phi, N_mos, 3)
+                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
+                              k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
+                              l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0).unsqueeze(0))
+            else:
+                # Single source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, N_phi, N_mos, 3)
+                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0) +
+                              k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0) +
+                              l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0))
+            rad_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
+            rad_sqr = rad_sqr * Na * Na * Nb * Nb * Nc * Nc
+
+        if shape == CrystalShape.GAUSS:
+            F_latt = Na * Nb * Nc * torch.exp(-(rad_sqr / 0.63) * fudge)
         else:
-            # Single source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, N_phi, N_mos, 3)
-            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0) +
-                          k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0) +
-                          l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0))
-        rad_star_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
-        rad_star_sqr = rad_star_sqr * Na * Na * Nb * Nb * Nc * Nc
-        inside_cutoff = (rad_star_sqr * fudge) < 0.3969
-        F_latt = torch.where(inside_cutoff,
-                            torch.full_like(rad_star_sqr, Na * Nb * Nc),
-                            torch.zeros_like(rad_star_sqr))
+            inside_cutoff = (rad_sqr * fudge) < 0.3969
+            F_latt = torch.where(inside_cutoff,
+                                torch.full_like(rad_sqr, Na * Nb * Nc),
+                                torch.zeros_like(rad_sqr))
     else:
         raise ValueError(f"Unsupported crystal shape: {shape}")
 
@@ -765,6 +761,7 @@ class Simulator:
             N_cells_c=self.crystal.N_cells_c,
             crystal_shape=self.crystal.config.shape,
             crystal_fudge=self.crystal.config.fudge,
+            spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
             # PERF-PYTORCH-004 P3.0b: Pass polarization parameters
             apply_polarization=not self.beam_config.nopolar,
             kahn_factor=self.kahn_factor,
@@ -1791,6 +1788,7 @@ class Simulator:
                                 N_cells_c=self.crystal.N_cells_c,
                                 crystal_shape=self.crystal.config.shape,
                                 crystal_fudge=self.crystal.config.fudge,
+                                spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
                                 apply_polarization=not self.beam_config.nopolar,
                                 kahn_factor=self.kahn_factor,
                                 polarization_axis=self.polarization_axis,

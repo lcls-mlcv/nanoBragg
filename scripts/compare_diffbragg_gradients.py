@@ -17,8 +17,9 @@ script builds one SimData, renders it with diffBragg and with the torch port via
 
 diffBragg's CPU kernel always uses a Gaussian lattice with the radius measured
 in hkl space, det(NABC)·exp(−|NABC·ΔH|²/0.63), whatever xtal_shape says. The
-default --shape is therefore gauss; it only matches once the torch GAUSS metric
-can be switched to hkl space (torch follows bl831's reciprocal-space rad_star).
+default --shape is therefore gauss, and the torch side uses SpotMetric.HKL (the
+compat layer's default) so the two lattices agree; --spot-metric reciprocal
+switches torch back to bl831's rad_star and the comparison then fails by design.
 
 For each parameter the torch gradient is obtained with autograd on the summed
 image, and per-pixel with a finite difference of the torch model as a sanity
@@ -97,6 +98,7 @@ def torch_forward_and_derivs(SIM, args):
         crystal_config_from_A, detector_config_from_dxtbx_panel, beam_config_from_dxtbx, rotate_A,
         set_structure_factors,
     )
+    from nanobrag_torch.config import SpotMetric
     from nanobrag_torch.models.crystal import Crystal as TCrystal
     from nanobrag_torch.models.detector import Detector as TDetector
     from nanobrag_torch.simulator import Simulator
@@ -117,7 +119,8 @@ def torch_forward_and_derivs(SIM, args):
                      -math.degrees(roty) if not torch.is_tensor(roty) else -torch.rad2deg(roty),
                      -math.degrees(rotz) if not torch.is_tensor(rotz) else -torch.rad2deg(rotz))
         n = ncells if torch.is_tensor(ncells) else float(ncells)
-        cfg = crystal_config_from_A(cell, A, Ncells_abc=(1, 1, 1), shape=args.shape, default_F=args.default_F)
+        cfg = crystal_config_from_A(cell, A, Ncells_abc=(1, 1, 1), shape=args.shape, default_F=args.default_F,
+                                    spot_metric=SpotMetric(args.spot_metric))
         cfg.N_cells = (n, n, n)
         crystal = TCrystal(cfg, beam_config=beam_cfg, device=device, dtype=dtype)
         # cctbx: F(0,0,0) = F000 (0), every other reflection default_F
@@ -168,6 +171,8 @@ def main():
     p.add_argument("--oversample", type=int, default=1)
     p.add_argument("--default_F", type=float, default=1e3)
     p.add_argument("--randomrotate", type=int, default=None)
+    p.add_argument("--spot-metric", dest="spot_metric", choices=["hkl", "reciprocal"], default="hkl",
+                   help="GAUSS/TOPHAT radius metric for the torch side; diffBragg always uses hkl")
     p.add_argument("--device", default="cpu")
     p.add_argument("--plot", action="store_true")
     args = p.parse_args()

@@ -93,6 +93,24 @@ class CrystalShape(Enum):
     TOPHAT = "tophat"  # Binary spots/top-hat function
 
 
+class SpotMetric(Enum):
+    """
+    How GAUSS and TOPHAT measure the distance from the nearest reciprocal lattice point.
+
+    RECIPROCAL is Holton's 2023 change (nanoBragg.c, "round in reciprocal space"):
+    |Δh·a* + Δk·b* + Δl·c*|² scaled by (Na·Nb·Nc)², so the spot width follows the
+    reciprocal cell. HKL is the pre-2023 form still used by cctbx's nanoBragg.cpp and by
+    diffBragg's kernel: Δh²Na² + Δk²Nb² + Δl²Nc², the same metric ROUND uses in both.
+
+    The two give different spot widths for anything but a cubic cell, so pick the one
+    that matches the reference you are comparing against: RECIPROCAL for bl831's C
+    (the default, and what the parity matrix pins), HKL for cctbx and diffBragg.
+    """
+
+    RECIPROCAL = "reciprocal"
+    HKL = "hkl"
+
+
 @dataclass
 class CrystalConfig:
     """Configuration for crystal properties and orientation.
@@ -147,6 +165,8 @@ class CrystalConfig:
     # Crystal shape parameters
     shape: CrystalShape = CrystalShape.SQUARE  # Crystal shape model for F_latt calculation
     fudge: float = 1.0  # Shape parameter scaling factor
+    # Spot-radius metric for GAUSS/TOPHAT; RECIPROCAL matches bl831's C, HKL matches cctbx
+    spot_metric: SpotMetric = SpotMetric.RECIPROCAL
 
     # Sample size in meters (calculated from N_cells and unit cell dimensions)
     # These are computed in __post_init__ and potentially clipped by beam size
