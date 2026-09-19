@@ -542,10 +542,11 @@ class BeamConfig:
     nopolar: bool = False  # If True, force polarization factor to 1 (disable polarization)
     polarization_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)  # Polarization E-vector direction
 
-    # Flux and fluence parameters (AT-FLU-001)
+    # Flux and fluence parameters (AT-FLU-001). Defaults are nanoBragg.c's
+    # (flux=0.0, exposure=1.0 s, beamsize=1e-4 m), so -flux alone is enough to set fluence.
     flux: float = 0.0  # Photons per second
-    exposure: float = 0.0  # Exposure time in seconds
-    beamsize_mm: float = 0.0  # Beam size in mm (used for fluence calculation and sample clipping)
+    exposure: float = 1.0  # Exposure time in seconds
+    beamsize_mm: float = 0.1  # Beam size in mm (fluence calculation and sample clipping)
     # Can be float or torch.Tensor for differentiable optimization (DBEX-GRADIENT-001)
     fluence: Union[float, torch.Tensor] = 125932015286227086360700780544.0  # Photons per square meter (default from C code)
     spot_scale: Union[float, torch.Tensor] = 1.0  # Extra multiplier on Bragg intensity (cctbx nanoBragg spot_scale; C has none)
@@ -557,25 +558,33 @@ class BeamConfig:
     water_size_um: float = 0.0  # Water thickness in micrometers for background calculation (0 = no background)
 
     def __post_init__(self):
-        """Calculate fluence from flux/exposure/beamsize if provided (AT-FLU-001).
+        """Derive fluence from flux exactly as nanoBragg.c does (AT-FLU-001).
 
-        Per spec: fluence SHALL be recomputed as flux·exposure/beamsize^2 whenever
-        flux != 0 and exposure > 0 and beamsize ≥ 0.
+        C (nanoBragg.c:1130-1148), with flux=0, exposure=1 s and beamsize=1e-4 m as
+        defaults:
+
+            if(flux != 0.0 && exposure > 0.0 && beamsize >= 0)
+                fluence = flux*exposure/beamsize/beamsize;
+            if(exposure > 0.0)
+                flux = fluence/exposure*beamsize*beamsize;
+
+        So -flux on its own already sets the fluence (1e12 photons/s over the default
+        0.1 mm beam for 1 s gives 1e20 photons/m^2), and an explicit -fluence is
+        overridden whenever flux is non-zero. The second statement only makes the
+        reported flux consistent; it never changes the image.
 
         SOURCE-WEIGHT-001 Phase C2: Validate source_weights edge cases.
         Ensures physical correctness for weighted multi-source simulations.
         """
-        if self.flux != 0 and self.exposure > 0 and self.beamsize_mm >= 0:
-            # Convert beamsize from mm to meters for fluence calculation
-            beamsize_m = self.beamsize_mm / 1000.0
-            if beamsize_m > 0:
-                self.fluence = self.flux * self.exposure / (beamsize_m * beamsize_m)
-            # If beamsize is 0 but flux and exposure are set, keep existing fluence
+        beamsize_m = self.beamsize_mm / 1000.0
+        if self.flux != 0 and self.exposure > 0 and beamsize_m > 0:
+            self.fluence = self.flux * self.exposure / (beamsize_m * beamsize_m)
+        # C divides by beamsize unconditionally once beamsize >= 0, so a zero beam size
+        # gives an infinite fluence there; keep the previous fluence instead.
 
-        # Also handle case where exposure > 0 recomputes flux to be consistent
-        elif self.exposure > 0 and self.beamsize_mm > 0 and self.fluence > 0:
-            beamsize_m = self.beamsize_mm / 1000.0
-            self.flux = self.fluence * (beamsize_m * beamsize_m) / self.exposure
+        if self.exposure > 0 and beamsize_m > 0 and not isinstance(self.fluence, torch.Tensor):
+            # keep the reported flux consistent with the fluence actually used
+            self.flux = self.fluence / self.exposure * (beamsize_m * beamsize_m)
 
         # SOURCE-WEIGHT-001 Phase C1 resolution: Source weights are read but ignored per spec
         # Per spec-a-core.md line 151: "The weight column is read but ignored (equal weighting results)"
