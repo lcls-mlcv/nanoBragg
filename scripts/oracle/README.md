@@ -39,3 +39,15 @@ C argv parsing uses `strstr`, which the parity cases have to work around:
 - `-twotheta_axis` also matches `-twotheta`, so it sets the twotheta angle and the SAMPLE pivot.
 - Any flag containing `-pixel` (for example a PyTorch-only `-pixel_batch_size`) is read as
   `-pixel`. Never pass PyTorch-only flags to the C binary.
+
+Beam intensity is likewise easy to get wrong, because three flags feed one number:
+
+- `exposure` defaults to 1 s and `beamsize` to 1e-4 m (0.1 mm), and C sets
+  `fluence = flux*exposure/beamsize^2` whenever `flux != 0`. **`-flux` alone therefore
+  changes the scale**, and it silently **overrides an explicit `-fluence`** no matter which
+  order the two appear in. To set the fluence directly, pass `-fluence` and no `-flux`.
+- The default fluence with no flags is 1.259e29 photons/m^2, which is *not* what
+  `-flux 1e12` gives (that is 1e20). A run with `-flux` and one without differ by ~9 orders
+  of magnitude, so these flags are worth pinning in any comparison (PARITY-FLUX-001 does).
+- C also recomputes `flux = fluence/exposure*beamsize^2` afterwards, which only affects what
+  it prints, never the image.
