@@ -1141,8 +1141,12 @@ def main():
             # Load sources from file
             wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
 
-            # Get beam direction based on detector convention (MOSFLM default is [1,0,0])
-            if detector_config.detector_convention == DetectorConvention.MOSFLM:
+            # Get beam direction based on detector convention.
+            # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0];
+            # ADXV/XDS/DIALS use [0,0,1].
+            if detector_config.detector_convention in (
+                DetectorConvention.MOSFLM, DetectorConvention.DENZO
+            ):
                 beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
             else:
                 beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
@@ -1181,8 +1185,12 @@ def main():
             # Generate source arrays
             wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
 
-            # Get beam direction based on detector convention (MOSFLM default is [1,0,0])
-            if detector_config.detector_convention == DetectorConvention.MOSFLM:
+            # Get beam direction based on detector convention.
+            # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0] with
+            # polar_vector = [0,0,1]; ADXV/XDS/DIALS use beam_vector = [0,0,1].
+            if detector_config.detector_convention in (
+                DetectorConvention.MOSFLM, DetectorConvention.DENZO
+            ):
                 beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
                 polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
             else:
