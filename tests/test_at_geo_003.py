@@ -6,6 +6,11 @@ Setup: Non-zero detector rotations + twotheta; set close_distance explicitly
 Expectation: r = b·o_after_rotations; distance SHALL be updated to distance = close_distance / r
 and direct-beam Fbeam/Sbeam computed from R = close_distance/r·b − D0 SHALL equal the user's
 beam center (within tolerance), for both BEAM and SAMPLE pivots.
+
+nanoBragg.c (bl831/main, nanoBragg.c:1709-1713) takes r after rotx/y/z but BEFORE the twotheta
+swing, and the final distance is (pix0·o_final)/r. With twotheta != 0 the BEAM pivot therefore does
+not reproduce the input beam centre exactly; image parity with C for those cases is covered by
+PARITY-PIVOT-001 in tests/parity_cases.yaml.
 """
 
 import pytest
@@ -23,7 +28,7 @@ class TestATGEO003RFactorAndBeamCenter:
     """Test r-factor distance update and beam center preservation."""
 
     def test_r_factor_calculation(self):
-        """Test that r-factor is correctly calculated as dot(beam, rotated_normal)."""
+        """r-factor is dot(beam, R_xyz·normal), without the twotheta swing (nanoBragg.c:1710-1711)."""
         # Setup with rotations
         config = DetectorConfig(
             spixels=1024,
@@ -66,10 +71,6 @@ class TestATGEO003RFactorAndBeamCenter:
         )
         odet_rotated = torch.matmul(rot_matrix, odet_initial)
 
-        # Apply twotheta rotation around MOSFLM twotheta axis [0, 0, -1]
-        twotheta_axis = torch.tensor([0.0, 0.0, -1.0], dtype=torch.float64)
-        odet_rotated = rotate_axis(odet_rotated, twotheta_axis, torch.tensor(twotheta, dtype=torch.float64))
-
         # Beam vector for MOSFLM is [1, 0, 0]
         beam_vector = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
 
@@ -79,8 +80,14 @@ class TestATGEO003RFactorAndBeamCenter:
         assert torch.allclose(r_factor, expected_r_factor, rtol=1e-6), \
             f"r-factor mismatch: got {r_factor}, expected {expected_r_factor}"
 
+        # twotheta does not enter r
+        no_twotheta = Detector(
+            DetectorConfig(**{**config.__dict__, "detector_twotheta_deg": 0.0}), dtype=torch.float64
+        )
+        assert torch.allclose(no_twotheta.get_r_factor(), r_factor, rtol=1e-12)
+
     def test_distance_update_with_close_distance(self):
-        """Test that distance is correctly updated as close_distance / r-factor."""
+        """distance = close_distance / r before the swing, (pix0·odet)/r after it (nanoBragg.c:1713, 1755)."""
         # Setup with explicit close_distance
         config = DetectorConfig(
             spixels=1024,
@@ -104,14 +111,21 @@ class TestATGEO003RFactorAndBeamCenter:
         r_factor = detector.get_r_factor()
         corrected_distance = detector.get_corrected_distance()
 
-        # Expected: distance = close_distance / r-factor
-        expected_distance = (95.0 / 1000.0) / r_factor  # Convert mm to meters
+        # BEAM pivot places the detector with distance = close_distance / r ...
+        beam = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float64)
+        Fbeam = detector.beam_center_f * detector.pixel_size
+        Sbeam = detector.beam_center_s * detector.pixel_size
+        expected_pix0 = -Fbeam * detector.fdet_vec - Sbeam * detector.sdet_vec + (0.095 / r_factor) * beam
+        assert torch.allclose(detector.pix0_vector, expected_pix0, atol=1e-12)
+
+        # ... and reports the post-swing distance (pix0·odet)/r
+        expected_distance = torch.dot(detector.pix0_vector, detector.odet_vec) / r_factor
 
         assert torch.allclose(corrected_distance, expected_distance, rtol=1e-6), \
             f"Distance update incorrect: got {corrected_distance}, expected {expected_distance}"
 
     def test_beam_center_preservation_beam_pivot(self):
-        """Test beam center preservation with BEAM pivot mode."""
+        """BEAM pivot preserves the beam center under rotx/y/z (twotheta shifts it, as in C)."""
         # Setup with BEAM pivot
         config = DetectorConfig(
             spixels=1024,
@@ -124,7 +138,7 @@ class TestATGEO003RFactorAndBeamCenter:
             detector_rotx_deg=5.0,
             detector_roty_deg=3.0,
             detector_rotz_deg=2.0,
-            detector_twotheta_deg=15.0,
+            detector_twotheta_deg=0.0,
             detector_pivot=DetectorPivot.BEAM,
             detector_convention=DetectorConvention.MOSFLM,
         )
@@ -225,6 +239,9 @@ class TestATGEO003RFactorAndBeamCenter:
         ]
 
         for rotx, roty, rotz, twotheta in test_cases:
+            if pivot_mode == DetectorPivot.BEAM and twotheta != 0.0:
+                # C's r excludes twotheta, so the BEAM pivot does not keep the input beam centre
+                continue
             config = DetectorConfig(
                 spixels=1024,
                 fpixels=1024,

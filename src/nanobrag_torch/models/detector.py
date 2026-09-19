@@ -550,12 +550,11 @@ class Detector:
         # When rotations are zero, the rotation matrix will be identity
         # and r-factor will naturally be 1.0
         if True:  # Always execute to preserve gradients
-            # Use the actual rotated detector normal (includes ALL rotations including twotheta)
-            # This is critical for correct obliquity calculations with tilted detectors
-            odet_rotated = self.odet_vec
-
-            # Calculate ratio (r-factor)
-            ratio = torch.dot(beam_vector, odet_rotated)
+            # nanoBragg.c computes ratio = beam·odet after rotx/y/z but BEFORE the twotheta
+            # swing: rotate(odet_vector,vector,rotx,roty,rotz); ratio = dot_product(beam_vector,vector);
+            _, _, odet_initial = self._initial_basis_vectors()
+            rotation_matrix = angles_to_rotation_matrix(detector_rotx, detector_roty, detector_rotz)
+            ratio = torch.dot(beam_vector, torch.matmul(rotation_matrix, odet_initial))
 
             # Prevent division by zero while maintaining gradient flow
             # Use torch operations to preserve gradients
@@ -697,41 +696,7 @@ class Detector:
             # IMPORTANT: Compute pix0 BEFORE rotating, using the same formula as C:
             # pix0 = -Fclose*fdet - Sclose*sdet + close_distance*odet
 
-            # Unrotated basis (by convention)
-            if self.config.detector_convention == DetectorConvention.MOSFLM:
-                # PHASE 1 FIX: Corrected initial MOSFLM basis vectors
-                fdet_initial = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)   # Fast along +Z (CORRECT)
-                sdet_initial = torch.tensor([0.0, -1.0, 0.0], device=self.device, dtype=self.dtype)  # Slow along -Y (CORRECT)
-                odet_initial = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=self.dtype)   # Normal along +X (CORRECT)
-            elif self.config.detector_convention == DetectorConvention.XDS:
-                # XDS convention
-                fdet_initial = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=self.dtype)
-                sdet_initial = torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=self.dtype)
-                odet_initial = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)
-            elif self.config.detector_convention == DetectorConvention.DIALS:
-                # DIALS convention
-                fdet_initial = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=self.dtype)
-                sdet_initial = torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=self.dtype)
-                odet_initial = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)
-            elif self.config.detector_convention == DetectorConvention.CUSTOM:
-                # CUSTOM convention: use custom vectors if provided, otherwise use defaults
-                # C code sets defaults to MOSFLM-like values (nanoBragg.c lines 263-265)
-                if self.config.custom_fdet_vector:
-                    fdet_initial = torch.tensor(self.config.custom_fdet_vector, device=self.device, dtype=self.dtype)
-                else:
-                    fdet_initial = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)
-
-                if self.config.custom_sdet_vector:
-                    sdet_initial = torch.tensor(self.config.custom_sdet_vector, device=self.device, dtype=self.dtype)
-                else:
-                    sdet_initial = torch.tensor([0.0, -1.0, 0.0], device=self.device, dtype=self.dtype)
-
-                if self.config.custom_odet_vector:
-                    odet_initial = torch.tensor(self.config.custom_odet_vector, device=self.device, dtype=self.dtype)
-                else:
-                    odet_initial = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=self.dtype)
-            else:
-                raise ValueError(f"Unknown detector convention: {self.config.detector_convention}")
+            fdet_initial, sdet_initial, odet_initial = self._initial_basis_vectors()
 
             # Distances from pixel (0,0) center to the beam spot, measured along detector axes
             # Mapping clarification:
@@ -767,8 +732,6 @@ class Detector:
             )
 
             # Now rotate pix0 with detector_rotx/roty/rotz and twotheta, same as C
-            # (rotation angles already converted to tensors above)
-            rotation_matrix = angles_to_rotation_matrix(detector_rotx, detector_roty, detector_rotz)
             pix0_rotated = torch.matmul(rotation_matrix, pix0_initial)
 
             if isinstance(c.twotheta_axis, torch.Tensor):
@@ -1222,6 +1185,104 @@ class Detector:
 
         return bool(is_preserved), details
 
+    def _initial_basis_vectors(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unrotated (fdet, sdet, odet) for the configured convention, as nanoBragg.c sets them."""
+        c = self.config
+        from ..config import DetectorConvention
+
+        if c.detector_convention == DetectorConvention.MOSFLM:
+            # PHASE 1 FIX: Corrected MOSFLM basis vectors to match C implementation
+            fdet_vec = torch.tensor(
+                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Fast along +Z (CORRECT)
+            )
+            sdet_vec = torch.tensor(
+                [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along -Y (CORRECT)
+            )
+            odet_vec = torch.tensor(
+                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype   # Normal along +X (CORRECT)
+            )
+        elif c.detector_convention == DetectorConvention.XDS:
+            # XDS convention: detector surface normal points away from source
+            fdet_vec = torch.tensor(
+                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype
+            )
+            sdet_vec = torch.tensor(
+                [0.0, 1.0, 0.0], device=self.device, dtype=self.dtype
+            )
+            odet_vec = torch.tensor(
+                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype
+            )
+        elif c.detector_convention == DetectorConvention.DIALS:
+            # DIALS convention: beam [0,0,1], f=[1,0,0], s=[0,1,0], o=[0,0,1]
+            # Similar to XDS but with specific beam and twotheta axis conventions
+            fdet_vec = torch.tensor(
+                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype  # Fast along +X
+            )
+            sdet_vec = torch.tensor(
+                [0.0, 1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along +Y
+            )
+            odet_vec = torch.tensor(
+                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Normal along +Z
+            )
+        elif c.detector_convention == DetectorConvention.ADXV:
+            # ADXV convention per spec: beam b = [0 0 1]; f = [1 0 0]; s = [0 -1 0]; o = [0 0 1]
+            fdet_vec = torch.tensor(
+                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype  # Fast along +X
+            )
+            sdet_vec = torch.tensor(
+                [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along -Y (like MOSFLM)
+            )
+            odet_vec = torch.tensor(
+                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Normal along +Z (beam direction)
+            )
+        elif c.detector_convention == DetectorConvention.DENZO:
+            # DENZO convention per spec: Same as MOSFLM bases (beam [1,0,0], f=[0,0,1], s=[0,-1,0], o=[1,0,0])
+            # Note: Different beam center mapping but same basis vectors as MOSFLM
+            fdet_vec = torch.tensor(
+                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Fast along +Z (same as MOSFLM)
+            )
+            sdet_vec = torch.tensor(
+                [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along -Y (same as MOSFLM)
+            )
+            odet_vec = torch.tensor(
+                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype   # Normal along +X (same as MOSFLM)
+            )
+        elif c.detector_convention == DetectorConvention.CUSTOM:
+            # CUSTOM convention uses user-provided vectors or defaults to MOSFLM
+            if c.custom_fdet_vector is not None:
+                fdet_vec = torch.tensor(
+                    c.custom_fdet_vector, device=self.device, dtype=self.dtype
+                )
+            else:
+                # Default to MOSFLM fast vector
+                fdet_vec = torch.tensor(
+                    [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype
+                )
+
+            if c.custom_sdet_vector is not None:
+                sdet_vec = torch.tensor(
+                    c.custom_sdet_vector, device=self.device, dtype=self.dtype
+                )
+            else:
+                # Default to MOSFLM slow vector
+                sdet_vec = torch.tensor(
+                    [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype
+                )
+
+            if c.custom_odet_vector is not None:
+                odet_vec = torch.tensor(
+                    c.custom_odet_vector, device=self.device, dtype=self.dtype
+                )
+            else:
+                # Default to MOSFLM normal vector
+                odet_vec = torch.tensor(
+                    [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype
+                )
+        else:
+            raise ValueError(f"Unknown detector convention: {c.detector_convention}")
+
+        return fdet_vec, sdet_vec, odet_vec
+
     def _calculate_basis_vectors(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -1328,99 +1389,7 @@ class Detector:
         elif detector_twotheta.device != self.device or detector_twotheta.dtype != self.dtype:
             detector_twotheta = detector_twotheta.to(device=self.device, dtype=self.dtype)
 
-        # Initialize basis vectors based on detector convention
-        from ..config import DetectorConvention
-
-        if c.detector_convention == DetectorConvention.MOSFLM:
-            # PHASE 1 FIX: Corrected MOSFLM basis vectors to match C implementation
-            fdet_vec = torch.tensor(
-                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Fast along +Z (CORRECT)
-            )
-            sdet_vec = torch.tensor(
-                [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along -Y (CORRECT)
-            )
-            odet_vec = torch.tensor(
-                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype   # Normal along +X (CORRECT)
-            )
-        elif c.detector_convention == DetectorConvention.XDS:
-            # XDS convention: detector surface normal points away from source
-            fdet_vec = torch.tensor(
-                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype
-            )
-            sdet_vec = torch.tensor(
-                [0.0, 1.0, 0.0], device=self.device, dtype=self.dtype
-            )
-            odet_vec = torch.tensor(
-                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype
-            )
-        elif c.detector_convention == DetectorConvention.DIALS:
-            # DIALS convention: beam [0,0,1], f=[1,0,0], s=[0,1,0], o=[0,0,1]
-            # Similar to XDS but with specific beam and twotheta axis conventions
-            fdet_vec = torch.tensor(
-                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype  # Fast along +X
-            )
-            sdet_vec = torch.tensor(
-                [0.0, 1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along +Y
-            )
-            odet_vec = torch.tensor(
-                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Normal along +Z
-            )
-        elif c.detector_convention == DetectorConvention.ADXV:
-            # ADXV convention per spec: beam b = [0 0 1]; f = [1 0 0]; s = [0 -1 0]; o = [0 0 1]
-            fdet_vec = torch.tensor(
-                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype  # Fast along +X
-            )
-            sdet_vec = torch.tensor(
-                [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along -Y (like MOSFLM)
-            )
-            odet_vec = torch.tensor(
-                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Normal along +Z (beam direction)
-            )
-        elif c.detector_convention == DetectorConvention.DENZO:
-            # DENZO convention per spec: Same as MOSFLM bases (beam [1,0,0], f=[0,0,1], s=[0,-1,0], o=[1,0,0])
-            # Note: Different beam center mapping but same basis vectors as MOSFLM
-            fdet_vec = torch.tensor(
-                [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype  # Fast along +Z (same as MOSFLM)
-            )
-            sdet_vec = torch.tensor(
-                [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype  # Slow along -Y (same as MOSFLM)
-            )
-            odet_vec = torch.tensor(
-                [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype   # Normal along +X (same as MOSFLM)
-            )
-        elif c.detector_convention == DetectorConvention.CUSTOM:
-            # CUSTOM convention uses user-provided vectors or defaults to MOSFLM
-            if c.custom_fdet_vector is not None:
-                fdet_vec = torch.tensor(
-                    c.custom_fdet_vector, device=self.device, dtype=self.dtype
-                )
-            else:
-                # Default to MOSFLM fast vector
-                fdet_vec = torch.tensor(
-                    [0.0, 0.0, 1.0], device=self.device, dtype=self.dtype
-                )
-
-            if c.custom_sdet_vector is not None:
-                sdet_vec = torch.tensor(
-                    c.custom_sdet_vector, device=self.device, dtype=self.dtype
-                )
-            else:
-                # Default to MOSFLM slow vector
-                sdet_vec = torch.tensor(
-                    [0.0, -1.0, 0.0], device=self.device, dtype=self.dtype
-                )
-
-            if c.custom_odet_vector is not None:
-                odet_vec = torch.tensor(
-                    c.custom_odet_vector, device=self.device, dtype=self.dtype
-                )
-            else:
-                # Default to MOSFLM normal vector
-                odet_vec = torch.tensor(
-                    [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype
-                )
-        else:
-            raise ValueError(f"Unknown detector convention: {c.detector_convention}")
+        fdet_vec, sdet_vec, odet_vec = self._initial_basis_vectors()
 
         # Apply detector rotations (rotx, roty, rotz) using the C-code's rotate function logic
         # The C-code applies rotations in order: X, then Y, then Z
