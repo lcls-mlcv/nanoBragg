@@ -972,8 +972,18 @@ class Simulator:
                 I_before_normalization_pre_polar = None
 
             # Apply last-value semantics if omega flag is not set
-            # Last subpixel's omega of the front layer; also reported by the pixel trace
-            omega_pixel = omega_all[:, :, n_sub - 1]  # Shape: (S, F)
+            if self.beam_config.water_size_um > 0:
+                # C: I = I_bg before the sample loop, so omega/capture below also apply.
+                # Its polarization factor is the cached one, from the first subpixel of the
+                # front layer, which is sample 0 here.
+                accumulated_intensity = accumulated_intensity + self._water_background_pre_scale(
+                    subpixel_coords_all[:, :, 0, :]
+                )
+
+            # nanoBragg.c computes omega once per pixel, at the FIRST subpixel of the front
+            # layer, and reuses it (omega_pixel is reset to 0 per pixel and recomputed only
+            # when it is still 0, or when -oversample_omega is given). Also reported by the trace.
+            omega_pixel = omega_all[:, :, 0]  # Shape: (S, F)
             if not oversample_omega:
                 accumulated_intensity = accumulated_intensity * omega_pixel
 
@@ -1053,6 +1063,9 @@ class Simulator:
                     * close_distance_m
                     / airpath_m
                 )
+
+            if self.beam_config.water_size_um > 0:
+                normalized_intensity = normalized_intensity + self._water_background_pre_scale(pixel_coords_meters)
 
             # Apply omega directly
             normalized_intensity = normalized_intensity * omega_pixel
@@ -1320,11 +1333,6 @@ class Simulator:
             * self.fluence
             * getattr(self.beam_config, "spot_scale", 1.0)
         )
-
-        # Add water background if configured (AT-BKG-001)
-        if self.beam_config.water_size_um > 0:
-            water_background = self._calculate_water_background()
-            physical_intensity = physical_intensity + water_background
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -1927,7 +1935,38 @@ class Simulator:
                 print(f"  = {normalized_intensity[target_slow, target_fast].item():.12e} * {self.r_e_sqr:.12e} * {self.fluence:.12e}")
                 print(f"  = {physical_intensity[target_slow, target_fast].item():.12e}")
 
-    def _calculate_water_background(self) -> torch.Tensor:
+    def _water_background_pre_scale(self, pixel_coords_meters: torch.Tensor) -> torch.Tensor:
+        """
+        Water background as nanoBragg.c seeds it, before the r_e^2*fluence/steps scaling.
+
+        C sets ``I = I_bg`` for each pixel and then adds the Bragg contributions, so the
+        background goes through the same tail as everything else: it is multiplied by
+        r_e^2*fluence a second time, divided by steps, and picks up the polarization
+        factor, the solid angle and the capture fraction (nanoBragg.c:2515, 2665, 3344).
+        Torch applies polarization per sub-sample inside the kernel, so the factor is
+        computed here at the pixel centre, which is where C evaluates it for a pixel.
+
+        Returns (S, F); the caller adds it to the accumulated intensity.
+        """
+        I_bg = self._calculate_water_background_amplitude()
+        if self.beam_config.nopolar:
+            return I_bg.expand(pixel_coords_meters.shape[:2])
+
+        diffracted = pixel_coords_meters / torch.linalg.norm(
+            pixel_coords_meters, dim=-1, keepdim=True
+        ).clamp_min(1e-30)
+        incident = self.incident_beam_direction
+        if incident.dim() == 2:  # multiple sources: C caches the factor from the first one
+            incident = incident[0]
+        polar = polarization_factor(
+            torch.as_tensor(self.beam_config.polarization_factor, device=self.device, dtype=self.dtype),
+            incident.expand_as(diffracted).reshape(-1, 3).contiguous(),
+            diffracted.reshape(-1, 3).contiguous(),
+            torch.as_tensor(self.beam_config.polarization_axis, device=self.device, dtype=self.dtype),
+        ).reshape(pixel_coords_meters.shape[:2])
+        return I_bg * polar
+
+    def _calculate_water_background_amplitude(self) -> torch.Tensor:
         """Calculate water background contribution (AT-BKG-001).
 
         The water background models forward scattering from amorphous water molecules.
@@ -1948,7 +1987,7 @@ class Simulator:
         but we replicate it exactly for compatibility.
 
         Returns:
-            Background intensity per pixel (same shape as detector)
+            I_bg as a scalar tensor, before any of the per-pixel corrections.
         """
         # Physical constants
         F_bg = 2.57  # Water forward scattering amplitude (dimensionless)
@@ -1970,19 +2009,8 @@ class Simulator:
             / water_MW
         )
 
-        # Create uniform background for all pixels
-        # Shape should match detector dimensions
-        fpixels = self.detector.fpixels
-        spixels = self.detector.spixels
-
-        background = torch.full(
-            (spixels, fpixels),
-            I_bg,
-            device=self.device,
-            dtype=self.dtype
-        )
-
-        return background
+        # Scalar tensor: torch.full() would break when fluence requires grad
+        return torch.as_tensor(I_bg, device=self.device, dtype=self.dtype)
 
     def _apply_detector_absorption(
         self,

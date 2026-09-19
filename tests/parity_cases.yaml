@@ -867,3 +867,54 @@ cases:
       - name: Na-then-N
         extra_args: >-
           -Na 4 -N 5
+
+  - id: PARITY-WATER-001
+    description: >-
+      Water background (C ↔ PyTorch). nanoBragg.c seeds each pixel with I = I_bg and then
+      adds the Bragg terms, so the background is scaled by r_e^2*fluence a second time,
+      divided by steps, and multiplied by the cached polarization factor, the solid angle
+      and the capture fraction. Its polarization and omega come from the first subpixel of
+      the front layer, which is why the oversampled runs are here.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: water-100um
+        extra_args: >-
+          -water 100
+          -oversample 1
+      - name: water-500um
+        extra_args: >-
+          -water 500
+          -oversample 1
+      - name: water-oversample-3
+        extra_args: >-
+          -water 100
+          -oversample 3
+      - name: water-polarized
+        extra_args: >-
+          -water 100
+          -polar 0.5
+          -oversample 3
+      - name: water-nopolar
+        extra_args: >-
+          -water 100
+          -nopolar
+          -oversample 1
+      - name: water-with-sensor-layers
+        extra_args: >-
+          -water 100
+          -detector_thick 450
+          -detector_abs 300
+          -thicksteps 3
+          -oversample 2
