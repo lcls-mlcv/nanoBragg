@@ -790,9 +790,12 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['water_size_um'] = args.water
 
     # Fluence calculation
-    if args.flux and args.exposure and args.beamsize:
+    # C needs only -flux; -exposure and -beamsize have defaults (1 s, 0.1 mm)
+    if args.flux is not None:
         config['flux'] = args.flux
+    if args.exposure is not None:
         config['exposure'] = args.exposure
+    if args.beamsize is not None:
         config['beamsize_mm'] = args.beamsize
     elif args.fluence:
         config['fluence'] = args.fluence
@@ -1212,20 +1215,20 @@ def main():
                 print(f"  V divergence: {vdiv_params.count} steps, range={vdiv_params.range:.4f} rad")
                 print(f"  Dispersion: {disp_params.count} steps, range={disp_params.range:.4f}")
 
-        # Create beam config
-        beam_config = BeamConfig(
+        # Create beam config. flux/exposure/beamsize and fluence go in through the
+        # constructor: BeamConfig.__post_init__ derives fluence from them the way C does,
+        # and assigning them afterwards would silently skip that.
+        beam_kwargs = dict(
             wavelength_A=config.get('wavelength_A', 1.0),
             dmin=config.get('dmin', 0.0),
-            water_size_um=config.get('water_size_um', 0.0)
+            water_size_um=config.get('water_size_um', 0.0),
         )
-
-        # Fluence
-        if 'flux' in config:
-            beam_config.flux = config['flux']
-            beam_config.exposure = config['exposure']
-            beam_config.beamsize_mm = config['beamsize_mm']
-        elif 'fluence' in config:
-            beam_config.fluence = config['fluence']
+        if 'fluence' in config:
+            beam_kwargs['fluence'] = config['fluence']
+        for key in ('flux', 'exposure', 'beamsize_mm'):
+            if key in config:
+                beam_kwargs[key] = config[key]
+        beam_config = BeamConfig(**beam_kwargs)
 
         # Polarization
         if config.get('nopolar'):

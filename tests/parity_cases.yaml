@@ -954,3 +954,50 @@ cases:
           -detector_abs 300
           -thicksteps 3
           -oversample 2
+
+  - id: PARITY-FLUX-001
+    description: >-
+      Fluence from flux/exposure/beamsize (C ↔ PyTorch). nanoBragg.c defaults to
+      exposure = 1 s and beamsize = 0.1 mm and computes fluence = flux*exposure/beamsize^2
+      whenever flux != 0, so -flux alone changes the scale and overrides an explicit
+      -fluence. These runs differ in absolute scale by ~9 orders of magnitude.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: default-fluence
+        extra_args: >-
+      - name: flux-only
+        extra_args: >-
+          -flux 1e12
+      - name: flux-and-exposure
+        extra_args: >-
+          -flux 1e12
+          -exposure 2
+      - name: flux-and-beamsize
+        extra_args: >-
+          -flux 1e12
+          -beamsize 0.05
+      - name: flux-exposure-beamsize
+        extra_args: >-
+          -flux 1e12
+          -exposure 0.5
+          -beamsize 0.2
+      - name: explicit-fluence
+        extra_args: >-
+          -fluence 1e24
+      - name: flux-overrides-fluence
+        extra_args: >-
+          -fluence 1e24
+          -flux 1e12
