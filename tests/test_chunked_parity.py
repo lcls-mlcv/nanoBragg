@@ -21,11 +21,11 @@ from nanobrag_torch.models.detector import Detector
 from nanobrag_torch.simulator import Simulator
 
 
-def _simulate(pixel_batch_size, water_size_um=0.0, **detector_kwargs):
+def _simulate(pixel_batch_size, water_size_um=0.0, spot_scale=1.0, **detector_kwargs):
     detector = DetectorConfig(spixels=40, fpixels=32, pixel_size_mm=0.2, distance_mm=80.0, **detector_kwargs)
     crystal = CrystalConfig(cell_a=60, cell_b=70, cell_c=80, cell_alpha=85, cell_beta=95, cell_gamma=100,
                             misset_deg=(10.0, 20.0, 30.0), N_cells=(5, 5, 5), default_F=100.0)
-    beam = BeamConfig(wavelength_A=1.0, water_size_um=water_size_um)
+    beam = BeamConfig(wavelength_A=1.0, water_size_um=water_size_um, spot_scale=spot_scale)
     sim = Simulator(Crystal(crystal, beam, dtype=torch.float64), Detector(detector, dtype=torch.float64),
                     crystal, beam, dtype=torch.float64)
     return sim.run(pixel_batch_size=pixel_batch_size)
@@ -40,6 +40,9 @@ def _simulate(pixel_batch_size, water_size_um=0.0, **detector_kwargs):
         dict(oversample=2, detector_thick_um=450.0, detector_abs_um=300.0, detector_thicksteps=3, oversample_thick=True),
         dict(oversample=1, roi_xmin=4, roi_xmax=20, roi_ymin=6, roi_ymax=30),
         dict(oversample=1, water_size_um=100.0),
+        # spot_scale is applied once in run(); the removed chunked kernel had its own copy
+        dict(oversample=1, spot_scale=2.5),
+        dict(oversample=1, spot_scale=2.5, detector_thick_um=450.0, detector_abs_um=300.0, detector_thicksteps=3),
     ],
 )
 @pytest.mark.parametrize("pixel_batch_size", [1, 7, 39])
