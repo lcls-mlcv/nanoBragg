@@ -133,6 +133,13 @@ def compute_metrics(c_img, py_img, compute_ssim=False):
         sum_ratio, [ssim]
     """
     # Flatten for correlation
+    # Measure in float64. The images are float32, and every metric here is a reduction over
+    # up to millions of pixels: in float32 the accumulation order decides the result, so
+    # pearsonr on a 1024^2 image returned 0.9998438 with one BLAS thread and 1.0000000 with
+    # eight, from the same data (the float64 value is 0.9999999). Sums and RMSE drift the
+    # same way.
+    c_img = np.asarray(c_img, dtype=np.float64)
+    py_img = np.asarray(py_img, dtype=np.float64)
     c_flat = c_img.flatten()
     py_flat = py_img.flatten()
 
