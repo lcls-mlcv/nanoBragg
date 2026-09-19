@@ -1085,10 +1085,16 @@ class Detector:
                 dtype=self.dtype
             )
         # Convention defaults
-        elif self.config.detector_convention == DetectorConvention.MOSFLM:
+        elif self.config.detector_convention in (
+            DetectorConvention.MOSFLM,
+            DetectorConvention.DENZO,
+        ):
+            # nanoBragg.c:1193 (MOSFLM) and nanoBragg.c:1208 (DENZO) both set
+            # beam_vector = [1,0,0]; DENZO is MOSFLM with a different beam-centre
+            # offset (Fbeam = Ybeam + 0.0*pixel instead of + 0.5*pixel).
             return torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=self.dtype)
         else:
-            # XDS, DIALS, and CUSTOM (without override) conventions use beam along +Z
+            # XDS, DIALS, ADXV and CUSTOM (without override) conventions use beam along +Z
             return torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)
 
     def get_r_factor(self) -> torch.Tensor:
@@ -1156,11 +1162,8 @@ class Detector:
         """
         from ..config import DetectorConvention, DetectorPivot
 
-        # Get beam vector
-        if self.config.detector_convention == DetectorConvention.MOSFLM:
-            beam_vector = torch.tensor([1.0, 0.0, 0.0], device=self.device, dtype=self.dtype)
-        else:
-            beam_vector = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)
+        # Get beam vector (honours every convention plus CUSTOM overrides)
+        beam_vector = self.beam_vector
 
         # Calculate direct beam position after all transformations
         # For both BEAM and SAMPLE pivots, the formula is the same:

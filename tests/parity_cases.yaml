@@ -1002,6 +1002,189 @@ cases:
           -fluence 1e24
           -flux 1e12
 
+  - id: PARITY-DENZO-001
+    description: >-
+      DENZO detector convention (C ↔ PyTorch). nanoBragg.c:1204-1218 makes DENZO
+      identical to MOSFLM -- beam_vector [1,0,0], fdet [0,0,1], sdet [0,-1,0],
+      odet [1,0,0], twotheta_axis [0,0,-1], polar_vector [0,0,1],
+      spindle_vector [0,0,1], BEAM pivot, default Xbeam/Ybeam = (detsize+pixel)/2 --
+      except for the beam-centre offset: Fbeam = Ybeam + 0.0*pixel and
+      Sbeam = Xbeam + 0.0*pixel where MOSFLM uses + 0.5*pixel. PyTorch used to fall
+      through to the [0,0,1] beam vector for DENZO, which put the beam in the
+      detector plane and produced an all-zero image (sum ratio 0.0).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+      -denzo
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: denzo-default-beam-center
+        extra_args: >-
+      - name: denzo-explicit-beam-center
+        extra_args: >-
+          -Xbeam 5.0
+          -Ybeam 7.5
+      - name: denzo-detector-rotations
+        extra_args: >-
+          -detector_rotx 3
+          -detector_roty -2
+          -detector_rotz 1
+      - name: denzo-twotheta
+        extra_args: >-
+          -twotheta 20
+      - name: denzo-twotheta-explicit-beam-center
+        extra_args: >-
+          -twotheta 20
+          -Xbeam 5.0
+          -Ybeam 7.5
+      - name: denzo-twotheta-and-rotations
+        extra_args: >-
+          -twotheta -10
+          -detector_rotx 5
+      - name: denzo-close-distance
+        extra_args: >-
+          -close_distance 95
+
+  - id: PARITY-CONVENTION-001
+    description: >-
+      Convention table pinned against nanoBragg.c:1172-1248, one run per convention.
+      MOSFLM/DENZO: beam [1,0,0], f [0,0,1], s [0,-1,0], o [1,0,0],
+      twotheta_axis [0,0,-1], BEAM pivot (DENZO drops MOSFLM's +0.5 pixel offset).
+      XDS: beam [0,0,1], f [1,0,0], s [0,1,0], o [0,0,1], twotheta_axis [1,0,0],
+      SAMPLE pivot. DIALS: same bases as XDS but twotheta_axis [0,1,0], SAMPLE pivot.
+      ADXV (beam [0,0,1], f [1,0,0], s [0,-1,0], o [0,0,1], twotheta_axis [-1,0,0],
+      Fbeam = Xbeam, Sbeam = detsize_s - Ybeam, BEAM pivot) is pinned only with an
+      explicit beam centre: PyTorch's ADXV *default* beam centre is still one pixel
+      off on the slow axis (it uses Sbeam = (detsize_s - pixel)/2 where C computes
+      Sbeam = detsize_s - Ybeam = (detsize_s + pixel)/2), which is a separate
+      unfixed bug and deliberately not pinned here.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: mosflm-default
+        extra_args: >-
+          -mosflm
+      - name: mosflm-explicit-beam-center
+        extra_args: >-
+          -mosflm
+          -Xbeam 5.0
+          -Ybeam 7.5
+      - name: denzo-default
+        extra_args: >-
+          -denzo
+      - name: denzo-explicit-beam-center
+        extra_args: >-
+          -denzo
+          -Xbeam 5.0
+          -Ybeam 7.5
+      - name: xds-default
+        extra_args: >-
+          -xds
+      - name: xds-twotheta
+        extra_args: >-
+          -xds
+          -twotheta 20
+      - name: dials-default
+        extra_args: >-
+          -dials
+      - name: dials-twotheta
+        extra_args: >-
+          -dials
+          -twotheta 20
+      - name: adxv-explicit-beam-center
+        extra_args: >-
+          -adxv
+          -Xbeam 5.0
+          -Ybeam 7.5
+
+  - id: PARITY-CONVENTION-002
+    description: >-
+      Per-convention polarization E-vector and spindle axis (C ↔ PyTorch). Each convention
+      block in nanoBragg.c sets polar_vector and spindle_vector alongside the detector basis:
+      MOSFLM and DENZO use [0,0,1], XDS and ADXV [1,0,0], DIALS [0,1,0]. A wrong spindle axis
+      only shows once phi rotates (it was r = 0.55 for XDS/DIALS/ADXV), and a wrong
+      polarization axis only once the Kahn factor is non-zero.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: mosflm-polarized
+        extra_args: >-
+          -mosflm
+          -polar 0.9
+      - name: denzo-polarized
+        extra_args: >-
+          -denzo
+          -polar 0.9
+      - name: xds-polarized
+        extra_args: >-
+          -xds
+          -polar 0.9
+      - name: dials-polarized
+        extra_args: >-
+          -dials
+          -polar 0.9
+      - name: adxv-polarized
+        extra_args: >-
+          -adxv
+          -polar 0.9
+      - name: mosflm-phi
+        extra_args: >-
+          -mosflm
+          -phi 0 -osc 6 -phisteps 3
+      - name: xds-phi
+        extra_args: >-
+          -xds
+          -phi 0 -osc 6 -phisteps 3
+      - name: dials-phi
+        extra_args: >-
+          -dials
+          -phi 0 -osc 6 -phisteps 3
+      - name: adxv-phi
+        extra_args: >-
+          -adxv
+          -phi 0 -osc 6 -phisteps 3
+      - name: adxv-default-beam-centre
+        extra_args: >-
+          -adxv
+      - name: adxv-default-beam-centre-rotated
+        extra_args: >-
+          -adxv
+          -detector_rotx 4
+          -twotheta 15
   - id: PARITY-CURVED-001
     description: >-
       Curved detector (C ↔ PyTorch). With -curved_det nanoBragg.c:2707-2716 throws away the
