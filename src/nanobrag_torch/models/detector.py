@@ -888,92 +888,105 @@ class Detector:
 
         return pixel_coords
 
+    @staticmethod
+    def _rotate_axis(v: torch.Tensor, axis: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+        """
+        Rodrigues rotation of ``v`` about unit ``axis`` by ``phi``, matching
+        ``rotate_axis()`` in nanoBragg.c:3378-3391 term for term::
+
+            temp = axis*(axis.v)*(1-cos(phi)) + v*cos(phi) + (axis x v)*sin(phi)
+
+        Args:
+            v: (..., 3) vectors to rotate.
+            axis: (3,) unit rotation axis.
+            phi: (...) rotation angle in radians, broadcastable against ``v[..., 0]``.
+
+        Returns:
+            torch.Tensor: rotated vectors, shape broadcast of ``v`` and ``phi``.
+        """
+        cos_phi = torch.cos(phi).unsqueeze(-1)
+        sin_phi = torch.sin(phi).unsqueeze(-1)
+        axis_dot_v = torch.sum(v * axis, dim=-1, keepdim=True)
+        cross = torch.cross(axis.expand_as(v), v, dim=-1)
+        return axis * axis_dot_v * (1.0 - cos_phi) + v * cos_phi + cross * sin_phi
+
+    def apply_curved_mapping(self, planar_coords: torch.Tensor) -> torch.Tensor:
+        """
+        Map planar detector positions onto the ``-curved_det`` sphere exactly as
+        nanoBragg.c:2707-2716 does inside the sensor-layer / sub-pixel loop::
+
+            vector = distance*beam_vector;
+            rotate_axis(vector,   newvector, sdet_vector, pixel_pos[2]/distance);
+            rotate_axis(newvector, pixel_pos, fdet_vector, pixel_pos[3]/distance);
+
+        Two things are easy to get wrong and are load-bearing here:
+
+        * the rotation angles are the **lab-frame Y and Z components** of the planar
+          ``pixel_pos`` (indices 1 and 2 zero-based), divided by ``distance`` -- not the
+          detector-plane ``Fdet``/``Sdet`` offsets, and they therefore include the whole
+          ``pix0_vector`` (beam centre) contribution;
+        * both angles come from the *planar* ``pixel_pos``: C evaluates
+          ``pixel_pos[3]/distance`` as an argument before the second ``rotate_axis`` call
+          overwrites ``pixel_pos``;
+        * the result replaces the position outright -- every pixel ends up exactly
+          ``distance`` from the sample, with no ``pix0_vector`` offset left in it.
+
+        ``distance`` is the r-factor corrected distance (``close_distance/ratio``), the
+        value C holds in ``distance`` by the time the render loop runs.
+
+        Args:
+            planar_coords: (..., 3) planar positions in meters, including any sub-pixel
+                and sensor-layer offsets.
+
+        Returns:
+            torch.Tensor: (..., 3) curved positions in meters.
+        """
+        distance = self.get_corrected_distance().to(
+            device=planar_coords.device, dtype=planar_coords.dtype
+        )
+        beam_vector = self.beam_vector.to(
+            device=planar_coords.device, dtype=planar_coords.dtype
+        )
+        sdet_vec = self.sdet_vec.to(device=planar_coords.device, dtype=planar_coords.dtype)
+        fdet_vec = self.fdet_vec.to(device=planar_coords.device, dtype=planar_coords.dtype)
+
+        # vector = distance * beam_vector, broadcast over every pixel/sub-pixel
+        start = (distance * beam_vector).expand(planar_coords.shape)
+
+        # "treat detector pixel coordinates as radians"
+        angle_about_s = planar_coords[..., 1] / distance  # pixel_pos[2] in C (lab Y)
+        angle_about_f = planar_coords[..., 2] / distance  # pixel_pos[3] in C (lab Z)
+
+        rotated = self._rotate_axis(start, sdet_vec, angle_about_s)
+        rotated = self._rotate_axis(rotated, fdet_vec, angle_about_f)
+        return rotated
+
     def _compute_curved_pixel_coords(self) -> torch.Tensor:
         """
-        Compute pixel coordinates for a curved (spherical) detector.
+        Pixel-centre coordinates for a curved (``-curved_det``) detector.
 
-        Per spec: "start at distance along b and rotate about s and f by small angles
-        Sdet/distance and Fdet/distance respectively."
+        Equivalent to the planar centres pushed through :meth:`apply_curved_mapping`.
+        With over-sampling or sensor layers the simulator instead maps each sub-pixel
+        position, as nanoBragg.c does inside its loops.
 
         Returns:
             torch.Tensor: Pixel coordinates with shape (spixels, fpixels, 3) in meters
         """
-        # Create pixel index grids - pixel centers to match C code behavior
-        # The C code uses pixel centers (0.5, 1.5, 2.5, ...) not corners
-        # Adding 0.5 to indices places coordinates at pixel centers
-        s_indices = torch.arange(self.spixels, device=self.device, dtype=self.dtype) + 0.5
-        f_indices = torch.arange(self.fpixels, device=self.device, dtype=self.dtype) + 0.5
-        s_grid, f_grid = torch.meshgrid(s_indices, f_indices, indexing="ij")
+        return self.apply_curved_mapping(self._compute_planar_pixel_coords())
 
-        # Calculate Sdet and Fdet in the detector plane
-        # Per spec, these are relative to pix0_vector (the detector origin)
-        Sdet = s_grid * self.pixel_size  # meters
-        Fdet = f_grid * self.pixel_size  # meters
+    def get_planar_pixel_coords(self) -> torch.Tensor:
+        """
+        Planar pixel-centre coordinates, ignoring ``curved_detector``.
 
-        # For curved detector, we need to map each (Fdet, Sdet) point to a sphere
-        # The idea is that each pixel is at the same distance from the sample,
-        # but at different angular positions
+        The simulator needs these even in curved mode: nanoBragg.c builds the planar
+        ``pixel_pos`` (with sub-pixel and sensor-layer offsets) first and only then
+        replaces it with the curved one, so the curved mapping has to be applied after
+        the offsets, not before.
 
-        # beam_vector is the incident beam direction (source→sample, photon propagation)
-        # So -beam_vector points from sample toward detector (opposite of incident)
-        beam_dir = -self.beam_vector
-
-        # Compute the angular offsets for each pixel
-        # These are based on the detector plane coordinates
-        # We use the small angle approximation: tan(θ) ≈ θ for small θ
-
-        # The detector plane is initially perpendicular to the beam
-        # In the detector plane, we have coordinates (Fdet, Sdet)
-        # We need to find the angles to rotate from the beam direction
-
-        # For a planar detector, a pixel at (Fdet, Sdet) would be at:
-        # P_planar = pix0_vector + Fdet * fdet_vec + Sdet * sdet_vec
-
-        # For a curved detector, we want all pixels at distance R from origin
-        # We achieve this by rotating the beam direction by small angles
-
-        # The angle to rotate about the s-axis (affects f-coordinate)
-        # tan(angle_s) = Fdet / distance, for small angles: angle_s ≈ Fdet / distance
-        angle_about_s = Fdet / self.distance
-
-        # The angle to rotate about the f-axis (affects s-coordinate)
-        # tan(angle_f) = Sdet / distance, for small angles: angle_f ≈ Sdet / distance
-        angle_about_f = Sdet / self.distance
-
-        # Apply rotations using Rodriguez formula for small angles
-        # For small angles, rotate(v, axis, θ) ≈ v + θ * (axis × v)
-
-        # Rotation about s-axis by angle_about_s
-        # s × beam_dir gives a vector in the f-o plane
-        cross_s_beam = torch.cross(self.sdet_vec, beam_dir, dim=0)
-
-        # Rotation about f-axis by angle_about_f
-        # f × beam_dir gives a vector in the s-o plane
-        cross_f_beam = torch.cross(self.fdet_vec, beam_dir, dim=0)
-
-        # Expand for broadcasting
-        beam_expanded = beam_dir.unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
-        cross_s_expanded = cross_s_beam.unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
-        cross_f_expanded = cross_f_beam.unsqueeze(0).unsqueeze(0)  # (1, 1, 3)
-
-        # Apply both rotations (small angle approximation)
-        # The rotated direction vector
-        direction = (
-            beam_expanded
-            + angle_about_s.unsqueeze(-1) * cross_s_expanded  # Rotation about s
-            + angle_about_f.unsqueeze(-1) * cross_f_expanded  # Rotation about f
-        )
-
-        # Normalize to get unit direction vector
-        direction_norm = torch.norm(direction, dim=-1, keepdim=True)
-        direction_normalized = direction / direction_norm
-
-        # Each pixel is at distance from the sample
-        # Note: We don't add pix0_vector here because for curved detector,
-        # pixels are positioned on a sphere centered at the sample
-        pixel_coords = self.distance * direction_normalized
-
-        return pixel_coords
+        Returns:
+            torch.Tensor: Pixel coordinates with shape (spixels, fpixels, 3) in meters
+        """
+        return self._compute_planar_pixel_coords()
 
     def thickness_layers(self):
         """

@@ -126,9 +126,21 @@ class TestATGEO005CurvedDetector:
         assert dist_corner_planar > dist_center_planar, \
             "Planar detector: corner pixels should be further from sample than center"
 
-    def test_small_angle_rotation_consistency(self):
-        """Test that curved mapping is consistent with small-angle rotations."""
-        # Setup: Create curved detector
+    def test_matches_c_two_rotate_axis_calls(self):
+        """The curved mapping must reproduce nanoBragg.c:2707-2716 exactly.
+
+        C does, per sub-pixel::
+
+            vector = distance*beam_vector;
+            rotate_axis(vector,    newvector, sdet_vector, pixel_pos[2]/distance);
+            rotate_axis(newvector, pixel_pos, fdet_vector, pixel_pos[3]/distance);
+
+        Note the angles are the lab-frame Y and Z components of the *planar* pixel_pos
+        (so they include pix0_vector / the beam centre), NOT the in-plane Sdet/Fdet
+        offsets, and rotate_axis is the full Rodrigues rotation, not a first-order
+        approximation. This test used to encode a first-order approximation driven by
+        Sdet/Fdet and a negated beam vector; both were wrong against C.
+        """
         config = DetectorConfig(
             distance_mm=100.0,
             pixel_size_mm=0.1,
@@ -140,53 +152,58 @@ class TestATGEO005CurvedDetector:
         )
         detector = Detector(config)
 
-        # Get pixel coordinates
         coords = detector.get_pixel_coords()
+        planar = detector.get_planar_pixel_coords()
 
-        # Test a specific pixel
-        test_s = 60  # 10 pixels offset from origin in slow direction
-        test_f = 70  # 20 pixels offset from origin in fast direction
+        distance = detector.get_corrected_distance()
+        beam = detector.beam_vector
 
-        # Calculate expected angles based on the spec
-        # "rotate about s by Sdet/distance and about f by Fdet/distance"
-        distance_m = config.distance_mm / 1000.0
-        pixel_size_m = config.pixel_size_mm / 1000.0
+        def rotate_axis(v, axis, phi):
+            """Literal transcription of nanoBragg.c rotate_axis()."""
+            c, s = torch.cos(phi), torch.sin(phi)
+            dot = torch.dot(axis, v) * (1.0 - c)
+            return axis * dot + v * c + torch.cross(axis, v, dim=0) * s
 
-        # Sdet and Fdet are the actual detector coordinates
-        Sdet = test_s * pixel_size_m
-        Fdet = test_f * pixel_size_m
+        # A few off-centre pixels, including one far out on both axes
+        for test_s, test_f in [(60, 70), (5, 95), (99, 0), (50, 50)]:
+            pixel_pos = planar[test_s, test_f]
 
-        # The rotation angles are Sdet/distance and Fdet/distance
-        expected_angle_s = Sdet / distance_m
-        expected_angle_f = Fdet / distance_m
+            vector = distance * beam
+            newvector = rotate_axis(vector, detector.sdet_vec, pixel_pos[1] / distance)
+            expected = rotate_axis(newvector, detector.fdet_vec, pixel_pos[2] / distance)
 
-        # Get the actual pixel position
-        pixel_pos = coords[test_s, test_f]
+            actual = coords[test_s, test_f]
+            assert torch.allclose(actual, expected, atol=1e-12), \
+                f"pixel ({test_s},{test_f}): got {actual.tolist()}, C gives {expected.tolist()}"
 
-        # The direction to this pixel from the sample
-        pixel_dir = pixel_pos / torch.norm(pixel_pos)
+            # And the defining property: exactly "distance" from the sample
+            assert torch.allclose(torch.norm(actual), distance, rtol=1e-12)
 
-        # The initial beam direction (before rotations)
-        beam_dir = -detector.beam_vector
+    def test_curved_mapping_applies_to_subpixels(self):
+        """C maps each sub-pixel, so mapping an offset position != offsetting a mapped one."""
+        config = DetectorConfig(
+            distance_mm=100.0,
+            pixel_size_mm=0.1,
+            spixels=64,
+            fpixels=64,
+            beam_center_s=3.2,
+            beam_center_f=3.2,
+            curved_detector=True,
+        )
+        detector = Detector(config)
+        planar = detector.get_planar_pixel_coords()
 
-        # For the curved detector with small angle approximation:
-        # The pixel direction should be approximately:
-        # beam_dir + angle_s * (s × beam_dir) + angle_f * (f × beam_dir)
+        # A quarter-pixel sub-sample offset along fast
+        offset = 0.25 * detector.pixel_size * detector.fdet_vec
+        mapped_offset = detector.apply_curved_mapping(planar + offset)
 
-        # Calculate the expected direction
-        cross_s_beam = torch.cross(detector.sdet_vec, beam_dir, dim=0)
-        cross_f_beam = torch.cross(detector.fdet_vec, beam_dir, dim=0)
+        # Every mapped sub-pixel still sits exactly "distance" from the sample ...
+        distance = detector.get_corrected_distance()
+        assert torch.allclose(torch.norm(mapped_offset, dim=-1), distance.expand(64, 64), rtol=1e-6)
 
-        expected_dir = beam_dir + expected_angle_s * cross_s_beam + expected_angle_f * cross_f_beam
-        expected_dir = expected_dir / torch.norm(expected_dir)
-
-        # The actual and expected directions should be very close
-        dot_product = torch.dot(pixel_dir, expected_dir).item()
-
-        # For small angles, cos(angle) ≈ 1 - angle^2/2
-        # So we expect dot product very close to 1
-        assert dot_product > 0.999, \
-            f"Pixel direction mismatch. Dot product: {dot_product} (should be close to 1)"
+        # ... and differs from simply shifting the mapped pixel centres.
+        naive = detector.get_pixel_coords() + offset
+        assert not torch.allclose(mapped_offset, naive, atol=1e-9)
 
     def test_gradient_flow_curved_detector(self):
         """Test that gradients flow through curved detector mapping."""

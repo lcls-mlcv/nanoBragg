@@ -1001,3 +1001,62 @@ cases:
         extra_args: >-
           -fluence 1e24
           -flux 1e12
+
+  - id: PARITY-CURVED-001
+    description: >-
+      Curved detector (C ↔ PyTorch). With -curved_det nanoBragg.c:2707-2716 throws away the
+      planar pixel_pos and rebuilds it as distance*beam_vector rotated twice:
+      rotate_axis about sdet_vector by pixel_pos[2]/distance, then about fdet_vector by
+      pixel_pos[3]/distance. The angles are the LAB-FRAME Y and Z components of the planar
+      position (so they include pix0_vector, i.e. the beam centre), both read from the planar
+      pixel_pos, and the whole thing happens inside the sensor-layer / sub-pixel loop, so
+      every sub-pixel and layer is mapped separately. Every pixel ends up exactly "distance"
+      from the sample.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -curved_det
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: curved-plain
+        extra_args: >-
+          -oversample 1
+      - name: curved-oversample-3
+        extra_args: >-
+          -oversample 3
+      - name: curved-detector-rotations
+        extra_args: >-
+          -detector_rotx 5
+          -detector_roty 3
+          -detector_rotz 2
+          -oversample 1
+      - name: curved-rotations-oversample-2
+        extra_args: >-
+          -detector_rotx 5
+          -detector_roty 3
+          -detector_rotz 2
+          -oversample 2
+      - name: curved-twotheta-20
+        extra_args: >-
+          -twotheta 20
+          -oversample 1
+      - name: curved-offset-beam-center
+        extra_args: >-
+          -Xbeam 3.0
+          -Ybeam 10.0
+          -oversample 1
+      - name: curved-thick-layers
+        extra_args: >-
+          -detector_thick 300
+          -detector_abs 200
+          -thicksteps 3
+          -oversample 2
