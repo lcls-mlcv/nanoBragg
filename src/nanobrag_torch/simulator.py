@@ -7,6 +7,7 @@ Detector objects as input and producing the final diffraction pattern.
 
 from typing import Optional, Callable
 
+import os
 import torch
 
 from .config import BeamConfig, CrystalConfig, CrystalShape
@@ -227,7 +228,7 @@ def compute_physics_for_position(
     # The debug print below is intended for eager/debug runs only. Under torch.compile/Dynamo,
     # string formatting can interact badly with graph tracing, so we explicitly skip this block
     # when a Dynamo trace is in progress.
-    log_hkl_stats = apply_polarization
+    log_hkl_stats = os.environ.get("NANOBRAGG_DEBUG_HKL", "0") == "1"  # debug only; was tied to apply_polarization
     if log_hkl_stats:
         is_compiling = False
         try:
@@ -1116,6 +1117,7 @@ class Simulator:
             / steps
             * self.r_e_sqr
             * self.fluence
+            * getattr(self.beam_config, "spot_scale", 1.0)
         )
 
         return physical_intensity
@@ -1631,6 +1633,7 @@ class Simulator:
             / steps
             * self.r_e_sqr
             * self.fluence
+            * getattr(self.beam_config, "spot_scale", 1.0)
         )
 
         # Add water background if configured (AT-BKG-001)
