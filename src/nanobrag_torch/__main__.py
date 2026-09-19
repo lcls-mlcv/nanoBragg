@@ -9,6 +9,7 @@ mapping command-line flags to engine parameters per spec requirements.
 import os
 import sys
 import argparse
+import re
 import time
 import warnings
 import torch
@@ -395,7 +396,27 @@ Examples:
                         supported_alternative='-vdivrange <mrad>',
                         help=argparse.SUPPRESS)
 
+    _allow_negative_numbers(parser)
     return parser
+
+
+def _allow_negative_numbers(parser: argparse.ArgumentParser) -> None:
+    """
+    Keep negative numeric values parseable, e.g. "-detector_roty -2".
+
+    argparse only accepts a token like "-2" as a value when no option string of the parser
+    looks like a negative number. We mirror nanoBragg's CLI, which includes "-4stol", and on
+    Python 3.13+ argparse counts any option beginning with a dash and a digit as
+    negative-number-like. That silently turned every negative angle, offset and beam centre
+    into "expected one argument" on new interpreters while older ones accepted them; the
+    parity matrix caught it only because one machine runs 3.14 and the other 3.12.
+
+    Restoring the narrow "a value that is entirely a number" rule keeps "-4stol" usable as a
+    flag and "-2" usable as a value, which is what the C CLI does.
+    """
+    parser._negative_number_matcher = re.compile(r"^-\d+$|^-\d*\.\d+$|^-\d+[eE][-+]?\d+$")
+    # argparse tests this list for truthiness, not for its contents, so it has to be emptied
+    del parser._has_negative_number_optionals[:]
 
 
 def determine_beam_center_source(args: argparse.Namespace, config: Dict[str, Any]) -> str:
