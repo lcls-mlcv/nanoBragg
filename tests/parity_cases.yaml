@@ -477,20 +477,27 @@ cases:
       -osc 0
       -mosaic 0
       -oversample 1
+    # -misset_seed goes first: nanoBragg.c's strstr() parser reads a later "-misset_seed N"
+    # as "-misset N <next> <next>" and silently drops the random orientation. -seed does not
+    # seed the random misset in C (misset_seed is copied from the time-based seed before argv
+    # is parsed), so only -misset_seed gives a reproducible C reference.
     thresholds:
-      corr_min: 0.99
-      sum_ratio_min: 0.98
-      sum_ratio_max: 1.02
-      max_abs_max: 500
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
     runs:
       - name: random-misset-seed-12345
         extra_args: >-
-          -misset random
           -misset_seed 12345
+          -misset random
       - name: random-misset-seed-54321
         extra_args: >-
-          -misset random
           -misset_seed 54321
+          -misset random
+      - name: random-misset-seed-1
+        extra_args: >-
+          -misset_seed 1
+          -misset random
 
   - id: AT-PARALLEL-010
     description: Solid angle corrections parity (C ↔ PyTorch)

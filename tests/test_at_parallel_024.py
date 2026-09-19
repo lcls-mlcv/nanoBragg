@@ -189,11 +189,6 @@ class TestAT_PARALLEL_024:
             assert corr <= 0.7, \
                 f"Different seeds produced too high correlation: {corr:.3f}"
 
-    @pytest.mark.skip(reason="Known scaling issue: ~500x difference between C and PyTorch implementations. Interface fix is complete - C code correctly receives misset parameters.")
-    @pytest.mark.skipif(
-        not Path("./golden_suite_generator/nanoBragg").exists(),
-        reason="Requires instrumented C binary"
-    )
     def test_c_pytorch_equivalence(self, base_config, tmp_path):
         """Test C vs PyTorch equivalence for random misset."""
         seeds = [12345, 54321]
@@ -297,26 +292,14 @@ class TestAT_PARALLEL_024:
             print(f"   Mean absolute difference: {diff.mean():.3e}")
             print(f"   Mean relative difference: {rel_diff.mean():.3e}")
 
-            # NOTE: There is a known ~500x scaling difference between C and PyTorch implementations
-            # that affects all tests, not just random misset. This is a broader PyTorch implementation
-            # issue that needs to be addressed separately. For this test, we focus on validating
-            # that the CReferenceRunner interface correctly passes misset parameters to the C code.
-
-            # Since we have verified that the C code receives the correct -misset random -misset_seed
-            # parameters, the interface fix is successful. The scaling issue is out of scope for this fix.
-            print(f"\n✅ Interface fix successful: C code received '-misset random -misset_seed {seed}'")
-            print(f"\u26a0️  Known issue: ~500x scaling difference between C and PyTorch (separate from misset)")
-
-            # For now, we'll skip the strict equivalence test since the underlying scaling issue
-            # needs to be fixed in the broader PyTorch implementation. The test interface is working.
-
-            # NOTE: Skipping correlation and image equivalence tests due to known ~500x
-            # scaling difference between C and PyTorch implementations. This test now
-            # focuses on validating that the CReferenceRunner interface correctly
-            # passes misset parameters to the C code, which has been verified.
-
-            # Future work: Once the broader scaling issue is resolved, restore the
-            # equivalence tests with original tolerances (rtol=1e-5, atol=1e-6, corr>=0.99)
+            # Cross-implementation equivalence. The C reference used to receive
+            # "-misset random -misset_seed N", which nanoBragg.c parses as fixed misset
+            # angles (N, ...), so the two programs rendered different orientations.
+            c_np = c_image.numpy().ravel()
+            pt_np = pt_image.detach().cpu().numpy().ravel()
+            corr = np.corrcoef(c_np, pt_np)[0, 1]
+            assert corr >= 0.9999, f"seed {seed}: C vs PyTorch correlation {corr:.6f}"
+            assert pt_np.sum() / c_np.sum() == pytest.approx(1.0, abs=1e-3), f"seed {seed}: sum ratio"
 
     def test_lcg_compatibility(self):
         """Test that our LCG implementation matches expected behavior."""
