@@ -630,7 +630,16 @@ class Simulator:
 
         # PERF-PYTORCH-004 P3.4: Cache frequently-accessed tensors to reduce per-run allocations
         # Pre-convert pixel coordinates to correct device/dtype once
-        self._cached_pixel_coords_meters = self.detector.get_pixel_coords().to(device=self.device, dtype=self.dtype)
+        # -curved_det (nanoBragg.c:2707-2716): C builds the PLANAR pixel_pos first -- including
+        # the sub-pixel and sensor-layer offsets -- and only then replaces it with the curved
+        # position. So in curved mode the cache holds planar centres and the curved mapping is
+        # applied downstream, after the offsets have been added.
+        self._curved_detector = bool(getattr(self.detector.config, "curved_detector", False))
+        if self._curved_detector:
+            _pixel_coords = self.detector.get_planar_pixel_coords()
+        else:
+            _pixel_coords = self.detector.get_pixel_coords()
+        self._cached_pixel_coords_meters = _pixel_coords.to(device=self.device, dtype=self.dtype)
 
         # Build ROI mask once and cache it (AT-ROI-001)
         # Start with all pixels enabled
@@ -856,6 +865,12 @@ class Simulator:
             # Shape: (S, F, oversample*oversample, 3)
             subpixel_coords_all = pixel_coords_expanded + offset_vectors_expanded
 
+            # -curved_det: nanoBragg.c:2707-2716 replaces the planar pixel_pos with a point
+            # "distance" from the sample, inside the sub-pixel/layer loop, so every sub-pixel
+            # and sensor layer gets its own mapping.
+            if self._curved_detector:
+                subpixel_coords_all = self.detector.apply_curved_mapping(subpixel_coords_all)
+
             # Convert to Angstroms for physics
             subpixel_coords_ang_all = subpixel_coords_all * 1e10
 
@@ -999,6 +1014,12 @@ class Simulator:
             normalized_intensity = accumulated_intensity
         else:
             # No subpixel sampling - compute physics once for pixel centers
+            # -curved_det: with a single sample per pixel the C mapping reduces to mapping the
+            # pixel centre (nanoBragg.c:2707-2716). Everything below -- airpath, omega,
+            # polarization, water background -- then sees the curved position, as in C.
+            if self._curved_detector:
+                pixel_coords_meters = self.detector.apply_curved_mapping(pixel_coords_meters)
+
             # SPEC MODE: Global vectorization per specs/spec-a-core.md:204-240
             pixel_coords_angstroms = pixel_coords_meters * 1e10
 
@@ -1378,6 +1399,11 @@ class Simulator:
 
         # Apply debug output if requested
         if self.printout or self.trace_pixel:
+            # -curved_det: the cached coordinates are planar in curved mode, so map them for
+            # the trace/printout to report the positions C actually renders.
+            if self._curved_detector:
+                pixel_coords_meters = self.detector.apply_curved_mapping(pixel_coords_meters)
+
             # For debug output, compute polarization for single pixel case
             # Also cache total steps for accurate trace output
             polarization_value = None
