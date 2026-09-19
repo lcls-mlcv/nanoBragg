@@ -875,12 +875,29 @@ def print_configuration(crystal_config, detector_config, beam_config, simulator_
     print("="*60 + "\n")
 
 
+def warn_c_misset_seed_order(argv) -> None:
+    """
+    Warn when ``-misset_seed`` follows ``-misset random``. nanoBragg.c matches
+    flags with strstr(), so it reads the later "-misset_seed N" as
+    "-misset N <next> <next>" and renders fixed angles instead of a random
+    orientation; the PyTorch CLI keeps the random orientation.
+    """
+    randoms = [i for i, a in enumerate(argv[:-1]) if a == '-misset' and argv[i + 1].startswith('rand')]
+    if randoms and '-misset_seed' in argv[randoms[-1] + 2:]:
+        warnings.warn(
+            "-misset_seed after -misset random: nanoBragg.c would use fixed misset angles here. "
+            "Put -misset_seed first to get the same random orientation from both programs.",
+            stacklevel=2,
+        )
+
+
 def main():
     """Main entry point for CLI."""
 
     # Parse arguments
     parser = create_parser()
     args = parser.parse_args()
+    warn_c_misset_seed_order(sys.argv[1:])
 
     try:
         # Parse dtype and device early (DTYPE-DEFAULT-001)

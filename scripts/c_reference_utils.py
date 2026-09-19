@@ -24,9 +24,16 @@ _DEFAULT_FLUENCE = 125932015286227086360700780544.0
 
 
 def _fmm(v) -> str:
-    """Format a float for CLI (mm, degrees) matching test expectations like '15.0'."""
+    """Format a float for CLI (mm, degrees) as '15.0' or '12.85' without losing precision.
+
+    One decimal place is not enough: the default MOSFLM beam centre of a 256-pixel,
+    0.1 mm detector is 12.85 mm, and rounding it to 12.9 shifts the C image by half a pixel.
+    """
     x = float(v)
-    return f"{x:.1f}"
+    text = f"{x:.12g}"
+    if text.lstrip("-").isdigit():
+        text += ".0"
+    return text
 
 
 def _fmt_twotheta(v) -> str:
@@ -81,9 +88,12 @@ def build_nanobragg_command(
     cmd += ["-default_F", _fmm(cc.default_F)]
 
     if cc.misset_random:
-        cmd += ["-misset", "random"]
+        # -misset_seed must precede -misset random: nanoBragg.c matches flags with strstr(),
+        # so a later "-misset_seed N" also hits the "-misset" branch and replaces the random
+        # orientation with fixed angles (N, next arg, next-but-one arg).
         if cc.misset_seed is not None:
             cmd += ["-misset_seed", str(int(cc.misset_seed))]
+        cmd += ["-misset", "random"]
     else:
         mx, my, mz = cc.misset_deg
         if abs(mx) + abs(my) + abs(mz) > 0.0:
