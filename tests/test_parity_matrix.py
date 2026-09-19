@@ -129,7 +129,8 @@ def compute_metrics(c_img, py_img, compute_ssim=False):
         compute_ssim: Whether to compute SSIM (optional)
 
     Returns:
-        dict with keys: correlation, mse, rmse, max_abs_diff, c_sum, py_sum, sum_ratio, [ssim]
+        dict with keys: correlation, mse, rmse, max_abs_diff, max_rel_diff, c_sum, py_sum,
+        sum_ratio, [ssim]
     """
     # Flatten for correlation
     c_flat = c_img.flatten()
@@ -158,6 +159,10 @@ def compute_metrics(c_img, py_img, compute_ssim=False):
         'mse': float(mse),
         'rmse': float(rmse),
         'max_abs_diff': float(max_abs_diff),
+        # max_abs_diff as a fraction of the brightest C pixel: comparable across cases whose
+        # absolute scale differs by orders of magnitude (point_pixel drops the pixel area, so
+        # its intensities are ~1e11 where a normal run is ~1e2).
+        'max_rel_diff': float(max_abs_diff / peak) if (peak := float(np.max(np.abs(c_img)))) > 0 else 0.0,
         'c_sum': c_sum,
         'py_sum': py_sum,
         'sum_ratio': sum_ratio,
@@ -373,6 +378,12 @@ def test_parity_case(parity_case, c_binary, pytorch_cli, request):
             if metrics['max_abs_diff'] > thresholds['max_abs_max']:
                 failures.append(f"max_abs_diff {metrics['max_abs_diff']:.2f} > {thresholds['max_abs_max']}")
 
+        if 'max_rel_max' in thresholds:
+            if metrics['max_rel_diff'] > thresholds['max_rel_max']:
+                failures.append(
+                    f"max_rel_diff {metrics['max_rel_diff']:.3g} > {thresholds['max_rel_max']}"
+                )
+
         if 'sum_ratio_min' in thresholds and 'sum_ratio_max' in thresholds:
             if not (thresholds['sum_ratio_min'] <= metrics['sum_ratio'] <= thresholds['sum_ratio_max']):
                 failures.append(f"sum_ratio {metrics['sum_ratio']:.4f} not in [{thresholds['sum_ratio_min']}, {thresholds['sum_ratio_max']}]")
@@ -397,7 +408,9 @@ def test_parity_case(parity_case, c_binary, pytorch_cli, request):
             # Construct failure message
             msg = f"\nParity test failed for {case_id} / {run_name}:\n"
             msg += "\n".join(f"  - {f}" for f in failures)
-            msg += f"\n\nMetrics: corr={metrics['correlation']:.6f}, RMSE={metrics['rmse']:.2f}, max|Δ|={metrics['max_abs_diff']:.2f}, sum_ratio={metrics['sum_ratio']:.4f}"
+            msg += (f"\n\nMetrics: corr={metrics['correlation']:.6f}, RMSE={metrics['rmse']:.2f}, "
+                    f"max|Δ|={metrics['max_abs_diff']:.2f} ({metrics['max_rel_diff']:.3g} of peak), "
+                    f"sum_ratio={metrics['sum_ratio']:.4f}")
             msg += f"\n\nArtifacts saved to: {artifact_dir}"
             msg += f"\n  - {metrics_path.name}"
             msg += f"\n  - {heatmap_path.name}"
