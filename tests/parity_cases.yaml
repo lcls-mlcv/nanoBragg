@@ -1118,3 +1118,70 @@ cases:
           -adxv
           -Xbeam 5.0
           -Ybeam 7.5
+
+  - id: PARITY-CONVENTION-002
+    description: >-
+      Per-convention polarization E-vector and spindle axis (C ↔ PyTorch). Each convention
+      block in nanoBragg.c sets polar_vector and spindle_vector alongside the detector basis:
+      MOSFLM and DENZO use [0,0,1], XDS and ADXV [1,0,0], DIALS [0,1,0]. A wrong spindle axis
+      only shows once phi rotates (it was r = 0.55 for XDS/DIALS/ADXV), and a wrong
+      polarization axis only once the Kahn factor is non-zero.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: mosflm-polarized
+        extra_args: >-
+          -mosflm
+          -polar 0.9
+      - name: denzo-polarized
+        extra_args: >-
+          -denzo
+          -polar 0.9
+      - name: xds-polarized
+        extra_args: >-
+          -xds
+          -polar 0.9
+      - name: dials-polarized
+        extra_args: >-
+          -dials
+          -polar 0.9
+      - name: adxv-polarized
+        extra_args: >-
+          -adxv
+          -polar 0.9
+      - name: mosflm-phi
+        extra_args: >-
+          -mosflm
+          -phi 0 -osc 6 -phisteps 3
+      - name: xds-phi
+        extra_args: >-
+          -xds
+          -phi 0 -osc 6 -phisteps 3
+      - name: dials-phi
+        extra_args: >-
+          -dials
+          -phi 0 -osc 6 -phisteps 3
+      - name: adxv-phi
+        extra_args: >-
+          -adxv
+          -phi 0 -osc 6 -phisteps 3
+      - name: adxv-default-beam-centre
+        extra_args: >-
+          -adxv
+      - name: adxv-default-beam-centre-rotated
+        extra_args: >-
+          -adxv
+          -detector_rotx 4
+          -twotheta 15

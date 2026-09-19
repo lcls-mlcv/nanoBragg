@@ -330,9 +330,13 @@ class DetectorConfig:
                 if self.beam_center_f is None:
                     self.beam_center_f = (detsize_f + self.pixel_size_mm) / 2.0
             elif self.detector_convention == DetectorConvention.ADXV:
-                # Per spec-a-core.md §66-67: "Default Xbeam = (detsize_f + pixel)/2, Ybeam = (detsize_s - pixel)/2"
+                # C defaults Xbeam = (detsize_f + pixel)/2 and Ybeam = (detsize_s - pixel)/2,
+                # then maps them with Fbeam = Xbeam and Sbeam = detsize_s - Ybeam
+                # (nanoBragg.c:1175-1186). beam_center_s holds Sbeam, so the default is the
+                # flipped value (detsize_s + pixel)/2, not Ybeam itself; the CLI applies the
+                # same flip for an explicit -Ybeam.
                 if self.beam_center_s is None:
-                    self.beam_center_s = (detsize_s - self.pixel_size_mm) / 2.0
+                    self.beam_center_s = (detsize_s + self.pixel_size_mm) / 2.0
                 if self.beam_center_f is None:
                     self.beam_center_f = (detsize_f + self.pixel_size_mm) / 2.0
             else:
