@@ -532,6 +532,7 @@ class BeamConfig:
     beamsize_mm: float = 0.0  # Beam size in mm (used for fluence calculation and sample clipping)
     # Can be float or torch.Tensor for differentiable optimization (DBEX-GRADIENT-001)
     fluence: Union[float, torch.Tensor] = 125932015286227086360700780544.0  # Photons per square meter (default from C code)
+    spot_scale: Union[float, torch.Tensor] = 1.0  # Extra multiplier on Bragg intensity (cctbx nanoBragg spot_scale; C has none)
 
     # Resolution cutoff
     dmin: float = 0.0  # Minimum d-spacing in Angstroms (0 = no cutoff)
