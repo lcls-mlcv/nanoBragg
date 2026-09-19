@@ -975,6 +975,39 @@ class Detector:
 
         return pixel_coords
 
+    def thickness_layers(self):
+        """
+        Sensor layers as nanoBragg.c resolves them: ``(n_layers, layer_step_m, mu_per_m)``.
+
+        With a thickness T and ``thicksteps`` N (nanoBragg.c:1583-1637, 1691-1695):
+
+        * N not given: 2 layers, step T/2;
+        * N given: at least 2 layers, step T/(N-1), so the layers sit at 0, step, ..., T;
+        * no attenuation depth given: mu = 1/T;
+        * T <= 0 or attenuation depth 0 ("-detector_abs 0/inf"): one layer, no absorption.
+
+        Layer t starts ``t*step`` behind the front face along odet and absorbs
+        exp(-t*step*mu/rho) - exp(-(t+1)*step*mu/rho), with rho = diffracted·odet.
+        Returns ``(1, None, None)`` when thickness is not modelled.
+        """
+        c = self.config
+        thick_um = c.detector_thick_um
+        if thick_um is None or float(thick_um) <= 0.0:
+            return 1, None, None
+        if c.detector_abs_um is not None and float(c.detector_abs_um) == 0.0:
+            return 1, None, None
+        thick_m = torch.as_tensor(thick_um, device=self.device, dtype=self.dtype) * 1e-6
+        if c.detector_thicksteps is None or c.detector_thicksteps <= 0:
+            n_layers, layer_step_m = 2, thick_m / 2
+        else:
+            n_layers = max(int(c.detector_thicksteps), 2)
+            layer_step_m = thick_m / (n_layers - 1)
+        if c.detector_abs_um is None:
+            mu = 1.0 / thick_m
+        else:
+            mu = 1.0 / (torch.as_tensor(c.detector_abs_um, device=self.device, dtype=self.dtype) * 1e-6)
+        return n_layers, layer_step_m, mu
+
     def get_solid_angle(self, pixel_coords: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Calculate the solid angle factor for each pixel.

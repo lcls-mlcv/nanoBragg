@@ -673,3 +673,67 @@ cases:
           -detector_rotx 5
           -close_distance 95
           -twotheta 12
+  - id: PARITY-THICK-001
+    description: >-
+      Detector sensor layers (C ↔ PyTorch). nanoBragg.c renders each layer at the pixel
+      position shifted t*step along odet, sums F^2 over layers without dividing by the layer
+      count, and scales by the last layer's capture fraction (or per sample with
+      -oversample_thick). -thicksteps N means N >= 2 layers T/(N-1) apart; no -thicksteps
+      means 2 layers T/2 apart; no -detector_abs means mu = 1/T.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: thick-no-thicksteps
+        extra_args: >-
+          -detector_thick 100
+          -detector_abs 500
+          -oversample 1
+      - name: thicksteps-1
+        extra_args: >-
+          -detector_thick 100
+          -detector_abs 500
+          -thicksteps 1
+          -oversample 1
+      - name: thicksteps-5
+        extra_args: >-
+          -detector_thick 100
+          -detector_abs 500
+          -thicksteps 5
+          -oversample 1
+      - name: thicksteps-4-oversample-2
+        extra_args: >-
+          -detector_thick 450
+          -detector_abs 300
+          -thicksteps 4
+          -oversample 2
+      - name: thicksteps-4-oversample-thick
+        extra_args: >-
+          -detector_thick 450
+          -detector_abs 300
+          -thicksteps 4
+          -oversample 2
+          -oversample_thick
+      - name: default-attenuation-depth
+        extra_args: >-
+          -detector_thick 200
+          -thicksteps 3
+          -oversample 1
+      - name: tilted-detector
+        extra_args: >-
+          -detector_thick 300
+          -detector_abs 200
+          -thicksteps 3
+          -detector_rotx 10
+          -detector_roty 15
+          -oversample 1

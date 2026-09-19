@@ -1354,8 +1354,13 @@ class Simulator:
         # Apply physical scaling factors (from nanoBragg.c ~line 3050)
         # Solid angle correction, converting all units to meters for calculation
 
-        # Check if we're doing subpixel sampling
-        if oversample > 1:
+        # Sensor layers (nanoBragg.c:2678-2740): each layer is rendered at the pixel position shifted
+        # t*step along odet, and its F^2 is added to the pixel without dividing by the layer count.
+        n_layers, layer_step_m, mu = self.detector.thickness_layers()
+        capture_fraction_for_trace = None
+
+        # Check if we're doing subpixel sampling (sensor layers use the same batched path)
+        if oversample > 1 or n_layers > 1:
             # VECTORIZED IMPLEMENTATION: Process all subpixels in parallel
             # Generate subpixel offsets (centered on pixel center)
             # Per spec: "Compute detector-plane coordinates (meters): Fdet and Sdet at subpixel centers."
@@ -1390,11 +1395,18 @@ class Simulator:
 
             # Shape: (oversample*oversample, 3)
             offset_vectors = delta_s_all.unsqueeze(-1) * s_axis + delta_f_all.unsqueeze(-1) * f_axis
+            n_sub = oversample * oversample
+            if n_layers > 1:
+                # Layer-major ordering: (layer 0: all subpixels), (layer 1: all subpixels), ...
+                layer_depths = torch.arange(n_layers, device=self.device, dtype=self.dtype) * layer_step_m
+                layer_offsets = layer_depths.unsqueeze(-1) * self.detector.odet_vec
+                offset_vectors = (layer_offsets.unsqueeze(1) + offset_vectors.unsqueeze(0)).reshape(-1, 3)
+            n_samples = offset_vectors.shape[0]
 
-            # Expand pixel_coords for all subpixels
-            # Shape: (S, F, oversample*oversample, 3)
-            pixel_coords_expanded = pixel_coords_meters.unsqueeze(2).expand(S, F, oversample*oversample, 3)
-            offset_vectors_expanded = offset_vectors.unsqueeze(0).unsqueeze(0).expand(S, F, oversample*oversample, 3)
+            # Expand pixel_coords for all subpixels (and layers)
+            # Shape: (S, F, n_samples, 3)
+            pixel_coords_expanded = pixel_coords_meters.unsqueeze(2).expand(S, F, n_samples, 3)
+            offset_vectors_expanded = offset_vectors.unsqueeze(0).unsqueeze(0).expand(S, F, n_samples, 3)
 
             # All subpixel coordinates at once
             # Shape: (S, F, oversample*oversample, 3)
@@ -1486,7 +1498,22 @@ class Simulator:
                 # Apply omega per subpixel
                 intensity_all = intensity_all * omega_all
 
-            # Sum over all subpixels to get final intensity
+            if n_layers > 1:
+                # capture fraction of each layer seen from each sample point (nanoBragg.c:2732-2739)
+                parallax = torch.sum(
+                    subpixel_coords_ang_all / sub_magnitudes_all.unsqueeze(-1) * self.detector.odet_vec,
+                    dim=-1,
+                )
+                parallax = torch.where(parallax.abs() < 1e-10, torch.sign(parallax) * 1e-10, parallax)
+                layer_index = torch.arange(n_layers, device=self.device, dtype=self.dtype).repeat_interleave(n_sub)
+                capture_all = (
+                    torch.exp(-layer_index * layer_step_m * mu / parallax)
+                    - torch.exp(-(layer_index + 1) * layer_step_m * mu / parallax)
+                )
+                if oversample_thick:
+                    intensity_all = intensity_all * capture_all
+
+            # Sum over all subpixels (and layers) to get final intensity
             # Shape: (S, F)
             accumulated_intensity = torch.sum(intensity_all, dim=2)
 
@@ -1501,10 +1528,18 @@ class Simulator:
                 I_before_normalization_pre_polar = None
 
             # Apply last-value semantics if omega flag is not set
+            # Last subpixel's omega of the front layer; also reported by the pixel trace
+            omega_pixel = omega_all[:, :, n_sub - 1]  # Shape: (S, F)
             if not oversample_omega:
-                # Get the last subpixel's omega (last in flattened order)
-                last_omega = omega_all[:, :, -1]  # Shape: (S, F)
-                accumulated_intensity = accumulated_intensity * last_omega
+                accumulated_intensity = accumulated_intensity * omega_pixel
+
+            if n_layers > 1:
+                # C computes capture_fraction once per layer (first subpixel) and, without
+                # -oversample_thick, scales the layer sum by the last layer's value.
+                capture_last = capture_all[:, :, (n_layers - 1) * n_sub]
+                if not oversample_thick:
+                    accumulated_intensity = accumulated_intensity * capture_last
+                capture_fraction_for_trace = capture_last
 
             # Use accumulated intensity
             normalized_intensity = accumulated_intensity
@@ -1577,38 +1612,6 @@ class Simulator:
 
             # Apply omega directly
             normalized_intensity = normalized_intensity * omega_pixel
-
-        # Apply detector absorption if configured (AT-ABS-001)
-        # Cache capture_fraction for trace output if trace_pixel is set
-        capture_fraction_for_trace = None
-        if (self.detector.config.detector_thick_um is not None and
-            self.detector.config.detector_thick_um > 0 and
-            self.detector.config.detector_abs_um is not None and
-            self.detector.config.detector_abs_um > 0):
-
-            # Apply absorption calculation
-            if self.trace_pixel:
-                # When tracing, we need to cache the capture fraction
-                # Call the absorption method and extract the per-pixel value
-                intensity_before_absorption = normalized_intensity.clone()
-                normalized_intensity = self._apply_detector_absorption(
-                    normalized_intensity,
-                    pixel_coords_meters,
-                    oversample_thick
-                )
-                # Compute capture fraction as ratio (avoiding division by zero)
-                capture_fraction_tensor = torch.where(
-                    intensity_before_absorption > 1e-20,
-                    normalized_intensity / intensity_before_absorption,
-                    torch.ones_like(normalized_intensity)
-                )
-                capture_fraction_for_trace = capture_fraction_tensor
-            else:
-                normalized_intensity = self._apply_detector_absorption(
-                    normalized_intensity,
-                    pixel_coords_meters,
-                    oversample_thick
-                )
 
         # Final intensity with all physical constants in meters
         # Per spec AT-SAM-001 and nanoBragg.c:3358, divide by steps for normalization

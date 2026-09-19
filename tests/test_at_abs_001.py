@@ -260,3 +260,27 @@ class TestAT_ABS_001:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+@pytest.mark.parametrize(
+    "thick_um, thicksteps, abs_um, expected",
+    [
+        (0.0, 5, 500.0, (1, None, None)),          # no sensor
+        (100.0, 3, 0.0, (1, None, None)),          # -detector_abs 0 / inf disables absorption
+        (100.0, None, 500.0, (2, 50e-6, 1 / 500e-6)),   # no -thicksteps: 2 layers, T/2 apart
+        (100.0, 1, 500.0, (2, 100e-6, 1 / 500e-6)),     # -thicksteps 1 still gives 2 layers
+        (100.0, 5, 500.0, (5, 25e-6, 1 / 500e-6)),      # N layers, T/(N-1) apart
+        (200.0, 3, None, (3, 100e-6, 1 / 200e-6)),      # no -detector_abs: mu = 1/T
+    ],
+)
+def test_thickness_layers_follow_nanoBragg_c(thick_um, thicksteps, abs_um, expected):
+    """Layer count, spacing and mu as nanoBragg.c:1583-1637 resolves them."""
+    config = DetectorConfig(
+        spixels=8, fpixels=8, detector_thick_um=thick_um, detector_thicksteps=thicksteps, detector_abs_um=abs_um,
+    )
+    n_layers, step_m, mu = Detector(config, dtype=torch.float64).thickness_layers()
+    assert n_layers == expected[0]
+    if expected[1] is None:
+        assert step_m is None and mu is None
+    else:
+        assert float(step_m) == pytest.approx(expected[1], rel=1e-12)
+        assert float(mu) == pytest.approx(expected[2], rel=1e-12)
