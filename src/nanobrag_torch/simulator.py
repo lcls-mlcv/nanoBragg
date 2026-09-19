@@ -771,9 +771,8 @@ class Simulator:
             polarization_axis=self.polarization_axis,
         )
 
-    def _run_chunked(
+    def _pixel_intensity(
         self,
-        pixel_batch_size: int,
         pixel_coords_meters: torch.Tensor,
         rot_a: torch.Tensor,
         rot_b: torch.Tensor,
@@ -785,572 +784,20 @@ class Simulator:
         source_directions: Optional[torch.Tensor],
         source_wavelengths_A: Optional[torch.Tensor],
         source_weights: Optional[torch.Tensor],
-        steps: int,
         oversample: int,
         oversample_omega: bool,
-        oversample_polar: bool,
         oversample_thick: bool,
-        roi_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
+    ):
         """
-        Process detector in row-wise chunks for memory efficiency.
+        Accumulated per-pixel intensity for a block of pixels, before the
+        r_e^2·fluence/steps scaling: the sum over subpixels, sensor layers,
+        sources, phi steps and mosaic domains of F^2 with polarization,
+        solid angle and capture fraction applied as nanoBragg.c does.
 
-        Each chunk is fully vectorized—this is orchestration-level batching,
-        not a violation of the kernel vectorization mandate. The vectorization
-        mandate applies to computational kernels (physics, interpolation), not
-        to memory management at the Simulator.run() level.
-
-        Memory scaling per chunk:
-            Peak ≈ pixel_batch_size × F × phi × mosaic × oversample² × 300 bytes
-
-        PIXEL-BATCH-001: Implements the existing but unused pixel_batch_size parameter
-        to enable memory-efficient execution on constrained GPUs.
-
-        Args:
-            pixel_batch_size: Number of rows (slow axis) to process per chunk
-            pixel_coords_meters: Full detector pixel coordinates (S, F, 3) in meters
-            rot_a, rot_b, rot_c: Rotated real-space lattice vectors (N_phi, N_mos, 3)
-            rot_a_star, rot_b_star, rot_c_star: Rotated reciprocal vectors (N_phi, N_mos, 3)
-            n_sources: Number of beam sources
-            source_directions: Source direction vectors (n_sources, 3) or None
-            source_wavelengths_A: Source wavelengths in Angstroms (n_sources,) or None
-            source_weights: Source weights (n_sources,) or None
-            steps: Normalization factor (sources × phi × mosaic × oversample²)
-            oversample: Subpixel oversampling factor
-            oversample_omega: Apply solid angle per subpixel
-            oversample_polar: Apply polarization per subpixel
-            oversample_thick: Apply absorption per subpixel
-            roi_mask: Region of interest mask (S, F) or None
-
-        Returns:
-            Tensor of shape (S, F) with final scaled intensities
+        Returns (normalized_intensity, omega_pixel, I_before_normalization,
+        I_before_normalization_pre_polar, capture_fraction_for_trace), each
+        (S, F) or None; the last four feed the pixel trace.
         """
-        S, F, _ = pixel_coords_meters.shape
-
-        # Pre-allocate output tensor
-        output = torch.zeros(S, F, device=self.device, dtype=self.dtype)
-
-        # Process chunks along slow axis
-        for s_start in range(0, S, pixel_batch_size):
-            s_end = min(s_start + pixel_batch_size, S)
-
-            # Extract chunk coordinates
-            chunk_coords = pixel_coords_meters[s_start:s_end, :, :]  # (chunk_S, F, 3)
-
-            # Extract chunk ROI mask if present
-            chunk_roi = roi_mask[s_start:s_end, :] if roi_mask is not None else None
-
-            # Compute chunk intensity using the core physics path
-            chunk_result = self._compute_chunk_intensity(
-                pixel_coords_meters=chunk_coords,
-                rot_a=rot_a,
-                rot_b=rot_b,
-                rot_c=rot_c,
-                rot_a_star=rot_a_star,
-                rot_b_star=rot_b_star,
-                rot_c_star=rot_c_star,
-                n_sources=n_sources,
-                source_directions=source_directions,
-                source_wavelengths_A=source_wavelengths_A,
-                source_weights=source_weights,
-                steps=steps,
-                oversample=oversample,
-                oversample_omega=oversample_omega,
-            )
-
-            # Apply ROI mask if present
-            if chunk_roi is not None:
-                chunk_result = chunk_result * chunk_roi
-
-            # Assign to output (preserves gradient graph via sliced assignment)
-            output[s_start:s_end, :] = chunk_result
-
-        return output
-
-    def _compute_chunk_intensity(
-        self,
-        pixel_coords_meters: torch.Tensor,
-        rot_a: torch.Tensor,
-        rot_b: torch.Tensor,
-        rot_c: torch.Tensor,
-        rot_a_star: torch.Tensor,
-        rot_b_star: torch.Tensor,
-        rot_c_star: torch.Tensor,
-        n_sources: int,
-        source_directions: Optional[torch.Tensor],
-        source_wavelengths_A: Optional[torch.Tensor],
-        source_weights: Optional[torch.Tensor],
-        steps: int,
-        oversample: int,
-        oversample_omega: bool,
-    ) -> torch.Tensor:
-        """
-        Compute intensity for a chunk of pixels.
-
-        This is the core physics computation, fully vectorized over:
-        - All pixels in chunk (chunk_S × F)
-        - All phi steps
-        - All mosaic domains
-        - All oversample positions
-
-        PIXEL-BATCH-001: Uses the pure function compute_physics_for_position directly
-        (not the compiled version) to avoid graph recompilation overhead for each
-        chunk shape. Chunked mode is for memory-constrained scenarios where raw
-        throughput is secondary.
-
-        Args:
-            pixel_coords_meters: Chunk pixel coordinates (chunk_S, F, 3) in meters
-            rot_a, rot_b, rot_c: Rotated real-space lattice vectors (N_phi, N_mos, 3)
-            rot_a_star, rot_b_star, rot_c_star: Rotated reciprocal vectors
-            n_sources: Number of beam sources
-            source_directions: Source direction vectors or None
-            source_wavelengths_A: Source wavelengths or None
-            source_weights: Source weights or None
-            steps: Normalization factor
-            oversample: Subpixel oversampling factor
-            oversample_omega: Apply solid angle per subpixel
-
-        Returns:
-            Tensor of shape (chunk_S, F) with scaled intensities (before ROI masking)
-        """
-        chunk_S, F, _ = pixel_coords_meters.shape
-
-        # Handle oversampling case
-        if oversample > 1:
-            # Generate subpixel offsets (same as main run path)
-            subpixel_step = 1.0 / oversample
-            offset_start = -0.5 + subpixel_step / 2.0
-
-            subpixel_offsets = offset_start + torch.arange(
-                oversample, device=self.device, dtype=self.dtype
-            ) * subpixel_step
-
-            sub_s, sub_f = torch.meshgrid(subpixel_offsets, subpixel_offsets, indexing='ij')
-            sub_s_flat = sub_s.flatten()
-            sub_f_flat = sub_f.flatten()
-
-            # Get detector basis vectors
-            f_axis = self.detector.fdet_vec
-            s_axis = self.detector.sdet_vec
-
-            # Create subpixel offset vectors
-            pixel_size_m_tensor = torch.as_tensor(
-                self.detector.pixel_size, device=self.device, dtype=self.dtype
-            )
-            delta_s_all = sub_s_flat * pixel_size_m_tensor
-            delta_f_all = sub_f_flat * pixel_size_m_tensor
-            offset_vectors = delta_s_all.unsqueeze(-1) * s_axis + delta_f_all.unsqueeze(-1) * f_axis
-
-            # Expand pixel_coords for all subpixels
-            pixel_coords_expanded = pixel_coords_meters.unsqueeze(2).expand(
-                chunk_S, F, oversample * oversample, 3
-            )
-            offset_vectors_expanded = offset_vectors.unsqueeze(0).unsqueeze(0).expand(
-                chunk_S, F, oversample * oversample, 3
-            )
-
-            # All subpixel coordinates
-            subpixel_coords_all = pixel_coords_expanded + offset_vectors_expanded
-            subpixel_coords_ang_all = subpixel_coords_all * 1e10
-
-            # Reshape for physics calculation
-            batch_shape = subpixel_coords_ang_all.shape[:-1]
-            coords_reshaped = subpixel_coords_ang_all.reshape(-1, 3).contiguous()
-
-            # Compute physics (use pure function, not compiled, to avoid recompilation)
-            if n_sources > 1:
-                incident_dirs_batched = -source_directions
-                wavelengths_batched = source_wavelengths_A
-
-                physics_intensity_flat, _ = compute_physics_for_position(
-                    coords_reshaped, rot_a, rot_b, rot_c,
-                    rot_a_star, rot_b_star, rot_c_star,
-                    incident_beam_direction=incident_dirs_batched,
-                    wavelength=wavelengths_batched,
-                    source_weights=source_weights,
-                    dmin=self.beam_config.dmin,
-                    crystal_get_structure_factor=self.crystal.get_structure_factor,
-                    N_cells_a=self.crystal.N_cells_a,
-                    N_cells_b=self.crystal.N_cells_b,
-                    N_cells_c=self.crystal.N_cells_c,
-                    crystal_shape=self.crystal.config.shape,
-                    crystal_fudge=self.crystal.config.fudge,
-                    apply_polarization=not self.beam_config.nopolar,
-                    kahn_factor=self.kahn_factor,
-                    polarization_axis=self.polarization_axis,
-                )
-            else:
-                physics_intensity_flat, _ = compute_physics_for_position(
-                    coords_reshaped, rot_a, rot_b, rot_c,
-                    rot_a_star, rot_b_star, rot_c_star,
-                    incident_beam_direction=self.incident_beam_direction,
-                    wavelength=self.wavelength,
-                    source_weights=None,
-                    dmin=self.beam_config.dmin,
-                    crystal_get_structure_factor=self.crystal.get_structure_factor,
-                    N_cells_a=self.crystal.N_cells_a,
-                    N_cells_b=self.crystal.N_cells_b,
-                    N_cells_c=self.crystal.N_cells_c,
-                    crystal_shape=self.crystal.config.shape,
-                    crystal_fudge=self.crystal.config.fudge,
-                    apply_polarization=not self.beam_config.nopolar,
-                    kahn_factor=self.kahn_factor,
-                    polarization_axis=self.polarization_axis,
-                )
-
-            # Reshape back
-            subpixel_physics_intensity_all = physics_intensity_flat.reshape(batch_shape)
-
-            # Calculate omega for all subpixels
-            sub_squared_all = torch.sum(subpixel_coords_ang_all * subpixel_coords_ang_all, dim=-1)
-            sub_squared_all = sub_squared_all.clamp_min(1e-20)
-            sub_magnitudes_all = torch.sqrt(sub_squared_all)
-            airpath_m_all = sub_magnitudes_all * 1e-10
-
-            close_distance_m = torch.as_tensor(
-                self.detector.close_distance, device=self.device, dtype=self.dtype
-            )
-            pixel_size_m = torch.as_tensor(
-                self.detector.pixel_size, device=self.device, dtype=self.dtype
-            )
-
-            if self.detector.config.point_pixel:
-                omega_all = 1.0 / (airpath_m_all * airpath_m_all)
-            else:
-                omega_all = (
-                    (pixel_size_m * pixel_size_m)
-                    / (airpath_m_all * airpath_m_all)
-                    * close_distance_m
-                    / airpath_m_all
-                )
-
-            # Apply omega based on oversample flags
-            intensity_all = subpixel_physics_intensity_all.clone()
-            if oversample_omega:
-                intensity_all = intensity_all * omega_all
-
-            # Sum over all subpixels
-            accumulated_intensity = torch.sum(intensity_all, dim=2)
-
-            # Apply last-value semantics if omega flag is not set
-            if not oversample_omega:
-                last_omega = omega_all[:, :, -1]
-                accumulated_intensity = accumulated_intensity * last_omega
-
-            normalized_intensity = accumulated_intensity
-
-        else:
-            # No subpixel sampling - compute physics for pixel centers
-            pixel_coords_angstroms = pixel_coords_meters * 1e10
-
-            if n_sources > 1:
-                incident_dirs_batched = -source_directions
-                wavelengths_batched = source_wavelengths_A
-
-                intensity, _ = compute_physics_for_position(
-                    pixel_coords_angstroms, rot_a, rot_b, rot_c,
-                    rot_a_star, rot_b_star, rot_c_star,
-                    incident_beam_direction=incident_dirs_batched,
-                    wavelength=wavelengths_batched,
-                    source_weights=source_weights,
-                    dmin=self.beam_config.dmin,
-                    crystal_get_structure_factor=self.crystal.get_structure_factor,
-                    N_cells_a=self.crystal.N_cells_a,
-                    N_cells_b=self.crystal.N_cells_b,
-                    N_cells_c=self.crystal.N_cells_c,
-                    crystal_shape=self.crystal.config.shape,
-                    crystal_fudge=self.crystal.config.fudge,
-                    apply_polarization=not self.beam_config.nopolar,
-                    kahn_factor=self.kahn_factor,
-                    polarization_axis=self.polarization_axis,
-                )
-            else:
-                intensity, _ = compute_physics_for_position(
-                    pixel_coords_angstroms, rot_a, rot_b, rot_c,
-                    rot_a_star, rot_b_star, rot_c_star,
-                    incident_beam_direction=self.incident_beam_direction,
-                    wavelength=self.wavelength,
-                    source_weights=None,
-                    dmin=self.beam_config.dmin,
-                    crystal_get_structure_factor=self.crystal.get_structure_factor,
-                    N_cells_a=self.crystal.N_cells_a,
-                    N_cells_b=self.crystal.N_cells_b,
-                    N_cells_c=self.crystal.N_cells_c,
-                    crystal_shape=self.crystal.config.shape,
-                    crystal_fudge=self.crystal.config.fudge,
-                    apply_polarization=not self.beam_config.nopolar,
-                    kahn_factor=self.kahn_factor,
-                    polarization_axis=self.polarization_axis,
-                )
-
-            # Calculate and apply omega
-            pixel_squared_sum = torch.sum(
-                pixel_coords_angstroms * pixel_coords_angstroms, dim=-1, keepdim=True
-            )
-            pixel_squared_sum = pixel_squared_sum.clamp_min(1e-12)
-            pixel_magnitudes = torch.sqrt(pixel_squared_sum)
-            airpath = pixel_magnitudes.squeeze(-1)
-            airpath_m = airpath * 1e-10
-
-            close_distance_m = torch.as_tensor(
-                self.detector.close_distance, device=self.device, dtype=self.dtype
-            )
-            pixel_size_m = torch.as_tensor(
-                self.detector.pixel_size, device=self.device, dtype=self.dtype
-            )
-
-            if self.detector.config.point_pixel:
-                omega_pixel = 1.0 / (airpath_m * airpath_m)
-            else:
-                omega_pixel = (
-                    (pixel_size_m * pixel_size_m)
-                    / (airpath_m * airpath_m)
-                    * close_distance_m
-                    / airpath_m
-                )
-
-            normalized_intensity = intensity * omega_pixel
-
-        # Apply final scaling (r_e², fluence, steps normalization)
-        physical_intensity = (
-            normalized_intensity
-            / steps
-            * self.r_e_sqr
-            * self.fluence
-            * getattr(self.beam_config, "spot_scale", 1.0)
-        )
-
-        return physical_intensity
-
-    def run(
-        self,
-        pixel_batch_size: Optional[int] = None,
-        override_a_star: Optional[torch.Tensor] = None,
-        oversample: Optional[int] = None,
-        oversample_omega: Optional[bool] = None,
-        oversample_polar: Optional[bool] = None,
-        oversample_thick: Optional[bool] = None,
-    ) -> torch.Tensor:
-        """
-        Run the diffraction simulation with crystal rotation and mosaicity.
-
-        This method vectorizes the simulation over all detector pixels, phi angles,
-        and mosaic domains. It integrates contributions from all crystal orientations
-        to produce the final diffraction pattern.
-
-        Important: This implementation uses the full Miller indices (h, k, l) for the
-        lattice shape factor calculation, not the fractional part (h-h0). This correctly
-        models the crystal shape transform and is consistent with the physics of
-        diffraction from a finite crystal.
-
-        C-Code Implementation Reference (from nanoBragg.c, lines 2993-3151):
-        The vectorized implementation replaces these nested loops. The outer `source`
-        loop is future work for handling beam divergence and dispersion.
-
-        ```c
-                        /* loop over sources now */
-                        for(source=0;source<sources;++source){
-
-                            /* retrieve stuff from cache */
-                            incident[1] = -source_X[source];
-                            incident[2] = -source_Y[source];
-                            incident[3] = -source_Z[source];
-                            lambda = source_lambda[source];
-
-                            /* ... scattering vector calculation ... */
-
-                            /* sweep over phi angles */
-                            for(phi_tic = 0; phi_tic < phisteps; ++phi_tic)
-                            {
-                                /* ... crystal rotation ... */
-
-                                /* enumerate mosaic domains */
-                                for(mos_tic=0;mos_tic<mosaic_domains;++mos_tic)
-                                {
-                                    /* ... mosaic rotation ... */
-                                    /* ... h,k,l calculation ... */
-                                    /* ... F_cell and F_latt calculation ... */
-
-                                    /* convert amplitudes into intensity (photons per steradian) */
-                                    I += F_cell*F_cell*F_latt*F_latt;
-                                }
-                            }
-                        }
-        ```
-
-        Args:
-            pixel_batch_size: If specified, process detector in chunks of this many
-                rows (slow axis). Reduces peak GPU memory at cost of multiple kernel
-                launches. Set to None (default) for full vectorization. Recommended
-                values: 128-256 for 24GB GPU, 64-128 for 12GB GPU.
-
-                Memory guidance (PIXEL-BATCH-001):
-                - None: Full vectorization, peak memory ≈ B × 300 bytes
-                  where B = S × F × phi × mosaic × oversample²
-                - 256: ~256 × F × phi × mosaic × 300 bytes per chunk
-                - 128: Half the above, for very constrained GPUs
-
-            override_a_star: Optional override for the a_star vector for testing.
-            oversample: Number of subpixel samples per axis. Defaults to detector config.
-            oversample_omega: Apply solid angle per subpixel. Defaults to detector config.
-            oversample_polar: Apply polarization per subpixel. Defaults to detector config.
-            oversample_thick: Apply absorption per subpixel. Defaults to detector config.
-
-        Returns:
-            torch.Tensor: Final diffraction image with shape (spixels, fpixels).
-        """
-        # Unified vectorization path (spec-compliant fresh rotations)
-        # Get oversampling parameters from detector config if not provided
-        if oversample is None:
-            oversample = self.detector.config.oversample
-        if oversample_omega is None:
-            oversample_omega = self.detector.config.oversample_omega
-        if oversample_polar is None:
-            oversample_polar = self.detector.config.oversample_polar
-        if oversample_thick is None:
-            oversample_thick = self.detector.config.oversample_thick
-
-        # Auto-select oversample if set to -1 (matches C behavior)
-        if oversample == -1:
-            # Calculate maximum crystal dimension in meters
-            xtalsize_max = max(
-                abs(self.crystal.config.cell_a * 1e-10 * self.crystal.config.N_cells[0]),  # a*Na in meters
-                abs(self.crystal.config.cell_b * 1e-10 * self.crystal.config.N_cells[1]),  # b*Nb in meters
-                abs(self.crystal.config.cell_c * 1e-10 * self.crystal.config.N_cells[2])   # c*Nc in meters
-            )
-
-            # Calculate reciprocal pixel size in meters
-            # reciprocal_pixel_size = λ * distance / pixel_size (all in meters)
-            wavelength_m = self.wavelength * 1e-10  # Convert from Angstroms to meters
-            distance_m = self.detector.config.distance_mm / 1000.0  # Convert from mm to meters
-            pixel_size_m = self.detector.config.pixel_size_mm / 1000.0  # Convert from mm to meters
-            reciprocal_pixel_size = wavelength_m * distance_m / pixel_size_m
-
-            # Calculate recommended oversample using C formula
-            import math
-            recommended_oversample = math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size)
-
-            # Ensure at least 1
-            if recommended_oversample <= 0:
-                recommended_oversample = 1
-
-            oversample = recommended_oversample
-            print(f"auto-selected {oversample}-fold oversampling")
-
-        # For now, we'll implement the base case without oversampling for this test
-        # The full subpixel implementation will come later
-        # This matches the current implementation which doesn't yet have subpixel sampling
-
-        # PERF-PYTORCH-004 P3.4: Use cached ROI mask instead of rebuilding every run
-        roi_mask = self._cached_roi_mask
-
-        # PERF-PYTORCH-004 P3.4: Use cached pixel coordinates instead of fetching/converting every run
-        pixel_coords_meters = self._cached_pixel_coords_meters
-
-        # Get rotated lattice vectors for all phi steps and mosaic domains
-        # Shape: (N_phi, N_mos, 3)
-        # PERF-PYTORCH-006: Convert crystal vectors to correct device/dtype
-        if override_a_star is None:
-            (rot_a, rot_b, rot_c), (rot_a_star, rot_b_star, rot_c_star) = (
-                self.crystal.get_rotated_real_vectors(self.crystal.config)
-            )
-            # Convert to correct dtype/device
-            rot_a = rot_a.to(device=self.device, dtype=self.dtype)
-            rot_b = rot_b.to(device=self.device, dtype=self.dtype)
-            rot_c = rot_c.to(device=self.device, dtype=self.dtype)
-            rot_a_star = rot_a_star.to(device=self.device, dtype=self.dtype)
-            rot_b_star = rot_b_star.to(device=self.device, dtype=self.dtype)
-            rot_c_star = rot_c_star.to(device=self.device, dtype=self.dtype)
-
-            # VECTOR-PARITY-001 Phase D5: Convert lattice vectors from Angstroms to meters
-            # The scattering vector q is in m⁻¹ (Phase D1 fix), and real-space lattice vectors
-            # must be in meters for dimensionally correct h=a·q computation (meters × m⁻¹ = dimensionless).
-            # Crystal.get_rotated_real_vectors() returns vectors in Angstroms, so multiply by 1e-10.
-            # Reference: specs/spec-a-core.md line 135 ("scaled by 1e-10 to meters for all subsequent dot products with q")
-            # and line 446 ("q: scattering vector in m⁻¹").
-            # Evidence: reports/2026-01-vectorization-parity/phase_d/20251010T073708Z/simulator_f_latt.md
-            # and C-code trace showing a = [1e-08, ...] |a| = 1e-08 meters (100 Å × 1e-10).
-            rot_a = rot_a * 1e-10  # Å → meters
-            rot_b = rot_b * 1e-10  # Å → meters
-            rot_c = rot_c * 1e-10  # Å → meters
-
-            # Cache rotated reciprocal vectors for GAUSS/TOPHAT shape models
-            self._rot_a_star = rot_a_star
-            self._rot_b_star = rot_b_star
-            self._rot_c_star = rot_c_star
-        else:
-            # For gradient testing with override, use single orientation
-            rot_a = override_a_star.view(1, 1, 3)
-            rot_b = self.crystal.b.view(1, 1, 3)
-            rot_c = self.crystal.c.view(1, 1, 3)
-            rot_a_star = override_a_star.view(1, 1, 3)
-            rot_b_star = self.crystal.b_star.view(1, 1, 3)
-            rot_c_star = self.crystal.c_star.view(1, 1, 3)
-
-            # VECTOR-PARITY-001 Phase D5: Convert lattice vectors from Angstroms to meters (same as non-override path)
-            rot_a = rot_a * 1e-10  # Å → meters
-            rot_b = rot_b * 1e-10  # Å → meters
-            rot_c = rot_c * 1e-10  # Å → meters
-
-            # Cache for shape models
-            self._rot_a_star = rot_a_star
-            self._rot_b_star = rot_b_star
-            self._rot_c_star = rot_c_star
-
-        # PERF-PYTORCH-004 P1.2: Use pre-normalized source tensors from __init__
-        # Tensors were already moved to correct device/dtype during initialization
-        if self._source_directions is not None:
-            n_sources = len(self._source_directions)
-            source_directions = self._source_directions
-            source_wavelengths_A = self._source_wavelengths_A
-            source_weights = self._source_weights
-        else:
-            # No explicit sources, use single beam configuration
-            n_sources = 1
-            source_directions = None
-            source_wavelengths_A = None
-            source_weights = None
-
-        # Calculate normalization factor (steps)
-        # Per spec AT-SAM-001: "Final per-pixel scale SHALL divide by steps"
-        # SOURCE-WEIGHT-001 Phase C1: C-parity requires ignoring source weights
-        # Per spec-a-core.md line 151: "The weight column is read but ignored (equal weighting results)"
-        # C code (nanoBragg.c:3358) divides by steps = sources*mosaic_domains*phisteps*oversample^2
-        # where sources is the COUNT of sources, not the sum of weights
-        phi_steps = self.crystal.config.phi_steps
-        mosaic_domains = self.crystal.config.mosaic_domains
-
-        # Always use n_sources (count) to match C behavior
-        # The spec explicitly states source weights are "read but ignored"
-        source_norm = n_sources
-
-        steps = source_norm * phi_steps * mosaic_domains * oversample * oversample  # Include sources and oversample^2
-
-        # PIXEL-BATCH-001: Route to chunked execution path for memory-constrained scenarios
-        # When pixel_batch_size is specified and less than detector rows, process in chunks
-        S, F, _ = pixel_coords_meters.shape
-        if pixel_batch_size is not None and pixel_batch_size < S:
-            return self._run_chunked(
-                pixel_batch_size=pixel_batch_size,
-                pixel_coords_meters=pixel_coords_meters,
-                rot_a=rot_a,
-                rot_b=rot_b,
-                rot_c=rot_c,
-                rot_a_star=rot_a_star,
-                rot_b_star=rot_b_star,
-                rot_c_star=rot_c_star,
-                n_sources=n_sources,
-                source_directions=source_directions,
-                source_wavelengths_A=source_wavelengths_A,
-                source_weights=source_weights,
-                steps=steps,
-                oversample=oversample,
-                oversample_omega=oversample_omega,
-                oversample_polar=oversample_polar,
-                oversample_thick=oversample_thick,
-                roi_mask=roi_mask,
-            )
-
         # Apply physical scaling factors (from nanoBragg.c ~line 3050)
         # Solid angle correction, converting all units to meters for calculation
 
@@ -1612,6 +1059,244 @@ class Simulator:
 
             # Apply omega directly
             normalized_intensity = normalized_intensity * omega_pixel
+
+        return (
+            normalized_intensity,
+            omega_pixel,
+            I_before_normalization,
+            I_before_normalization_pre_polar,
+            capture_fraction_for_trace,
+        )
+
+    def run(
+        self,
+        pixel_batch_size: Optional[int] = None,
+        override_a_star: Optional[torch.Tensor] = None,
+        oversample: Optional[int] = None,
+        oversample_omega: Optional[bool] = None,
+        oversample_polar: Optional[bool] = None,
+        oversample_thick: Optional[bool] = None,
+    ) -> torch.Tensor:
+        """
+        Run the diffraction simulation with crystal rotation and mosaicity.
+
+        This method vectorizes the simulation over all detector pixels, phi angles,
+        and mosaic domains. It integrates contributions from all crystal orientations
+        to produce the final diffraction pattern.
+
+        Important: This implementation uses the full Miller indices (h, k, l) for the
+        lattice shape factor calculation, not the fractional part (h-h0). This correctly
+        models the crystal shape transform and is consistent with the physics of
+        diffraction from a finite crystal.
+
+        C-Code Implementation Reference (from nanoBragg.c, lines 2993-3151):
+        The vectorized implementation replaces these nested loops. The outer `source`
+        loop is future work for handling beam divergence and dispersion.
+
+        ```c
+                        /* loop over sources now */
+                        for(source=0;source<sources;++source){
+
+                            /* retrieve stuff from cache */
+                            incident[1] = -source_X[source];
+                            incident[2] = -source_Y[source];
+                            incident[3] = -source_Z[source];
+                            lambda = source_lambda[source];
+
+                            /* ... scattering vector calculation ... */
+
+                            /* sweep over phi angles */
+                            for(phi_tic = 0; phi_tic < phisteps; ++phi_tic)
+                            {
+                                /* ... crystal rotation ... */
+
+                                /* enumerate mosaic domains */
+                                for(mos_tic=0;mos_tic<mosaic_domains;++mos_tic)
+                                {
+                                    /* ... mosaic rotation ... */
+                                    /* ... h,k,l calculation ... */
+                                    /* ... F_cell and F_latt calculation ... */
+
+                                    /* convert amplitudes into intensity (photons per steradian) */
+                                    I += F_cell*F_cell*F_latt*F_latt;
+                                }
+                            }
+                        }
+        ```
+
+        Args:
+            pixel_batch_size: If specified, process detector in chunks of this many
+                rows (slow axis). Reduces peak GPU memory at cost of multiple kernel
+                launches. Set to None (default) for full vectorization. Recommended
+                values: 128-256 for 24GB GPU, 64-128 for 12GB GPU.
+
+                Memory guidance (PIXEL-BATCH-001):
+                - None: Full vectorization, peak memory ≈ B × 300 bytes
+                  where B = S × F × phi × mosaic × oversample²
+                - 256: ~256 × F × phi × mosaic × 300 bytes per chunk
+                - 128: Half the above, for very constrained GPUs
+
+            override_a_star: Optional override for the a_star vector for testing.
+            oversample: Number of subpixel samples per axis. Defaults to detector config.
+            oversample_omega: Apply solid angle per subpixel. Defaults to detector config.
+            oversample_polar: Apply polarization per subpixel. Defaults to detector config.
+            oversample_thick: Apply absorption per subpixel. Defaults to detector config.
+
+        Returns:
+            torch.Tensor: Final diffraction image with shape (spixels, fpixels).
+        """
+        # Unified vectorization path (spec-compliant fresh rotations)
+        # Get oversampling parameters from detector config if not provided
+        if oversample is None:
+            oversample = self.detector.config.oversample
+        if oversample_omega is None:
+            oversample_omega = self.detector.config.oversample_omega
+        if oversample_polar is None:
+            oversample_polar = self.detector.config.oversample_polar
+        if oversample_thick is None:
+            oversample_thick = self.detector.config.oversample_thick
+
+        # Auto-select oversample if set to -1 (matches C behavior)
+        if oversample == -1:
+            # Calculate maximum crystal dimension in meters
+            xtalsize_max = max(
+                abs(self.crystal.config.cell_a * 1e-10 * self.crystal.config.N_cells[0]),  # a*Na in meters
+                abs(self.crystal.config.cell_b * 1e-10 * self.crystal.config.N_cells[1]),  # b*Nb in meters
+                abs(self.crystal.config.cell_c * 1e-10 * self.crystal.config.N_cells[2])   # c*Nc in meters
+            )
+
+            # Calculate reciprocal pixel size in meters
+            # reciprocal_pixel_size = λ * distance / pixel_size (all in meters)
+            wavelength_m = self.wavelength * 1e-10  # Convert from Angstroms to meters
+            distance_m = self.detector.config.distance_mm / 1000.0  # Convert from mm to meters
+            pixel_size_m = self.detector.config.pixel_size_mm / 1000.0  # Convert from mm to meters
+            reciprocal_pixel_size = wavelength_m * distance_m / pixel_size_m
+
+            # Calculate recommended oversample using C formula
+            import math
+            recommended_oversample = math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size)
+
+            # Ensure at least 1
+            if recommended_oversample <= 0:
+                recommended_oversample = 1
+
+            oversample = recommended_oversample
+            print(f"auto-selected {oversample}-fold oversampling")
+
+        # For now, we'll implement the base case without oversampling for this test
+        # The full subpixel implementation will come later
+        # This matches the current implementation which doesn't yet have subpixel sampling
+
+        # PERF-PYTORCH-004 P3.4: Use cached ROI mask instead of rebuilding every run
+        roi_mask = self._cached_roi_mask
+
+        # PERF-PYTORCH-004 P3.4: Use cached pixel coordinates instead of fetching/converting every run
+        pixel_coords_meters = self._cached_pixel_coords_meters
+
+        # Get rotated lattice vectors for all phi steps and mosaic domains
+        # Shape: (N_phi, N_mos, 3)
+        # PERF-PYTORCH-006: Convert crystal vectors to correct device/dtype
+        if override_a_star is None:
+            (rot_a, rot_b, rot_c), (rot_a_star, rot_b_star, rot_c_star) = (
+                self.crystal.get_rotated_real_vectors(self.crystal.config)
+            )
+            # Convert to correct dtype/device
+            rot_a = rot_a.to(device=self.device, dtype=self.dtype)
+            rot_b = rot_b.to(device=self.device, dtype=self.dtype)
+            rot_c = rot_c.to(device=self.device, dtype=self.dtype)
+            rot_a_star = rot_a_star.to(device=self.device, dtype=self.dtype)
+            rot_b_star = rot_b_star.to(device=self.device, dtype=self.dtype)
+            rot_c_star = rot_c_star.to(device=self.device, dtype=self.dtype)
+
+            # VECTOR-PARITY-001 Phase D5: Convert lattice vectors from Angstroms to meters
+            # The scattering vector q is in m⁻¹ (Phase D1 fix), and real-space lattice vectors
+            # must be in meters for dimensionally correct h=a·q computation (meters × m⁻¹ = dimensionless).
+            # Crystal.get_rotated_real_vectors() returns vectors in Angstroms, so multiply by 1e-10.
+            # Reference: specs/spec-a-core.md line 135 ("scaled by 1e-10 to meters for all subsequent dot products with q")
+            # and line 446 ("q: scattering vector in m⁻¹").
+            # Evidence: reports/2026-01-vectorization-parity/phase_d/20251010T073708Z/simulator_f_latt.md
+            # and C-code trace showing a = [1e-08, ...] |a| = 1e-08 meters (100 Å × 1e-10).
+            rot_a = rot_a * 1e-10  # Å → meters
+            rot_b = rot_b * 1e-10  # Å → meters
+            rot_c = rot_c * 1e-10  # Å → meters
+
+            # Cache rotated reciprocal vectors for GAUSS/TOPHAT shape models
+            self._rot_a_star = rot_a_star
+            self._rot_b_star = rot_b_star
+            self._rot_c_star = rot_c_star
+        else:
+            # For gradient testing with override, use single orientation
+            rot_a = override_a_star.view(1, 1, 3)
+            rot_b = self.crystal.b.view(1, 1, 3)
+            rot_c = self.crystal.c.view(1, 1, 3)
+            rot_a_star = override_a_star.view(1, 1, 3)
+            rot_b_star = self.crystal.b_star.view(1, 1, 3)
+            rot_c_star = self.crystal.c_star.view(1, 1, 3)
+
+            # VECTOR-PARITY-001 Phase D5: Convert lattice vectors from Angstroms to meters (same as non-override path)
+            rot_a = rot_a * 1e-10  # Å → meters
+            rot_b = rot_b * 1e-10  # Å → meters
+            rot_c = rot_c * 1e-10  # Å → meters
+
+            # Cache for shape models
+            self._rot_a_star = rot_a_star
+            self._rot_b_star = rot_b_star
+            self._rot_c_star = rot_c_star
+
+        # PERF-PYTORCH-004 P1.2: Use pre-normalized source tensors from __init__
+        # Tensors were already moved to correct device/dtype during initialization
+        if self._source_directions is not None:
+            n_sources = len(self._source_directions)
+            source_directions = self._source_directions
+            source_wavelengths_A = self._source_wavelengths_A
+            source_weights = self._source_weights
+        else:
+            # No explicit sources, use single beam configuration
+            n_sources = 1
+            source_directions = None
+            source_wavelengths_A = None
+            source_weights = None
+
+        # Calculate normalization factor (steps)
+        # Per spec AT-SAM-001: "Final per-pixel scale SHALL divide by steps"
+        # SOURCE-WEIGHT-001 Phase C1: C-parity requires ignoring source weights
+        # Per spec-a-core.md line 151: "The weight column is read but ignored (equal weighting results)"
+        # C code (nanoBragg.c:3358) divides by steps = sources*mosaic_domains*phisteps*oversample^2
+        # where sources is the COUNT of sources, not the sum of weights
+        phi_steps = self.crystal.config.phi_steps
+        mosaic_domains = self.crystal.config.mosaic_domains
+
+        # Always use n_sources (count) to match C behavior
+        # The spec explicitly states source weights are "read but ignored"
+        source_norm = n_sources
+
+        steps = source_norm * phi_steps * mosaic_domains * oversample * oversample  # Include sources and oversample^2
+
+        # PIXEL-BATCH-001: pixel_batch_size evaluates the same per-pixel kernel on blocks of rows to
+        # bound peak memory; scaling, background, ROI and trace below are applied once to the
+        # assembled image, so chunked and unchunked runs give the same result.
+        S, F, _ = pixel_coords_meters.shape
+        kernel_args = dict(
+            rot_a=rot_a, rot_b=rot_b, rot_c=rot_c,
+            rot_a_star=rot_a_star, rot_b_star=rot_b_star, rot_c_star=rot_c_star,
+            n_sources=n_sources, source_directions=source_directions,
+            source_wavelengths_A=source_wavelengths_A, source_weights=source_weights,
+            oversample=oversample, oversample_omega=oversample_omega, oversample_thick=oversample_thick,
+        )
+        if pixel_batch_size is not None and pixel_batch_size < S:
+            chunks = [
+                self._pixel_intensity(pixel_coords_meters[s_start:s_start + pixel_batch_size], **kernel_args)
+                for s_start in range(0, S, pixel_batch_size)
+            ]
+            (normalized_intensity, omega_pixel, I_before_normalization,
+             I_before_normalization_pre_polar, capture_fraction_for_trace) = (
+                None if part[0] is None else torch.cat(part, dim=0) for part in zip(*chunks)
+            )
+        else:
+            (normalized_intensity, omega_pixel, I_before_normalization,
+             I_before_normalization_pre_polar, capture_fraction_for_trace) = self._pixel_intensity(
+                pixel_coords_meters, **kernel_args
+            )
 
         # Final intensity with all physical constants in meters
         # Per spec AT-SAM-001 and nanoBragg.c:3358, divide by steps for normalization
