@@ -833,3 +833,37 @@ cases:
       - name: gauss
         extra_args: >-
           -gauss_xtal
+
+  - id: PARITY-NCELLS-001
+    description: >-
+      N_cells flag handling (C ↔ PyTorch). nanoBragg.c defaults Na=Nb=Nc=1 and applies each
+      N flag to its own axis in argv order, so a later -Na beats an earlier -N and a run
+      with no N flags is a 1x1x1 crystal.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: no-N-flags-defaults-to-1
+        extra_args: >-
+      - name: Na-only
+        extra_args: >-
+          -Na 4
+      - name: per-axis
+        extra_args: >-
+          -Na 4 -Nb 7 -Nc 9
+      - name: N-then-Na
+        extra_args: >-
+          -N 5 -Na 4
+      - name: Na-then-N
+        extra_args: >-
+          -Na 4 -N 5
