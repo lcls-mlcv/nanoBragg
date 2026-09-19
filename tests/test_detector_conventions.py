@@ -188,11 +188,12 @@ class TestDetectorConventions:
         detsize_s = 1024 * 0.1  # 102.4 mm
         detsize_f = 1024 * 0.1  # 102.4 mm
 
-        # Per spec: ADXV default Xbeam = (detsize_f + pixel)/2, Ybeam = (detsize_s - pixel)/2
-        # But internally we use different mapping: beam_center_f is for fast axis, beam_center_s for slow
-        # ADXV: Fbeam = Xbeam, Sbeam = detsize_s - Ybeam (per spec line 67)
-        expected_beam_center_f = (detsize_f + 0.1) / 2.0  # Xbeam
-        expected_beam_center_s = (detsize_s - 0.1) / 2.0  # Ybeam maps differently
+        # C defaults Xbeam = (detsize_f + pixel)/2 and Ybeam = (detsize_s - pixel)/2, then maps
+        # Fbeam = Xbeam and Sbeam = detsize_s - Ybeam (nanoBragg.c:1175-1186). beam_center_s
+        # holds Sbeam, so it is the flipped value; this test previously asserted Ybeam itself,
+        # which left the default ADXV image one pixel off on the slow axis (r = 0.77 vs C).
+        expected_beam_center_f = (detsize_f + 0.1) / 2.0            # Fbeam = Xbeam
+        expected_beam_center_s = detsize_s - (detsize_s - 0.1) / 2.0  # Sbeam = detsize_s - Ybeam
 
         assert abs(config.beam_center_f - expected_beam_center_f) < 1e-6, \
             f"ADXV beam_center_f incorrect: {config.beam_center_f} vs {expected_beam_center_f}"

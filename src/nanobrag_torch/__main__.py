@@ -457,6 +457,15 @@ _C_PIVOT_PARSER = (
     ('-distance', ('pivot', 'BEAM')), ('-close_distance', ('pivot', 'SAMPLE')),
     ('-twotheta', ('pivot', 'SAMPLE')),
 )
+# Each convention block in nanoBragg.c (lines 1172-1248) sets the polarization E-vector and
+# the spindle axis along with the detector basis; CUSTOM leaves whatever the flags gave.
+_CONVENTION_POLAR_AND_SPINDLE = {
+    'MOSFLM': (0.0, 0.0, 1.0),
+    'DENZO': (0.0, 0.0, 1.0),
+    'XDS': (1.0, 0.0, 0.0),
+    'ADXV': (1.0, 0.0, 0.0),
+    'DIALS': (0.0, 1.0, 0.0),
+}
 _NAMESPACE_FLAG_ATTRS = {
     '-Xbeam': 'Xbeam', '-Ybeam': 'Ybeam', '-Xclose': 'Xclose', '-Yclose': 'Yclose',
     '-ORGX': 'ORGX', '-ORGY': 'ORGY', '-distance': 'distance', '-close_distance': 'close_distance',
@@ -692,6 +701,13 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['custom_polar_vector'] = tuple(args.polar_vector)
     if args.spindle_axis:
         config['custom_spindle_axis'] = tuple(args.spindle_axis)
+
+    # Convention defaults for both vectors; an explicit flag wins, as in C, where a vector
+    # flag switches to CUSTOM and the convention block then leaves them alone.
+    convention_axis = _CONVENTION_POLAR_AND_SPINDLE.get(config['convention'])
+    if convention_axis is not None:
+        config.setdefault('custom_polar_vector', convention_axis)
+        config.setdefault('custom_spindle_axis', convention_axis)
     # Handle pix0 override (validate mutual exclusivity)
     if args.pix0_vector and args.pix0_vector_mm:
         raise ValueError("Cannot specify both -pix0_vector and -pix0_vector_mm simultaneously")
@@ -1233,6 +1249,8 @@ def main():
         )
         if 'fluence' in config:
             beam_kwargs['fluence'] = config['fluence']
+        if 'custom_polar_vector' in config:
+            beam_kwargs['polarization_axis'] = config['custom_polar_vector']
         for key in ('flux', 'exposure', 'beamsize_mm'):
             if key in config:
                 beam_kwargs[key] = config[key]
