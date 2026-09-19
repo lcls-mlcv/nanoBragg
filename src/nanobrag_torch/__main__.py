@@ -467,6 +467,47 @@ _NAMESPACE_FLAG_ATTRS = {
 }
 
 
+def resolve_n_cells(args: argparse.Namespace) -> Tuple[int, int, int]:
+    """
+    Unit cells along a, b, c exactly as nanoBragg.c resolves them.
+
+    C starts from Na = Nb = Nc = 1 and applies the N flags in argv order, each to its
+    own axis, so the last flag for an axis wins: "-N 5 -Na 4" is (4, 5, 5) while
+    "-Na 4 -N 5" is (5, 5, 5), and "-Na 4" alone is (4, 1, 1). ``-N`` is an exact match
+    in C (strcmp), the per-axis flags are strstr matches.
+
+    The argv order comes from ``args._argv`` (set by main()); without it the flags in
+    the namespace are applied per-axis, with -N first so an explicit axis still wins.
+    """
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        argv = []
+        if getattr(args, 'N', None) is not None:
+            argv += ['-N', str(args.N)]
+        for flag in ('-Na', '-Nb', '-Nc'):
+            value = getattr(args, flag[1:], None)
+            if value is not None:
+                argv += [flag, str(value)]
+
+    n_cells = [1, 1, 1]  # nanoBragg.c: double Na=1.0, Nb=1.0, Nc=1.0
+    for i, token in enumerate(argv):
+        if i + 1 >= len(argv):
+            break
+        try:
+            value = int(argv[i + 1])
+        except ValueError:
+            continue
+        if '-Na' in token:
+            n_cells[0] = value
+        elif '-Nb' in token:
+            n_cells[1] = value
+        elif '-Nc' in token:
+            n_cells[2] = value
+        elif token == '-N':
+            n_cells = [value, value, value]
+    return tuple(n_cells)
+
+
 def resolve_detector_pivot(args: argparse.Namespace) -> str:
     """
     Detector pivot exactly as nanoBragg.c chooses it.
@@ -678,14 +719,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['detector_thicksteps'] = args.detector_thicksteps
 
     # Crystal parameters
-    if args.N:
-        config['Na'] = args.N
-        config['Nb'] = args.N
-        config['Nc'] = args.N
-    else:
-        config['Na'] = args.Na if args.Na else 5
-        config['Nb'] = args.Nb if args.Nb else 5
-        config['Nc'] = args.Nc if args.Nc else 5
+    config['Na'], config['Nb'], config['Nc'] = resolve_n_cells(args)
 
     # Crystal shape
     if args.crystal_shape:
