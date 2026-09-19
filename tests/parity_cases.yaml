@@ -748,3 +748,88 @@ cases:
           -detector_rotx 10
           -detector_roty 15
           -oversample 1
+
+  - id: PARITY-SHAPE-001
+    description: >-
+      Crystal shape models against C with the default spot metric (C ↔ PyTorch). GAUSS and
+      TOPHAT use bl831's reciprocal-space rad_star radius; ROUND uses the hkl-space one.
+      The cell is triclinic on purpose: the two metrics coincide only for a cubic cell, so
+      these runs fail if SpotMetric.HKL ever becomes the default.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: square
+        extra_args: >-
+          -square_xtal
+      - name: round
+        extra_args: >-
+          -round_xtal
+      - name: gauss
+        extra_args: >-
+          -gauss_xtal
+      - name: tophat
+        extra_args: >-
+          -tophat_spots
+        # A binary cutoff aliases at the spot edge: 3-4 of ~4300 lit pixels sit on opposite
+        # sides of "rad_sqr*fudge < 0.3969" in the two programs. r rises to 0.99997 at
+        # oversample 4, so this is sampling, not a metric difference.
+        thresholds:
+          corr_min: 0.999
+          sum_ratio_min: 0.998
+          sum_ratio_max: 1.002
+      - name: tophat-oversample-4
+        extra_args: >-
+          -tophat_spots
+          -oversample 4
+        thresholds:
+          corr_min: 0.9999
+          sum_ratio_min: 0.999
+          sum_ratio_max: 1.002
+      - name: gauss-fudge
+        extra_args: >-
+          -gauss_xtal
+          -fudge 1.5
+
+  - id: PARITY-SHAPE-002
+    description: >-
+      Anisotropic N_cells with each shape (C ↔ PyTorch). No -N here: nanoBragg.c takes the
+      last N flag in argv order, while the PyTorch CLI lets -N win over -Na/-Nb/-Nc, so
+      mixing them is a separate parity bug tracked outside this case.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -Na 4
+      -Nb 7
+      -Nc 9
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: square
+        extra_args: >-
+          -square_xtal
+      - name: round
+        extra_args: >-
+          -round_xtal
+      - name: gauss
+        extra_args: >-
+          -gauss_xtal

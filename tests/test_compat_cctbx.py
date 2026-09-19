@@ -317,13 +317,6 @@ def test_multipanel_simulator_stacks_panels_and_shares_crystal():
 # --------------------------------------------------------------------------- #
 # real cctbx comparison (skipped unless cctbx/dxtbx importable)
 # --------------------------------------------------------------------------- #
-_METRIC_XFAIL = pytest.mark.xfail(
-    strict=True,
-    reason="cctbx measures GAUSS/TOPHAT spot radius in hkl space; torch follows bl831's 2023 "
-           "reciprocal-space rad_star metric. Needs a spot-metric switch (audit Phase 3 item 13).",
-)
-
-
 @pytest.mark.parametrize(
     "shape, ncells, mosaic, oversample, distance_mm",
     [
@@ -331,8 +324,11 @@ _METRIC_XFAIL = pytest.mark.xfail(
         ("round", (5, 9, 12), (1, 0.0), 1, 100.0),
         ("square", (7, 7, 7), (10, 0.5), 1, 150.0),
         ("square", (7, 7, 7), (1, 0.0), 3, 80.0),
-        pytest.param("gauss", (7, 7, 7), (1, 0.0), 1, 150.0, marks=_METRIC_XFAIL),
-        pytest.param("tophat", (7, 7, 7), (1, 0.0), 1, 150.0, marks=_METRIC_XFAIL),
+        # GAUSS/TOPHAT match only because the compat layer selects SpotMetric.HKL,
+        # cctbx's spot-radius metric; bl831's C uses the reciprocal-space one.
+        ("gauss", (7, 7, 7), (1, 0.0), 1, 150.0),
+        ("tophat", (7, 7, 7), (1, 0.0), 1, 150.0),
+        ("gauss", (5, 9, 12), (1, 0.0), 2, 100.0),
     ],
 )
 def test_against_simtbx_nanoBragg(shape, ncells, mosaic, oversample, distance_mm):
@@ -392,3 +388,21 @@ def test_against_simtbx_nanoBragg_rotated_monoclinic_without_miller_array():
     img = simulator_from_sim_data(SIM, dtype=torch.float64).run().numpy()
     assert np.corrcoef(ref.ravel(), img.ravel())[0, 1] > 0.99999
     assert img.sum() == pytest.approx(ref.sum(), rel=1e-4)
+
+
+@pytest.mark.parametrize("shape", ["gauss", "tophat"])
+def test_spot_metric_switch_changes_gauss_and_tophat(shape):
+    """The two metrics differ for a non-cubic cell, and the compat default is cctbx's."""
+    from nanobrag_torch.config import BeamConfig, SpotMetric
+    from nanobrag_torch.simulator import Simulator
+
+    cell = (70.0, 80.0, 90.0, 75.0, 85.0, 95.0)
+    det, beam, xtal = simple_detector(120.0, 0.1, (64, 64)), FakeBeam(wavelength=1.0), FakeCrystal(cell)
+    kwargs = dict(Ncells_abc=6, default_F=100.0, oversample=1, shape=shape)
+    hkl = simulator_from_dxtbx(det, beam, xtal, **kwargs).run()
+    recip = simulator_from_dxtbx(det, beam, xtal, spot_metric=SpotMetric.RECIPROCAL, **kwargs).run()
+
+    assert not torch.allclose(hkl, recip, rtol=1e-3), "metrics should differ for a triclinic cell"
+    # the compat layer must default to cctbx's metric
+    default_cfg = crystal_config_from_dxtbx(xtal, Ncells_abc=6, shape=shape)
+    assert default_cfg.spot_metric is SpotMetric.HKL

@@ -28,6 +28,7 @@ crystal_config_from_dxtbx(crystal, ...)          # or crystal_config_from_A(...)
 beam_config_from_dxtbx(beam, ...)
 structure_factors_from_miller_array(miller_array)
 set_structure_factors(crystal, indices, amplitudes, default_F)
+# GAUSS/TOPHAT use SpotMetric.HKL here (cctbx's metric), not bl831's reciprocal-space one
 set_mosaic_blocks(crystal, umats)
 isotropic_umats(mos_spread_deg, n_domains, seed)
 simulator_from_dxtbx(detector, beam, crystal, ...)
@@ -52,6 +53,7 @@ from ..config import (
     DetectorConfig,
     DetectorConvention,
     DetectorPivot,
+    SpotMetric,
 )
 from ..models.crystal import Crystal
 from ..models.detector import Detector
@@ -213,6 +215,7 @@ def crystal_config_from_A(
     default_F: float = 0.0,
     fudge: float = 1.0,
     misset_deg: Vec3 = (0.0, 0.0, 0.0),
+    spot_metric: SpotMetric = SpotMetric.HKL,
 ) -> CrystalConfig:
     """
     CrystalConfig from unit-cell parameters (Å, deg) and a dxtbx-style A matrix.
@@ -221,6 +224,10 @@ def crystal_config_from_A(
     reciprocal basis vectors a*, b*, c* (dxtbx ``Crystal.get_A()`` flattened row
     major). Its transpose is what cctbx passes to ``nanoBragg.Amatrix``. A torch
     tensor (possibly requiring grad) is accepted so orientation gradients flow.
+
+    ``spot_metric`` defaults to HKL here, because cctbx's nanoBragg.cpp and diffBragg
+    measure the GAUSS/TOPHAT spot radius in hkl space; pass
+    ``SpotMetric.RECIPROCAL`` to reproduce bl831's C instead.
     """
     if isinstance(A, torch.Tensor):
         A_t = A.reshape(3, 3)
@@ -247,6 +254,7 @@ def crystal_config_from_A(
         default_F=float(default_F),
         shape=_xtal_shape(shape),
         fudge=float(fudge),
+        spot_metric=spot_metric,
     )
 
 
@@ -490,6 +498,7 @@ def simulator_from_dxtbx(
     structure_factors: Optional[Tuple] = None,
     default_F: float = 0.0,
     F000: Optional[float] = 0.0,
+    spot_metric: SpotMetric = SpotMetric.HKL,
     oversample: int = -1,
     fluence: Optional[float] = None,
     spot_scale: float = 1.0,
@@ -511,7 +520,7 @@ def simulator_from_dxtbx(
     det_cfg = detector_config_from_dxtbx_panel(panel, s0, oversample=oversample)
     cry_cfg = crystal_config_from_dxtbx(
         crystal, Ncells_abc=Ncells_abc, shape=shape, mosaic_spread_deg=mosaic_spread_deg,
-        mosaic_domains=mosaic_domains, default_F=default_F,
+        mosaic_domains=mosaic_domains, default_F=default_F, spot_metric=spot_metric,
     )
     beam_cfg = beam_config_from_dxtbx(beam, fluence=fluence, spot_scale=spot_scale)
 
