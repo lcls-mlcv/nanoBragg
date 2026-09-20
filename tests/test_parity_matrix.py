@@ -321,9 +321,13 @@ def test_parity_case(parity_case, c_binary, pytorch_cli, request):
     case_id = case['id']
     run_name = run['name']
 
-    # Combine arguments
-    base_args = case['base_args'].strip().split()
-    extra_args = run['extra_args'].strip().split()
+    # Combine arguments.
+    # {REPO} expands to the repository root so a case can reference a checked-in
+    # input file (e.g. -hkl {REPO}/tests/golden_data/P1_interp.hkl) regardless of
+    # the directory pytest was invoked from.
+    repo_root = str(Path(__file__).resolve().parent.parent)
+    base_args = [a.replace('{REPO}', repo_root) for a in case['base_args'].strip().split()]
+    extra_args = [a.replace('{REPO}', repo_root) for a in run['extra_args'].strip().split()]
     all_args = base_args + extra_args
 
     # Get thresholds (case-level or run-level)
