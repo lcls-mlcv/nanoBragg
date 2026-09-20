@@ -100,17 +100,21 @@ def test_header_precedence_img_then_mask():
         float_file = tmpdir / "output.bin"
         int_file = tmpdir / "output.img"
 
-        # Run with both -img and -mask (mask should win)
+        # Explicitly-typed flags must beat BOTH headers: nanoBragg.c reads the
+        # -img/-mask headers in a pre-pass (:419-502) that runs before its
+        # argument loop (:506), so the loop overwrites whatever the header set.
+        # Confirmed against the binary: `-img h48.img -detpixels 32` renders
+        # 32x32, and `-img h.img -pixel 0.2` uses 0.2 mm.
         cmd = [
             'python', '-m', 'nanobrag_torch',
             '-hkl', str(hkl_file),
             '-cell', '100', '100', '100', '90', '90', '90',
-            '-lambda', '1.5',  # CLI value (should be overridden)
-            '-distance', '50',  # CLI value (should be overridden)
+            '-lambda', '1.5',
+            '-distance', '50',
             '-detpixels', '32',
-            '-pixel', '0.15',  # CLI value (should be overridden)
+            '-pixel', '0.15',
             '-img', str(img_file),
-            '-mask', str(mask_file),  # This comes last, should win
+            '-mask', str(mask_file),
             '-floatfile', str(float_file),
             '-intfile', str(int_file),
             '-default_F', '100'
@@ -118,19 +122,53 @@ def test_header_precedence_img_then_mask():
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         assert result.returncode == 0, f"Command failed: {result.stderr}"
-
-        # Check the output SMV header - should have mask values
         assert int_file.exists()
 
-        # Read header values
         pixel_size = read_smv_header_value(int_file, 'PIXEL_SIZE')
         distance = read_smv_header_value(int_file, 'DISTANCE')
         wavelength = read_smv_header_value(int_file, 'WAVELENGTH')
 
-        # Mask values should have won
-        assert float(pixel_size) == 0.2, f"Expected pixel size 0.2 from mask, got {pixel_size}"
-        assert float(distance) == 200.0, f"Expected distance 200 from mask, got {distance}"
-        assert float(wavelength) == 2.0, f"Expected wavelength 2.0 from mask, got {wavelength}"
+        assert float(pixel_size) == 0.15, f"-pixel should win, got {pixel_size}"
+        assert float(distance) == 50.0, f"-distance should win, got {distance}"
+        assert float(wavelength) == 1.5, f"-lambda should win, got {wavelength}"
+
+
+def test_img_header_beats_mask_header():
+    """With no competing CLI flag, the -img header wins over the -mask header.
+
+    C runs the mask pre-pass at nanoBragg.c:419 and the img pre-pass at :462, so
+    "the last file read" is always the img file, whatever the argv order.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+        hkl_file = tmpdir / "test.hkl"
+        create_simple_hkl_file(hkl_file)
+
+        common = {'HEADER_BYTES': '512', 'DIM': '2', 'SIZE1': '32', 'SIZE2': '32',
+                  'TYPE': 'unsigned_short', 'BYTE_ORDER': 'little_endian'}
+        img_file = tmpdir / "geom.img"
+        create_smv_with_headers(img_file, {**common, 'PIXEL_SIZE': '0.100000',
+                                           'DISTANCE': '100.000', 'WAVELENGTH': '1.0'})
+        mask_file = tmpdir / "geom.mask"
+        create_smv_with_headers(mask_file, {**common, 'PIXEL_SIZE': '0.200000',
+                                            'DISTANCE': '200.000', 'WAVELENGTH': '2.0'})
+
+        for order in (['-img', str(img_file), '-mask', str(mask_file)],
+                      ['-mask', str(mask_file), '-img', str(img_file)]):
+            int_file = tmpdir / "out.img"
+            cmd = ['python', '-m', 'nanobrag_torch',
+                   '-hkl', str(hkl_file),
+                   '-cell', '100', '100', '100', '90', '90', '90',
+                   *order,
+                   '-intfile', str(int_file),
+                   '-default_F', '100']
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            assert result.returncode == 0, f"Command failed: {result.stderr}"
+
+            assert float(read_smv_header_value(int_file, 'WAVELENGTH')) == 1.0, (
+                f"-img wavelength should win for order {order}")
+            assert float(read_smv_header_value(int_file, 'PIXEL_SIZE')) == 0.1, (
+                f"-img pixel size should win for order {order}")
 
 def test_mask_beam_center_y_flip():
     """Test that BEAM_CENTER_Y is interpreted with Y-flip for mask files."""
@@ -226,15 +264,11 @@ def test_img_only_no_mask():
         float_file = tmpdir / "output.bin"
         int_file = tmpdir / "output.img"
 
-        # Run with only -img
+        # -img alone: the header supplies everything the user did NOT type.
         cmd = [
             'python', '-m', 'nanobrag_torch',
             '-hkl', str(hkl_file),
             '-cell', '100', '100', '100', '90', '90', '90',
-            '-lambda', '2.0',  # CLI value (should be overridden by img)
-            '-distance', '50',  # CLI value (should be overridden by img)
-            '-detpixels', '32',  # CLI value (should be overridden by img)
-            '-pixel', '0.1',  # CLI value (should be overridden by img)
             '-img', str(img_file),
             '-floatfile', str(float_file),
             '-intfile', str(int_file),
@@ -243,23 +277,27 @@ def test_img_only_no_mask():
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         assert result.returncode == 0, f"Command failed: {result.stderr}"
-
-        # Check the output SMV header - should have img values
         assert int_file.exists()
 
-        # Read header values
-        size1 = read_smv_header_value(int_file, 'SIZE1')
-        size2 = read_smv_header_value(int_file, 'SIZE2')
-        pixel_size = read_smv_header_value(int_file, 'PIXEL_SIZE')
-        distance = read_smv_header_value(int_file, 'DISTANCE')
-        wavelength = read_smv_header_value(int_file, 'WAVELENGTH')
+        assert int(read_smv_header_value(int_file, 'SIZE1')) == 48
+        assert int(read_smv_header_value(int_file, 'SIZE2')) == 48
+        assert float(read_smv_header_value(int_file, 'PIXEL_SIZE')) == 0.15
+        assert float(read_smv_header_value(int_file, 'DISTANCE')) == 150.0
+        assert float(read_smv_header_value(int_file, 'WAVELENGTH')) == 1.5
 
-        # IMG values should have been applied
-        assert int(size1) == 48, f"Expected size1=48 from img, got {size1}"
-        assert int(size2) == 48, f"Expected size2=48 from img, got {size2}"
-        assert float(pixel_size) == 0.15, f"Expected pixel size 0.15 from img, got {pixel_size}"
-        assert float(distance) == 150.0, f"Expected distance 150 from img, got {distance}"
-        assert float(wavelength) == 1.5, f"Expected wavelength 1.5 from img, got {wavelength}"
+        # ...but each flag the user does type wins over the header, per C's
+        # pre-pass-then-argument-loop ordering. Verified against the binary.
+        int_file2 = tmpdir / "output2.img"
+        result = subprocess.run(cmd[:-6] + [
+            '-lambda', '2.0', '-distance', '50', '-detpixels', '32', '-pixel', '0.1',
+            '-intfile', str(int_file2), '-default_F', '100',
+        ], capture_output=True, text=True)
+        assert result.returncode == 0, f"Command failed: {result.stderr}"
+
+        assert int(read_smv_header_value(int_file2, 'SIZE1')) == 32, "-detpixels should win"
+        assert float(read_smv_header_value(int_file2, 'PIXEL_SIZE')) == 0.1, "-pixel should win"
+        assert float(read_smv_header_value(int_file2, 'DISTANCE')) == 50.0, "-distance should win"
+        assert float(read_smv_header_value(int_file2, 'WAVELENGTH')) == 2.0, "-lambda should win"
 
 if __name__ == "__main__":
     test_header_precedence_img_then_mask()

@@ -194,15 +194,22 @@ class TestAT_IO_004:
             max_diff = torch.max(diff).item()
             assert max_diff < 1e-10, f"Format {formats[i]} produces different pattern than {formats[0]}"
 
-    def test_fdump_caching_for_all_formats(self, hkl_files_dir, test_crystal_config, tmp_path):
-        """Test that Fdump caching works correctly for all formats."""
+    def test_fdump_caching_for_all_formats(self, hkl_files_dir, test_crystal_config,
+                                           tmp_path, monkeypatch):
+        """Test that Fdump caching works correctly for all formats.
+
+        Uses monkeypatch.chdir, not os.chdir: pytest restores the working
+        directory afterwards. A bare os.chdir leaked out of this test and broke
+        every later test in the session that resolved a relative path (notably
+        the subprocess tests in test_at_pre_001.py, which run with PYTHONPATH=src).
+        """
         formats = ["minimal.hkl", "with_phase.hkl", "with_sigma.hkl", "negative_indices.hkl"]
 
         for hkl_filename in formats:
             # Create a new temp directory for each format
             format_dir = tmp_path / hkl_filename.replace(".hkl", "")
             format_dir.mkdir()
-            os.chdir(format_dir)
+            monkeypatch.chdir(format_dir)
 
             hkl_file = hkl_files_dir / hkl_filename
 

@@ -7,6 +7,12 @@ Per spec lines 796-798:
 - Expectation: The last file read among -img/-mask determines shared header-
   initialized quantities. Pixels where the mask value is 0 are skipped
   (remain zero in outputs) and excluded from statistics.
+
+"The last file read" is the -img file, NOT the last one named on the command
+line: nanoBragg.c runs the mask pre-pass at :419 and the img pre-pass at :462,
+both before the argument loop at :506. So -img wins for shared keys whichever
+order the flags appear in, and an explicitly-typed flag wins over both.
+Verified against the binary; pinned by PARITY-SMVHDR-001.
 """
 
 import os
@@ -58,8 +64,13 @@ def create_test_smv_file(filename: str, fpixels: int, spixels: int,
     )
 
 
-def test_header_precedence_img_then_mask():
-    """Test that -mask header values override -img header values."""
+@pytest.mark.parametrize("img_first", [True, False])
+def test_header_precedence_img_beats_mask(img_first):
+    """-img header values beat -mask ones, in either command-line order.
+
+    C reads the mask block (nanoBragg.c:419) before the img block (:462), so the
+    img file is "the last file read" no matter how the flags are ordered.
+    """
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -99,31 +110,30 @@ def test_header_precedence_img_then_mask():
             f.write("0 0 0 100.0\n")
             f.write("1 0 0 50.0\n")
 
-        # Run nanoBragg with both -img and -mask
+        file_flags = (["-img", str(img_file), "-mask", str(mask_file)] if img_first
+                      else ["-mask", str(mask_file), "-img", str(img_file)])
         cmd = [
             "python", "-m", "nanobrag_torch",
             "-hkl", str(hkl_file),
             "-cell", "10", "10", "10", "90", "90", "90",
-            "-img", str(img_file),
-            "-mask", str(mask_file),
+            *file_flags,
             "-detpixels", "64",
             "-roi", "0", "63", "0", "63",
             "-floatfile", str(output_file),
             "-N", "1"
         ]
 
-        # Run and capture output
         result = subprocess.run(cmd, capture_output=True, text=True)
 
-        # Check that both headers were read
         assert "Read header from -img file" in result.stdout
         assert "Read header from -mask file" in result.stdout
-
-        # The simulation should use mask file's parameters (last wins)
-        # We can't directly verify the parameters used, but we verify
-        # that the simulation ran successfully
         assert result.returncode == 0
         assert output_file.exists()
+
+        # img says 1.0 A, mask says 2.0 A: the img file must win either way.
+        assert "Wavelength: 1.00" in result.stdout, (
+            f"-img wavelength should win regardless of flag order, got:\n{result.stdout}"
+        )
 
 
 def test_mask_zeros_are_skipped():
@@ -237,7 +247,13 @@ def test_mask_beam_center_y_flip():
 
 
 def test_conflicting_detector_size():
-    """Test precedence when -img and -mask have different detector sizes."""
+    """A -mask smaller than the -img-sized detector is rejected, not silently used.
+
+    -img wins the detector size (C reads the mask block first and the img block
+    second), which leaves a 32x32 mask against a 64x64 detector. nanoBragg.c
+    indexes its mask buffer with the final pixel count and reads past the end of
+    it; we refuse the combination instead of inheriting that undefined behaviour.
+    """
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -288,14 +304,13 @@ def test_conflicting_detector_size():
 
         result = subprocess.run(cmd, capture_output=True, text=True)
 
-        # Should succeed, using mask file's 32x32 size (last wins)
-        assert result.returncode == 0
-
-        # Verify output size matches mask file (32x32)
-        with open(output_file, "rb") as f:
-            data = np.fromfile(f, dtype=np.float32)
-
-        assert data.size == 32 * 32, f"Output should be 32x32, got {data.size} pixels"
+        assert result.returncode != 0, (
+            "A 32x32 mask against a 64x64 detector must be rejected, not rendered"
+        )
+        combined = result.stdout + result.stderr
+        assert "32x32" in combined and "64x64" in combined, (
+            f"Error should name both sizes, got: {combined[-500:]}"
+        )
 
 
 def test_img_only_no_mask():
