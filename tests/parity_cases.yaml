@@ -1243,3 +1243,57 @@ cases:
           -detector_abs 200
           -thicksteps 3
           -oversample 2
+
+  - id: PARITY-MOSAIC-001
+    description: >-
+      Mosaic domain orientations (C ↔ PyTorch). nanoBragg.c draws each domain from a
+      spherical cap with ran1, keeping one seed state across the set (three deviates per
+      domain) and forcing domain 0 to the identity after its draws are taken. It also
+      resolves the flags together: a spread with no -mosaic_dom is rendered with 10 domains,
+      and a zero spread forces one domain. torch previously sampled Gaussian axes and angles
+      from its own RNG, which matched only statistically (r ~ 0.94 for 10 domains).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: spread-only-ups-to-10-domains
+        extra_args: >-
+          -mosaic 1.0
+      - name: ten-domains
+        extra_args: >-
+          -mosaic 1.0
+          -mosaic_dom 10
+      - name: explicit-seed
+        extra_args: >-
+          -mosaic 1.0
+          -mosaic_dom 10
+          -mosaic_seed 12345
+      - name: fifty-domains
+        extra_args: >-
+          -mosaic 2.0
+          -mosaic_dom 50
+      - name: small-spread-seeded
+        extra_args: >-
+          -mosaic 0.5
+          -mosaic_dom 25
+          -mosaic_seed 777
+      - name: zero-spread-forces-one-domain
+        extra_args: >-
+          -mosaic 0.0
+          -mosaic_dom 10
+      - name: mosaic-with-phi
+        extra_args: >-
+          -mosaic 1.0
+          -mosaic_dom 10
+          -phi 0 -osc 5 -phisteps 3
