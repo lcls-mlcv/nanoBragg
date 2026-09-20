@@ -1119,11 +1119,16 @@ class Crystal:
         step_indices = torch.arange(
             config.phi_steps, device=self.device, dtype=self.dtype
         )
-        step_size = (
-            config.osc_range_deg / config.phi_steps
-            if config.phi_steps > 0
-            else torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        )
+        # C steps the loop by phistep, which it usually derives as osc/phisteps but
+        # keeps independent when -osc, -phisteps and -phistep are all given.
+        if getattr(config, 'phi_step_deg', None) is not None:
+            step_size = config.phi_step_deg
+        else:
+            step_size = (
+                config.osc_range_deg / config.phi_steps
+                if config.phi_steps > 0
+                else torch.tensor(0.0, device=self.device, dtype=self.dtype)
+            )
         # C loop formula: phi = phi_start + step_size * step_index
         # where step_index ranges from 0 to (phi_steps - 1)
         phi_angles = config.phi_start_deg + step_size * step_indices

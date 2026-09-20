@@ -149,6 +149,10 @@ class CrystalConfig:
     phi_start_deg: float = 0.0
     osc_range_deg: float = 0.0
     phi_steps: int = 1
+    # Spindle step actually used by the render loop (phistep in nanoBragg.c:3004-3009).
+    # None means osc_range_deg / phi_steps, which is what C itself derives in every
+    # case except "-osc, -phisteps and -phistep all given", where it keeps all three.
+    phi_step_deg: Optional[float] = None
     spindle_axis: Tuple[float, float, float] = (0.0, 0.0, 1.0)
 
     # Mosaicity parameters
@@ -206,6 +210,15 @@ class DetectorConfig:
     # Beam center (mm from detector origin)
     beam_center_s: Union[float, torch.Tensor, None] = None  # slow axis (auto-calculated if None)
     beam_center_f: Union[float, torch.Tensor, None] = None  # fast axis (auto-calculated if None)
+
+    # Point of closest approach between sample and detector (Fclose/Sclose in
+    # nanoBragg.c), in mm. nanoBragg.c keeps these separate from the direct-beam spot
+    # (Fbeam/Sbeam) and only the SAMPLE pivot reads them (nanoBragg.c:1719-1721); they
+    # are set by -ORGX/-ORGY and, under the CUSTOM convention, by -Xclose/-Yclose.
+    # None means "derive them from the beam centre", which is what every convention
+    # whose Fclose and Fbeam coincide does.
+    close_center_f_mm: Optional[float] = None  # Fclose (fast axis)
+    close_center_s_mm: Optional[float] = None  # Sclose (slow axis)
 
     # Beam center source tracking (DETECTOR-CONFIG-001 Phase C1)
     # Distinguishes auto-calculated defaults from explicit user-provided values

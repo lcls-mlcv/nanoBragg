@@ -20,6 +20,17 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 # Repository root for absolute path resolution
 REPO_ROOT = Path(__file__).parent.parent
 
+# Resolved at import time on purpose: tests/test_at_tools_001.py deletes NB_C_BIN from
+# os.environ and never puts it back, so anything that reads it at call time silently
+# skips for the rest of the session.
+try:
+    from tests.conftest import _resolve_c_binary as _conftest_resolve_c_binary
+
+    C_BINARY = _conftest_resolve_c_binary()
+except Exception:  # pragma: no cover - conftest import shape is not ours to rely on
+    C_BINARY = None
+RUN_PARALLEL = os.environ.get('NB_RUN_PARALLEL', '0') == '1'
+
 
 def run_parse(args):
     """
@@ -276,7 +287,14 @@ class TestCLIIntegrationSanity:
     """Integration tests to ensure new flags don't break existing behavior."""
 
     def test_pix0_does_not_alter_beam_vector(self):
-        """Verify -pix0_vector doesn't mutate beam_vector."""
+        """Verify -pix0_vector doesn't move the beam off +X.
+
+        -pix0_vector switches nanoBragg.c to the CUSTOM convention, whose block sets
+        no basis vectors, so beam_vector keeps the value it was declared with:
+        [1,0,0] (nanoBragg.c:191), the same beam MOSFLM uses. The CLI therefore
+        pins custom_beam_vector to that default instead of leaving it unset, which
+        would have let the Detector fall back to its CUSTOM guess of [0,0,1].
+        """
         config = run_parse([
             '-cell', '100', '100', '100', '90', '90', '90',
             '-pixel', '0.1',
@@ -284,8 +302,8 @@ class TestCLIIntegrationSanity:
             '-pix0_vector', '0.1', '0.2', '0.3'
         ])
 
-        # custom_beam_vector should remain unset
-        assert config.get('custom_beam_vector') is None
+        assert config['convention'] == 'CUSTOM'
+        assert config['custom_beam_vector'] == (1.0, 0.0, 0.0)
 
     def test_pix0_triggers_custom_convention(self):
         """Verify pix0 vectors trigger CUSTOM convention."""
@@ -947,3 +965,106 @@ class TestHKLFdumpParity:
         finally:
             # Cleanup
             Path(tmp_path).unlink(missing_ok=True)
+
+
+class TestInterpolateParity:
+    """-interpolate / -nointerpolate against the C reference (audit item 11).
+
+    nanoBragg.c defaults `interpolate` to 2 ("auto") and resolves it at line 1778:
+    tricubic interpolation is auto-selected when any of Na/Nb/Nc is <= 2, otherwise
+    nearest-neighbour. -interpolate pins it to 1 and -nointerpolate to 0. The
+    interpolator is fed the *fractional* h,k,l (nanoBragg.c:2939-3007); only the
+    nearest-neighbour branch uses the rounded h0,k0,l0.
+
+    These runs need a real -hkl grid: with -default_F alone C sets hkls = 0 and then
+    forces interpolate = 0 (nanoBragg.c:2246), so the flag cannot change anything.
+    They run in a tmp_path so the Fdump.bin the C binary writes next to an -hkl file
+    never lands in the repo (which would silently feed every other parity run).
+    """
+
+    BASE_ARGS = [
+        '-cell', '70', '80', '90', '75', '85', '95',
+        '-misset', '10', '20', '30',
+        '-lambda', '1.0',
+        '-pixel', '0.1',
+        '-distance', '100',
+        '-detpixels', '64',
+        '-oversample', '1',
+    ]
+
+    @staticmethod
+    def _write_hkl(path):
+        """An hkl grid whose F varies smoothly, so interpolating is not a no-op."""
+        import math
+        with open(path, 'w') as handle:
+            for h in range(-10, 11):
+                for k in range(-10, 11):
+                    for l in range(-10, 11):  # noqa: E741
+                        F = (100.0
+                             + 50.0 * math.sin(0.7 * h + 0.3) * math.cos(0.5 * k - 0.2)
+                             + 30.0 * math.sin(0.9 * l))
+                        handle.write(f"{h} {k} {l} {F:.4f}\n")
+
+    @classmethod
+    def _render(cls, workdir, binary_cmd, extra_args, tag):
+        import subprocess
+        import numpy as np
+
+        out = workdir / f"{tag}.bin"
+        env = dict(os.environ)
+        env['PYTHONPATH'] = str(REPO_ROOT / 'src')
+        env['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+        env['NANOBRAGG_DISABLE_COMPILE'] = '1'
+        args = (binary_cmd
+                + ['-hkl', str(workdir / 'vary.hkl')]
+                + cls.BASE_ARGS + extra_args
+                + ['-floatfile', str(out)])
+        result = subprocess.run(args, cwd=str(workdir), env=env,
+                                capture_output=True, text=True, timeout=600)
+        assert result.returncode == 0, f"{tag} failed:\n{result.stdout}\n{result.stderr}"
+        return np.fromfile(out, dtype=np.float32).astype(np.float64)
+
+    @pytest.mark.parametrize('extra_args,label', [
+        (['-N', '5', '-interpolate'], 'forced-on'),
+        (['-N', '5', '-nointerpolate'], 'forced-off'),
+        (['-N', '2'], 'auto-on-small-crystal'),
+        (['-N', '2', '-nointerpolate'], 'auto-overridden-off'),
+    ])
+    def test_interpolate_matches_c(self, tmp_path, extra_args, label):
+        import sys
+        import numpy as np
+
+        if C_BINARY is None:
+            pytest.skip("No C binary (set NB_C_BIN)")
+        if not RUN_PARALLEL:
+            pytest.skip("NB_RUN_PARALLEL not set to 1")
+        c_binary = C_BINARY
+
+        self._write_hkl(tmp_path / 'vary.hkl')
+
+        c_img = self._render(tmp_path, [str(c_binary)], extra_args, f"c_{label}")
+        (tmp_path / 'Fdump.bin').unlink(missing_ok=True)
+        py_img = self._render(tmp_path, [sys.executable, '-m', 'nanobrag_torch'],
+                              extra_args, f"py_{label}")
+
+        corr = float(np.corrcoef(c_img, py_img)[0, 1])
+        sum_ratio = float(py_img.sum() / c_img.sum())
+        assert corr >= 0.9999, f"{label}: correlation {corr:.8f}"
+        assert 0.999 <= sum_ratio <= 1.001, f"{label}: sum ratio {sum_ratio:.6f}"
+
+    def test_interpolate_actually_changes_the_image(self, tmp_path):
+        """Guard: these runs are only meaningful because the flag moves the image."""
+        import sys
+        import numpy as np
+
+        if not RUN_PARALLEL:
+            pytest.skip("NB_RUN_PARALLEL not set to 1")
+
+        self._write_hkl(tmp_path / 'vary.hkl')
+        torch_cmd = [sys.executable, '-m', 'nanobrag_torch']
+
+        on = self._render(tmp_path, torch_cmd, ['-N', '5', '-interpolate'], 'py_on')
+        off = self._render(tmp_path, torch_cmd, ['-N', '5', '-nointerpolate'], 'py_off')
+
+        assert not np.allclose(on, off), \
+            "-interpolate and -nointerpolate produced identical images"

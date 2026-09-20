@@ -714,6 +714,18 @@ class Detector:
             Fclose = self.beam_center_f * self.pixel_size  # pixels * (m/pixel) → meters
             Sclose = self.beam_center_s * self.pixel_size  # pixels * (m/pixel) → meters
 
+            # nanoBragg.c tracks Fclose/Sclose separately from Fbeam/Sbeam; -ORGX/-ORGY
+            # (and -Xclose/-Yclose under CUSTOM) move only the former. The CLI resolves
+            # them per nanoBragg.c:1156-1165 and passes them here in mm.
+            if c.close_center_f_mm is not None:
+                Fclose = torch.as_tensor(
+                    c.close_center_f_mm, device=self.device, dtype=self.dtype
+                ) / 1000.0
+            if c.close_center_s_mm is not None:
+                Sclose = torch.as_tensor(
+                    c.close_center_s_mm, device=self.device, dtype=self.dtype
+                ) / 1000.0
+
             # Compute pix0 BEFORE rotations using close_distance if specified
             # When close_distance is provided, use it directly for SAMPLE pivot
             # CLI-FLAGS-003 Phase L3k.3c.4: CRITICAL FIX - use close_distance not distance
