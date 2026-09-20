@@ -25,14 +25,20 @@ def test_tricubic_interpolation_enabled():
 
     Setup: Enable -interpolate; choose fractional h,k,l within a grid with complete 4×4×4 neighborhoods.
     Expectation: F_cell SHALL be tricubically interpolated between neighbors.
+
+    INTERP-PARITY-001: the grid used to be h,k,l ∈ [-2,2]. C's safety test is
+    `(h-h_min+3) > h_range || h-2 < h_min` (with h_range = h_max-h_min+1), i.e. it
+    demands a margin of *two* whole indices on each side, not the one the 4×4×4
+    gather needs — on a [-2,2] grid that leaves only h == 0 exactly. Widened to
+    [-4,4] so the fractional queries below sit inside C's window.
     """
-    # Create a simple HKL file with a 5x5x5 grid of known values
+    # Create a simple HKL file with a 9x9x9 grid of known values
     hkl_content = StringIO()
 
     # Generate a grid with values that vary smoothly
-    for h in range(-2, 3):
-        for k in range(-2, 3):
-            for l in range(-2, 3):
+    for h in range(-4, 5):
+        for k in range(-4, 5):
+            for l in range(-4, 5):
                 # Create a smooth function: F = 100 + 10*h + 5*k + 2*l
                 F = 100.0 + 10.0 * h + 5.0 * k + 2.0 * l
                 hkl_content.write(f"{h} {k} {l} {F:.1f}\n")
@@ -88,6 +94,24 @@ def test_tricubic_interpolation_enabled():
         assert 97.0 < F_interp2.item() < 104.0, \
             f"Second interpolated value {F_interp2.item()} outside expected range"
 
+        # INTERP-PARITY-001 regression: interpolation must actually change the
+        # answer. The simulator used to hand the ROUNDED h0,k0,l0 to this lookup,
+        # and a 4-point Lagrange polynomial evaluated on one of its own nodes
+        # returns that node's value exactly — so -interpolate and -nointerpolate
+        # produced bit-identical images. Querying at a fractional point with the
+        # flag off must give the nearest-neighbour value, and it must differ.
+        crystal.interpolate = False
+        F_nearest = crystal.get_structure_factor(h, k, l)
+        crystal.interpolate = True
+
+        h0, k0, l0 = torch.round(h), torch.round(k), torch.round(l)
+        expected_nn = 100.0 + 10.0 * h0.item() + 5.0 * k0.item() + 2.0 * l0.item()
+        assert torch.allclose(F_nearest, torch.tensor(expected_nn, dtype=F_nearest.dtype)), \
+            f"Nearest-neighbour lookup should be F{(h0.item(), k0.item(), l0.item())}={expected_nn}, got {F_nearest.item()}"
+        assert not torch.allclose(F_interp2, F_nearest), \
+            "Tricubic interpolation returned the nearest-neighbour value — the fractional " \
+            "h,k,l are not reaching polin3 (dead-code regression)"
+
     finally:
         # Clean up temp file
         os.unlink(hkl_file)
@@ -99,18 +123,28 @@ def test_tricubic_out_of_bounds_fallback():
     """
     AT-STR-002: Test out-of-bounds fallback behavior.
 
-    Setup: Enable interpolation but query a point where 4×4×4 neighborhood would be out of bounds.
-    Expectation:
+    Setup: Enable interpolation but query a point where C's safety test fails.
+    Expectation (INTERP-PARITY-001, verified against nanoBragg.c):
     - SHALL print a one-time warning
-    - SHALL use default_F for that evaluation
-    - SHALL permanently disable interpolation for the rest of the run
+    - SHALL fall back to the NEAREST-NEIGHBOUR lookup for that evaluation, which
+      yields default_F only when the rounded index is also outside the Fhkl box.
+      C writes `F_cell = default_F` in the out-of-range branch, but that value is
+      immediately overwritten: clearing `interpolate` makes the very next
+      `if(! interpolate){ ... F_cell = Fhkl[h0-h_min]... }` block run.
+    - SHALL NOT mutate the crystal's interpolate flag. C *does* latch its shared
+      `interpolate` scalar to 0 there, which silently renders the rest of the
+      image nearest-neighbour; that is evaluation-order dependent (and racy under
+      OpenMP) and is deliberately not reproduced in the vectorised port. Samples
+      that are in range keep being interpolated.
     """
-    # Create a small HKL grid (3x3x3)
+    # Create an HKL grid (9x9x9). C's safety window is [h_min+2, h_max-2] = [-2, 2],
+    # so queries outside that band exercise the fallback while queries inside it
+    # prove the flag was not latched off.
     hkl_content = StringIO()
 
-    for h in range(-1, 2):
-        for k in range(-1, 2):
-            for l in range(-1, 2):
+    for h in range(-4, 5):
+        for k in range(-4, 5):
+            for l in range(-4, 5):
                 F = 100.0 + h + k + l
                 hkl_content.write(f"{h} {k} {l} {F:.1f}\n")
 
@@ -136,33 +170,36 @@ def test_tricubic_out_of_bounds_fallback():
         crystal.load_hkl(hkl_file)
         crystal.interpolate = True  # Force interpolation on initially
 
-        # Query a point near the edge where 4x4x4 neighborhood would go out of bounds
-        # For h=1.5, we'd need points at h=0,1,2,3 but our grid only goes to h=1
-        h = torch.tensor(1.5)
-        k = torch.tensor(0.0)
-        l = torch.tensor(0.0)
+        # (a) Outside C's safety window (h > h_max-2 = 2) but the rounded index
+        #     h0 = 3 is still inside the Fhkl box → nearest-neighbour F(3,0,0).
+        F_oob = crystal.get_structure_factor(
+            torch.tensor(3.2), torch.tensor(0.0), torch.tensor(0.0)
+        )
+        assert torch.allclose(F_oob, torch.tensor(103.0, dtype=F_oob.dtype)), \
+            f"Out-of-window query should fall back to nearest-neighbour F(3,0,0)=103.0, got {F_oob.item()}"
 
-        # This should trigger the out-of-bounds condition
-        F_oob = crystal.get_structure_factor(h, k, l)
+        # (b) Out of the Fhkl box entirely → default_F.
+        F_far = crystal.get_structure_factor(
+            torch.tensor(6.2), torch.tensor(0.0), torch.tensor(0.0)
+        )
+        assert torch.allclose(F_far, torch.tensor(999.0, dtype=F_far.dtype)), \
+            f"Query outside the Fhkl box should return default_F=999.0, got {F_far.item()}"
 
-        # Should return default_F
-        assert torch.allclose(F_oob, torch.tensor(999.0, dtype=F_oob.dtype)), \
-            f"Out-of-bounds should return default_F=999.0, got {F_oob.item()}"
+        # The flag must survive: no mid-run mutation of model state.
+        assert crystal.interpolate, \
+            "Out-of-range query must not mutate crystal.interpolate"
 
-        # Interpolation should now be permanently disabled
-        assert not crystal.interpolate, \
-            "Interpolation should be disabled after out-of-bounds access"
-
-        # Subsequent queries should use nearest-neighbor even for in-bounds points
-        h = torch.tensor(0.0)
-        k = torch.tensor(0.0)
-        l = torch.tensor(0.0)
-
+        # An in-window query afterwards is still interpolated, not rounded.
+        h = torch.tensor(0.5)
+        k = torch.tensor(0.5)
+        l = torch.tensor(0.5)
+        F_in = crystal.get_structure_factor(h, k, l)
+        crystal.interpolate = False
         F_nn = crystal.get_structure_factor(h, k, l)
-
-        # Should get exact value from nearest-neighbor lookup (100.0)
-        assert torch.allclose(F_nn, torch.tensor(100.0, dtype=F_nn.dtype)), \
-            f"After fallback, should use nearest-neighbor, got {F_nn.item()}"
+        crystal.interpolate = True
+        assert not torch.allclose(F_in, F_nn), \
+            "In-range query after an out-of-range one fell back to nearest-neighbour: " \
+            "the interpolate flag was latched off"
 
     finally:
         # Clean up temp file

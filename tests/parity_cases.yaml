@@ -1297,3 +1297,67 @@ cases:
           -mosaic 1.0
           -mosaic_dom 10
           -phi 0 -osc 5 -phisteps 3
+
+  - id: PARITY-INTERP-001
+    description: >-
+      Tricubic structure-factor interpolation (C ↔ PyTorch). nanoBragg.c hands the
+      FRACTIONAL h,k,l to polin3() when interpolation is on, and only rounds
+      (h0 = ceil(h-0.5)) inside the nearest-neighbour branch; it turns interpolation on
+      by itself whenever the crystal is under three unit cells wide in any direction
+      ("if((Na<=2)||(Nb<=2)||(Nc<=2)) interpolate=1"), and -interpolate/-nointerpolate
+      override that. torch previously passed the ROUNDED h0,k0,l0 into the lookup, so the
+      tricubic path evaluated a 4-point Lagrange polynomial on one of its own nodes and
+      returned that node's value exactly: -interpolate and -nointerpolate gave
+      bit-identical images and the whole tricubic machinery was dead code. The CLI flags
+      also never reached the model (they were written to an attribute nothing reads), so
+      only the auto rule was ever in play.
+      A real .hkl is required here: -default_F alone is a constant field, which
+      interpolates trivially and would hide the bug.
+      These runs stay inside the Fhkl box (h_min+2 <= h <= h_max-2 everywhere), which is
+      the regime where C's edge handling is well defined. Outside it C clears its shared
+      `interpolate` flag and silently renders the REST of the image nearest-neighbour;
+      that is evaluation-order dependent and is not reproduced (see
+      Crystal._tricubic_interpolation).
+    base_args: >-
+      -hkl {REPO}/tests/golden_data/P1_interp.hkl
+      -dumpfile /dev/null
+      -cell 20 20 20 90 90 90
+      -misset 10 20 30
+      -lambda 1.0
+      -pixel 0.4
+      -distance 100
+      -detpixels 64
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      # -interpolate forced on for a crystal the auto rule would leave off.
+      # C: r=0.998255 / sum ratio 1.031 against its own -nointerpolate image, so a torch
+      # build that ignored the flag would miss corr_min by 4 orders of magnitude.
+      - name: forced-on-n5
+        extra_args: >-
+          -N 5
+          -interpolate
+      # Explicit off, same crystal: pins the nearest-neighbour branch.
+      - name: forced-off-n5
+        extra_args: >-
+          -N 5
+          -nointerpolate
+      # No flag, N=5: C prints "auto-selected no interpolation".
+      - name: auto-off-n5
+        extra_args: >-
+          -N 5
+      # No flag, N=2: C prints "auto-selected tricubic interpolation of structure
+      # factors". C's interpolated image differs from its nearest-neighbour one by
+      # r=0.987849 / sum ratio 1.0528, so this run fails outright if the auto rule
+      # or the fractional-index path is dropped.
+      - name: auto-on-n2
+        extra_args: >-
+          -N 2
+      # Same small crystal, flag overriding the auto rule the other way.
+      - name: forced-off-n2
+        extra_args: >-
+          -N 2
+          -nointerpolate
