@@ -1517,3 +1517,41 @@ cases:
         extra_args: >-
           -xds
           -img {REPO}/tests/golden_data/header_orgx_64.img
+
+  - id: PARITY-DMIN-001
+    description: >-
+      Resolution culling with -dmin (C <-> PyTorch). C converts at parse time,
+      dmin = atof(argv)*1e-10 (nanoBragg.c:957), then culls with dmin > 0.5/stol
+      (:2765) entirely in SI. torch compared a dmin still in Angstroms against a
+      stol in m^-1, a factor 1e10 too small, so ANY non-zero -dmin culled every
+      pixel and produced an identically zero image. The geometry below spans
+      d = 31 A at the corner to infinity at the centre, so 25-60 A cull a
+      growing annulus and 2 A culls nothing.
+    base_args: >-
+      -default_F 100
+      -cell 100 100 100 90 90 90
+      -N 5
+      -lambda 1.0
+      -distance 100
+      -detpixels 64
+      -pixel 0.1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: dmin-no-culling
+        extra_args: >-
+          -dmin 2
+      - name: dmin-25
+        extra_args: >-
+          -dmin 25
+      - name: dmin-30
+        extra_args: >-
+          -dmin 30
+      - name: dmin-40
+        extra_args: >-
+          -dmin 40
+      - name: dmin-60
+        extra_args: >-
+          -dmin 60

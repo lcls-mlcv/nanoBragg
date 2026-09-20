@@ -167,7 +167,14 @@ def compute_physics_for_position(
     dmin_mask = None
     if dmin is not None and dmin > 0:
         stol = 0.5 * torch.norm(scattering_vector, dim=-1)
-        stol_threshold = 0.5 / dmin
+        # dmin arrives in Angstroms (CLI metavar and CrystalConfig both say so)
+        # but stol is in m^-1, because scattering_vector is divided by
+        # wavelength_meters above. C converts at parse time --
+        # `dmin = atof(argv[i+1])*1e-10` (nanoBragg.c:957) -- and then compares
+        # `dmin > 0.5/stol` (:2765) entirely in SI. Without this 1e-10 the
+        # threshold is ~1e10 too small and every pixel is culled: -dmin 2 gave
+        # an identically zero image where C was unaffected.
+        stol_threshold = 0.5 / (dmin * 1e-10)
         dmin_mask = (stol > 0) & (stol > stol_threshold)
 
     # Calculate Miller indices
