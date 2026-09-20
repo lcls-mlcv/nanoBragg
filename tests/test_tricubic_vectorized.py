@@ -126,23 +126,33 @@ class TestTricubicGather:
         assert not torch.isnan(F_grid).any(), "Grid output contains NaNs"
         assert not torch.isinf(F_grid).any(), "Grid output contains Infs"
 
-        # Test case 4: Verify neighborhood bounds checking still works
-        # Query point near edge (h=4.5 → floor=4 → needs neighbors 3,4,5,6; 6>h_max=5)
-        h_edge = torch.tensor([4.5], dtype=torch.float32)
+        # Test case 4: Verify neighborhood bounds checking still works.
+        # C's safety test is on the FRACTIONAL index and needs two whole indices of
+        # margin: h_min+2 <= h <= h_max-2, i.e. [-3, 3] for this [-5, 5] grid.
+        # h=4.2 is outside it.
+        h_edge = torch.tensor([4.2], dtype=torch.float32)
         k_edge = torch.tensor([0.0], dtype=torch.float32)
         l_edge = torch.tensor([0.0], dtype=torch.float32)
 
         # Capture warning state before test
         warning_shown_before = crystal._interpolation_warning_shown
+        interpolate_before = crystal.interpolate
 
-        # This should trigger OOB fallback and return default_F
+        # INTERP-PARITY-001: an out-of-range sample falls back to the
+        # nearest-neighbour lookup, not to default_F. C assigns default_F in the
+        # out-of-range branch, then immediately overwrites it because clearing
+        # `interpolate` makes the nearest-neighbour block run for the same sample.
         F_edge = crystal._tricubic_interpolation(h_edge, k_edge, l_edge)
 
-        # Should fallback to default_F due to OOB
-        expected_default = crystal.config.default_F
-        # Allow small tolerance due to potential floating point ops
-        assert torch.allclose(F_edge, torch.tensor(expected_default, dtype=F_edge.dtype, device=F_edge.device), atol=1e-5), \
-            f"OOB fallback failed: expected {expected_default}, got {F_edge.item()}"
+        expected_nn = crystal._nearest_neighbor_lookup(h_edge, k_edge, l_edge)
+        assert torch.allclose(F_edge, expected_nn, atol=1e-5), \
+            f"OOB fallback should be nearest-neighbour {expected_nn.item()}, got {F_edge.item()}"
+        assert F_edge.item() != crystal.config.default_F, \
+            "h0=4 is inside the Fhkl box, so the fallback must not be default_F"
+
+        # No mid-run mutation of model state.
+        assert crystal.interpolate == interpolate_before, \
+            "Out-of-range query must not mutate crystal.interpolate"
 
         # Warning should have been shown
         assert crystal._interpolation_warning_shown, "OOB warning was not triggered"
@@ -198,13 +208,25 @@ class TestTricubicGather:
 
     def test_oob_warning_single_fire(self, simple_crystal_config):
         """
-        Verify that out-of-bounds warning fires exactly once and disables interpolation.
+        Verify that the out-of-bounds warning fires exactly once.
 
         Phase C2 requirement: Lock the single-warning behavior for OOB fallback.
-        When tricubic interpolation encounters an out-of-bounds neighborhood query:
-        1. First occurrence triggers warning message (printed once only)
-        2. Interpolation is permanently disabled (self.interpolate = False)
-        3. Subsequent OOB queries return default_F without additional warnings
+        When tricubic interpolation encounters an out-of-range query:
+        1. First occurrence triggers the warning message (printed once only)
+        2. Subsequent OOB queries fall back silently
+        3. The crystal's interpolate flag is NOT mutated
+
+        INTERP-PARITY-001 updated points 2 and 3. This test used to assert that
+        the first OOB query returned default_F and latched `self.interpolate =
+        False` for the rest of the run. Neither matches nanoBragg.c:
+        - C's `F_cell = default_F` in the out-of-range branch is dead: clearing
+          `interpolate` makes the following `if(! interpolate)` block run for the
+          same sample, so the sample actually takes Fhkl[h0][k0][l0] (default_F
+          only if the rounded index is outside the box too).
+        - C's latch is a shared scalar that silently switches the rest of the
+          image to nearest-neighbour. That is evaluation-order dependent and is
+          deliberately not reproduced here; samples in range keep interpolating.
+          Config/state is never mutated mid-run.
 
         Reference: plans/active/vectorization.md Phase C2
         """
@@ -227,8 +249,8 @@ class TestTricubicGather:
         assert not initial_warning_state, "Warning flag should start False"
         assert crystal.interpolate, "Interpolation should start enabled"
 
-        # First OOB query: h=4.8 → floor=4 → needs neighbors [3,4,5,6]
-        # Since h_max=5, neighbor h=6 is out of range
+        # First OOB query: C's safety window here is h_min+2 <= h <= h_max-2,
+        # i.e. [-3, 3]; h=4.8 is outside it.
         h_oob = torch.tensor([4.8], dtype=torch.float32)
         k_oob = torch.tensor([0.0], dtype=torch.float32)
         l_oob = torch.tensor([0.0], dtype=torch.float32)
@@ -254,12 +276,13 @@ class TestTricubicGather:
 
         # Verify state changes
         assert crystal._interpolation_warning_shown, "Warning flag should be set"
-        assert not crystal.interpolate, "Interpolation should be disabled"
+        assert crystal.interpolate, "Out-of-range query must not mutate crystal.interpolate"
 
-        # Verify fallback to default_F
+        # Verify fallback to the nearest-neighbour value (all grid values are 50.0
+        # here, and h0=5 is still inside the box, so default_F=100 would be wrong).
         expected_default = crystal.config.default_F
-        assert torch.allclose(F_first, torch.tensor(expected_default, dtype=F_first.dtype, device=F_first.device), atol=1e-5), \
-            f"First OOB call should return default_F={expected_default}, got {F_first.item()}"
+        assert torch.allclose(F_first, torch.tensor(50.0, dtype=F_first.dtype, device=F_first.device), atol=1e-5), \
+            f"First OOB call should fall back to nearest-neighbour 50.0, got {F_first.item()}"
 
         # Second OOB query: should NOT print warning
         h_oob2 = torch.tensor([4.9], dtype=torch.float32)
@@ -278,15 +301,15 @@ class TestTricubicGather:
         assert "WARNING" not in warning_text2, \
             "Second OOB call should not print any warnings"
 
-        # Verify still returns default_F
-        assert torch.allclose(F_second, torch.tensor(expected_default, dtype=F_second.dtype, device=F_second.device), atol=1e-5), \
-            f"Second OOB call should return default_F={expected_default}, got {F_second.item()}"
+        # Verify still falls back to the nearest-neighbour value
+        assert torch.allclose(F_second, torch.tensor(50.0, dtype=F_second.dtype, device=F_second.device), atol=1e-5), \
+            f"Second OOB call should fall back to nearest-neighbour 50.0, got {F_second.item()}"
 
         # Verify persistent state
         assert crystal._interpolation_warning_shown, "Warning flag should remain set"
-        assert not crystal.interpolate, "Interpolation should remain disabled"
+        assert crystal.interpolate, "Interpolation must still be enabled (no mid-run mutation)"
 
-        # Third query (in-bounds but interpolation disabled): should use nearest-neighbor
+        # Third query, this time inside C's safety window: still interpolated.
         h_valid = torch.tensor([1.5], dtype=torch.float32)
         k_valid = torch.tensor([0.0], dtype=torch.float32)
         l_valid = torch.tensor([0.0], dtype=torch.float32)
@@ -303,15 +326,16 @@ class TestTricubicGather:
         assert "out of range" not in warning_text3, \
             "In-bounds query should not mention out of range"
 
-        # Nearest-neighbor should return one of the grid values (50.0 in this case)
-        # Since interpolation is disabled, we expect the nearest neighbor value
-        assert F_third.item() == 50.0 or F_third.item() == expected_default, \
-            f"Disabled interpolation should use nearest-neighbor or default_F, got {F_third.item()}"
+        # The grid is uniform (50.0 everywhere), so interpolating it must also
+        # give exactly 50.0 — what matters is that we got a value at all and the
+        # earlier out-of-range queries did not latch the path off.
+        assert torch.allclose(F_third, torch.tensor(50.0, dtype=F_third.dtype, device=F_third.device), atol=1e-5), \
+            f"In-range query should interpolate the uniform grid to 50.0, got {F_third.item()}"
 
         print("✓ Phase C2: OOB warning single-fire behavior validated")
-        print(f"  - First OOB: warning printed, interpolation disabled, returned default_F={expected_default}")
-        print(f"  - Second OOB: no warning, still returns default_F={expected_default}")
-        print(f"  - In-bounds post-disable: uses fallback path, returns {F_third.item()}")
+        print(f"  - First OOB: warning printed, fell back to nearest-neighbour 50.0")
+        print(f"  - Second OOB: no warning, still falls back to nearest-neighbour")
+        print(f"  - In-range afterwards: still interpolated, returns {F_third.item()}")
 
     @pytest.mark.parametrize("device", [
         "cpu",

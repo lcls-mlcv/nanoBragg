@@ -82,6 +82,11 @@ Examples:
                         help='Text file of "h k l F" (P1 reflections)')
     parser.add_argument('-mat', type=str, metavar='FILE',
                         help='3×3 MOSFLM-style A matrix (reciprocal vectors)')
+    # C writes its binary Fhkl cache here after reading -hkl, and re-reads it when
+    # -hkl is absent. We only ever read it; the flag exists so a run can redirect
+    # C's cache away from the working directory.
+    parser.add_argument('-dumpfile', type=str, metavar='FILE', default='Fdump.bin',
+                        help='Binary Fhkl cache read when -hkl is not given (default: Fdump.bin)')
     parser.add_argument('-cell', nargs=6, type=float,
                         metavar=('a', 'b', 'c', 'α', 'β', 'γ'),
                         help='Direct cell in Å and degrees')
@@ -816,7 +821,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config = {}
 
     # Check required inputs
-    has_hkl = args.hkl is not None or Path('Fdump.bin').exists()
+    has_hkl = args.hkl is not None or Path(args.dumpfile).exists()
     has_cell = args.mat is not None or args.cell is not None
 
     if not has_hkl and args.default_F == 0:
@@ -863,8 +868,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['default_F'] = args.default_F
     if args.hkl:
         config['hkl_data'] = read_hkl_file(args.hkl, default_F=args.default_F)
-    elif Path('Fdump.bin').exists():
-        config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path="Fdump.bin", default_F=args.default_F)
+    elif Path(args.dumpfile).exists():
+        config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F)
 
     # Wavelength/energy
     if args.energy:
@@ -1553,9 +1558,10 @@ def main():
 
         # Check interpolation settings. Crystal auto-enables interpolation for small
         # crystals in __init__ (nanoBragg.c:1778-1789); -interpolate/-nointerpolate
-        # override that, so this must set the attribute the lookup actually reads.
+        # override that. This used to assign `crystal.interpolation_enabled`, an attribute
+        # nothing reads, so neither flag ever reached the lookup.
         if 'interpolate' in config:
-            crystal.interpolate = config['interpolate']
+            crystal.interpolate = bool(config['interpolate'])
 
         # Create and run simulator with debug options
         debug_config = {

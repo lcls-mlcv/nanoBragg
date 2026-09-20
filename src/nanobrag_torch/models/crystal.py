@@ -18,6 +18,20 @@ from ..utils.geometry import angles_to_rotation_matrix
 from ..io.hkl import read_hkl_file, try_load_hkl_or_fdump
 
 
+def _is_compiling() -> bool:
+    """True while torch.compile/Dynamo is tracing this code.
+
+    Used to keep host-side reductions (``.any()``) and prints out of compiled
+    graphs, where they would force a graph break.
+    """
+    try:
+        import torch._dynamo as _dynamo  # type: ignore[attr-defined]
+
+        return bool(_dynamo.is_compiling())
+    except Exception:
+        return False
+
+
 class Crystal:
     """
     Crystal model managing unit cell, orientation, and structure factors.
@@ -109,13 +123,26 @@ class Crystal:
         # Initialize interpolation warning flag
         self._interpolation_warning_shown = False
 
-        # Auto-enable interpolation if crystal is small (matching C code)
-        # This can be overridden by explicit CLI flags -interpolate/-nointerpolate
-        self.interpolate = any(n <= 2 for n in [
-            self.N_cells_a.item(),
-            self.N_cells_b.item(),
-            self.N_cells_c.item()
-        ])
+        # Auto-enable interpolation if crystal is small, matching nanoBragg.c:
+        #
+        #   if(interpolate > 1){           /* no user options */
+        #       if(( Na <= 2) || (Nb <= 2) || (Nc <= 2)) interpolate = 1;
+        #       else                                     interpolate = 0;
+        #   }
+        #
+        # i.e. tricubic interpolation is ON by default for a crystal less than
+        # three unit cells wide in any direction, OFF otherwise. Overridden by
+        # the explicit CLI flags -interpolate / -nointerpolate (see __main__.py).
+        # C additionally forces interpolate=0 when no Fhkl were loaded
+        # ("if(hkls == 0) interpolate = 0;"); get_structure_factor reproduces that
+        # by short-circuiting to default_F whenever hkl_data is None.
+        #
+        # .detach() keeps this host-side comparison from touching autograd state
+        # if N_cells is ever supplied as a differentiable tensor.
+        self.interpolate = any(
+            float(n.detach()) <= 2.0
+            for n in (self.N_cells_a, self.N_cells_b, self.N_cells_c)
+        )
 
         # Phase CLI-FLAGS-003 M0a: Trace instrumentation guard
         # Only populate _last_tricubic_neighborhood when trace mode is explicitly enabled
@@ -327,9 +354,23 @@ class Crystal:
         /* run the tricubic polynomial interpolation */
         polin3(h_interp_d,k_interp_d,l_interp_d,sub_Fhkl,h,k,l,&F_cell);
         ```
-        """
-        from ..utils.physics import polin3
 
+        Edge handling (INTERP-PARITY-001): C's `F_cell = default_F` inside the
+        out-of-range branch is immediately *overwritten*, because the very next
+        statement is `if(! interpolate) { ... F_cell = Fhkl[h0-h_min]... }` and
+        `interpolate` was just cleared. So the effective C behaviour for an
+        out-of-range evaluation is the plain nearest-neighbour lookup (which
+        itself falls back to default_F when the rounded index is outside the
+        box). We reproduce that per element.
+
+        The one behaviour we deliberately do NOT reproduce is C's *sticky*
+        `interpolate=0`: because the flag is a shared scalar, C silently reverts
+        the whole rest of the image to nearest-neighbour once any single
+        sub-sample leaves the safe box. That is evaluation-order dependent
+        (and, under OpenMP, racy), and cannot be expressed in a vectorised
+        kernel; we keep interpolating the samples that are in range. The two
+        agree exactly whenever no sample is out of range.
+        """
         if self.hkl_metadata is None:
             return torch.full_like(h, float(self.config.default_F), device=self.device, dtype=self.dtype)
 
@@ -340,43 +381,34 @@ class Crystal:
         l_min = self.hkl_metadata['l_min']
         l_max = self.hkl_metadata['l_max']
 
-        # Get h_range, k_range, l_range for bounds checking
-        h_range = h_max - h_min
-        k_range = k_max - k_min
-        l_range = l_max - l_min
+        # C's h_range/k_range/l_range are inclusive counts (h_max - h_min + 1),
+        # see nanoBragg.c "h_range = h_max - h_min + 1".
+        h_range = h_max - h_min + 1
+        k_range = k_max - k_min + 1
+        l_range = l_max - l_min + 1
 
         # Ensure inputs are tensors with the right properties
         h = torch.as_tensor(h, device=self.device, dtype=self.dtype)
         k = torch.as_tensor(k, device=self.device, dtype=self.dtype)
         l = torch.as_tensor(l, device=self.device, dtype=self.dtype)  # noqa: E741
 
-        # Get the floor indices (h0_flr, k0_flr, l0_flr in C code)
-        h_flr = torch.floor(h).long()
-        k_flr = torch.floor(k).long()
-        l_flr = torch.floor(l).long()
-
-        # Check if 4x4x4 neighborhood would be out of bounds
-        # The neighborhood needs indices [floor(x)-1, floor(x), floor(x)+1, floor(x)+2]
-        # So we need to check if these would go outside [x_min, x_max]
+        # C's safety test, verbatim, on the FRACTIONAL Miller indices:
+        #   ((h-h_min+3)>h_range) || (h-2<h_min) || ...
+        # i.e. the interpolation is only run for h_min+2 <= h <= h_max-2.
+        # (Testing floor(h) instead would accept a one-unit-wider band than C.)
         out_of_bounds = (
-            (h_flr - 1 < h_min) | (h_flr + 2 > h_max) |
-            (k_flr - 1 < k_min) | (k_flr + 2 > k_max) |
-            (l_flr - 1 < l_min) | (l_flr + 2 > l_max)
+            ((h - h_min + 3) > h_range) | ((h - 2) < h_min) |
+            ((k - k_min + 3) > k_range) | ((k - 2) < k_min) |
+            ((l - l_min + 3) > l_range) | ((l - 2) < l_min)
         )
 
-        # Handle out-of-bounds case
-        if torch.any(out_of_bounds):
-            # Print warning only once
-            if not self._interpolation_warning_shown:
+        # One-shot warning, mirroring C's `babble` latch. Skipped under Dynamo so
+        # the .any() reduction never forces a graph break in compiled runs.
+        if not self._interpolation_warning_shown and not _is_compiling():
+            if bool(torch.any(out_of_bounds)):
                 print("WARNING: out of range for three point interpolation")
                 print("WARNING: further warnings will not be printed!")
                 self._interpolation_warning_shown = True
-
-            # Disable interpolation permanently
-            self.interpolate = False
-
-            # Return default_F for this evaluation
-            return torch.full_like(h, float(self.config.default_F), device=self.device, dtype=self.dtype)
 
         # Phase C1: Batched Neighborhood Gather Implementation
         # Following design_notes.md Section 2: flatten all batch dimensions, build (B,4,4,4) neighborhoods
@@ -413,10 +445,13 @@ class Crystal:
             k_indices = k_grid_coords.to(dtype=self.dtype)
             l_indices = l_grid_coords.to(dtype=self.dtype)
         else:
-            # Convert to array indices (relative to hkl_data origin)
-            h_array_grid = h_grid_coords - h_min  # (B, 4)
-            k_array_grid = k_grid_coords - k_min  # (B, 4)
-            l_array_grid = l_grid_coords - l_min  # (B, 4)
+            # Convert to array indices (relative to hkl_data origin).
+            # Out-of-range queries are clamped so the gather stays legal; their
+            # interpolated value is discarded by the torch.where below, which
+            # substitutes C's nearest-neighbour result instead.
+            h_array_grid = torch.clamp(h_grid_coords - h_min, 0, self.hkl_data.shape[0] - 1)  # (B, 4)
+            k_array_grid = torch.clamp(k_grid_coords - k_min, 0, self.hkl_data.shape[1] - 1)  # (B, 4)
+            l_array_grid = torch.clamp(l_grid_coords - l_min, 0, self.hkl_data.shape[2] - 1)  # (B, 4)
 
             # Advanced indexing to build (B, 4, 4, 4) neighborhoods
             # Following design_notes.md Section 2.6 broadcasting pattern:
@@ -476,50 +511,41 @@ class Crystal:
         # Perform tricubic interpolation
         # Phase C1: batched gather complete
         # Phase D2: vectorized polynomial helpers now available
-        if B == 1:
-            # Scalar case: use existing polin3 (squeeze to remove batch dim)
-            F_cell = polin3(h_indices.squeeze(0), k_indices.squeeze(0), l_indices.squeeze(0),
-                            sub_Fhkl.squeeze(0), h_flat.squeeze(0), k_flat.squeeze(0), l_flat.squeeze(0))
+        from ..utils.physics import polin3_vectorized
 
-            # Phase C3: Output shape assertion (scalar path)
-            # polin3 may return scalar [] or [1], both are acceptable for single-element batch
-            assert F_cell.numel() == 1, \
-                f"Scalar interpolation output must have 1 element, got {F_cell.numel()} (shape {F_cell.shape})"
+        # Call vectorized helper with batched inputs
+        # h_indices, k_indices, l_indices: (B, 4)
+        # sub_Fhkl: (B, 4, 4, 4)
+        # h_flat, k_flat, l_flat: (B,)
+        # Returns: (B,)
+        F_cell_flat = polin3_vectorized(
+            h_indices, k_indices, l_indices,
+            sub_Fhkl,
+            h_flat, k_flat, l_flat
+        )
 
-            result = F_cell.reshape(original_shape)
+        # Phase D2: Output shape assertion (batched path)
+        assert F_cell_flat.shape == (B,), \
+            f"Batched interpolation output must have shape ({B},), got {F_cell_flat.shape}"
 
-            # Phase C3: Verify final output shape matches original input shape
-            assert result.shape == original_shape, \
-                f"Output shape mismatch: expected {original_shape}, got {result.shape}"
+        # Reshape back to original input shape
+        result = F_cell_flat.reshape(original_shape)
 
-            return result
-        else:
-            # Batched case: use vectorized polin3 (Phase D2 implementation)
-            from ..utils.physics import polin3_vectorized
+        # INTERP-PARITY-001: per-element edge handling. C clears its `interpolate`
+        # flag for an out-of-range sample and then falls straight through to the
+        # nearest-neighbour branch, so the sample takes Fhkl[h0][k0][l0] (or
+        # default_F when even the rounded index is outside the box).
+        result = torch.where(
+            out_of_bounds,
+            self._nearest_neighbor_lookup(h, k, l),
+            result,
+        )
 
-            # Call vectorized helper with batched inputs
-            # h_indices, k_indices, l_indices: (B, 4)
-            # sub_Fhkl: (B, 4, 4, 4)
-            # h_flat, k_flat, l_flat: (B,)
-            # Returns: (B,)
-            F_cell_flat = polin3_vectorized(
-                h_indices, k_indices, l_indices,
-                sub_Fhkl,
-                h_flat, k_flat, l_flat
-            )
+        # Phase D2: Verify final output shape matches original input shape
+        assert result.shape == original_shape, \
+            f"Output shape mismatch: expected {original_shape}, got {result.shape}"
 
-            # Phase D2: Output shape assertion (batched path)
-            assert F_cell_flat.shape == (B,), \
-                f"Batched interpolation output must have shape ({B},), got {F_cell_flat.shape}"
-
-            # Reshape back to original input shape
-            result = F_cell_flat.reshape(original_shape)
-
-            # Phase D2: Verify final output shape matches original input shape
-            assert result.shape == original_shape, \
-                f"Output shape mismatch: expected {original_shape}, got {result.shape}"
-
-            return result
+        return result
 
 
     def compute_cell_tensors(self) -> dict:

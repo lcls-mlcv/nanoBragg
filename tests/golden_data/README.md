@@ -224,6 +224,44 @@ Note: This large test case is used for validating performance and numerical stab
 
 ---
 
+### 6. `P1_interp.hkl` — structure factors for PARITY-INTERP-001
+
+Not an image: a synthetic P1 reflection list used as the `-hkl` input for the
+`PARITY-INTERP-001` tricubic-interpolation parity case in `tests/parity_cases.yaml`.
+
+`-default_F` alone gives a *constant* structure-factor field, which any interpolation
+scheme reproduces exactly — it cannot tell a working tricubic path from a dead one. This
+file gives every reflection its own amplitude so the interpolated and nearest-neighbour
+images actually differ (r = 0.988 between them at N=2).
+
+**Contents:** 2197 reflections, a full h,k,l ∈ [-6, 6] block (13³), F between ~0 and ~150.
+
+**Regenerate (bit-identical; `numpy.random.default_rng` is a documented stable stream):**
+```python
+import numpy as np, math
+rng = np.random.default_rng(20260920)
+R = 6
+lines = []
+for h in range(-R, R+1):
+    for k in range(-R, R+1):
+        for l in range(-R, R+1):
+            F = 100.0 * math.exp(-0.02*(h*h+k*k+l*l)) * (0.5 + rng.random())
+            lines.append(f"{h} {k} {l} {F:.4f}")
+open("tests/golden_data/P1_interp.hkl", "w").write("\n".join(lines) + "\n")
+```
+
+- Gaussian falloff `exp(-0.02·(h²+k²+l²))` gives a realistic resolution decay.
+- The uniform `0.5 + U(0,1)` factor makes neighbouring reflections differ, which is what
+  the tricubic polynomial has to reproduce.
+- The box is wide enough that the parity geometry (20 Å cell, λ=1 Å, 64×64 px of 0.4 mm
+  at 100 mm) keeps every sample inside C's safe interpolation window
+  `h_min+2 ≤ h ≤ h_max-2`, i.e. |h|,|k|,|l| ≤ 4, so C never trips its out-of-range latch.
+
+**Provenance:** generated 2026-09-20 by the snippet above.
+SHA256 `fda7cc01fea59d0e034ff46112853f11d56a118240597c9bbbfa50e93e6261d6`.
+
+---
+
 ## Detector Trace Format
 
 When nanoBragg.c is compiled with detector tracing enabled, it outputs the following vectors after all rotations have been applied:

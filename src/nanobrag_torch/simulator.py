@@ -35,8 +35,6 @@ def compute_physics_for_position(
     dmin: float = 0.0,
     # Crystal structure factor function
     crystal_get_structure_factor: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] = None,
-    # Structure-factor interpolation (-interpolate/-nointerpolate)
-    interpolate_structure_factors: bool = False,
     # Crystal parameters for lattice factor
     N_cells_a: int = 0,
     N_cells_b: int = 0,
@@ -88,7 +86,9 @@ def compute_physics_for_position(
         source_weights: Optional per-source weights for multi-source accumulation.
             Shape: (n_sources,). If None, equal weighting is assumed.
         dmin: Minimum d-spacing for resolution culling (0 = no culling)
-        crystal_get_structure_factor: Function to look up structure factors for (h0, k0, l0)
+        crystal_get_structure_factor: Function to look up structure factors for the
+            FRACTIONAL (h, k, l). It rounds internally for the nearest-neighbour
+            branch and feeds the fractional values to polin3 when interpolating.
         N_cells_a/b/c: Number of unit cells in each direction
         crystal_shape: Crystal shape enum for lattice structure factor calculation
         crystal_fudge: Fudge factor for lattice structure factor
@@ -210,17 +210,22 @@ def compute_physics_for_position(
     k = dot_product(scattering_broadcast, rot_b_broadcast)
     l = dot_product(scattering_broadcast, rot_c_broadcast)  # noqa: E741
 
-    # Find nearest integer Miller indices
+    # Find nearest integer Miller indices (C: h0 = ceil(h-0.5)); used by the
+    # ROUND/GAUSS/TOPHAT lattice shapes below, which need the offset h-h0.
     h0 = torch.round(h)
     k0 = torch.round(k)
     l0 = torch.round(l)
 
-    # Look up structure factors. nanoBragg.c:2939-3007 feeds the tricubic interpolator
-    # the *fractional* h,k,l and only the nearest-neighbour branch uses h0,k0,l0.
-    if interpolate_structure_factors:
-        F_cell = crystal_get_structure_factor(h, k, l)
-    else:
-        F_cell = crystal_get_structure_factor(h0, k0, l0)
+    # Look up structure factors.
+    #
+    # INTERP-PARITY-001: pass the FRACTIONAL h,k,l. nanoBragg.c hands the
+    # fractional indices to polin3() when interpolation is on, and only rounds
+    # (h0,k0,l0) inside the nearest-neighbour branch. Passing h0,k0,l0 here made
+    # the tricubic path dead code: a 4-point Lagrange polynomial evaluated on one
+    # of its own nodes returns that node's value exactly, so -interpolate and
+    # -nointerpolate produced bit-identical images. Crystal.get_structure_factor
+    # does the rounding itself for the nearest-neighbour path.
+    F_cell = crystal_get_structure_factor(h, k, l)
 
     # Ensure F_cell is on the same device as h (device-neutral implementation per Core Rule #16)
     # The crystal.get_structure_factor may return CPU tensors even when h0/k0/l0 are on CUDA
@@ -773,7 +778,6 @@ class Simulator:
             source_weights=source_weights,
             dmin=self.beam_config.dmin,
             crystal_get_structure_factor=self.crystal.get_structure_factor,
-            interpolate_structure_factors=bool(getattr(self.crystal, 'interpolate', False)),
             N_cells_a=self.crystal.N_cells_a,
             N_cells_b=self.crystal.N_cells_b,
             N_cells_c=self.crystal.N_cells_c,
@@ -1677,8 +1681,9 @@ class Simulator:
                         ).item()
                         print(f"TRACE_PY: F_cell_nearest {F_cell_nearest:.15g}")
 
-                        # Use nearest-neighbor value to match production run behavior
-                        F_cell = F_cell_nearest
+                        # Report whichever value the production run actually uses
+                        # (INTERP-PARITY-001: -interpolate now reaches the lookup).
+                        F_cell = F_cell_interp if interpolate_saved else F_cell_nearest
                     finally:
                         # Ensure flag is restored even if error occurs
                         self.crystal.interpolate = interpolate_saved
@@ -1826,7 +1831,6 @@ class Simulator:
                                 source_weights=None,  # Single source, no weighting needed
                                 dmin=self.beam_config.dmin,
                                 crystal_get_structure_factor=self.crystal.get_structure_factor,
-                                interpolate_structure_factors=bool(getattr(self.crystal, 'interpolate', False)),
                                 N_cells_a=self.crystal.N_cells_a,
                                 N_cells_b=self.crystal.N_cells_b,
                                 N_cells_c=self.crystal.N_cells_c,
