@@ -766,12 +766,19 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     config['fudge'] = args.fudge
 
-    # Mosaicity
-    if args.mosaic:
-        config['mosaic_spread_deg'] = args.mosaic
-    if args.mosaic_dom:
-        config['mosaic_domains'] = args.mosaic_dom
-    if args.mosaic_seed:
+    # Mosaicity. C's defaults are mosaic_spread = -1 and mosaic_domains = -1, and it
+    # resolves them together (nanoBragg.c:1640-1672): a spread with no domain count is
+    # rendered with 10 domains ("upping to 10 mosaic domains"), and a zero or absent spread
+    # forces a single domain whatever -mosaic_dom said.
+    spread = args.mosaic
+    domains = args.mosaic_dom
+    if spread is None or spread == 0.0:
+        config['mosaic_spread_deg'] = 0.0
+        config['mosaic_domains'] = 1
+    else:
+        config['mosaic_spread_deg'] = spread
+        config['mosaic_domains'] = domains if domains is not None and domains > 0 else 10
+    if args.mosaic_seed is not None:
         config['mosaic_seed'] = args.mosaic_seed
 
     # Misset
@@ -1054,6 +1061,7 @@ def main():
                 phi_steps=config.get('phi_steps', 1),
                 mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
                 mosaic_domains=config.get('mosaic_domains', 1),
+                mosaic_seed=config.get('mosaic_seed'),
                 shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
                 fudge=config.get('fudge', 1.0),
                 default_F=config.get('default_F', 0.0),

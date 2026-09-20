@@ -305,6 +305,76 @@ def mosaic_rotation_umat(
     return umat
 
 
+def mosaic_rotation_umats(
+    mosaicity,
+    n_domains: int,
+    seed: Optional[int] = None,
+    dtype: Optional[torch.dtype] = None,
+    device: torch.device = torch.device('cpu'),
+) -> torch.Tensor:
+    """Every mosaic domain's rotation matrix, exactly as nanoBragg.c builds them.
+
+    C keeps one seed state for the whole set and advances it three ran1 draws per domain
+    (nanoBragg.c:2439-2448)::
+
+        for(mos_tic=0;mos_tic<mosaic_domains;++mos_tic){
+            mosaic_rotation_umat(mosaic_spread, mosaic_umats+9*mos_tic, &mosaic_seed);
+            if(mos_tic==0) { /* force the first domain to the identity */ }
+        }
+
+    Domain 0 is overwritten with the identity *after* its three draws are taken, so the
+    remaining domains see the same stream either way - dropping those draws would shift
+    every later domain.
+
+    ``mosaicity`` is the spread in radians and may be a tensor: it enters only through
+    ``rot = mosaicity * (1 - r3^2)^(1/3)``, so gradients flow while the deviates stay
+    frozen, exactly the reparameterisation the Gaussian sampler used to provide.
+
+    Returns (n_domains, 3, 3).
+    """
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    rng = CLCG(seed)
+
+    mosaicity_t = mosaicity if isinstance(mosaicity, torch.Tensor) else torch.as_tensor(
+        mosaicity, dtype=dtype, device=device
+    )
+    mosaicity_t = mosaicity_t.to(device=device, dtype=dtype)
+
+    umats = []
+    for domain in range(n_domains):
+        # three uniform deviates on [-1:1], drawn even for domain 0
+        r1 = 2.0 * rng.ran1() - 1.0
+        r2 = 2.0 * rng.ran1() - 1.0
+        r3 = 2.0 * rng.ran1() - 1.0
+        if domain == 0:
+            umats.append(torch.eye(3, dtype=dtype, device=device))
+            continue
+
+        xyrad = math.sqrt(1.0 - r2 * r2)
+        v1 = torch.as_tensor(xyrad * math.sin(math.pi * r1), dtype=dtype, device=device)
+        v2 = torch.as_tensor(xyrad * math.cos(math.pi * r1), dtype=dtype, device=device)
+        v3 = torch.as_tensor(r2, dtype=dtype, device=device)
+        rot = mosaicity_t * math.pow(1.0 - r3 * r3, 1.0 / 3.0)
+
+        t1 = torch.cos(rot)
+        t2 = 1.0 - t1
+        t8 = torch.sin(rot)
+        t6 = t2 * v1
+        t7 = t6 * v2
+        t9 = t8 * v3
+        t11 = t6 * v3
+        t12 = t8 * v2
+        t19 = t2 * v2 * v3
+        t20 = t8 * v1
+        umats.append(torch.stack([
+            torch.stack([t1 + t2 * v1 * v1, t7 - t9, t11 + t12]),
+            torch.stack([t7 + t9, t1 + t2 * v2 * v2, t19 - t20]),
+            torch.stack([t11 - t12, t19 + t20, t1 + t2 * v3 * v3]),
+        ]))
+    return torch.stack(umats)
+
+
 def umat2misset(umat: torch.Tensor) -> Tuple[float, float, float]:
     """Convert a unitary rotation matrix into misset angles.
 
