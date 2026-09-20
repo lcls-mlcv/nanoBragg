@@ -35,6 +35,8 @@ def compute_physics_for_position(
     dmin: float = 0.0,
     # Crystal structure factor function
     crystal_get_structure_factor: Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor] = None,
+    # Structure-factor interpolation (-interpolate/-nointerpolate)
+    interpolate_structure_factors: bool = False,
     # Crystal parameters for lattice factor
     N_cells_a: int = 0,
     N_cells_b: int = 0,
@@ -213,8 +215,12 @@ def compute_physics_for_position(
     k0 = torch.round(k)
     l0 = torch.round(l)
 
-    # Look up structure factors
-    F_cell = crystal_get_structure_factor(h0, k0, l0)
+    # Look up structure factors. nanoBragg.c:2939-3007 feeds the tricubic interpolator
+    # the *fractional* h,k,l and only the nearest-neighbour branch uses h0,k0,l0.
+    if interpolate_structure_factors:
+        F_cell = crystal_get_structure_factor(h, k, l)
+    else:
+        F_cell = crystal_get_structure_factor(h0, k0, l0)
 
     # Ensure F_cell is on the same device as h (device-neutral implementation per Core Rule #16)
     # The crystal.get_structure_factor may return CPU tensors even when h0/k0/l0 are on CUDA
@@ -508,6 +514,8 @@ class Simulator:
                 self.crystal.config.osc_range_deg = crystal_config.osc_range_deg
             if hasattr(crystal_config, 'phi_steps'):
                 self.crystal.config.phi_steps = crystal_config.phi_steps
+            if hasattr(crystal_config, 'phi_step_deg'):
+                self.crystal.config.phi_step_deg = crystal_config.phi_step_deg
             if hasattr(crystal_config, 'mosaic_spread_deg'):
                 self.crystal.config.mosaic_spread_deg = crystal_config.mosaic_spread_deg
             if hasattr(crystal_config, 'mosaic_domains'):
@@ -765,6 +773,7 @@ class Simulator:
             source_weights=source_weights,
             dmin=self.beam_config.dmin,
             crystal_get_structure_factor=self.crystal.get_structure_factor,
+            interpolate_structure_factors=bool(getattr(self.crystal, 'interpolate', False)),
             N_cells_a=self.crystal.N_cells_a,
             N_cells_b=self.crystal.N_cells_b,
             N_cells_c=self.crystal.N_cells_c,
@@ -1817,6 +1826,7 @@ class Simulator:
                                 source_weights=None,  # Single source, no weighting needed
                                 dmin=self.beam_config.dmin,
                                 crystal_get_structure_factor=self.crystal.get_structure_factor,
+                                interpolate_structure_factors=bool(getattr(self.crystal, 'interpolate', False)),
                                 N_cells_a=self.crystal.N_cells_a,
                                 N_cells_b=self.crystal.N_cells_b,
                                 N_cells_c=self.crystal.N_cells_c,
@@ -1860,7 +1870,9 @@ class Simulator:
                         # Compute phi angles for each step
                         # Match C formula: phi = phi_start + (osc_range / phi_steps) * phi_tic
                         # where phi_tic ranges from 0 to (phi_steps - 1)
-                        phi_step_size = osc_range_deg / phi_steps if phi_steps > 0 else 0.0
+                        phi_step_size = getattr(self.crystal.config, 'phi_step_deg', None)
+                        if phi_step_size is None:
+                            phi_step_size = osc_range_deg / phi_steps if phi_steps > 0 else 0.0
 
                         # Loop over phi steps (first mosaic domain [phi_tic, 0])
                         for phi_tic in range(phi_steps):

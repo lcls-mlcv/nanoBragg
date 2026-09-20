@@ -1297,3 +1297,106 @@ cases:
           -mosaic 1.0
           -mosaic_dom 10
           -phi 0 -osc 5 -phisteps 3
+
+  - id: PARITY-CLIFLAGS-001
+    description: >-
+      Flags the PyTorch CLI parsed and then dropped (C ↔ PyTorch). -twotheta_axis picks
+      the twotheta rotation axis, switches nanoBragg.c to the CUSTOM convention and - because
+      C matches flags with strstr - also fires the -twotheta branch, so it sets the angle from
+      its own X component and the last twotheta-ish flag in argv wins. -phistep, -osc and
+      -phisteps are resolved together (nanoBragg.c:1380-1430), and only when all three are
+      given does the render loop step by phistep rather than osc/phisteps. -samplesize and
+      -xtalsize set the crystal size in mm, which C turns into Na/Nb/Nc = ceil(size/cell)
+      after the cell is known, overriding -N (the beam clips the y and z dimensions at
+      -beamsize first). -ORGX/-ORGY move Fclose/Sclose, which only the SAMPLE pivot reads;
+      -Xclose/-Yclose reach Fclose only through the CUSTOM convention block, so under MOSFLM
+      none of these four change the image at all and this case does not claim they should.
+      Every run here changes the C image relative to the same run without the flag.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -misset 10 20 30
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      # -twotheta_axis: CUSTOM convention, SAMPLE pivot, and the strstr collision that
+      # makes the axis' X component the twotheta angle. Order decides which one wins.
+      - name: twotheta-then-axis
+        extra_args: >-
+          -twotheta 20
+          -twotheta_axis 0 1 0
+      - name: axis-then-twotheta
+        extra_args: >-
+          -twotheta_axis 0 1 0
+          -twotheta 20
+      # A unit axis on purpose: nanoBragg.c unitizes every other vector but leaves
+      # twotheta_axis as typed, and torch's rotate_axis normalizes it, so a non-unit
+      # axis is a separate (still open) divergence, not a dropped flag.
+      - name: twotheta-axis-alone
+        extra_args: >-
+          -twotheta_axis 0.6 0.8 0.0
+      # -phistep and the rest of the phi sampling block
+      - name: phistep-alone
+        extra_args: >-
+          -phistep 0.5
+      - name: osc-alone
+        extra_args: >-
+          -osc 2.0
+      - name: osc-and-phistep
+        extra_args: >-
+          -osc 2.0
+          -phistep 0.5
+      - name: phisteps-alone
+        extra_args: >-
+          -phisteps 5
+      - name: osc-phisteps-and-phistep
+        extra_args: >-
+          -osc 2.0
+          -phisteps 5
+          -phistep 0.25
+      # -samplesize / -xtalsize override -N through the unit cell
+      - name: xtalsize-overrides-N
+        extra_args: >-
+          -xtalsize 5.0e-5
+      - name: samplesize-overrides-N
+        extra_args: >-
+          -samplesize 5.0e-5
+      - name: samplesize-clipped-by-beam
+        extra_args: >-
+          -samplesize 0.0005
+          -beamsize 0.0002
+      - name: sample-axes-separately
+        extra_args: >-
+          -sample_thick 5.0e-5
+          -sample_width 3.0e-5
+          -sample_height 8.0e-5
+      # -ORGX/-ORGY and -Xclose/-Yclose under the conventions that actually read them
+      - name: xds-orgx-orgy
+        extra_args: >-
+          -xds
+          -ORGX 20
+          -ORGY 45
+      - name: custom-xclose-yclose
+        extra_args: >-
+          -fdet_vector 0 0 1
+          -sdet_vector 0 -1 0
+          -odet_vector 1 0 0
+          -beam_vector 1 0 0
+          -Xclose 4.0
+          -Yclose 8.0
+      - name: custom-orgx-orgy
+        extra_args: >-
+          -fdet_vector 0 0 1
+          -sdet_vector 0 -1 0
+          -odet_vector 1 0 0
+          -beam_vector 1 0 0
+          -ORGX 20
+          -ORGY 45

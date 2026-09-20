@@ -9,13 +9,14 @@ mapping command-line flags to engine parameters per spec requirements.
 import os
 import sys
 import argparse
+import math
 import re
 import time
 import warnings
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 # Set environment variable for MKL conflicts
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -538,6 +539,225 @@ def resolve_n_cells(args: argparse.Namespace) -> Tuple[int, int, int]:
     return tuple(n_cells)
 
 
+def c_atof(text: str) -> float:
+    """C's atof(): the leading float of the string, 0.0 when there is none."""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        pass
+    match = re.match(r'\s*[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?', text or '')
+    return float(match.group(0)) if match else 0.0
+
+
+# nanoBragg.c:568-604 reads the crystal dimensions with strstr, in this order, and every
+# match overwrites the axes it names, so the last flag in argv wins. Values are mm.
+_C_SAMPLE_PARSER = (
+    (('-samplesize', '-sample_size'), 'xyz'),
+    (('-sample_thick', '-sample_x'), 'x'),
+    (('-sample_width', '-sample_y', '-width'), 'y'),
+    (('-sample_heigh', '-sample_z', '-heigh'), 'z'),
+    (('-xtalsize', '-xtal_size'), 'xyz'),
+    (('-xtal_thick', '-xtal_x'), 'x'),
+    (('-xtal_width', '-xtal_y', '-width'), 'y'),
+    (('-xtal_heigh', '-xtal_z', '-heigh'), 'z'),
+)
+
+
+def resolve_sample_dimensions(args: argparse.Namespace) -> Tuple[float, float, float]:
+    """
+    Crystal dimensions (x, y, z) in mm exactly as nanoBragg.c reads them.
+
+    ``-samplesize``/``-xtalsize`` set all three axes, the per-axis flags set one each,
+    and everything is applied in argv order (nanoBragg.c:568-604). 0 means "not given".
+
+    The argv order comes from ``args._argv`` (set by main()); without it the flags in
+    the namespace are replayed with the all-axis flag first.
+    """
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        argv = []
+        if getattr(args, 'samplesize', None) is not None:
+            argv += ['-samplesize', str(args.samplesize)]
+        for flag, attr in (('-sample_x', 'sample_x'), ('-sample_y', 'sample_y'),
+                           ('-sample_z', 'sample_z')):
+            value = getattr(args, attr, None)
+            if value is not None:
+                argv += [flag, str(value)]
+
+    dims = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+    for i, token in enumerate(argv):
+        if not token.startswith('-') or i + 1 >= len(argv):
+            continue
+        for names, axes in _C_SAMPLE_PARSER:
+            if not any(name in token for name in names):
+                continue
+            value = c_atof(argv[i + 1])
+            for axis in axes:
+                dims[axis] = value
+    return dims['x'], dims['y'], dims['z']
+
+
+def resolve_n_cells_from_sample(
+    args: argparse.Namespace, cell_abc_A: Sequence[float], n_cells: Tuple[int, int, int]
+) -> Tuple[int, int, int]:
+    """
+    Apply -samplesize/-xtalsize/-sample_x/y/z on top of the -N flags, as nanoBragg.c does.
+
+    C turns a physical crystal size into a cell count only once the unit cell is known
+    (nanoBragg.c:2065-2070)::
+
+        if(sample_x > 0) Na = ceil(sample_x/a[0]);  ...  if(Na <= 1.0) Na = 1.0;
+
+    so a sample dimension always overrides -N for that axis, whatever the argv order.
+    The beam clips the sample first (nanoBragg.c:1134-1143): sample_y and sample_z are
+    capped at beamsize (default 0.1 mm); sample_x is not.
+    """
+    sample_x, sample_y, sample_z = resolve_sample_dimensions(args)
+    if not (sample_x > 0.0 or sample_y > 0.0 or sample_z > 0.0):
+        return n_cells
+
+    beamsize_mm = args.beamsize if args.beamsize is not None else 0.1
+    if beamsize_mm >= 0:
+        if beamsize_mm < sample_y:
+            print(f"WARNING: clipping sample ({sample_y * 1e-3:g} m high) "
+                  f"with beam ({beamsize_mm * 1e-3:g} m)")
+            sample_y = beamsize_mm
+        if beamsize_mm < sample_z:
+            print(f"WARNING: clipping sample ({sample_z * 1e-3:g} m wide) "
+                  f"with beam ({beamsize_mm * 1e-3:g} m)")
+            sample_z = beamsize_mm
+
+    # Do the division in metres, the way C does, so the ceil() lands on the same integer.
+    resolved = list(n_cells)
+    for axis, sample_mm in enumerate((sample_x, sample_y, sample_z)):
+        if sample_mm > 0.0:
+            cell_m = float(cell_abc_A[axis]) * 1e-10
+            resolved[axis] = int(math.ceil((sample_mm / 1000.0) / cell_m))
+    return tuple(max(1, n) for n in resolved)
+
+
+def resolve_twotheta_deg(args: argparse.Namespace) -> float:
+    """
+    Detector twotheta in degrees exactly as nanoBragg.c reads it.
+
+    C matches with strstr, so ``-twotheta_axis X Y Z`` also fires the ``-twotheta``
+    branch (nanoBragg.c:764) and sets detector_twotheta from the *X component* of the
+    axis. The flags are applied in argv order, so the last one wins:
+    ``-twotheta 20 -twotheta_axis 0 1 0`` leaves twotheta at 0, while
+    ``-twotheta_axis 0 1 0 -twotheta 20`` leaves it at 20.
+
+    The argv order comes from ``args._argv`` (set by main()); without it the namespace
+    is replayed with -twotheta_axis first, so an explicit -twotheta still wins.
+    """
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        argv = []
+        if getattr(args, 'twotheta_axis', None):
+            argv += ['-twotheta_axis'] + [str(v) for v in args.twotheta_axis]
+        if getattr(args, 'twotheta', None) is not None:
+            argv += ['-twotheta', str(args.twotheta)]
+
+    twotheta_deg = 0.0
+    for i, token in enumerate(argv):
+        if token.startswith('-') and '-twotheta' in token and i + 1 < len(argv):
+            twotheta_deg = c_atof(argv[i + 1])
+    return twotheta_deg
+
+
+def resolve_phi_sampling(args: argparse.Namespace) -> Tuple[float, float, int]:
+    """
+    (osc_deg, phistep_deg, phisteps) exactly as nanoBragg.c:1380-1430 resolves them.
+
+    The three flags are entangled: ``-phistep`` alone makes osc = phistep over 2 steps,
+    ``-osc`` alone makes 2 steps of osc/2, ``-osc`` with ``-phistep`` makes
+    ceil(osc/phistep) steps, and ``-phisteps`` alone sweeps a 1 degree oscillation.
+    Only when all three are given does C keep them all, and then phistep - not
+    osc/phisteps - is what the render loop steps by (nanoBragg.c:3004-3009).
+    """
+    osc = args.osc if args.osc is not None else -1.0
+    phistep = args.phistep if args.phistep is not None else -1.0
+    phisteps = args.phisteps if args.phisteps is not None else -1
+
+    if phisteps < 0:
+        if osc < 0.0:
+            if phistep <= 0.0:
+                # user doesn't care about anything
+                phisteps, osc, phistep = 1, 0.0, 0.0
+            else:
+                # user doesn't care about osc or steps, but specified step
+                osc = phistep
+                phisteps = 2
+        else:
+            if phistep <= 0.0:
+                # osc specified, but nothing else
+                phisteps = 2
+                phistep = osc / 2.0
+            else:
+                # osc and phi step specified
+                phisteps = int(math.ceil(osc / phistep))
+    else:
+        # user-specified number of phi steps
+        if phisteps == 0:
+            phisteps = 1
+        if osc < 0.0:
+            if phistep <= 0.0:
+                # user cares only about number of steps
+                osc = 1.0
+                phistep = osc / phisteps
+            else:
+                # user doesn't care about osc, but specified step
+                osc = phistep
+                phisteps = 2
+        else:
+            if phistep < 0.0:
+                # osc and steps specified
+                phistep = osc / phisteps
+            # else: everything specified, C keeps all three as given
+
+    return osc, phistep, phisteps
+
+
+def resolve_close_centers_mm(
+    args: argparse.Namespace, config: Dict[str, Any]
+) -> Optional[Tuple[float, float]]:
+    """
+    (Fclose, Sclose) in mm from -ORGX/-ORGY/-Xclose/-Yclose, or None when unused.
+
+    nanoBragg.c keeps the point of closest approach (Fclose/Sclose) separate from the
+    direct-beam spot (Fbeam/Sbeam) and only the SAMPLE pivot reads it
+    (nanoBragg.c:1156-1165, 1719-1721)::
+
+        if(! isnan(ORGX)) Fclose = (ORGX-0.5)*pixel_size;
+        if(isnan(Fclose))  Fclose = detsize_f/2;
+        if(isnan(Xclose))  Xclose = Fclose;
+
+    -Xclose/-Yclose themselves never reach Fclose except through the CUSTOM convention
+    block (nanoBragg.c:1250-1257), which sets Xbeam = Xclose and then Fclose = Xbeam.
+    Under MOSFLM/DENZO/ADXV the convention forces the BEAM pivot, so none of these
+    flags change the image there - matching C means leaving that alone too.
+    """
+    if all(getattr(args, name) is None for name in ('Xclose', 'Yclose', 'ORGX', 'ORGY')):
+        return None
+
+    pixel_mm = config['pixel_size_mm']
+    fclose = ((args.ORGX - 0.5) * pixel_mm if args.ORGX is not None
+              else config['fpixels'] * pixel_mm / 2.0)
+    sclose = ((args.ORGY - 0.5) * pixel_mm if args.ORGY is not None
+              else config['spixels'] * pixel_mm / 2.0)
+
+    if config['convention'] == 'CUSTOM':
+        # CUSTOM: Xbeam defaults to Xclose (which defaults to Fclose), then Fclose = Xbeam.
+        xbeam = args.Xbeam if args.Xbeam is not None else (
+            args.Xclose if args.Xclose is not None else fclose)
+        ybeam = args.Ybeam if args.Ybeam is not None else (
+            args.Yclose if args.Yclose is not None else sclose)
+        fclose, sclose = xbeam, ybeam
+        config['beam_center_x_mm'] = xbeam
+        config['beam_center_y_mm'] = ybeam
+
+    return fclose, sclose
+
+
 def resolve_detector_pivot(args: argparse.Namespace) -> str:
     """
     Detector pivot exactly as nanoBragg.c chooses it.
@@ -656,9 +876,11 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['wavelength_A'] = 1.0  # Default
 
     # Convention and pivot
+    # nanoBragg.c:665-728 switches to CUSTOM for every explicit basis vector, and
+    # -twotheta_axis (nanoBragg.c:714-720) is one of them.
     if any([args.fdet_vector, args.sdet_vector, args.odet_vector,
             args.beam_vector, args.polar_vector, args.spindle_axis,
-            args.pix0_vector, args.pix0_vector_mm]):
+            args.twotheta_axis, args.pix0_vector, args.pix0_vector_mm]):
         config['convention'] = 'CUSTOM'
     elif args.convention:
         config['convention'] = args.convention
@@ -698,13 +920,18 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     if args.Ybeam is not None:
         config['beam_center_y_mm'] = args.Ybeam
 
+    # Point of closest approach (-ORGX/-ORGY/-Xclose/-Yclose); only the SAMPLE pivot reads it
+    close_centers = resolve_close_centers_mm(args, config)
+    if close_centers is not None:
+        config['close_center_f_mm'], config['close_center_s_mm'] = close_centers
+
     # Detector rotations
     config['detector_rotx_deg'] = args.detector_rotx
     config['detector_roty_deg'] = args.detector_roty
     config['detector_rotz_deg'] = args.detector_rotz
-    config['twotheta_deg'] = args.twotheta if args.twotheta is not None else 0.0
+    config['twotheta_deg'] = resolve_twotheta_deg(args)
     if args.twotheta_axis:
-        config['twotheta_axis'] = args.twotheta_axis
+        config['twotheta_axis'] = tuple(args.twotheta_axis)
 
     config['point_pixel'] = args.point_pixel
     config['curved_detector'] = args.curved_det
@@ -729,6 +956,11 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     if convention_axis is not None:
         config.setdefault('custom_polar_vector', convention_axis)
         config.setdefault('custom_spindle_axis', convention_axis)
+    else:
+        # CUSTOM runs no convention block, so every vector keeps the value it was
+        # declared with in nanoBragg.c: beam [1,0,0] (line 191), fdet [0,0,1],
+        # sdet [0,-1,0], odet [1,0,0] (lines 246-248), polar and spindle [0,0,1].
+        config.setdefault('custom_beam_vector', (1.0, 0.0, 0.0))
     # Handle pix0 override (validate mutual exclusivity)
     if args.pix0_vector and args.pix0_vector_mm:
         raise ValueError("Cannot specify both -pix0_vector and -pix0_vector_mm simultaneously")
@@ -756,7 +988,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['detector_thicksteps'] = args.detector_thicksteps
 
     # Crystal parameters
-    config['Na'], config['Nb'], config['Nc'] = resolve_n_cells(args)
+    config['Na'], config['Nb'], config['Nc'] = resolve_n_cells_from_sample(
+        args, config['cell_params'], resolve_n_cells(args)
+    )
 
     # Crystal shape
     if args.crystal_shape:
@@ -790,10 +1024,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     if args.misset_seed:
         config['misset_seed'] = args.misset_seed
 
-    # Phi rotation
+    # Phi rotation: -osc/-phistep/-phisteps are resolved together, as in nanoBragg.c
     config['phi_deg'] = args.phi if args.phi else 0.0
-    config['osc_deg'] = args.osc if args.osc else 0.0
-    config['phi_steps'] = args.phisteps if args.phisteps else 1
+    config['osc_deg'], config['phi_step_deg'], config['phi_steps'] = resolve_phi_sampling(args)
 
     # Sampling
     config['dmin'] = args.dmin if args.dmin else 0.0
@@ -1059,6 +1292,7 @@ def main():
                 phi_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
                 phi_steps=config.get('phi_steps', 1),
+                phi_step_deg=config.get('phi_step_deg'),
                 mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
                 mosaic_domains=config.get('mosaic_domains', 1),
                 mosaic_seed=config.get('mosaic_seed'),
@@ -1094,6 +1328,10 @@ def main():
             detector_roty_deg=config.get('detector_roty_deg', 0.0),
             detector_rotz_deg=config.get('detector_rotz_deg', 0.0),
             detector_twotheta_deg=config.get('twotheta_deg', 0.0),
+            twotheta_axis=(torch.tensor(config['twotheta_axis'], dtype=torch.float64)
+                           if 'twotheta_axis' in config else None),
+            close_center_f_mm=config.get('close_center_f_mm'),
+            close_center_s_mm=config.get('close_center_s_mm'),
             detector_convention=DetectorConvention[config.get('convention', 'MOSFLM')],
             detector_pivot=DetectorPivot[config.get('pivot', 'BEAM')] if config.get('pivot') else None,
             oversample=config.get('oversample', -1),  # -1 means auto-select
@@ -1313,9 +1551,11 @@ def main():
                     crystal.hkl_data = torch.tensor(hkl_array, device=device, dtype=dtype)
                 crystal.hkl_metadata = hkl_metadata
 
-        # Check interpolation settings
+        # Check interpolation settings. Crystal auto-enables interpolation for small
+        # crystals in __init__ (nanoBragg.c:1778-1789); -interpolate/-nointerpolate
+        # override that, so this must set the attribute the lookup actually reads.
         if 'interpolate' in config:
-            crystal.interpolation_enabled = config['interpolate']
+            crystal.interpolate = config['interpolate']
 
         # Create and run simulator with debug options
         debug_config = {
