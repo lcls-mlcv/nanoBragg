@@ -16,7 +16,8 @@ import warnings
 import torch
 import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 # Set environment variable for MKL conflicts
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
@@ -1330,6 +1331,379 @@ def warn_c_misset_seed_order(argv) -> None:
         )
 
 
+@dataclass
+class SimulationBundle:
+    """Everything `build_simulation` constructs from a parsed CLI namespace.
+
+    Exists so that callers other than `main()` — gradient sweeps, benchmarks,
+    refinement loops — can get the same models the CLI builds from the same
+    argument strings, without duplicating ~300 lines of construction logic that
+    would then drift from the CLI.
+    """
+
+    args: argparse.Namespace
+    config: Dict[str, Any]
+    crystal: Crystal
+    detector: Detector
+    simulator: Simulator
+    crystal_config: CrystalConfig
+    detector_config: DetectorConfig
+    beam_config: BeamConfig
+    dtype: torch.dtype
+    device: torch.device
+
+
+def build_simulation(
+    args: argparse.Namespace,
+    config_hook: Optional[Callable[[Any, DetectorConfig, BeamConfig], None]] = None,
+) -> SimulationBundle:
+    """Build the models the CLI would build for `args`, without running them.
+
+    `args` must be a namespace from `create_parser()`, with `_argv` set (the
+    pivot resolution in nanoBragg.c depends on flag order). Raises the same
+    exceptions `main()` would; callers own the error reporting.
+
+    `config_hook`, if given, is called with (crystal_config, detector_config,
+    beam_config) after the three configs are built but before any model is
+    constructed. It is the seam for swapping scalar config fields for leaf
+    tensors with requires_grad, so a caller can differentiate the exact
+    configuration a CLI argument string produces. Mutate the configs in place;
+    the return value is ignored.
+    """
+    # Parse dtype and device early (DTYPE-DEFAULT-001)
+    dtype = torch.float32 if args.dtype == 'float32' else torch.float64
+    device = torch.device(args.device)
+
+    # Validate and convert arguments
+    config = parse_and_validate_args(args)
+
+    # DETECTOR-CONFIG-001 Phase C2: Determine beam center source (explicit vs auto)
+    # This must be called AFTER parse_and_validate_args (which may set beam centers from headers)
+    # but BEFORE creating DetectorConfig (which needs this information)
+    beam_center_source = determine_beam_center_source(args, config)
+
+    # Create configuration objects
+    if 'cell_params' in config:
+        crystal_config = CrystalConfig(
+            cell_a=config['cell_params'][0],
+            cell_b=config['cell_params'][1],
+            cell_c=config['cell_params'][2],
+            cell_alpha=config['cell_params'][3],
+            cell_beta=config['cell_params'][4],
+            cell_gamma=config['cell_params'][5],
+            N_cells=(config.get('Na', 1), config.get('Nb', 1), config.get('Nc', 1)),  # Match C defaults
+            phi_start_deg=config.get('phi_deg', 0.0),
+            osc_range_deg=config.get('osc_deg', 0.0),
+            phi_steps=config.get('phi_steps', 1),
+            phi_step_deg=config.get('phi_step_deg'),
+            mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
+            mosaic_domains=config.get('mosaic_domains', 1),
+            mosaic_seed=config.get('mosaic_seed'),
+            shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
+            fudge=config.get('fudge', 1.0),
+            default_F=config.get('default_F', 0.0),
+            # Phase G1: Pass MOSFLM orientation if provided
+            mosflm_a_star=config.get('mosflm_a_star'),
+            mosflm_b_star=config.get('mosflm_b_star'),
+            mosflm_c_star=config.get('mosflm_c_star')
+        )
+
+        if 'misset_deg' in config:
+            crystal_config.misset_deg = tuple(config['misset_deg'])
+
+        if 'misset_random' in config:
+            crystal_config.misset_random = config['misset_random']
+
+        if 'misset_seed' in config:
+            crystal_config.misset_seed = config['misset_seed']
+
+        if 'custom_spindle_axis' in config:
+            crystal_config.spindle_axis = config['custom_spindle_axis']
+
+    # Create detector config
+    detector_config = DetectorConfig(
+        distance_mm=config.get('distance_mm', 100.0),
+        close_distance_mm=config.get('close_distance_mm'),
+        pixel_size_mm=config.get('pixel_size_mm', 0.1),
+        spixels=config.get('spixels', 1024),
+        fpixels=config.get('fpixels', 1024),
+        detector_rotx_deg=config.get('detector_rotx_deg', 0.0),
+        detector_roty_deg=config.get('detector_roty_deg', 0.0),
+        detector_rotz_deg=config.get('detector_rotz_deg', 0.0),
+        detector_twotheta_deg=config.get('twotheta_deg', 0.0),
+        twotheta_axis=(torch.tensor(config['twotheta_axis'], dtype=torch.float64)
+                       if 'twotheta_axis' in config else None),
+        close_center_f_mm=config.get('close_center_f_mm'),
+        close_center_s_mm=config.get('close_center_s_mm'),
+        detector_convention=DetectorConvention[config.get('convention', 'MOSFLM')],
+        detector_pivot=DetectorPivot[config.get('pivot', 'BEAM')] if config.get('pivot') else None,
+        oversample=config.get('oversample', -1),  # -1 means auto-select
+        point_pixel=config.get('point_pixel', False),
+        curved_detector=config.get('curved_detector', False),
+        oversample_omega=config.get('oversample_omega', False),
+        oversample_polar=config.get('oversample_polar', False),
+        oversample_thick=config.get('oversample_thick', False),
+        # DETECTOR-CONFIG-001 Phase C2: Pass beam_center_source for MOSFLM offset logic
+        beam_center_source=beam_center_source,
+        # Custom vectors for CUSTOM convention
+        custom_fdet_vector=config.get('custom_fdet_vector'),
+        custom_sdet_vector=config.get('custom_sdet_vector'),
+        custom_odet_vector=config.get('custom_odet_vector'),
+        custom_beam_vector=config.get('custom_beam_vector'),
+        # Detector origin override (CLI-FLAGS-003)
+        pix0_override_m=config.get('pix0_override_m')
+    )
+
+    # Set beam center if provided (values are in mm)
+    # CRITICAL: C-code Xbeam/Ybeam semantics are convention AND pivot-mode dependent! (AT-PARALLEL-004 root cause)
+    #
+    # C-code behavior (nanoBragg.c lines 631-648, 1206-1275):
+    #   - `-Xbeam`/`-Ybeam` set detector_pivot = BEAM (line 632, 637)
+    #   - `-Xclose`/`-Yclose` set detector_pivot = SAMPLE (line 642, 647)
+    #   - Convention selection OVERRIDES pivot: XDS/DIALS force SAMPLE pivot (lines 1250, 1265)
+    #   - For SAMPLE pivot: Xbeam/Ybeam are IGNORED; C uses detector center (Fclose=detsize/2)
+    #   - For BEAM pivot: Xbeam/Ybeam are mapped to Fbeam/Sbeam with convention-specific axis swaps
+    #
+    # Result: `-xds -Xbeam X -Ybeam Y` is contradictory; C resolves by using SAMPLE pivot
+    #         and ignoring X/Y, falling back to detector center (detsize_f/2, detsize_s/2)
+    #
+    # PyTorch must replicate this: For XDS/DIALS conventions, ignore Xbeam/Ybeam and use detector center.
+    convention = detector_config.detector_convention
+    pixel_size_mm = detector_config.pixel_size_mm
+
+    if 'beam_center_x_mm' in config and 'beam_center_y_mm' in config:
+        Xbeam_mm = config['beam_center_x_mm']
+        Ybeam_mm = config['beam_center_y_mm']
+
+        # Check if convention forces SAMPLE pivot (XDS/DIALS)
+        # For these conventions, Xbeam/Ybeam are ignored; use detector center instead
+        if convention in [DetectorConvention.XDS, DetectorConvention.DIALS]:
+            # XDS/DIALS: Convention forces SAMPLE pivot; ignore Xbeam/Ybeam
+            # Use detector center: Fclose = detsize_f/2, Sclose = detsize_s/2 (C line 1178)
+            # Leave beam_center_f and beam_center_s at their defaults (detector center)
+            # NOTE: DetectorConfig defaults are already set to detector center
+            pass
+        elif convention in [DetectorConvention.MOSFLM, DetectorConvention.DENZO]:
+            # MOSFLM/DENZO: BEAM pivot with axis swap (Fbeam ← Ybeam, Sbeam ← Xbeam)
+            # +0.5 pixel offset is added later in Detector.__init__
+            detector_config.beam_center_f = Ybeam_mm
+            detector_config.beam_center_s = Xbeam_mm
+        elif convention == DetectorConvention.ADXV:
+            # ADXV: BEAM pivot with Y-axis flip
+            detsize_s_mm = detector_config.spixels * pixel_size_mm
+            detector_config.beam_center_f = Xbeam_mm
+            detector_config.beam_center_s = detsize_s_mm - Ybeam_mm
+        elif convention == DetectorConvention.CUSTOM:
+            # CUSTOM: No axis swap (Fbeam ← Xbeam, Sbeam ← Ybeam)
+            detector_config.beam_center_f = Xbeam_mm
+            detector_config.beam_center_s = Ybeam_mm
+    elif 'beam_center_x_mm' in config or 'beam_center_y_mm' in config:
+        # Partial beam center - this shouldn't happen in well-formed input
+        raise ValueError("Both -Xbeam and -Ybeam must be provided together")
+
+    # ROI
+    if 'roi' in config:
+        detector_config.roi_xmin = config['roi'][0]
+        detector_config.roi_xmax = config['roi'][1]
+        detector_config.roi_ymin = config['roi'][2]
+        detector_config.roi_ymax = config['roi'][3]
+
+    # Mask
+    if 'mask_file' in config:
+        mask_data, _ = read_smv_mask(config['mask_file'])  # Returns tuple (mask, header)
+        # Deliberate divergence from C: nanoBragg.c sizes its mask buffer from
+        # the mask file but indexes it with the *final* detector pixel count,
+        # so a mask smaller than the detector reads out of bounds (this is
+        # reachable via `-img big.img -mask small.img`, where the img header
+        # wins the detector size). Refuse it instead of inheriting the UB.
+        expected = (config['spixels'], config['fpixels'])
+        if tuple(mask_data.shape) != expected:
+            raise ValueError(
+                f"-mask file {config['mask_file']} is "
+                f"{mask_data.shape[0]}x{mask_data.shape[1]} but the detector is "
+                f"{expected[0]}x{expected[1]}. nanoBragg.c reads past the end of "
+                "its mask buffer in this case; give a mask that matches the "
+                "detector, or size the detector with -detpixels."
+            )
+        detector_config.mask_array = mask_data
+
+    # Absorption
+    if 'detector_abs_um' in config:
+        detector_config.detector_abs_um = config['detector_abs_um']
+    if 'detector_thick_um' in config:
+        detector_config.detector_thick_um = config['detector_thick_um']
+    if 'detector_thicksteps' in config:
+        detector_config.detector_thicksteps = config['detector_thicksteps']
+
+    # Generate sources from divergence/dispersion if not from file
+    # This implements proper source generation per spec AT-SRC-002
+    if 'sourcefile' in config:
+        # Load sources from file
+        wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
+
+        # Get beam direction based on detector convention.
+        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0];
+        # ADXV/XDS/DIALS use [0,0,1].
+        if detector_config.detector_convention in (
+            DetectorConvention.MOSFLM, DetectorConvention.DENZO
+        ):
+            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
+        else:
+            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
+
+        source_directions, source_weights, source_wavelengths = read_sourcefile(
+            config['sourcefile'],
+            default_wavelength_m=wavelength_m,
+            default_source_distance_m=10.0,  # C code default
+            beam_direction=beam_direction
+        )
+
+        # Store loaded sources in config
+        config['source_directions'] = source_directions
+        config['source_weights'] = source_weights
+        config['source_wavelengths'] = source_wavelengths
+
+        # Report source loading
+        n_sources = len(source_directions)
+        print(f"Loaded {n_sources} sources from {config['sourcefile']}")
+    elif 'sourcefile' not in config:
+        # Auto-select divergence parameters
+        hdiv_params, vdiv_params = auto_select_divergence(
+            hdivsteps=config.get('hdivsteps'),
+            hdivrange=config.get('hdivrange'),
+            hdivstep=config.get('hdivstep'),
+            vdivsteps=config.get('vdivsteps'),
+            vdivrange=config.get('vdivrange'),
+            vdivstep=config.get('vdivstep')
+        )
+        disp_params = auto_select_dispersion(
+            dispsteps=config.get('dispsteps'),
+            dispersion=config.get('dispersion'),
+            dispstep=None  # No direct dispstep in CLI, computed from range/count
+        )
+
+        # Generate source arrays
+        wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
+
+        # Get beam direction based on detector convention.
+        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0] with
+        # polar_vector = [0,0,1]; ADXV/XDS/DIALS use beam_vector = [0,0,1].
+        if detector_config.detector_convention in (
+            DetectorConvention.MOSFLM, DetectorConvention.DENZO
+        ):
+            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
+            polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
+        else:
+            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
+            polarization_axis = torch.tensor([0.0, 1.0, 0.0], dtype=dtype)
+
+        source_directions, source_weights, source_wavelengths = \
+            generate_sources_from_divergence_dispersion(
+                hdiv_params=hdiv_params,
+                vdiv_params=vdiv_params,
+                disp_params=disp_params,
+                central_wavelength_m=wavelength_m,
+                source_distance_m=10.0,  # Default 10m source distance
+                beam_direction=beam_direction,
+                polarization_axis=polarization_axis,
+                round_div=config.get('round_div', True),  # Apply elliptical trimming based on CLI flag
+                dtype=dtype
+            )
+
+        # Store generated sources in config
+        config['source_directions'] = source_directions
+        config['source_weights'] = source_weights
+        config['source_wavelengths'] = source_wavelengths
+
+        # Report source generation if multiple sources
+        n_sources = len(source_directions)
+        if n_sources > 1:
+            print(f"Generated {n_sources} sources from divergence/dispersion:")
+            print(f"  H divergence: {hdiv_params.count} steps, range={hdiv_params.range:.4f} rad")
+            print(f"  V divergence: {vdiv_params.count} steps, range={vdiv_params.range:.4f} rad")
+            print(f"  Dispersion: {disp_params.count} steps, range={disp_params.range:.4f}")
+
+    # Create beam config. flux/exposure/beamsize and fluence go in through the
+    # constructor: BeamConfig.__post_init__ derives fluence from them the way C does,
+    # and assigning them afterwards would silently skip that.
+    beam_kwargs = dict(
+        wavelength_A=config.get('wavelength_A', 1.0),
+        dmin=config.get('dmin', 0.0),
+        water_size_um=config.get('water_size_um', 0.0),
+    )
+    if 'fluence' in config:
+        beam_kwargs['fluence'] = config['fluence']
+    if 'custom_polar_vector' in config:
+        beam_kwargs['polarization_axis'] = config['custom_polar_vector']
+    for key in ('flux', 'exposure', 'beamsize_mm'):
+        if key in config:
+            beam_kwargs[key] = config[key]
+    beam_config = BeamConfig(**beam_kwargs)
+
+    # Polarization
+    if config.get('nopolar'):
+        beam_config.nopolar = True
+    elif 'polarization_factor' in config:
+        beam_config.polarization_factor = config['polarization_factor']
+
+    # Set generated sources if available
+    if 'source_directions' in config:
+        beam_config.source_directions = config['source_directions']
+        beam_config.source_weights = config['source_weights']
+        beam_config.source_wavelengths = config['source_wavelengths']
+
+    if config_hook is not None:
+        config_hook(crystal_config, detector_config, beam_config)
+
+    # Create models
+    detector = Detector(detector_config)
+    crystal = Crystal(crystal_config, beam_config=beam_config)
+
+    # Set HKL data if available
+    hkl_entry = config.get('hkl_data')
+    if hkl_entry is not None:
+        hkl_array, hkl_metadata = hkl_entry
+        # Check if we actually got data (not just (None, None))
+        if hkl_array is not None:
+            if isinstance(hkl_array, torch.Tensor):
+                crystal.hkl_data = hkl_array.clone().detach().to(device=device, dtype=dtype)
+            else:
+                crystal.hkl_data = torch.tensor(hkl_array, device=device, dtype=dtype)
+            crystal.hkl_metadata = hkl_metadata
+
+    # Check interpolation settings. Crystal auto-enables interpolation for small
+    # crystals in __init__ (nanoBragg.c:1778-1789); -interpolate/-nointerpolate
+    # override that. This used to assign `crystal.interpolation_enabled`, an attribute
+    # nothing reads, so neither flag ever reached the lookup.
+    if 'interpolate' in config:
+        crystal.interpolate = bool(config['interpolate'])
+
+    # Create and run simulator with debug options
+    debug_config = {
+        'printout': args.printout,
+        'printout_pixel': args.printout_pixel,  # [fast, slow] indices
+        'trace_pixel': args.trace_pixel,  # [slow, fast] indices
+    }
+
+    # dtype and device already parsed earlier (DTYPE-DEFAULT-001)
+
+    simulator = Simulator(crystal, detector, beam_config=beam_config,
+                        device=device, dtype=dtype, debug_config=debug_config)
+
+    return SimulationBundle(
+        args=args,
+        config=config,
+        crystal=crystal,
+        detector=detector,
+        simulator=simulator,
+        crystal_config=crystal_config,
+        detector_config=detector_config,
+        beam_config=beam_config,
+        dtype=dtype,
+        device=device,
+    )
+
+
 def main():
     """Main entry point for CLI."""
 
@@ -1340,322 +1714,17 @@ def main():
     warn_c_misset_seed_order(sys.argv[1:])
 
     try:
-        # Parse dtype and device early (DTYPE-DEFAULT-001)
-        dtype = torch.float32 if args.dtype == 'float32' else torch.float64
-        device = torch.device(args.device)
-
-        # Validate and convert arguments
-        config = parse_and_validate_args(args)
-
-        # DETECTOR-CONFIG-001 Phase C2: Determine beam center source (explicit vs auto)
-        # This must be called AFTER parse_and_validate_args (which may set beam centers from headers)
-        # but BEFORE creating DetectorConfig (which needs this information)
-        beam_center_source = determine_beam_center_source(args, config)
-
-        # Create configuration objects
-        if 'cell_params' in config:
-            crystal_config = CrystalConfig(
-                cell_a=config['cell_params'][0],
-                cell_b=config['cell_params'][1],
-                cell_c=config['cell_params'][2],
-                cell_alpha=config['cell_params'][3],
-                cell_beta=config['cell_params'][4],
-                cell_gamma=config['cell_params'][5],
-                N_cells=(config.get('Na', 1), config.get('Nb', 1), config.get('Nc', 1)),  # Match C defaults
-                phi_start_deg=config.get('phi_deg', 0.0),
-                osc_range_deg=config.get('osc_deg', 0.0),
-                phi_steps=config.get('phi_steps', 1),
-                phi_step_deg=config.get('phi_step_deg'),
-                mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
-                mosaic_domains=config.get('mosaic_domains', 1),
-                mosaic_seed=config.get('mosaic_seed'),
-                shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
-                fudge=config.get('fudge', 1.0),
-                default_F=config.get('default_F', 0.0),
-                # Phase G1: Pass MOSFLM orientation if provided
-                mosflm_a_star=config.get('mosflm_a_star'),
-                mosflm_b_star=config.get('mosflm_b_star'),
-                mosflm_c_star=config.get('mosflm_c_star')
-            )
-
-            if 'misset_deg' in config:
-                crystal_config.misset_deg = tuple(config['misset_deg'])
-
-            if 'misset_random' in config:
-                crystal_config.misset_random = config['misset_random']
-
-            if 'misset_seed' in config:
-                crystal_config.misset_seed = config['misset_seed']
-
-            if 'custom_spindle_axis' in config:
-                crystal_config.spindle_axis = config['custom_spindle_axis']
-
-        # Create detector config
-        detector_config = DetectorConfig(
-            distance_mm=config.get('distance_mm', 100.0),
-            close_distance_mm=config.get('close_distance_mm'),
-            pixel_size_mm=config.get('pixel_size_mm', 0.1),
-            spixels=config.get('spixels', 1024),
-            fpixels=config.get('fpixels', 1024),
-            detector_rotx_deg=config.get('detector_rotx_deg', 0.0),
-            detector_roty_deg=config.get('detector_roty_deg', 0.0),
-            detector_rotz_deg=config.get('detector_rotz_deg', 0.0),
-            detector_twotheta_deg=config.get('twotheta_deg', 0.0),
-            twotheta_axis=(torch.tensor(config['twotheta_axis'], dtype=torch.float64)
-                           if 'twotheta_axis' in config else None),
-            close_center_f_mm=config.get('close_center_f_mm'),
-            close_center_s_mm=config.get('close_center_s_mm'),
-            detector_convention=DetectorConvention[config.get('convention', 'MOSFLM')],
-            detector_pivot=DetectorPivot[config.get('pivot', 'BEAM')] if config.get('pivot') else None,
-            oversample=config.get('oversample', -1),  # -1 means auto-select
-            point_pixel=config.get('point_pixel', False),
-            curved_detector=config.get('curved_detector', False),
-            oversample_omega=config.get('oversample_omega', False),
-            oversample_polar=config.get('oversample_polar', False),
-            oversample_thick=config.get('oversample_thick', False),
-            # DETECTOR-CONFIG-001 Phase C2: Pass beam_center_source for MOSFLM offset logic
-            beam_center_source=beam_center_source,
-            # Custom vectors for CUSTOM convention
-            custom_fdet_vector=config.get('custom_fdet_vector'),
-            custom_sdet_vector=config.get('custom_sdet_vector'),
-            custom_odet_vector=config.get('custom_odet_vector'),
-            custom_beam_vector=config.get('custom_beam_vector'),
-            # Detector origin override (CLI-FLAGS-003)
-            pix0_override_m=config.get('pix0_override_m')
-        )
-
-        # Set beam center if provided (values are in mm)
-        # CRITICAL: C-code Xbeam/Ybeam semantics are convention AND pivot-mode dependent! (AT-PARALLEL-004 root cause)
-        #
-        # C-code behavior (nanoBragg.c lines 631-648, 1206-1275):
-        #   - `-Xbeam`/`-Ybeam` set detector_pivot = BEAM (line 632, 637)
-        #   - `-Xclose`/`-Yclose` set detector_pivot = SAMPLE (line 642, 647)
-        #   - Convention selection OVERRIDES pivot: XDS/DIALS force SAMPLE pivot (lines 1250, 1265)
-        #   - For SAMPLE pivot: Xbeam/Ybeam are IGNORED; C uses detector center (Fclose=detsize/2)
-        #   - For BEAM pivot: Xbeam/Ybeam are mapped to Fbeam/Sbeam with convention-specific axis swaps
-        #
-        # Result: `-xds -Xbeam X -Ybeam Y` is contradictory; C resolves by using SAMPLE pivot
-        #         and ignoring X/Y, falling back to detector center (detsize_f/2, detsize_s/2)
-        #
-        # PyTorch must replicate this: For XDS/DIALS conventions, ignore Xbeam/Ybeam and use detector center.
+        bundle = build_simulation(args)
+        config = bundle.config
+        crystal_config = bundle.crystal_config
+        detector_config = bundle.detector_config
+        beam_config = bundle.beam_config
+        detector = bundle.detector
+        simulator = bundle.simulator
+        dtype = bundle.dtype
+        device = bundle.device
         convention = detector_config.detector_convention
         pixel_size_mm = detector_config.pixel_size_mm
-
-        if 'beam_center_x_mm' in config and 'beam_center_y_mm' in config:
-            Xbeam_mm = config['beam_center_x_mm']
-            Ybeam_mm = config['beam_center_y_mm']
-
-            # Check if convention forces SAMPLE pivot (XDS/DIALS)
-            # For these conventions, Xbeam/Ybeam are ignored; use detector center instead
-            if convention in [DetectorConvention.XDS, DetectorConvention.DIALS]:
-                # XDS/DIALS: Convention forces SAMPLE pivot; ignore Xbeam/Ybeam
-                # Use detector center: Fclose = detsize_f/2, Sclose = detsize_s/2 (C line 1178)
-                # Leave beam_center_f and beam_center_s at their defaults (detector center)
-                # NOTE: DetectorConfig defaults are already set to detector center
-                pass
-            elif convention in [DetectorConvention.MOSFLM, DetectorConvention.DENZO]:
-                # MOSFLM/DENZO: BEAM pivot with axis swap (Fbeam ← Ybeam, Sbeam ← Xbeam)
-                # +0.5 pixel offset is added later in Detector.__init__
-                detector_config.beam_center_f = Ybeam_mm
-                detector_config.beam_center_s = Xbeam_mm
-            elif convention == DetectorConvention.ADXV:
-                # ADXV: BEAM pivot with Y-axis flip
-                detsize_s_mm = detector_config.spixels * pixel_size_mm
-                detector_config.beam_center_f = Xbeam_mm
-                detector_config.beam_center_s = detsize_s_mm - Ybeam_mm
-            elif convention == DetectorConvention.CUSTOM:
-                # CUSTOM: No axis swap (Fbeam ← Xbeam, Sbeam ← Ybeam)
-                detector_config.beam_center_f = Xbeam_mm
-                detector_config.beam_center_s = Ybeam_mm
-        elif 'beam_center_x_mm' in config or 'beam_center_y_mm' in config:
-            # Partial beam center - this shouldn't happen in well-formed input
-            raise ValueError("Both -Xbeam and -Ybeam must be provided together")
-
-        # ROI
-        if 'roi' in config:
-            detector_config.roi_xmin = config['roi'][0]
-            detector_config.roi_xmax = config['roi'][1]
-            detector_config.roi_ymin = config['roi'][2]
-            detector_config.roi_ymax = config['roi'][3]
-
-        # Mask
-        if 'mask_file' in config:
-            mask_data, _ = read_smv_mask(config['mask_file'])  # Returns tuple (mask, header)
-            # Deliberate divergence from C: nanoBragg.c sizes its mask buffer from
-            # the mask file but indexes it with the *final* detector pixel count,
-            # so a mask smaller than the detector reads out of bounds (this is
-            # reachable via `-img big.img -mask small.img`, where the img header
-            # wins the detector size). Refuse it instead of inheriting the UB.
-            expected = (config['spixels'], config['fpixels'])
-            if tuple(mask_data.shape) != expected:
-                raise ValueError(
-                    f"-mask file {config['mask_file']} is "
-                    f"{mask_data.shape[0]}x{mask_data.shape[1]} but the detector is "
-                    f"{expected[0]}x{expected[1]}. nanoBragg.c reads past the end of "
-                    "its mask buffer in this case; give a mask that matches the "
-                    "detector, or size the detector with -detpixels."
-                )
-            detector_config.mask_array = mask_data
-
-        # Absorption
-        if 'detector_abs_um' in config:
-            detector_config.detector_abs_um = config['detector_abs_um']
-        if 'detector_thick_um' in config:
-            detector_config.detector_thick_um = config['detector_thick_um']
-        if 'detector_thicksteps' in config:
-            detector_config.detector_thicksteps = config['detector_thicksteps']
-
-        # Generate sources from divergence/dispersion if not from file
-        # This implements proper source generation per spec AT-SRC-002
-        if 'sourcefile' in config:
-            # Load sources from file
-            wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
-
-            # Get beam direction based on detector convention.
-            # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0];
-            # ADXV/XDS/DIALS use [0,0,1].
-            if detector_config.detector_convention in (
-                DetectorConvention.MOSFLM, DetectorConvention.DENZO
-            ):
-                beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-            else:
-                beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-
-            source_directions, source_weights, source_wavelengths = read_sourcefile(
-                config['sourcefile'],
-                default_wavelength_m=wavelength_m,
-                default_source_distance_m=10.0,  # C code default
-                beam_direction=beam_direction
-            )
-
-            # Store loaded sources in config
-            config['source_directions'] = source_directions
-            config['source_weights'] = source_weights
-            config['source_wavelengths'] = source_wavelengths
-
-            # Report source loading
-            n_sources = len(source_directions)
-            print(f"Loaded {n_sources} sources from {config['sourcefile']}")
-        elif 'sourcefile' not in config:
-            # Auto-select divergence parameters
-            hdiv_params, vdiv_params = auto_select_divergence(
-                hdivsteps=config.get('hdivsteps'),
-                hdivrange=config.get('hdivrange'),
-                hdivstep=config.get('hdivstep'),
-                vdivsteps=config.get('vdivsteps'),
-                vdivrange=config.get('vdivrange'),
-                vdivstep=config.get('vdivstep')
-            )
-            disp_params = auto_select_dispersion(
-                dispsteps=config.get('dispsteps'),
-                dispersion=config.get('dispersion'),
-                dispstep=None  # No direct dispstep in CLI, computed from range/count
-            )
-
-            # Generate source arrays
-            wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
-
-            # Get beam direction based on detector convention.
-            # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0] with
-            # polar_vector = [0,0,1]; ADXV/XDS/DIALS use beam_vector = [0,0,1].
-            if detector_config.detector_convention in (
-                DetectorConvention.MOSFLM, DetectorConvention.DENZO
-            ):
-                beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-                polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-            else:
-                beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-                polarization_axis = torch.tensor([0.0, 1.0, 0.0], dtype=dtype)
-
-            source_directions, source_weights, source_wavelengths = \
-                generate_sources_from_divergence_dispersion(
-                    hdiv_params=hdiv_params,
-                    vdiv_params=vdiv_params,
-                    disp_params=disp_params,
-                    central_wavelength_m=wavelength_m,
-                    source_distance_m=10.0,  # Default 10m source distance
-                    beam_direction=beam_direction,
-                    polarization_axis=polarization_axis,
-                    round_div=config.get('round_div', True),  # Apply elliptical trimming based on CLI flag
-                    dtype=dtype
-                )
-
-            # Store generated sources in config
-            config['source_directions'] = source_directions
-            config['source_weights'] = source_weights
-            config['source_wavelengths'] = source_wavelengths
-
-            # Report source generation if multiple sources
-            n_sources = len(source_directions)
-            if n_sources > 1:
-                print(f"Generated {n_sources} sources from divergence/dispersion:")
-                print(f"  H divergence: {hdiv_params.count} steps, range={hdiv_params.range:.4f} rad")
-                print(f"  V divergence: {vdiv_params.count} steps, range={vdiv_params.range:.4f} rad")
-                print(f"  Dispersion: {disp_params.count} steps, range={disp_params.range:.4f}")
-
-        # Create beam config. flux/exposure/beamsize and fluence go in through the
-        # constructor: BeamConfig.__post_init__ derives fluence from them the way C does,
-        # and assigning them afterwards would silently skip that.
-        beam_kwargs = dict(
-            wavelength_A=config.get('wavelength_A', 1.0),
-            dmin=config.get('dmin', 0.0),
-            water_size_um=config.get('water_size_um', 0.0),
-        )
-        if 'fluence' in config:
-            beam_kwargs['fluence'] = config['fluence']
-        if 'custom_polar_vector' in config:
-            beam_kwargs['polarization_axis'] = config['custom_polar_vector']
-        for key in ('flux', 'exposure', 'beamsize_mm'):
-            if key in config:
-                beam_kwargs[key] = config[key]
-        beam_config = BeamConfig(**beam_kwargs)
-
-        # Polarization
-        if config.get('nopolar'):
-            beam_config.nopolar = True
-        elif 'polarization_factor' in config:
-            beam_config.polarization_factor = config['polarization_factor']
-
-        # Set generated sources if available
-        if 'source_directions' in config:
-            beam_config.source_directions = config['source_directions']
-            beam_config.source_weights = config['source_weights']
-            beam_config.source_wavelengths = config['source_wavelengths']
-
-        # Create models
-        detector = Detector(detector_config)
-        crystal = Crystal(crystal_config, beam_config=beam_config)
-
-        # Set HKL data if available
-        hkl_entry = config.get('hkl_data')
-        if hkl_entry is not None:
-            hkl_array, hkl_metadata = hkl_entry
-            # Check if we actually got data (not just (None, None))
-            if hkl_array is not None:
-                if isinstance(hkl_array, torch.Tensor):
-                    crystal.hkl_data = hkl_array.clone().detach().to(device=device, dtype=dtype)
-                else:
-                    crystal.hkl_data = torch.tensor(hkl_array, device=device, dtype=dtype)
-                crystal.hkl_metadata = hkl_metadata
-
-        # Check interpolation settings. Crystal auto-enables interpolation for small
-        # crystals in __init__ (nanoBragg.c:1778-1789); -interpolate/-nointerpolate
-        # override that. This used to assign `crystal.interpolation_enabled`, an attribute
-        # nothing reads, so neither flag ever reached the lookup.
-        if 'interpolate' in config:
-            crystal.interpolate = bool(config['interpolate'])
-
-        # Create and run simulator with debug options
-        debug_config = {
-            'printout': args.printout,
-            'printout_pixel': args.printout_pixel,  # [fast, slow] indices
-            'trace_pixel': args.trace_pixel,  # [slow, fast] indices
-        }
-
-        # dtype and device already parsed earlier (DTYPE-DEFAULT-001)
-
-        simulator = Simulator(crystal, detector, beam_config=beam_config,
-                            device=device, dtype=dtype, debug_config=debug_config)
 
         # Print configuration if requested
         if args.show_config:
