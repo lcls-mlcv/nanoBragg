@@ -32,7 +32,8 @@ from .io.hkl import read_hkl_file, try_load_hkl_or_fdump
 from .io.smv import write_smv
 from .io.mosflm import read_mosflm_matrix, reciprocal_to_real_cell
 from .io.pgm import write_pgm
-from .io.mask import read_smv_mask, parse_smv_header, apply_smv_header_to_config
+from .io.mask import (read_smv_mask, parse_smv_header,
+                      read_smv_header_text, smv_header_defaults)
 from .io.source import read_sourcefile
 from .utils.units import (
     mm_to_meters, micrometers_to_meters, degrees_to_radians,
@@ -815,8 +816,92 @@ def resolve_detector_pivot(args: argparse.Namespace) -> str:
     return pivot
 
 
+# nanoBragg.c reads the -img/-mask headers in a pre-pass (nanoBragg.c:419-502)
+# that runs *before* its argument loop (nanoBragg.c:506), so a flag the user
+# actually typed always beats the header. Two consequences, both verified
+# against the binary rather than inferred:
+#   * `-img h.img -detpixels 16` renders 16x16, not the header's size;
+#   * the mask block runs first and the img block second, so -img wins over
+#     -mask for shared keys *regardless of their order in argv*.
+# Maps a key from smv_header_defaults() to the argparse dest it seeds and the
+# flag tokens whose presence means "the user set this, leave it alone". The
+# extra tokens are the ones C's strstr would also match onto the same variable.
+_HEADER_ARG_SEEDS = {
+    'pixel_size_mm':     ('pixel',          ('-pixel',)),
+    'distance_mm':       ('distance',       ('-distance',)),
+    'close_distance_mm': ('close_distance', ('-close_distance',)),
+    'wavelength_A':      ('wavelength',     ('-lambda', '-wave', '-energy')),
+    'beam_center_x_mm':  ('Xbeam',          ('-Xbeam',)),
+    'beam_center_y_mm':  ('Ybeam',          ('-Ybeam',)),
+    'orgx':              ('ORGX',           ('-ORGX',)),
+    'orgy':              ('ORGY',           ('-ORGY',)),
+    'phi_start_deg':     ('phi',            ('-phi', '-phistep', '-phisteps')),
+    'osc_range_deg':     ('osc',            ('-osc',)),
+    # No TWOTHETA entry: see smv_header_defaults() -- C parses it into a
+    # pixel-loop scratch variable, so a header TWOTHETA changes nothing.
+}
+
+# Any of these means the user sized the detector themselves, so SIZE1/SIZE2
+# from the header must not be injected.
+_HEADER_SIZE_FLAGS = ('-detpixels', '-detpixels_f', '-detpixels_s',
+                      '-detpixels_x', '-detpixels_y',
+                      '-detsize', '-detsize_f', '-detsize_s')
+
+
+def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
+    """Apply -img/-mask header geometry as *defaults*, the way C's pre-pass does.
+
+    Only fills options the user did not name on the command line, so explicit
+    flags keep winning. Mutates ``args`` in place; everything downstream (the
+    twotheta, phi and close-center resolvers) then works unchanged.
+    """
+    if not getattr(args, 'img', None) and not getattr(args, 'mask', None):
+        return
+
+    argv = getattr(args, '_argv', None) or []
+    named = set(argv)
+
+    # C order: mask pre-pass first (nanoBragg.c:419), img second (:462), so a
+    # value present in both files ends up with the img file's version.
+    defaults: Dict[str, float] = {}
+    for filename, is_mask in ((getattr(args, 'mask', None), True),
+                              (getattr(args, 'img', None), False)):
+        if not filename:
+            continue
+        try:
+            header_text = read_smv_header_text(filename)
+        except (FileNotFoundError, ValueError) as exc:
+            which = '-mask' if is_mask else '-img'
+            print(f"Warning: Failed to read {which} file header: {exc}",
+                  file=sys.stderr)
+            continue
+        defaults.update(smv_header_defaults(header_text, is_mask=is_mask))
+        print(f"Read header from {'-mask' if is_mask else '-img'} file: {filename}")
+
+    if not defaults:
+        return
+
+    if not named.intersection(_HEADER_SIZE_FLAGS):
+        if 'fpixels' in defaults:
+            args.detpixels_f = defaults['fpixels']
+        if 'spixels' in defaults:
+            args.detpixels_s = defaults['spixels']
+
+    for key, (dest, tokens) in _HEADER_ARG_SEEDS.items():
+        if key not in defaults:
+            continue
+        if named.intersection(tokens):
+            continue
+        if getattr(args, dest, None) is None:
+            setattr(args, dest, defaults[key])
+
+
 def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     """Parse and validate command-line arguments into configuration."""
+
+    # Must run before anything reads `args`: C applies the header first and
+    # lets the argument loop override it.
+    seed_args_from_smv_headers(args)
 
     config = {}
 
@@ -1040,28 +1125,11 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['oversample_polar'] = args.oversample_polar
     config['oversample_omega'] = args.oversample_omega
 
-    # Process -img and -mask files with proper precedence (AT-CLI-004)
-    # Per spec: last file read wins for shared header keys
-    if args.img or args.mask:
-        # Process -img first if provided
-        if args.img:
-            try:
-                img_header = parse_smv_header(args.img)
-                apply_smv_header_to_config(img_header, config, is_mask=False)
-                print(f"Read header from -img file: {args.img}")
-            except (FileNotFoundError, ValueError) as e:
-                print(f"Warning: Failed to read -img file: {e}", file=sys.stderr)
-
-        # Process -mask second (wins if both provided per AT-CLI-004)
-        if args.mask:
-            try:
-                mask_header = parse_smv_header(args.mask)
-                apply_smv_header_to_config(mask_header, config, is_mask=True)
-                config['mask_file'] = args.mask  # Store mask file for later loading
-                print(f"Read header from -mask file: {args.mask}")
-            except (FileNotFoundError, ValueError) as e:
-                print(f"Warning: Failed to read -mask file header: {e}", file=sys.stderr)
-                config['mask_file'] = args.mask  # Still try to load mask data
+    # The -img/-mask header geometry was already applied by
+    # seed_args_from_smv_headers() at the top of this function, mirroring C's
+    # pre-pass. All that is left is to remember the mask *data* for later.
+    if args.mask:
+        config['mask_file'] = args.mask
 
     # ROI
     if args.roi:
@@ -1413,6 +1481,20 @@ def main():
         # Mask
         if 'mask_file' in config:
             mask_data, _ = read_smv_mask(config['mask_file'])  # Returns tuple (mask, header)
+            # Deliberate divergence from C: nanoBragg.c sizes its mask buffer from
+            # the mask file but indexes it with the *final* detector pixel count,
+            # so a mask smaller than the detector reads out of bounds (this is
+            # reachable via `-img big.img -mask small.img`, where the img header
+            # wins the detector size). Refuse it instead of inheriting the UB.
+            expected = (config['spixels'], config['fpixels'])
+            if tuple(mask_data.shape) != expected:
+                raise ValueError(
+                    f"-mask file {config['mask_file']} is "
+                    f"{mask_data.shape[0]}x{mask_data.shape[1]} but the detector is "
+                    f"{expected[0]}x{expected[1]}. nanoBragg.c reads past the end of "
+                    "its mask buffer in this case; give a mask that matches the "
+                    "detector, or size the detector with -detpixels."
+                )
             detector_config.mask_array = mask_data
 
         # Absorption

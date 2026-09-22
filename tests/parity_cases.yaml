@@ -1463,3 +1463,95 @@ cases:
           -beam_vector 1 0 0
           -ORGX 20
           -ORGY 45
+
+  - id: PARITY-SMVHDR-001
+    description: >-
+      -img/-mask SMV header ingestion (C ↔ PyTorch). nanoBragg.c reads the headers in a
+      pre-pass (nanoBragg.c:419-502) that runs BEFORE its argument loop (:506), so a flag
+      the user typed always wins over the header. The mask block runs first and the img
+      block second, so -img wins over -mask for shared keys regardless of argv order.
+      ValueOf (:4248) is a substring search that keeps the LAST match, so ORGX also matches
+      XDS_ORGX and DISTANCE also matches CLOSE_DISTANCE. Fixtures: header_img_64.img
+      (PIXEL_SIZE .1, DISTANCE 150, CLOSE_DISTANCE 111, WAVELENGTH 1.54, BEAM_CENTER 3.21/9.87,
+      TWOTHETA 15, PHI 7, OSC_RANGE 5), header_mask_64.img (DISTANCE 250, WAVELENGTH 2.5,
+      BEAM_CENTER 1.11/2.22, PHI 3, OSC_RANGE 9, all pixels = 1 so nothing is masked),
+      header_orgx_64.img (ORGX 11 then XDS_ORGX 50 - the last match, 50, must win).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -N 4
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: smvhdr-img-only
+        extra_args: >-
+          -img {REPO}/tests/golden_data/header_img_64.img
+      - name: smvhdr-img-cli-overrides
+        extra_args: >-
+          -img {REPO}/tests/golden_data/header_img_64.img
+          -distance 180
+          -lambda 1.2
+          -detpixels 48
+          -Xbeam 2.0
+          -Ybeam 2.5
+      - name: smvhdr-img-cli-phi-twotheta
+        extra_args: >-
+          -img {REPO}/tests/golden_data/header_img_64.img
+          -phi 20
+          -osc 1
+          -twotheta 3
+      - name: smvhdr-mask-only
+        extra_args: >-
+          -mask {REPO}/tests/golden_data/header_mask_64.img
+      - name: smvhdr-img-then-mask
+        extra_args: >-
+          -img {REPO}/tests/golden_data/header_img_64.img
+          -mask {REPO}/tests/golden_data/header_mask_64.img
+      - name: smvhdr-mask-then-img
+        extra_args: >-
+          -mask {REPO}/tests/golden_data/header_mask_64.img
+          -img {REPO}/tests/golden_data/header_img_64.img
+      - name: smvhdr-orgx-last-match-wins
+        extra_args: >-
+          -xds
+          -img {REPO}/tests/golden_data/header_orgx_64.img
+
+  - id: PARITY-DMIN-001
+    description: >-
+      Resolution culling with -dmin (C <-> PyTorch). C converts at parse time,
+      dmin = atof(argv)*1e-10 (nanoBragg.c:957), then culls with dmin > 0.5/stol
+      (:2765) entirely in SI. torch compared a dmin still in Angstroms against a
+      stol in m^-1, a factor 1e10 too small, so ANY non-zero -dmin culled every
+      pixel and produced an identically zero image. The geometry below spans
+      d = 31 A at the corner to infinity at the centre, so 25-60 A cull a
+      growing annulus and 2 A culls nothing.
+    base_args: >-
+      -default_F 100
+      -cell 100 100 100 90 90 90
+      -N 5
+      -lambda 1.0
+      -distance 100
+      -detpixels 64
+      -pixel 0.1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: dmin-no-culling
+        extra_args: >-
+          -dmin 2
+      - name: dmin-25
+        extra_args: >-
+          -dmin 25
+      - name: dmin-30
+        extra_args: >-
+          -dmin 30
+      - name: dmin-40
+        extra_args: >-
+          -dmin 40
+      - name: dmin-60
+        extra_args: >-
+          -dmin 60

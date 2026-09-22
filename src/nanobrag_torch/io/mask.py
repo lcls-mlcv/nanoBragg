@@ -3,6 +3,8 @@
 Handles reading SMV format files including images and masks.
 """
 
+import math
+import re
 import struct
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -58,78 +60,137 @@ def parse_smv_header(filename: str) -> Dict[str, str]:
     return header_dict
 
 
-def apply_smv_header_to_config(header: Dict[str, str], config: dict,
-                              is_mask: bool = False) -> None:
-    """Apply SMV header values to configuration dictionary.
+def read_smv_header_text(filename: str) -> str:
+    """Return the raw SMV header text, the equivalent of C's ``frame.header``.
 
-    Per spec AT-CLI-004 and section "File I/O":
-    - Recognized header fields initialize corresponding parameters
-    - For -mask headers, BEAM_CENTER_Y is interpreted with a flip
-    - Updates config dict in-place
-
-    Args:
-        header: Dictionary of SMV header key-value pairs
-        config: Configuration dictionary to update
-        is_mask: True if this is a mask file (affects Y beam center interpretation)
+    ``value_of`` scans this text the way nanoBragg.c's ``ValueOf`` scans the
+    header buffer, so the raw string (not a parsed dict) is what we need.
     """
-    # Pixel counts
-    if "SIZE1" in header:
-        config["fpixels"] = int(header["SIZE1"])
-    if "SIZE2" in header:
-        config["spixels"] = int(header["SIZE2"])
+    path = Path(filename)
+    if not path.exists():
+        raise FileNotFoundError(f"SMV file not found: {filename}")
+    with open(path, "rb") as f:
+        return f.read(512).decode("ascii", errors="ignore")
 
-    # Pixel size (mm)
-    if "PIXEL_SIZE" in header:
-        config["pixel_size_mm"] = float(header["PIXEL_SIZE"])
 
-    # Distances (mm)
-    if "DISTANCE" in header:
-        config["distance_mm"] = float(header["DISTANCE"])
-    if "CLOSE_DISTANCE" in header:
-        config["close_distance_mm"] = float(header["CLOSE_DISTANCE"])
+def _c_atof(text: str) -> float:
+    """C's ``atof``: parse a leading number, return 0.0 if there isn't one."""
+    match = re.match(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", text)
+    if match is None:
+        return 0.0
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return 0.0
 
-    # Wavelength (Å)
-    if "WAVELENGTH" in header:
-        config["wavelength_A"] = float(header["WAVELENGTH"])
 
-    # Beam centers (mm) - key part of AT-CLI-004
-    if "BEAM_CENTER_X" in header:
-        beam_x_mm = float(header["BEAM_CENTER_X"])
-        config["beam_center_f"] = beam_x_mm  # Direct mapping for X
+def value_of(keyword: str, header_text: str) -> float:
+    """Faithful port of nanoBragg.c's ``ValueOf`` (nanoBragg.c:4248-4275).
 
-    if "BEAM_CENTER_Y" in header:
-        beam_y_mm = float(header["BEAM_CENTER_Y"])
-        if is_mask:
-            # Per spec: For -mask, Y is interpreted as detsize_s - value_mm
-            # We need detector size to do this flip
-            if "spixels" in config and "pixel_size_mm" in config:
-                detsize_s = config["spixels"] * config["pixel_size_mm"]
-                config["beam_center_s"] = detsize_s - beam_y_mm
-            else:
-                # Store raw value with flag for later processing
-                config["beam_center_s_raw"] = beam_y_mm
-                config["beam_center_s_needs_flip"] = True
+    Two behaviours here are load-bearing and are *not* what a dict lookup does:
+
+    1. The match is a **substring** search, not a key comparison, so
+       ``value_of("ORGX", ...)`` matches ``XDS_ORGX=`` and
+       ``value_of("DISTANCE", ...)`` matches ``CLOSE_DISTANCE=``.
+    2. It keeps advancing while the keyword still occurs, so the **last**
+       occurrence wins, then reads the first ``=`` after it.
+
+    Verified against the binary: a header carrying ``ORGX=11`` followed by
+    ``XDS_ORGX=50`` yields 50.
+
+    Returns NaN when the keyword never appears (C returns NAN and the caller
+    skips the assignment), and 0.0 when it appears with no following ``=``.
+    """
+    idx = 0
+    found = False
+    while True:
+        hit = header_text.find(keyword, idx)
+        if hit == -1:
+            break
+        found = True
+        idx = hit + len(keyword)
+    if not found:
+        return float("nan")
+    eq = header_text.find("=", idx)
+    if eq == -1:
+        return 0.0
+    return _c_atof(header_text[eq + 1:])
+
+
+def smv_header_defaults(header_text: str, is_mask: bool = False) -> Dict[str, float]:
+    """Extract the geometry nanoBragg.c takes from a ``-img``/``-mask`` header.
+
+    Mirrors the mask pre-pass at nanoBragg.c:419-459 and the img pre-pass at
+    nanoBragg.c:462-502. Only keys actually present in the header are returned,
+    so the caller can distinguish "header said nothing" from "header said 0".
+
+    The one deliberate difference between the two blocks in C is BEAM_CENTER_Y:
+    the mask block flips it (``detsize_s - value``), the img block does not.
+    """
+    out: Dict[str, float] = {}
+
+    size1 = value_of("SIZE1", header_text)
+    size2 = value_of("SIZE2", header_text)
+    if not math.isnan(size1):
+        out["fpixels"] = int(size1)
+    if not math.isnan(size2):
+        out["spixels"] = int(size2)
+
+    pixel_size_mm = value_of("PIXEL_SIZE", header_text)
+    if not math.isnan(pixel_size_mm):
+        out["pixel_size_mm"] = pixel_size_mm
+
+    # C recomputes detsize from the (possibly just-updated) pixel size, so the
+    # flip below must use the same value C would have had.
+    detsize_s_mm = None
+    if "spixels" in out:
+        detsize_s_mm = out["spixels"] * out.get("pixel_size_mm", 0.1)
+
+    distance_mm = value_of("DISTANCE", header_text)
+    if not math.isnan(distance_mm):
+        out["distance_mm"] = distance_mm
+    close_distance_mm = value_of("CLOSE_DISTANCE", header_text)
+    if not math.isnan(close_distance_mm):
+        out["close_distance_mm"] = close_distance_mm
+
+    wavelength_A = value_of("WAVELENGTH", header_text)
+    if not math.isnan(wavelength_A):
+        out["wavelength_A"] = wavelength_A
+
+    beam_x_mm = value_of("BEAM_CENTER_X", header_text)
+    if not math.isnan(beam_x_mm):
+        out["beam_center_x_mm"] = beam_x_mm
+    beam_y_mm = value_of("BEAM_CENTER_Y", header_text)
+    if not math.isnan(beam_y_mm):
+        if is_mask and detsize_s_mm is not None:
+            out["beam_center_y_mm"] = detsize_s_mm - beam_y_mm
         else:
-            # For -img, use value directly
-            config["beam_center_s"] = beam_y_mm
+            out["beam_center_y_mm"] = beam_y_mm
 
-    # XDS origin (pixels)
-    if "XDS_ORGX" in header:
-        config["orgx"] = float(header["XDS_ORGX"])
-    if "XDS_ORGY" in header:
-        config["orgy"] = float(header["XDS_ORGY"])
+    orgx = value_of("ORGX", header_text)
+    if not math.isnan(orgx):
+        out["orgx"] = orgx
+    orgy = value_of("ORGY", header_text)
+    if not math.isnan(orgy):
+        out["orgy"] = orgy
 
-    # Phi and oscillation (degrees)
-    if "PHI" in header:
-        config["phi_start_deg"] = float(header["PHI"])
-    if "OSC_START" in header:
-        config["phi_start_deg"] = float(header["OSC_START"])
-    if "OSC_RANGE" in header:
-        config["osc_range_deg"] = float(header["OSC_RANGE"])
+    phi_deg = value_of("PHI", header_text)
+    if not math.isnan(phi_deg):
+        out["phi_start_deg"] = phi_deg
+    osc_deg = value_of("OSC_RANGE", header_text)
+    if not math.isnan(osc_deg):
+        out["osc_range_deg"] = osc_deg
 
-    # Two-theta (degrees)
-    if "TWOTHETA" in header:
-        config["detector_twotheta_deg"] = float(header["TWOTHETA"])
+    # TWOTHETA is deliberately NOT extracted. C reads it (nanoBragg.c:450, :493)
+    # into `twotheta`, which is declared at :279 as the pixel-loop scratch
+    # variable for the scattering angle and is overwritten on the first pixel.
+    # The detector swing is the separate `detector_twotheta` (:254), which only
+    # -twotheta writes (:766). So a header TWOTHETA has no effect in C -- it
+    # writes TWOTHETA=0 back out for a header that said 15 -- and honouring it
+    # here would be a divergence, not a fix. Pinned by PARITY-SMVHDR-001, whose
+    # fixture header carries TWOTHETA=15.
+
+    return out
 
 
 def read_smv_mask(filename: str) -> Tuple[torch.Tensor, dict]:

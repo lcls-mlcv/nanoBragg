@@ -312,8 +312,26 @@ def polarization_factor(
         E_out = torch.sum(diffracted_norm * E_in_norm, dim=-1)
         B_out = torch.sum(diffracted_norm * B_in_norm, dim=-1)
 
-        # Compute the angle of the diffracted ray projected onto the incident E-B plane
-        psi = -torch.atan2(B_out, E_out)
+        # Compute the angle of the diffracted ray projected onto the incident E-B plane.
+        #
+        # At exactly forward scattering the diffracted ray lies along the incident
+        # beam, so it has no component in the E-B plane and E_out == B_out == 0.0
+        # exactly. C evaluates atan2(0,0), which IEEE-754 defines as +0, and moves
+        # on. We cannot: the *forward* value is fine, but d/dx atan2(y,x) is
+        # y/(x^2+y^2) = 0/0 = NaN, and that NaN propagates through the whole
+        # backward pass -- sin^2(2theta) being 0 there does not rescue it, because
+        # 0 * NaN is NaN. Measured: a 32x32 detector with the beam centre on the
+        # geometric detector centre and oversample=1 produced a clean image and
+        # d(sum)/d(distance) = nan.
+        #
+        # Guard the INPUTS, not the output: torch.where on the result would still
+        # evaluate the degenerate branch's backward. Substituting (0, 1) there
+        # gives atan2(0,1) = 0, identical to C's value, and routes the gradient to
+        # a constant so nothing downstream sees a NaN.
+        degenerate = (E_out == 0) & (B_out == 0)
+        E_safe = torch.where(degenerate, torch.ones_like(E_out), E_out)
+        B_safe = torch.where(degenerate, torch.zeros_like(B_out), B_out)
+        psi = -torch.atan2(B_safe, E_safe)
 
     # Correction for polarized incident beam
     # Per spec equation: 0.5·(1 + cos^2(2θ) − K·cos(2ψ)·sin^2(2θ))
