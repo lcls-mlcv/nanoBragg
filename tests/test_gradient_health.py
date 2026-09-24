@@ -373,3 +373,63 @@ def test_degenerate_geometry_gradient_health(case):
         f"exactly on the beam axis poisoned the backward pass while the "
         f"rendered image stayed clean"
     )
+
+
+# --- The TOPHAT warning ----------------------------------------------------
+
+
+def _tophat_crystal(requires_grad: bool):
+    from nanobrag_torch.config import CrystalConfig, CrystalShape
+    from nanobrag_torch.models import Crystal
+
+    def cell(v):
+        return (
+            torch.tensor(v, dtype=torch.float64, requires_grad=True)
+            if requires_grad
+            else v
+        )
+
+    return lambda: Crystal(
+        CrystalConfig(
+            cell_a=cell(100.0), cell_b=cell(100.0), cell_c=cell(100.0),
+            cell_alpha=cell(90.0), cell_beta=cell(90.0), cell_gamma=cell(90.0),
+            default_F=100.0, N_cells=(5, 5, 5), shape=CrystalShape.TOPHAT,
+        ),
+        dtype=torch.float64,
+    )
+
+
+def test_tophat_warns_when_cell_parameters_require_grad():
+    """The dead-gradient case is silent without this warning; say so up front."""
+    with pytest.warns(UserWarning, match="TOPHAT crystal shape has no gradient path"):
+        _tophat_crystal(requires_grad=True)()
+
+
+def test_tophat_silent_without_differentiable_cell():
+    """No warning for the ordinary forward-only TOPHAT run, which is most of them."""
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error", UserWarning)
+        _tophat_crystal(requires_grad=False)()
+
+
+def test_differentiable_shapes_do_not_warn():
+    """Only TOPHAT is affected — a false positive here would train people to ignore it."""
+    import warnings as _warnings
+
+    from nanobrag_torch.config import CrystalConfig, CrystalShape
+    from nanobrag_torch.models import Crystal
+
+    for shape in (CrystalShape.SQUARE, CrystalShape.ROUND, CrystalShape.GAUSS):
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("error", UserWarning)
+            Crystal(
+                CrystalConfig(
+                    cell_a=torch.tensor(100.0, dtype=torch.float64, requires_grad=True),
+                    cell_b=100.0, cell_c=100.0,
+                    cell_alpha=90.0, cell_beta=90.0, cell_gamma=90.0,
+                    default_F=100.0, N_cells=(5, 5, 5), shape=shape,
+                ),
+                dtype=torch.float64,
+            )
