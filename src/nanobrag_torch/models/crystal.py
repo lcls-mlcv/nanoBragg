@@ -11,6 +11,8 @@ golden test case, which uses a 10 Å unit cell and a 500×500×500 cell crystal 
 from typing import Optional, Tuple
 
 import math
+import warnings
+
 import torch
 
 from ..config import CrystalConfig, BeamConfig
@@ -101,6 +103,8 @@ class Crystal:
 
         # Validate cell parameters for numerical stability
         self._validate_cell_parameters()
+
+        self._warn_if_tophat_kills_cell_gradients()
 
         # Crystal size from config
         self.N_cells_a = torch.as_tensor(
@@ -196,6 +200,52 @@ class Crystal:
         self._geometry_cache = {}
 
         return self
+
+    def _warn_if_tophat_kills_cell_gradients(self):
+        """Warn when TOPHAT is combined with differentiable cell parameters.
+
+        TOPHAT's lattice factor is a hard binary cutoff,
+
+            F_latt = where(rad_sqr * fudge < 0.3969, Na*Nb*Nc, 0)
+
+        (see `simulator.py`). `rad_sqr` carries the whole cell and orientation
+        dependence but enters only through a boolean, so the six cell
+        parameters have no gradient path at all. That is mathematically right —
+        a top hat is a step function and its derivative is zero almost
+        everywhere — and it matches nanoBragg.c's binary cutoff, so it is not
+        something to fix by softening the cutoff.
+
+        The problem is that it fails *silently*: `.backward()` does not raise,
+        it returns `None` for exactly these six parameters while every other
+        gradient (detector distance, rotations, two-theta) stays healthy. A
+        refinement loop over cell parameters under `-binary_spots` therefore
+        runs to convergence without ever moving. Measured across shapes at one
+        geometry: SQUARE, ROUND and GAUSS each give 6/6 live cell gradients,
+        TOPHAT gives 0/6. Pinned by tests/test_gradient_health.py.
+        """
+        if getattr(self.config, "shape", None) is None:
+            return
+        if getattr(self.config.shape, "name", "") != "TOPHAT":
+            return
+
+        differentiable = [
+            name
+            for name in ("a", "b", "c", "alpha", "beta", "gamma")
+            if getattr(self, f"cell_{name}").requires_grad
+        ]
+        if not differentiable:
+            return
+
+        warnings.warn(
+            "TOPHAT crystal shape has no gradient path to the cell parameters: "
+            f"cell_{', cell_'.join(differentiable)} require grad but will "
+            "receive grad=None. TOPHAT's lattice factor is a binary cutoff, so "
+            "its derivative w.r.t. the cell is zero almost everywhere (this "
+            "matches nanoBragg.c). Use -gauss_xtal for a differentiable spot "
+            "shape, or refine parameters other than the cell.",
+            UserWarning,
+            stacklevel=3,
+        )
 
     def _validate_cell_parameters(self):
         """Validate cell parameters for numerical stability."""
