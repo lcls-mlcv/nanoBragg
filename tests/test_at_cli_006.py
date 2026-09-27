@@ -305,7 +305,9 @@ def test_pgm_format_compliance():
 
             # Line 3: Comment with scale
             line3 = f.readline().decode().strip()
-            expected_comment = f"# pixels scaled by {pgmscale_value}"
+            # C uses %lg (nanoBragg.c:3233), so match that formatting rather
+            # than Python's default float repr.
+            expected_comment = f"# pixels scaled by {pgmscale_value:g}"
             assert line3 == expected_comment, f"Expected '{expected_comment}', got '{line3}'"
 
             # Line 4: Max value

@@ -896,6 +896,53 @@ def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
             setattr(args, dest, defaults[key])
 
 
+# nanoBragg.c:145-150. C initialises these and writes them unconditionally, so a
+# bare `nanoBragg -cell ... -default_F 100` leaves four files behind.
+C_DEFAULT_FLOATFILE = "floatimage.bin"
+C_DEFAULT_INTFILE = "intimage.img"
+C_DEFAULT_PGMFILE = "image.pgm"
+C_DEFAULT_NOISEFILE = "noiseimage.img"
+
+# Flags that switch an output back on, and the ones that switch it off. C tests
+# these in the argument loop, so the LAST occurrence wins and `-nopgm -pgmfile x`
+# writes the pgm while `-pgmfile x -nopgm` does not (nanoBragg.c:1010-1038).
+_PGM_ENABLERS = ("-pgmfile", "-pgmimage", "-pgmscale")
+_NOISE_ENABLERS = ("-noisefile", "-noiseimage")
+
+
+def resolve_output_files(args: argparse.Namespace):
+    """Resolve the four output filenames and the two enable flags, as C does.
+
+    Returns (floatfile, intfile, pgmfile, noisefile, write_pgm, calculate_noise).
+
+    C keeps `write_pgm` and `calculate_noise` as plain ints initialised to 1 and
+    flips them inside the argv loop, so the result depends on flag order: naming
+    a pgm or noise file re-enables that output even after `-nopgm`/`-nonoise`.
+    Reading `args.nopgm` alone would lose that, which is why this walks `_argv`.
+    """
+    write_pgm = True
+    calculate_noise = True
+
+    for token in getattr(args, "_argv", None) or []:
+        if token in _PGM_ENABLERS:
+            write_pgm = True
+        elif token in _NOISE_ENABLERS:
+            calculate_noise = True
+        elif token == "-nopgm":
+            write_pgm = False
+        elif token == "-nonoise":
+            calculate_noise = False
+
+    return (
+        args.floatfile or C_DEFAULT_FLOATFILE,
+        args.intfile or C_DEFAULT_INTFILE,
+        args.pgmfile or C_DEFAULT_PGMFILE,
+        args.noisefile or C_DEFAULT_NOISEFILE,
+        write_pgm,
+        calculate_noise,
+    )
+
+
 def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     """Parse and validate command-line arguments into configuration."""
 
@@ -1188,12 +1235,17 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     elif args.nointerpolate:
         config['interpolate'] = False
 
-    # Output files
-    config['floatfile'] = args.floatfile
-    config['intfile'] = args.intfile
-    config['pgmfile'] = args.pgmfile
-    config['noisefile'] = args.noisefile
-    config['suppress_noise'] = args.nonoise
+    # Output files. nanoBragg.c initialises all four filenames to defaults
+    # (nanoBragg.c:145-150) and writes them whether or not a flag was given, so
+    # an unflagged run produces four files; torch used to produce none and exit
+    # 0, which made an existing nanoBragg script look like it had succeeded.
+    float_name, int_name, pgm_name, noise_name, write_pgm, calculate_noise = \
+        resolve_output_files(args)
+    config['floatfile'] = float_name
+    config['intfile'] = int_name
+    config['pgmfile'] = pgm_name if write_pgm else None
+    config['noisefile'] = noise_name
+    config['suppress_noise'] = not calculate_noise
     config['scale'] = args.scale
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
@@ -1744,9 +1796,35 @@ def main():
             print(f"Wrote SMV image to {config['intfile']}")
 
         if config.get('pgmfile'):
-            # Write PGM per AT-CLI-006
-            # If pgmscale not provided, default to 1.0 per spec
-            pgmscale = config.get('pgmscale', 1.0) if config.get('pgmscale') is not None else 1.0
+            # UNRESOLVED: the default PGM scale diverges from C, and is left
+            # diverging deliberately pending a ruling.
+            #
+            # C (nanoBragg.c:3203-3206) auto-exposes the preview:
+            #
+            #     if(pgm_scale <= 0.0){
+            #         pgm_scale = intfile_scale;
+            #         if(rmsd > 0.0) pgm_scale = 250.0/(5.0*rmsd);
+            #     }
+            #
+            # torch hardcodes 1.0, citing spec AT-IO-002, and three tests assert
+            # that (test_at_cli_006.py, test_at_io_002.py). While the PGM was
+            # written only on an explicit -pgmfile this was just a poor default;
+            # now that an unflagged run writes one it is what a user sees first.
+            #
+            # Measured on a 32x32 default run -- C auto-selected scale 25.1377
+            # and produced max=182, mean=65.23 over 256 grey levels; torch at
+            # scale 1.0 produced max=7, mean=2.14. Not a blank image, but about
+            # 26x under-exposed, so it renders as near-black.
+            #
+            # The cited spec document is not in this repository, so the "1.0"
+            # claim cannot be checked against its source. C is the accuracy
+            # oracle, which argues for 250/(5*rmsd); three existing tests argue
+            # for 1.0. Changing it is a spec decision, not a code decision, so
+            # the behaviour stays as-is and the conflict is pinned by two strict
+            # xfails in tests/test_cli_output_surface.py.
+            pgmscale = config.get('pgmscale')
+            if pgmscale is None or pgmscale <= 0.0:
+                pgmscale = 1.0
             write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 
