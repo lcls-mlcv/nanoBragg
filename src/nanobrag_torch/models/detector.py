@@ -68,6 +68,33 @@ class Detector:
         # (e.g., after _calculate_pix0_vector updates it based on r-factor)
         self._close_distance_cached: Optional[torch.Tensor] = None
 
+        # Initialize attributes used by pyrefly only if not already set
+        # These will be set properly in _calculate_pix0_vector
+        if not hasattr(self, 'distance_corrected'):
+            self.distance_corrected: Optional[torch.Tensor] = None
+        if not hasattr(self, 'r_factor'):
+            self.r_factor: Optional[torch.Tensor] = None
+
+        self._geometry_version = 0
+        self._pixel_coords_cache: Optional[torch.Tensor] = None
+        self._geometry_fingerprint: Optional[tuple] = None
+        self._recompute_geometry()
+        # Record what the geometry was just derived from, so a config edit made
+        # between construction and the first get_pixel_coords() is still seen.
+        # Leaving this None until the first call would skip that first rebuild.
+        self._geometry_fingerprint = self._current_geometry_fingerprint()
+
+    def _recompute_geometry(self):
+        """Derive every geometry attribute from the current config.
+
+        Beam centres, basis vectors and pix0_vector are plain attributes, not
+        properties, so they do not track later edits to `self.config` the way
+        `distance` and `pixel_size` do. __init__ and `invalidate_cache` both
+        call this, so there is one definition of "geometry derived from config"
+        rather than two that can drift.
+        """
+        config = self.config
+
         # Copy dimension parameters
         self.spixels = config.spixels
         self.fpixels = config.fpixels
@@ -155,24 +182,6 @@ class Detector:
 
         # Calculate and cache pix0_vector (position of first pixel)
         self._calculate_pix0_vector()
-
-        self._pixel_coords_cache: Optional[torch.Tensor] = None
-        self._geometry_version = 0
-        self._cached_basis_vectors = (
-            self.fdet_vec.clone(),
-            self.sdet_vec.clone(),
-            self.odet_vec.clone(),
-        )
-        self._cached_pix0_vector = self.pix0_vector.clone()
-
-        # Initialize attributes used by pyrefly only if not already set
-        # These will be set properly in _calculate_pix0_vector
-        if not hasattr(self, 'distance_corrected'):
-            self.distance_corrected: Optional[torch.Tensor] = None
-        if not hasattr(self, 'r_factor'):
-            self.r_factor: Optional[torch.Tensor] = None
-        if not hasattr(self, 'pix0_vector'):
-            self.pix0_vector: Optional[torch.Tensor] = None
 
     # =========================================================================
     # DBEX-GRADIENT-001: Dynamic properties for geometry parameters
@@ -342,12 +351,61 @@ class Detector:
         self.invalidate_cache()
         return self
 
+    # Config fields the detector geometry is derived from. Anything listed here
+    # is watched by `_current_geometry_fingerprint`; anything missing from here
+    # will go unnoticed when it is edited after construction.
+    _GEOMETRY_FIELDS = (
+        "spixels", "fpixels", "pixel_size_mm",
+        "distance_mm", "close_distance_mm",
+        "beam_center_f", "beam_center_s",
+        "detector_rotx_deg", "detector_roty_deg", "detector_rotz_deg",
+        "detector_twotheta_deg", "twotheta_axis",
+        "detector_convention", "detector_pivot", "curved_detector",
+        "custom_fdet_vector", "custom_sdet_vector", "custom_odet_vector",
+        "custom_beam_vector", "pix0_override_m",
+        "close_center_f_mm", "close_center_s_mm",
+        "beam_center_source",
+    )
+
+    @staticmethod
+    def _fingerprint_key(value):
+        """A comparable key for one config value.
+
+        Tensors contribute both their identity and their contents: identity
+        because a refinement loop that installs a *fresh* leaf holding the same
+        number still needs the cached coordinates rebuilt onto the new graph,
+        and contents because an in-place edit keeps the same object.
+        """
+        if isinstance(value, torch.Tensor):
+            return (id(value), tuple(value.detach().reshape(-1).tolist()))
+        if isinstance(value, (list, tuple)):
+            return tuple(Detector._fingerprint_key(v) for v in value)
+        return value
+
+    def _current_geometry_fingerprint(self) -> tuple:
+        """Snapshot of every config value the derived geometry depends on."""
+        return tuple(
+            self._fingerprint_key(getattr(self.config, name, None))
+            for name in self._GEOMETRY_FIELDS
+        )
+
     def invalidate_cache(self):
-        """Invalidate cached pixel coordinates when geometry changes."""
+        """Rebuild every derived geometry attribute from the current config.
+
+        Previously this reset the pixel-coordinate cache and recomputed only
+        pix0_vector, which could not repair a change to the rotations, the
+        two-theta angle or the beam centre: those feed the basis vectors and
+        the beam-centre pixel conversion, both of which were computed once in
+        __init__ and never again. Measured before this change, mutating
+        `config` and then calling `invalidate_cache()` still returned stale
+        coordinates for detector_rotx/roty/rotz_deg, detector_twotheta_deg,
+        beam_center_f and beam_center_s -- six of the eight geometry fields.
+        """
         self._pixel_coords_cache = None
+        self._geometry_fingerprint = None
         self._geometry_version += 1
-        # Recalculate pix0_vector when geometry changes
-        self._calculate_pix0_vector()
+        self._close_distance_cached = None
+        self._recompute_geometry()
 
     def _apply_mosflm_beam_convention(self):
         """
@@ -818,33 +876,22 @@ class Detector:
         Returns:
             torch.Tensor: Pixel coordinates with shape (spixels, fpixels, 3) in meters
         """
-        # Check if geometry has changed by comparing cached values
-        geometry_changed = False
-        if hasattr(self, "_cached_basis_vectors") and hasattr(
-            self, "_cached_pix0_vector"
-        ):
-            # Check if basis vectors have changed
-            # Move cached vectors to current device and dtype for comparison
-            cached_f = self._cached_basis_vectors[0].to(device=self.device, dtype=self.dtype)
-            cached_s = self._cached_basis_vectors[1].to(device=self.device, dtype=self.dtype)
-            cached_o = self._cached_basis_vectors[2].to(device=self.device, dtype=self.dtype)
+        # Detect a config edit since the cache was filled.
+        #
+        # This used to compare self.fdet_vec / self.pix0_vector against cached
+        # copies of those same attributes. Since nothing recomputed them after
+        # __init__, both sides were the same stale values and the comparison was
+        # tautological: it never fired, so an edit to config was silently
+        # ignored and get_pixel_coords returned the geometry of the *original*
+        # configuration. Compare against the config instead, which is what the
+        # geometry is actually derived from.
+        fingerprint = self._current_geometry_fingerprint()
+        geometry_changed = fingerprint != self._geometry_fingerprint
 
-            if not (
-                torch.allclose(self.fdet_vec, cached_f, atol=1e-15)
-                and torch.allclose(
-                    self.sdet_vec, cached_s, atol=1e-15
-                )
-                and torch.allclose(
-                    self.odet_vec, cached_o, atol=1e-15
-                )
-            ):
-                geometry_changed = True
-            # Check if pix0_vector has changed
-            cached_pix0 = self._cached_pix0_vector.to(device=self.device, dtype=self.dtype)
-            if not torch.allclose(
-                self.pix0_vector, cached_pix0, atol=1e-15
-            ):
-                geometry_changed = True
+        if geometry_changed:
+            # The derived attributes are stale too, not just the coordinates.
+            self._close_distance_cached = None
+            self._recompute_geometry()
 
         if self._pixel_coords_cache is None or geometry_changed:
             if self.config.curved_detector:
@@ -856,13 +903,10 @@ class Detector:
 
             self._pixel_coords_cache = pixel_coords
 
-            # Update cached values for future comparisons
-            self._cached_basis_vectors = (
-                self.fdet_vec.clone(),
-                self.sdet_vec.clone(),
-                self.odet_vec.clone(),
-            )
-            self._cached_pix0_vector = self.pix0_vector.clone()
+            # Record what the cache was built from. Taken after the recompute
+            # above, so an edit made during this call is not mistaken for the
+            # state the cache reflects.
+            self._geometry_fingerprint = self._current_geometry_fingerprint()
             self._geometry_version += 1
 
         return self._pixel_coords_cache
