@@ -129,18 +129,24 @@ def test_autoscale_without_scale_flag():
         # Allow for rounding errors
         assert 54900 <= max_int <= 55100, f"Max int value {max_int} not near 55,000"
 
-        # Verify the scaling relationship
-        # With ADC=40, scale should be (55000 - 40) / max_float
-        expected_scale = (55000 - 40) / max_float if max_float > 0 else 1.0
+        # C: intfile_scale = 55000.0/max_I (nanoBragg.c:3149), and adc_offset is
+        # added per pixel AFTERWARDS (:3164). This previously expected
+        # (55000 - adc)/max_float, folding the offset into the scale, which made
+        # every pixel disagree with C -- measured 1024/1024 differing on a default
+        # 32x32 run, max |delta| = 41 counts. With the formula corrected and the
+        # rounding below, intimage.img pixel data is byte-identical to the oracle.
+        expected_scale = 55000.0 / max_float if max_float > 0 else 1.0
 
-        # Check a few pixels
+        # Check a few pixels. C rounds: (unsigned short)(floorf(test + 0.5)).
         for i in range(min(5, float_data.size)):
             flat_idx = i
             float_val = float_data.flat[flat_idx]
             int_val = int_data.flat[flat_idx]
 
             if float_val > 1e-10:  # Non-zero pixel
-                expected_int = min(65535, int(float_val * expected_scale + 40))
+                expected_int = min(
+                    65535, int(np.floor(float_val * expected_scale + 40 + 0.5))
+                )
                 assert abs(int_val - expected_int) <= 1, f"Pixel {i}: expected {expected_int}, got {int_val}"
 
 
@@ -175,14 +181,18 @@ def test_explicit_scale_flag():
         float_data = read_float_image(floatfile, (10, 10))
         int_data, _ = read_smv_data(intfile)
 
-        # Verify scaling formula: integer pixel = floor(min(65535, float*scale + adc))
+        # C rounds rather than truncates: intimage = (unsigned short int)
+        # (floorf(test + 0.5)) at nanoBragg.c:3167. This previously expected
+        # truncation via int(), a systematic -0.5 ADU bias on every pixel.
         for i in range(10):
             for j in range(10):
                 float_val = float_data[i, j]
                 int_val = int_data[i, j]
 
                 if float_val > 1e-10:  # Non-zero pixel
-                    expected = min(65535, int(float_val * scale_value + adc_value))
+                    expected = min(
+                        65535, int(np.floor(float_val * scale_value + adc_value + 0.5))
+                    )
                     assert int_val == expected, f"Pixel ({i},{j}): expected {expected}, got {int_val}"
                 else:
                     # Zero pixels should remain zero (ROI behavior)

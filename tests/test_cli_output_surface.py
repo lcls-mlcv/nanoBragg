@@ -57,6 +57,10 @@ CASES = [
     ("nonoise-then-noisefile", ["-nonoise", "-noisefile", "custom_noise.img"]),
     ("noisefile-then-nonoise", ["-noisefile", "custom_noise.img", "-nonoise"]),
     ("explicit-floatfile-only", ["-floatfile", "custom_float.bin"]),
+    # A single-pixel ROI drives rmsd to 0, which is the PGM auto-exposure's
+    # fallback branch. That branch was wrong (it used 1.0 where C uses the
+    # resolved integer-image scale) and no case here exercised it.
+    ("roi-single-pixel", ["-roi", "17", "17", "17", "17"]),
 ]
 
 
@@ -231,4 +235,57 @@ def test_default_pgm_uses_most_of_the_grey_range(tmp_path):
         f"default PGM peaks at {max(body)} of 255 — the preview is "
         f"under-exposed because the auto-scale is not applied (C uses "
         f"250/(5*rmsd) and reaches 182 on this run)"
+    )
+
+
+@pytest.mark.parametrize(
+    "extra,label",
+    [([], "defaults"), (["-roi", "17", "17", "17", "17"], "roi-single-pixel"),
+     (["-scale", "3"], "explicit-scale")],
+    ids=["defaults", "roi-single-pixel", "explicit-scale"],
+)
+def test_intimage_pixels_match_c(extra, label, tmp_path):
+    """Integer-image PIXEL data must match C exactly.
+
+    Only the pixels: the 512-byte SMV header still diverges from C on a separate,
+    already-catalogued finding (C writes the beam centre in mm, torch in pixels --
+    `ADXV_CENTER_*`, `MOSFLM_CENTER_*`, `DENZO_*_BEAM` -- plus numeric formatting
+    and `BEAMLINE=`). That is out of scope here; this pins the arithmetic.
+
+    Before the scale/rounding fix, all 1024 pixels of a default run disagreed with
+    C by up to 41 counts, because the adc offset was folded into the scale
+    ((55000-adc)/max instead of C's 55000/max) and the result was truncated
+    instead of rounded.
+    """
+    import numpy as np
+
+    args = BASE_ARGS + extra
+    c_dir = tmp_path / "c"
+    py_dir = tmp_path / "py"
+    c_dir.mkdir()
+    py_dir.mkdir()
+
+    assert run_in(c_dir, [c_binary()] + args).returncode == 0
+
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT / "src")
+    env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+    env["NANOBRAGG_DISABLE_COMPILE"] = "1"
+    assert subprocess.run(
+        [sys.executable, "-m", "nanobrag_torch"] + args,
+        cwd=str(py_dir), capture_output=True, text=True, timeout=300, env=env,
+    ).returncode == 0
+
+    def pixels(path):
+        return np.frombuffer(path.read_bytes()[512:], dtype=np.uint16)
+
+    c_px = pixels(c_dir / "intimage.img")
+    py_px = pixels(py_dir / "intimage.img")
+
+    assert len(c_px) == len(py_px)
+    differing = int((c_px != py_px).sum())
+    worst = int(np.abs(c_px.astype(int) - py_px.astype(int)).max()) if differing else 0
+    assert differing == 0, (
+        f"{label}: {differing}/{len(c_px)} integer pixels differ from C, "
+        f"max |delta| = {worst} counts (C peak {c_px.max()}, torch peak {py_px.max()})"
     )

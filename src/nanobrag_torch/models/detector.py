@@ -389,6 +389,36 @@ class Detector:
             for name in self._GEOMETRY_FIELDS
         )
 
+    def _ensure_geometry_current(self) -> bool:
+        """Rebuild the derived geometry if the config has changed since last time.
+
+        Returns True when a rebuild happened, so callers can also drop whatever
+        they cached off the back of the old geometry. Every public entry point
+        that reads a derived attribute should go through this; `distance` and
+        `pixel_size` are properties and need no help, but `pix0_vector`, the
+        basis vectors and the beam centres in pixels are plain attributes.
+        """
+        fingerprint = self._current_geometry_fingerprint()
+        if fingerprint == self._geometry_fingerprint:
+            return False
+
+        self._close_distance_cached = None
+        # Drop the coordinate cache here, not at the call site. This method can
+        # be reached more than once per logical change -- Simulator calls it, then
+        # get_pixel_coords calls it again -- and only the first call sees a
+        # fingerprint mismatch. Leaving the cache for the caller to clear meant
+        # the second call reported "current" and handed back coordinates built
+        # from the previous geometry, even though pix0_vector had been rebuilt.
+        self._pixel_coords_cache = None
+        self._recompute_geometry()
+        # Re-record after recomputing, not before: _calculate_pix0_vector can
+        # write derived state back onto the config (the r-factor path), so the
+        # fingerprint has to be taken from the settled state or the next call
+        # would rebuild again for no reason.
+        self._geometry_fingerprint = self._current_geometry_fingerprint()
+        self._geometry_version += 1
+        return True
+
     def invalidate_cache(self):
         """Rebuild every derived geometry attribute from the current config.
 
@@ -402,10 +432,13 @@ class Detector:
         beam_center_f and beam_center_s -- six of the eight geometry fields.
         """
         self._pixel_coords_cache = None
-        self._geometry_fingerprint = None
-        self._geometry_version += 1
         self._close_distance_cached = None
         self._recompute_geometry()
+        # Re-record rather than clearing to None. Clearing left the fingerprint
+        # unset, so the next get_pixel_coords() ran a second, redundant full
+        # recompute (~96 us at 1024^2) before settling.
+        self._geometry_fingerprint = self._current_geometry_fingerprint()
+        self._geometry_version += 1
 
     def _apply_mosflm_beam_convention(self):
         """
@@ -885,13 +918,7 @@ class Detector:
         # ignored and get_pixel_coords returned the geometry of the *original*
         # configuration. Compare against the config instead, which is what the
         # geometry is actually derived from.
-        fingerprint = self._current_geometry_fingerprint()
-        geometry_changed = fingerprint != self._geometry_fingerprint
-
-        if geometry_changed:
-            # The derived attributes are stale too, not just the coordinates.
-            self._close_distance_cached = None
-            self._recompute_geometry()
+        geometry_changed = self._ensure_geometry_current()
 
         if self._pixel_coords_cache is None or geometry_changed:
             if self.config.curved_detector:
@@ -902,12 +929,6 @@ class Detector:
                 pixel_coords = self._compute_planar_pixel_coords()
 
             self._pixel_coords_cache = pixel_coords
-
-            # Record what the cache was built from. Taken after the recompute
-            # above, so an edit made during this call is not mistaken for the
-            # state the cache reflects.
-            self._geometry_fingerprint = self._current_geometry_fingerprint()
-            self._geometry_version += 1
 
         return self._pixel_coords_cache
 
@@ -1042,6 +1063,15 @@ class Detector:
         Returns:
             torch.Tensor: Pixel coordinates with shape (spixels, fpixels, 3) in meters
         """
+        # Must honour a config edit too. This used to call straight through to
+        # the computation, which reads the derived pix0_vector and basis vectors
+        # -- so it returned the geometry of the original configuration. The
+        # simulator uses this entry point whenever curved_detector is set, which
+        # meant curved detectors kept the exact staleness bug the rest of this
+        # class now guards against. Measured with curved_detector=True and
+        # distance 100 -> 200: this returned x = 0.100 while get_pixel_coords()
+        # correctly returned 0.200.
+        self._ensure_geometry_current()
         return self._compute_planar_pixel_coords()
 
     def thickness_layers(self):

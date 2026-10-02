@@ -918,10 +918,22 @@ def resolve_output_files(args: argparse.Namespace):
     C keeps `write_pgm` and `calculate_noise` as plain ints initialised to 1 and
     flips them inside the argv loop, so the result depends on flag order: naming
     a pgm or noise file re-enables that output even after `-nopgm`/`-nonoise`.
-    Reading `args.nopgm` alone would lose that, which is why this walks `_argv`.
+    Reading `args.nopgm` alone would lose that, which is why this also walks
+    `_argv`.
+
+    But it must not depend on `_argv` alone. `_argv` is set by `main()` from
+    sys.argv; a programmatic caller building a namespace with
+    `create_parser().parse_args([...])` has no `_argv`, and an earlier version of
+    this function silently ignored `-nonoise` for every such caller. The parsed
+    flags therefore seed the values, and `_argv` only refines the ordering.
+
+    One documented deviation: C tests these with `strstr`, so a token that merely
+    *contains* a flag -- a filename like `out-nopgm.bin` -- disables the PGM
+    under C. torch compares exactly. Too obscure to reproduce deliberately, but
+    it is a real difference.
     """
-    write_pgm = True
-    calculate_noise = True
+    write_pgm = not getattr(args, "nopgm", False)
+    calculate_noise = not getattr(args, "nonoise", False)
 
     for token in getattr(args, "_argv", None) or []:
         if token in _PGM_ENABLERS:
@@ -1748,19 +1760,24 @@ def main():
             data.tofile(config['floatfile'])
             print(f"Wrote float image to {config['floatfile']}")
 
+        # Resolve the integer-image scale once, before either the int or the PGM
+        # block, because C does: nanoBragg.c:3147-3150 settles intfile_scale
+        # ahead of the PGM block at :3204, which falls back to it when rmsd is 0.
+        adc_offset = config.get('adc', 40.0)
+        intfile_scale = config.get('scale')
+        if not intfile_scale or intfile_scale <= 0:
+            # C: intfile_scale = 1.0; if(max_I > 0) intfile_scale = 55000.0/max_I
+            # Note 55000/max, NOT (55000 - adc)/max, which is what this used to
+            # compute -- the adc offset is added per pixel afterwards, so folding
+            # it into the scale made every pixel disagree with C. Measured on a
+            # default 32x32 run before this fix: 1024/1024 pixels differed,
+            # max |delta| = 41 counts, C peak 55040 against torch 55000.
+            max_val = intensity.max().item()
+            intfile_scale = 55000.0 / max_val if max_val > 0 else 1.0
+
         if config.get('intfile'):
             # Scale and write SMV per AT-CLI-006
-            scale = config.get('scale')
-            adc_offset = config.get('adc', 40.0)
-
-            if not scale or scale <= 0:
-                # Auto-scale: map max float pixel to approximately 55,000 counts
-                max_val = intensity.max().item()
-                if max_val > 0:
-                    # Calculate scale to achieve 55000 after adding ADC
-                    scale = (55000.0 - adc_offset) / max_val if adc_offset < 55000 else 55000.0 / max_val
-                else:
-                    scale = 1.0
+            scale = intfile_scale
 
             # Apply scaling per spec: integer pixel = floor(min(65535, float*scale + adc))
             # Only apply to non-zero pixels (AT-CLI-005)
@@ -1772,9 +1789,16 @@ def main():
             scaled = intensity * scale + adc_offset
             # Only apply scaling where intensity > 0 (inside ROI)
             scaled = torch.where(roi_mask, scaled, torch.zeros_like(scaled))
-            # Clip to valid range and floor
+            # C rounds: intimage = (unsigned short)(floorf(test + 0.5))
+            # (nanoBragg.c:3167). This used to truncate, a systematic -0.5 ADU
+            # bias on every pixel. floor(x + 0.5) is round-half-UP, which is not
+            # torch.round's round-half-to-even, so spell it out.
             scaled = scaled.clip(0, 65535)
-            scaled_int = torch.floor(scaled).to(torch.int16).cpu().numpy().astype(np.uint16)
+            # int32 then uint16: the old int16 cast relied on two's-complement
+            # wrapping for values above 32767 and happened to round-trip.
+            scaled_int = (
+                torch.floor(scaled + 0.5).to(torch.int32).cpu().numpy().astype(np.uint16)
+            )
 
             write_smv(
                 filepath=config['intfile'],
@@ -1823,10 +1847,13 @@ def main():
                 if rmsd > 0.0:
                     pgmscale = 250.0 / (5.0 * rmsd)
                 else:
-                    # C falls back to the resolved intfile scale when rmsd is 0
-                    # (a uniform image), which is 1.0 unless -scale was given.
-                    scale = config.get('scale')
-                    pgmscale = scale if scale and scale > 0 else 1.0
+                    # rmsd == 0 (a uniform image, or a single-pixel ROI). C falls
+                    # back to the *resolved* intfile_scale, which is already
+                    # 55000/max_I by this point -- not 1.0, which is what an
+                    # earlier version of this comment claimed. Measured with
+                    # -roi 17 17 17 17 (one pixel, so rmsd is 0 in both): C wrote
+                    # "# pixels scaled by 7570.47" where torch wrote 1.
+                    pgmscale = intfile_scale
             write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 

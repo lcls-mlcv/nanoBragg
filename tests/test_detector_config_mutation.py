@@ -168,3 +168,96 @@ def test_fresh_leaf_with_the_same_value_rebuilds_the_graph():
     )
     coords_b.sum().backward()
     assert second_leaf.grad is not None, "gradient did not reach the new leaf"
+
+
+# --- Entry points other than get_pixel_coords -------------------------------
+
+
+def test_geometry_fields_are_real_dataclass_fields():
+    """A typo in _GEOMETRY_FIELDS would silently stop watching a field.
+
+    `_current_geometry_fingerprint` reads with `getattr(..., None)`, so a renamed
+    or misspelled entry degrades to "always None" rather than raising — which is
+    the same silent staleness this module exists to prevent.
+    """
+    import dataclasses
+
+    real = {f.name for f in dataclasses.fields(DetectorConfig)}
+    watched = set(Detector._GEOMETRY_FIELDS)
+    assert watched <= real, f"not DetectorConfig fields: {sorted(watched - real)}"
+
+
+def test_curved_detector_planar_coords_follow_config():
+    """get_planar_pixel_coords() is the simulator's curved-mode entry point.
+
+    It bypassed the fingerprint entirely, so curved detectors kept the staleness
+    bug: it reads the derived pix0_vector and basis vectors directly.
+    """
+    det = Detector(DetectorConfig(**BASE, curved_detector=True))
+    before = det.get_planar_pixel_coords().clone()
+
+    det.config.distance_mm = 200.0
+    after = det.get_planar_pixel_coords()
+
+    assert not torch.allclose(before, after), (
+        "get_planar_pixel_coords() ignored a config edit — curved detectors are "
+        "still using stale geometry"
+    )
+
+
+def test_simulator_picks_up_detector_config_mutation():
+    """The Simulator snapshots pixel coords, so the fix has to reach it too.
+
+    Before this, mutating the detector config and re-running the *same* Simulator
+    returned a bit-identical image — the exact mutate-then-rerun pattern that
+    finite-difference checks and config-writing optimizers use.
+    """
+    from nanobrag_torch.config import BeamConfig, CrystalConfig
+    from nanobrag_torch.models import Crystal
+    from nanobrag_torch.simulator import Simulator
+
+    ccfg = CrystalConfig(
+        cell_a=100.0, cell_b=100.0, cell_c=100.0,
+        cell_alpha=90.0, cell_beta=90.0, cell_gamma=90.0,
+        default_F=100.0, N_cells=(3, 3, 3),
+    )
+    det = Detector(DetectorConfig(**BASE))
+    sim = Simulator(
+        Crystal(ccfg), det, crystal_config=ccfg,
+        beam_config=BeamConfig(wavelength_A=6.2, fluence=1e24),
+    )
+
+    first = sim.run(oversample=1).sum().item()
+    det.config.distance_mm = 200.0
+    second = sim.run(oversample=1).sum().item()
+
+    assert first != second, (
+        f"same Simulator returned {second} after the detector distance doubled; "
+        f"it is still reading the snapshot taken at construction"
+    )
+
+    fresh_det = Detector(DetectorConfig(**{**BASE, "distance_mm": 200.0}))
+    fresh = Simulator(
+        Crystal(ccfg), fresh_det, crystal_config=ccfg,
+        beam_config=BeamConfig(wavelength_A=6.2, fluence=1e24),
+    ).run(oversample=1).sum().item()
+
+    assert second == pytest.approx(fresh, rel=1e-12), (
+        f"mutated Simulator gives {second}, freshly built gives {fresh}"
+    )
+
+
+def test_invalidate_cache_does_not_leave_a_redundant_recompute():
+    """invalidate_cache() used to clear the fingerprint, forcing a second rebuild."""
+    det = Detector(DetectorConfig(**BASE))
+    det.get_pixel_coords()
+
+    det.config.distance_mm = 200.0
+    det.invalidate_cache()
+    version_after_invalidate = det._geometry_version
+
+    det.get_pixel_coords()
+    assert det._geometry_version == version_after_invalidate, (
+        "get_pixel_coords() rebuilt the geometry again after invalidate_cache() "
+        "had already done it"
+    )

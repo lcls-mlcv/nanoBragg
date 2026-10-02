@@ -7,6 +7,7 @@ Detector objects as input and producing the final diffraction pattern.
 
 from typing import Optional, Callable
 
+import math
 import os
 import torch
 
@@ -655,11 +656,7 @@ class Simulator:
         # position. So in curved mode the cache holds planar centres and the curved mapping is
         # applied downstream, after the offsets have been added.
         self._curved_detector = bool(getattr(self.detector.config, "curved_detector", False))
-        if self._curved_detector:
-            _pixel_coords = self.detector.get_planar_pixel_coords()
-        else:
-            _pixel_coords = self.detector.get_pixel_coords()
-        self._cached_pixel_coords_meters = _pixel_coords.to(device=self.device, dtype=self.dtype)
+        self._refresh_pixel_coords()
 
         # Build ROI mask once and cache it (AT-ROI-001)
         # Start with all pixels enabled
@@ -1119,6 +1116,37 @@ class Simulator:
             capture_fraction_for_trace,
         )
 
+    def _refresh_pixel_coords(self) -> None:
+        """Re-read the detector's pixel coordinates into the local cache."""
+        if self._curved_detector:
+            coords = self.detector.get_planar_pixel_coords()
+        else:
+            coords = self.detector.get_pixel_coords()
+        self._cached_pixel_coords_meters = coords.to(device=self.device, dtype=self.dtype)
+        self._pixel_coords_geometry_version = self.detector._geometry_version
+
+    def _ensure_pixel_coords_current(self) -> None:
+        """Pick up a detector geometry change made after this Simulator was built.
+
+        The Simulator snapshots pixel coordinates in __init__ and `run()` reads
+        only that snapshot, so editing `detector.config` and re-running the *same*
+        Simulator used to return the old geometry bit-for-bit -- the detector's
+        own cache was fixed, but this copy was not. Measured before this change:
+        a Detector+Simulator at 100 mm summed to 126.0028, and after setting
+        `config.distance_mm = 200.0` the same Simulator still summed to exactly
+        126.0028, where a freshly built one gives 73.9102.
+
+        That is precisely the mutate-then-rerun pattern finite-difference checks
+        and config-writing optimizers use, so it follows the detector's
+        `_geometry_version` rather than asking callers to rebuild.
+        """
+        # Touch the detector's own guard first, so its version is up to date.
+        self.detector._ensure_geometry_current()
+        if self.detector._geometry_version != getattr(
+            self, "_pixel_coords_geometry_version", None
+        ):
+            self._refresh_pixel_coords()
+
     def run(
         self,
         pixel_batch_size: Optional[int] = None,
@@ -1196,6 +1224,8 @@ class Simulator:
         Returns:
             torch.Tensor: Final diffraction image with shape (spixels, fpixels).
         """
+        self._ensure_pixel_coords_current()
+
         # Unified vectorization path (spec-compliant fresh rotations)
         # Get oversampling parameters from detector config if not provided
         if oversample is None:
@@ -2329,12 +2359,18 @@ class Simulator:
         # Compute RMS = sqrt(sum(pixel^2)/(N - 1))
         # Note: Using N-1 for unbiased estimate per spec
         if N > 1:
+            # math.sqrt on the Python float rather than torch.sqrt(torch.tensor(x)):
+            # the latter builds a tensor in the default dtype, which is float32,
+            # so a float64 sum was rounded to ~7 significant digits on its way
+            # back out. RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the
+            # PGM is byte-compared against C, where a boundary pixel could flip on
+            # that rounding.
             sum_sq = (masked_pixels ** 2).sum().item()
-            RMS = torch.sqrt(torch.tensor(sum_sq / (N - 1))).item()
+            RMS = math.sqrt(sum_sq / (N - 1))
 
             # Compute RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
             sum_dev_sq = ((masked_pixels - mean) ** 2).sum().item()
-            RMSD = torch.sqrt(torch.tensor(sum_dev_sq / (N - 1))).item()
+            RMSD = math.sqrt(sum_dev_sq / (N - 1))
         else:
             # N=1 case: avoid division by zero
             RMS = masked_pixels[0].item()
