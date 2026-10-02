@@ -8,6 +8,8 @@ Detector objects as input and producing the final diffraction pattern.
 from typing import Optional, Callable
 
 import os
+import warnings
+
 import torch
 
 from .config import BeamConfig, CrystalConfig, CrystalShape, SpotMetric
@@ -1119,6 +1121,65 @@ class Simulator:
             capture_fraction_for_trace,
         )
 
+    def _warn_if_tophat_severs_cell_gradients(self) -> None:
+        """Warn once when TOPHAT leaves differentiable cell parameters with no path.
+
+        TOPHAT's lattice factor is a hard binary cutoff,
+        `where(rad_sqr * fudge < 0.3969, Na*Nb*Nc, 0)`, so `rad_sqr` -- which
+        carries the cell and orientation dependence -- reaches F_latt only
+        through a boolean. That is mathematically right (a top hat is a step
+        function, derivative zero almost everywhere) and matches nanoBragg.c, so
+        it is not something to fix by softening the cutoff.
+
+        But it severs F_latt's cell dependence, not the intensity's. With
+        I = (F_cell * F_latt)^2, an *interpolated* hkl lookup evaluates F_cell at
+        fractional h,k,l derived from the cell, which keeps the cell gradients
+        alive and comparable to GAUSS's. So the warning is conditional on the
+        F_cell source, and it lives here rather than in Crystal.__init__ because
+        `hkl_data` and `interpolate` are both set after the Crystal is built --
+        checking at construction time would warn in exactly the configuration
+        where TOPHAT cell refinement works.
+
+        Interpolation auto-enables whenever any N_cells <= 2 (mirroring C), so
+        the live path needs no flag.
+        """
+        if getattr(self, "_tophat_gradient_warning_issued", False):
+            return
+
+        shape = getattr(self.crystal.config, "shape", None)
+        if shape is None or getattr(shape, "name", "") != "TOPHAT":
+            return
+
+        # An interpolated structure-factor lookup keeps the cell in the graph.
+        if getattr(self.crystal, "hkl_data", None) is not None and getattr(
+            self.crystal, "interpolate", False
+        ):
+            return
+
+        differentiable = [
+            name
+            for name in ("a", "b", "c", "alpha", "beta", "gamma")
+            if getattr(self.crystal, f"cell_{name}", None) is not None
+            and getattr(self.crystal, f"cell_{name}").requires_grad
+        ]
+        if not differentiable:
+            return
+
+        self._tophat_gradient_warning_issued = True
+        warnings.warn(
+            "TOPHAT crystal shape has no gradient path to the cell parameters "
+            f"for this configuration: cell_{', cell_'.join(differentiable)} "
+            "require grad but will not receive one. TOPHAT's lattice factor is a "
+            "binary cutoff, so its derivative with respect to the cell is zero "
+            "almost everywhere (this matches nanoBragg.c). If these are the only "
+            "differentiable parameters, backward() will raise rather than return "
+            "None. Use -gauss_xtal for a differentiable spot shape, or supply "
+            "structure factors with -hkl and interpolation enabled, which keeps "
+            "the cell in the graph through F_cell.",
+            UserWarning,
+            stacklevel=3,
+        )
+
     def run(
         self,
         pixel_batch_size: Optional[int] = None,
@@ -1196,6 +1257,8 @@ class Simulator:
         Returns:
             torch.Tensor: Final diffraction image with shape (spixels, fpixels).
         """
+        self._warn_if_tophat_severs_cell_gradients()
+
         # Unified vectorization path (spec-compliant fresh rotations)
         # Get oversampling parameters from detector config if not provided
         if oversample is None:

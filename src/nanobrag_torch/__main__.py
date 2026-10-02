@@ -1719,12 +1719,9 @@ def main():
         crystal_config = bundle.crystal_config
         detector_config = bundle.detector_config
         beam_config = bundle.beam_config
-        detector = bundle.detector
         simulator = bundle.simulator
         dtype = bundle.dtype
         device = bundle.device
-        convention = detector_config.detector_convention
-        pixel_size_mm = detector_config.pixel_size_mm
 
         # Print configuration if requested
         if args.show_config:

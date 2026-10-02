@@ -46,8 +46,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # chosen to cover the distinct code paths rather than to be fast.
 SMOKE_CASES = {
     "AT-PARALLEL-001-detpixels-64",
-    "AT-PARALLEL-004-mosflm-default",
-    "AT-PARALLEL-012-triclinic",
+    "AT-PARALLEL-004-mosflm",
+    "AT-PARALLEL-012-simple_cubic",
+    "PARITY-SHAPE-001-tophat",
 }
 
 # Configurations where a parameter legitimately has no gradient. Each entry is
@@ -57,15 +58,28 @@ SMOKE_CASES = {
 # either way.
 #
 # TOPHAT: `F_latt` is `torch.where(rad_sqr * fudge < 0.3969, Na*Nb*Nc, 0)`
-# (simulator.py). `rad_sqr` carries the whole cell/orientation dependence but
-# enters only through a boolean, so the six cell parameters have no gradient
-# path. That is mathematically right — a top hat is a step function, its
-# derivative is zero almost everywhere — and it matches nanoBragg.c's binary
-# cutoff. It is recorded rather than fixed because "fixing" it means softening
-# the cutoff, which would be a deliberate divergence from the C oracle. The
-# trap for callers is that `.backward()` does not raise: it silently returns
-# `None` for exactly these six parameters while every other gradient stays
-# healthy.
+# (simulator.py:366-369). `rad_sqr` carries the cell/orientation dependence but
+# enters only through a boolean, so F_latt contributes no cell gradient. That is
+# mathematically right — a top hat is a step function, its derivative is zero
+# almost everywhere — and it matches nanoBragg.c's binary cutoff, so it is
+# recorded rather than fixed: "fixing" it means softening the cutoff, a
+# deliberate divergence from the C oracle.
+#
+# IMPORTANT, and initially got wrong here: this severs F_latt's cell dependence,
+# not the whole intensity's. I = (F_cell * F_latt)^2, and when F_cell comes from
+# an *interpolated* hkl lookup it is evaluated at fractional h,k,l derived from
+# the cell, so the cell gradients are live and comparable to GAUSS's (measured
+# d/d cell_a = -8.84e-05 for TOPHAT against -8.30e-05 for GAUSS on the same
+# geometry). Interpolation auto-enables whenever any N_cells <= 2, so that path
+# needs no flag. `_cell_reaches_f_cell` encodes the distinction.
+#
+# How it fails when the cell genuinely is severed depends on what else is
+# differentiable. With another live parameter (any detector term, as this sweep
+# always installs) the backward pass succeeds and returns `None` for the six cell
+# parameters. With *only* cell parameters differentiable the loss has no
+# grad_fn at all and `.backward()` raises RuntimeError. The original audit
+# finding said "graph-less image, so .backward() raises" and was right; an
+# earlier version of this comment claimed otherwise.
 TOPHAT_DEAD_CELL_PARAMS = frozenset(
     {"cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma"}
 )
@@ -88,6 +102,18 @@ class ParamSpec:
     owner: str  # "crystal" | "detector" | "beam"
     field: str
     nudge: float = 0.0
+
+
+# KNOWN LIMIT of the nudges below: every case is evaluated 1 degree off a 90
+# degree cell angle and 0.5 degrees off an unrotated, zero-twotheta detector. So
+# the sweep does NOT evaluate exactly-orthogonal geometry, and cannot catch a
+# gradient bug that appears only there. The nudges exist because at an exact
+# stationary point a true zero gradient is indistinguishable from a dead graph,
+# which would make the dead-parameter assertions meaningless. The honest
+# description is "the parity geometries, perturbed off their stationary points",
+# not "every configuration the parity matrix exercises". Exactly-degenerate
+# geometry is covered by construction instead, in
+# test_degenerate_geometry_gradient_health below.
 
 
 PARAMS: List[ParamSpec] = [
@@ -149,8 +175,20 @@ def pytest_generate_tests(metafunc):
         return
 
     runs = load_parity_runs()
+
+    # A mistyped id used to degrade silently to `runs[:1]`, so the default suite
+    # ran one arbitrary case while claiming to cover one geometry per family.
+    # Two of the three original ids did not exist. Fail loudly instead.
+    known = {r[0] for r in runs}
+    missing = SMOKE_CASES - known
+    assert not missing, (
+        f"SMOKE_CASES names runs that are not in parity_cases.yaml: "
+        f"{sorted(missing)} — fix the ids rather than letting the default "
+        f"suite quietly shrink"
+    )
+
     if not sweep_enabled():
-        runs = [r for r in runs if r[0] in SMOKE_CASES] or runs[:1]
+        runs = [r for r in runs if r[0] in SMOKE_CASES]
 
     metafunc.parametrize("grad_case", runs, ids=[r[0] for r in runs])
 
@@ -168,15 +206,13 @@ def _shrink(argv: List[str], max_pixels: int = 64) -> List[str]:
     """
     out = list(argv)
     for flag in ("-detpixels", "-detpixels_f", "-detpixels_s"):
-        while flag in out:
+        if flag in out:
             i = out.index(flag)
             if i + 1 < len(out):
                 try:
                     out[i + 1] = str(min(int(out[i + 1]), max_pixels))
                 except ValueError:
                     pass
-            # Only the first occurrence needs rewriting; break to avoid a loop.
-            break
     return out
 
 
@@ -234,11 +270,33 @@ def _expected_dead(leaves: Dict[str, torch.Tensor], bundle) -> set:
     if "close_distance_mm" in leaves:
         dead.add("distance_mm")
 
+    # TOPHAT severs the cell dependence of F_latt, but NOT of F_cell. When the
+    # structure factors come from an interpolated hkl lookup, F_cell is
+    # evaluated at fractional h,k,l derived from the cell, so the cell
+    # gradients are alive and of the same magnitude as GAUSS's. Waiving them on
+    # shape alone would fail the sweep on correct behaviour.
     shape = getattr(bundle.crystal_config, "shape", None)
     if shape is not None and getattr(shape, "name", "") == "TOPHAT":
-        dead |= {n for n in TOPHAT_DEAD_CELL_PARAMS if n in leaves}
+        if not _cell_reaches_f_cell(bundle.crystal):
+            dead |= {n for n in TOPHAT_DEAD_CELL_PARAMS if n in leaves}
 
     return dead
+
+
+def _cell_reaches_f_cell(crystal) -> bool:
+    """Whether F_cell carries a cell dependence for this crystal.
+
+    True only for an interpolated hkl lookup: tricubic interpolation evaluates
+    at fractional h,k,l, which are functions of the cell. A flat `default_F` is
+    a constant, and a nearest-neighbour lookup rounds h,k,l to integers, which
+    is non-differentiable in the same way the TOPHAT cutoff is.
+
+    Note `interpolate` auto-enables for small crystals (any N_cells <= 2,
+    mirroring nanoBragg.c), so this path is reachable with no flag at all.
+    """
+    if getattr(crystal, "hkl_data", None) is None:
+        return False
+    return bool(getattr(crystal, "interpolate", False))
 
 
 # --- The test --------------------------------------------------------------
@@ -375,61 +433,139 @@ def test_degenerate_geometry_gradient_health(case):
     )
 
 
+
+
 # --- The TOPHAT warning ----------------------------------------------------
+#
+# The warning lives on Simulator and fires at run() time, not in
+# Crystal.__init__: `hkl_data` and `interpolate` are both set after the Crystal
+# is built, so a construction-time check would warn in exactly the configuration
+# where TOPHAT cell refinement works.
+
+HKL_INTERP = REPO_ROOT / "tests" / "golden_data" / "P1_interp.hkl"
 
 
-def _tophat_crystal(requires_grad: bool):
-    from nanobrag_torch.config import CrystalConfig, CrystalShape
+def _tophat_sim(shape_name="TOPHAT", requires_grad=True, hkl=False, interpolate=None,
+                n_cells=(5, 5, 5)):
+    from nanobrag_torch.config import (
+        BeamConfig, CrystalConfig, CrystalShape, DetectorConfig,
+    )
     from nanobrag_torch.models import Crystal
+    from nanobrag_torch.models.detector import Detector
+    from nanobrag_torch.simulator import Simulator
 
     def cell(v):
         return (
             torch.tensor(v, dtype=torch.float64, requires_grad=True)
-            if requires_grad
-            else v
+            if requires_grad else v
         )
 
-    return lambda: Crystal(
-        CrystalConfig(
-            cell_a=cell(100.0), cell_b=cell(100.0), cell_c=cell(100.0),
-            cell_alpha=cell(90.0), cell_beta=cell(90.0), cell_gamma=cell(90.0),
-            default_F=100.0, N_cells=(5, 5, 5), shape=CrystalShape.TOPHAT,
-        ),
+    cfg = CrystalConfig(
+        cell_a=cell(20.0), cell_b=cell(20.0), cell_c=cell(20.0),
+        cell_alpha=cell(89.0), cell_beta=cell(89.0), cell_gamma=cell(89.0),
+        default_F=100.0, N_cells=n_cells, shape=CrystalShape[shape_name],
+    )
+    crystal = Crystal(cfg, dtype=torch.float64)
+    if hkl:
+        from nanobrag_torch.io.hkl import read_hkl_file
+        arr, meta = read_hkl_file(str(HKL_INTERP))
+        crystal.hkl_data = (
+            arr if isinstance(arr, torch.Tensor)
+            else torch.tensor(arr, dtype=torch.float64)
+        )
+        crystal.hkl_metadata = meta
+    if interpolate is not None:
+        crystal.interpolate = interpolate
+
+    detector = Detector(
+        DetectorConfig(distance_mm=100.0, pixel_size_mm=0.1, spixels=16, fpixels=16),
         dtype=torch.float64,
+    )
+    return Simulator(
+        crystal, detector, crystal_config=cfg,
+        beam_config=BeamConfig(wavelength_A=1.0, fluence=1e24), dtype=torch.float64,
     )
 
 
 def test_tophat_warns_when_cell_parameters_require_grad():
-    """The dead-gradient case is silent without this warning; say so up front."""
+    """The severed case is silent without this warning; say so up front."""
+    sim = _tophat_sim()
     with pytest.warns(UserWarning, match="TOPHAT crystal shape has no gradient path"):
-        _tophat_crystal(requires_grad=True)()
+        sim.run(oversample=1)
+
+
+def test_tophat_warning_fires_only_once_per_simulator():
+    """run() is called repeatedly in a refinement loop; don't warn every step."""
+    import warnings as _w
+
+    sim = _tophat_sim()
+    with pytest.warns(UserWarning):
+        sim.run(oversample=1)
+    with _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        sim.run(oversample=1)
 
 
 def test_tophat_silent_without_differentiable_cell():
     """No warning for the ordinary forward-only TOPHAT run, which is most of them."""
-    import warnings as _warnings
+    import warnings as _w
 
-    with _warnings.catch_warnings():
-        _warnings.simplefilter("error", UserWarning)
-        _tophat_crystal(requires_grad=False)()
+    sim = _tophat_sim(requires_grad=False)
+    with _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        sim.run(oversample=1)
 
 
-def test_differentiable_shapes_do_not_warn():
-    """Only TOPHAT is affected — a false positive here would train people to ignore it."""
-    import warnings as _warnings
+@pytest.mark.parametrize("shape", ["SQUARE", "ROUND", "GAUSS"])
+def test_differentiable_shapes_do_not_warn(shape):
+    """Only TOPHAT is affected — a false positive would train people to ignore it."""
+    import warnings as _w
 
-    from nanobrag_torch.config import CrystalConfig, CrystalShape
-    from nanobrag_torch.models import Crystal
+    sim = _tophat_sim(shape_name=shape)
+    with _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        sim.run(oversample=1)
 
-    for shape in (CrystalShape.SQUARE, CrystalShape.ROUND, CrystalShape.GAUSS):
-        with _warnings.catch_warnings():
-            _warnings.simplefilter("error", UserWarning)
-            Crystal(
-                CrystalConfig(
-                    cell_a=torch.tensor(100.0, dtype=torch.float64, requires_grad=True),
-                    cell_b=100.0, cell_c=100.0,
-                    cell_alpha=90.0, cell_beta=90.0, cell_gamma=90.0,
-                    default_F=100.0, N_cells=(5, 5, 5), shape=shape,
-                ),
-                dtype=torch.float64,
-            )
+
+@pytest.mark.skipif(not HKL_INTERP.exists(), reason="P1_interp.hkl not present")
+def test_tophat_with_interpolated_hkl_keeps_cell_gradients_and_is_silent():
+    """TOPHAT + interpolated F_cell is a WORKING configuration, not a dead one.
+
+    This is the case the first version of this module got wrong: it waived the
+    cell gradients on shape alone, which would have failed the sweep on correct
+    behaviour, and warned that gradients were unavailable where they are in fact
+    live. Measured d/d cell_a = -8.84e-05 here against -8.30e-05 for GAUSS on
+    the same geometry.
+    """
+    import warnings as _w
+
+    sim = _tophat_sim(hkl=True, interpolate=True)
+    with _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        image = sim.run(oversample=1)
+
+    loss = image.sum()
+    assert loss.requires_grad, "interpolated F_cell should keep the cell in the graph"
+    loss.backward()
+
+    live = [
+        n for n in ("a", "b", "c", "alpha", "beta", "gamma")
+        if getattr(sim.crystal, f"cell_{n}").grad is not None
+        and getattr(sim.crystal, f"cell_{n}").grad.abs().item() > 0
+    ]
+    assert len(live) == 6, f"expected all six cell gradients live, got {sorted(live)}"
+
+
+def test_cell_only_tophat_backward_raises():
+    """With nothing else differentiable the loss has no grad_fn at all.
+
+    Pins the behaviour the original audit finding described and an earlier
+    version of this module denied: it is not a silent `None`, it raises.
+    """
+    sim = _tophat_sim()
+    with pytest.warns(UserWarning):
+        image = sim.run(oversample=1)
+    loss = image.sum()
+    assert not loss.requires_grad
+    with pytest.raises(RuntimeError, match="does not require grad"):
+        loss.backward()
