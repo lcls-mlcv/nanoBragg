@@ -102,6 +102,7 @@ class Crystal:
         # Validate cell parameters for numerical stability
         self._validate_cell_parameters()
 
+
         # Crystal size from config
         self.N_cells_a = torch.as_tensor(
             self.config.N_cells[0], device=self.device, dtype=self.dtype
