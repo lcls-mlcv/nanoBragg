@@ -165,19 +165,8 @@ def test_default_output_sizes_match_c(name, tmp_path):
     )
 
 
-_PGM_SCALE_CONFLICT = (
-    "Unresolved C-vs-spec conflict on the default PGM scale. C auto-exposes the "
-    "preview as 250/(5*rmsd) when -pgmscale is absent (nanoBragg.c:3203-3206); "
-    "torch hardcodes 1.0, citing spec AT-IO-002, and three existing tests "
-    "assert that. Measured on a 32x32 default run: C chose 25.1377 and got "
-    "max=182 mean=65.23 of 255, torch at 1.0 got max=7 mean=2.14 -- about 26x "
-    "under-exposed, so it renders near-black. The cited spec document is not in "
-    "this repository, so the claim cannot be checked against its source. "
-    "Strict xfail so this flips loudly once the scale is ruled on."
-)
 
 
-@pytest.mark.xfail(reason=_PGM_SCALE_CONFLICT, strict=True)
 def test_default_pgm_is_byte_identical_to_c(tmp_path):
     """The PGM preview must match C exactly, header included.
 
@@ -188,8 +177,9 @@ def test_default_pgm_is_byte_identical_to_c(tmp_path):
     that the rounding washes out.
 
     This is the check that caught two real defects at once: the scale was
-    hardcoded to 1.0, making the default preview an entirely blank image, and
-    the header printed Python's full float repr where C uses %lg.
+    hardcoded to 1.0, leaving the default preview about 26x under-exposed
+    (max=7 of 255 against C's max=182), and the header printed Python's full
+    float repr where C uses %lg.
     """
     c_dir = tmp_path / "c"
     py_dir = tmp_path / "py"
@@ -218,7 +208,6 @@ def test_default_pgm_is_byte_identical_to_c(tmp_path):
     assert py_bytes == c_bytes, "PGM pixel data differs from C"
 
 
-@pytest.mark.xfail(reason=_PGM_SCALE_CONFLICT, strict=True)
 def test_default_pgm_uses_most_of_the_grey_range(tmp_path):
     """The preview should be exposed, not near-black.
 

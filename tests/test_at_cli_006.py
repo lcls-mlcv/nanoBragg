@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
+import pytest
 import struct
 import sys
 
@@ -214,8 +215,24 @@ def test_pgm_without_pgmscale():
         float_data = read_float_image(floatfile, (10, 10))
         pgm_data, scale = read_pgm(pgmfile)
 
-        # Without -pgmscale, default should be 1.0
-        assert scale == 1.0, f"Expected default pgmscale=1.0, got {scale}"
+        # Without -pgmscale the CLI auto-exposes the preview as C does,
+        # pgm_scale = 250/(5*rmsd) (nanoBragg.c:3203-3206), where rmsd is
+        # sqrt(sum((x - mean)^2)/(N - 1)) over the ROI. This previously asserted
+        # 1.0, citing spec AT-IO-002; that spec text is not in this repository
+        # and 1.0 leaves the preview ~26x under-exposed, so the behaviour was
+        # changed to follow the C oracle (deliberate spec amendment, 2026-10-02).
+        #
+        # Note write_pgm()'s own `pgm_scale` parameter still defaults to 1.0 --
+        # the auto-exposure lives in the CLI, which is the layer C implements it
+        # in. tests/test_at_io_002.py covers the library default.
+        n = float_data.size
+        mean = float_data.mean()
+        rmsd = np.sqrt(((float_data - mean) ** 2).sum() / (n - 1))
+        expected_scale = 250.0 / (5.0 * rmsd) if rmsd > 0 else 1.0
+        assert scale == pytest.approx(expected_scale, rel=1e-4), (
+            f"Expected auto-exposed pgmscale=250/(5*rmsd)={expected_scale:g} "
+            f"(rmsd={rmsd:g}), got {scale}"
+        )
 
         # Verify PGM formula: min(255, floor(float*pgmscale))
         for i in range(10):

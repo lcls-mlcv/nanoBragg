@@ -1796,35 +1796,37 @@ def main():
             print(f"Wrote SMV image to {config['intfile']}")
 
         if config.get('pgmfile'):
-            # UNRESOLVED: the default PGM scale diverges from C, and is left
-            # diverging deliberately pending a ruling.
-            #
-            # C (nanoBragg.c:3203-3206) auto-exposes the preview:
+            # Auto-expose the preview exactly as C does (nanoBragg.c:3203-3206):
             #
             #     if(pgm_scale <= 0.0){
             #         pgm_scale = intfile_scale;
             #         if(rmsd > 0.0) pgm_scale = 250.0/(5.0*rmsd);
             #     }
             #
-            # torch hardcodes 1.0, citing spec AT-IO-002, and three tests assert
-            # that (test_at_cli_006.py, test_at_io_002.py). While the PGM was
-            # written only on an explicit -pgmfile this was just a poor default;
-            # now that an unflagged run writes one it is what a user sees first.
+            # This used to hardcode 1.0, citing spec AT-IO-002. That spec text
+            # does not exist anywhere in this repository's history, so it could
+            # not be checked against its source, and C is the accuracy oracle.
+            # Deliberate spec amendment, approved 2026-10-02.
             #
-            # Measured on a 32x32 default run -- C auto-selected scale 25.1377
-            # and produced max=182, mean=65.23 over 256 grey levels; torch at
-            # scale 1.0 produced max=7, mean=2.14. Not a blank image, but about
-            # 26x under-exposed, so it renders as near-black.
+            # 1.0 is not a neutral default: it silently assumes intensities
+            # happen to land in 0-255, which stops holding as soon as fluence,
+            # exposure or crystal size change. C's form measures the image, so it
+            # makes no such assumption. Measured on a 32x32 default run, C chose
+            # 25.1377 and reached max=182 mean=65.23 of 255, where 1.0 reached
+            # max=7 mean=2.14 -- about 26x under-exposed, rendering near-black.
             #
-            # The cited spec document is not in this repository, so the "1.0"
-            # claim cannot be checked against its source. C is the accuracy
-            # oracle, which argues for 250/(5*rmsd); three existing tests argue
-            # for 1.0. Changing it is a spec decision, not a code decision, so
-            # the behaviour stays as-is and the conflict is pinned by two strict
-            # xfails in tests/test_cli_output_surface.py.
+            # torch's RMSD matches C's rmsd definition exactly, sqrt(sum((x -
+            # mean)^2)/(N-1)): measured 1.989 against C's 1.98905 on that run.
             pgmscale = config.get('pgmscale')
             if pgmscale is None or pgmscale <= 0.0:
-                pgmscale = 1.0
+                rmsd = float(stats['RMSD'])
+                if rmsd > 0.0:
+                    pgmscale = 250.0 / (5.0 * rmsd)
+                else:
+                    # C falls back to the resolved intfile scale when rmsd is 0
+                    # (a uniform image), which is 1.0 unless -scale was given.
+                    scale = config.get('scale')
+                    pgmscale = scale if scale and scale > 0 else 1.0
             write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 
