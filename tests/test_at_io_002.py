@@ -50,8 +50,10 @@ class TestAT_IO_002:
                 assert int(width_str) == 48, f"Width {width_str} != 48"
                 assert int(height_str) == 64, f"Height {height_str} != 64"
 
-                # Check comment line
-                expected_comment = f"# pixels scaled by {pgm_scale}"
+                # Check comment line. C uses %lg (nanoBragg.c:3233), so format
+                # the expected value the same way rather than with Python's
+                # default float repr.
+                expected_comment = f"# pixels scaled by {pgm_scale:g}"
                 assert comment == expected_comment, f"Comment '{comment}' != '{expected_comment}'"
 
                 # Check max value
@@ -127,7 +129,11 @@ class TestAT_IO_002:
                 f.readline()  # Skip dimensions
                 comment = f.readline().decode("ascii").strip()
 
-                assert comment == "# pixels scaled by 1.0"
+                # C formats this with %lg (nanoBragg.c:3233), which prints 1.0
+                # as "1". Measured against the oracle binary with -pgmscale 1:
+                # "# pixels scaled by 1". This assertion previously expected
+                # Python's "1.0", which no C run ever produces.
+                assert comment == "# pixels scaled by 1"
 
         finally:
             if os.path.exists(tmp_path):

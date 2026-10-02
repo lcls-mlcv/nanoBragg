@@ -270,7 +270,15 @@ class TestNoiseSuppressionFlag:
         assert config['suppress_noise'] is True
 
     def test_nonoise_without_noisefile(self):
-        """Verify -nonoise can be used without -noisefile (no-op but valid)."""
+        """Verify -nonoise suppresses the noise image even with no -noisefile.
+
+        `noisefile` is no longer None when the flag is absent: C initialises all
+        four output filenames (nanoBragg.c:145-150) and torch now does too, so a
+        run with no output flags writes files instead of silently producing
+        nothing. Suppression is carried by `suppress_noise`, not by leaving the
+        name unset -- which matches C, where `-nonoise` clears `calculate_noise`
+        and the filename keeps its default.
+        """
         config = run_parse([
             '-cell', '100', '100', '100', '90', '90', '90',
             '-pixel', '0.1',
@@ -279,8 +287,8 @@ class TestNoiseSuppressionFlag:
             '-nonoise'
         ])
 
-        assert config.get('noisefile') is None
         assert config['suppress_noise'] is True
+        assert config.get('noisefile') == 'noiseimage.img'
 
 
 class TestCLIIntegrationSanity:

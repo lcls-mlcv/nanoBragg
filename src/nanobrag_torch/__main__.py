@@ -896,6 +896,65 @@ def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
             setattr(args, dest, defaults[key])
 
 
+# nanoBragg.c:145-150. C initialises these and writes them unconditionally, so a
+# bare `nanoBragg -cell ... -default_F 100` leaves four files behind.
+C_DEFAULT_FLOATFILE = "floatimage.bin"
+C_DEFAULT_INTFILE = "intimage.img"
+C_DEFAULT_PGMFILE = "image.pgm"
+C_DEFAULT_NOISEFILE = "noiseimage.img"
+
+# Flags that switch an output back on, and the ones that switch it off. C tests
+# these in the argument loop, so the LAST occurrence wins and `-nopgm -pgmfile x`
+# writes the pgm while `-pgmfile x -nopgm` does not (nanoBragg.c:1010-1038).
+_PGM_ENABLERS = ("-pgmfile", "-pgmimage", "-pgmscale")
+_NOISE_ENABLERS = ("-noisefile", "-noiseimage")
+
+
+def resolve_output_files(args: argparse.Namespace):
+    """Resolve the four output filenames and the two enable flags, as C does.
+
+    Returns (floatfile, intfile, pgmfile, noisefile, write_pgm, calculate_noise).
+
+    C keeps `write_pgm` and `calculate_noise` as plain ints initialised to 1 and
+    flips them inside the argv loop, so the result depends on flag order: naming
+    a pgm or noise file re-enables that output even after `-nopgm`/`-nonoise`.
+    Reading `args.nopgm` alone would lose that, which is why this also walks
+    `_argv`.
+
+    But it must not depend on `_argv` alone. `_argv` is set by `main()` from
+    sys.argv; a programmatic caller building a namespace with
+    `create_parser().parse_args([...])` has no `_argv`, and an earlier version of
+    this function silently ignored `-nonoise` for every such caller. The parsed
+    flags therefore seed the values, and `_argv` only refines the ordering.
+
+    One documented deviation: C tests these with `strstr`, so a token that merely
+    *contains* a flag -- a filename like `out-nopgm.bin` -- disables the PGM
+    under C. torch compares exactly. Too obscure to reproduce deliberately, but
+    it is a real difference.
+    """
+    write_pgm = not getattr(args, "nopgm", False)
+    calculate_noise = not getattr(args, "nonoise", False)
+
+    for token in getattr(args, "_argv", None) or []:
+        if token in _PGM_ENABLERS:
+            write_pgm = True
+        elif token in _NOISE_ENABLERS:
+            calculate_noise = True
+        elif token == "-nopgm":
+            write_pgm = False
+        elif token == "-nonoise":
+            calculate_noise = False
+
+    return (
+        args.floatfile or C_DEFAULT_FLOATFILE,
+        args.intfile or C_DEFAULT_INTFILE,
+        args.pgmfile or C_DEFAULT_PGMFILE,
+        args.noisefile or C_DEFAULT_NOISEFILE,
+        write_pgm,
+        calculate_noise,
+    )
+
+
 def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     """Parse and validate command-line arguments into configuration."""
 
@@ -1188,12 +1247,17 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     elif args.nointerpolate:
         config['interpolate'] = False
 
-    # Output files
-    config['floatfile'] = args.floatfile
-    config['intfile'] = args.intfile
-    config['pgmfile'] = args.pgmfile
-    config['noisefile'] = args.noisefile
-    config['suppress_noise'] = args.nonoise
+    # Output files. nanoBragg.c initialises all four filenames to defaults
+    # (nanoBragg.c:145-150) and writes them whether or not a flag was given, so
+    # an unflagged run produces four files; torch used to produce none and exit
+    # 0, which made an existing nanoBragg script look like it had succeeded.
+    float_name, int_name, pgm_name, noise_name, write_pgm, calculate_noise = \
+        resolve_output_files(args)
+    config['floatfile'] = float_name
+    config['intfile'] = int_name
+    config['pgmfile'] = pgm_name if write_pgm else None
+    config['noisefile'] = noise_name
+    config['suppress_noise'] = not calculate_noise
     config['scale'] = args.scale
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
@@ -1696,19 +1760,24 @@ def main():
             data.tofile(config['floatfile'])
             print(f"Wrote float image to {config['floatfile']}")
 
+        # Resolve the integer-image scale once, before either the int or the PGM
+        # block, because C does: nanoBragg.c:3147-3150 settles intfile_scale
+        # ahead of the PGM block at :3204, which falls back to it when rmsd is 0.
+        adc_offset = config.get('adc', 40.0)
+        intfile_scale = config.get('scale')
+        if not intfile_scale or intfile_scale <= 0:
+            # C: intfile_scale = 1.0; if(max_I > 0) intfile_scale = 55000.0/max_I
+            # Note 55000/max, NOT (55000 - adc)/max, which is what this used to
+            # compute -- the adc offset is added per pixel afterwards, so folding
+            # it into the scale made every pixel disagree with C. Measured on a
+            # default 32x32 run before this fix: 1024/1024 pixels differed,
+            # max |delta| = 41 counts, C peak 55040 against torch 55000.
+            max_val = intensity.max().item()
+            intfile_scale = 55000.0 / max_val if max_val > 0 else 1.0
+
         if config.get('intfile'):
             # Scale and write SMV per AT-CLI-006
-            scale = config.get('scale')
-            adc_offset = config.get('adc', 40.0)
-
-            if not scale or scale <= 0:
-                # Auto-scale: map max float pixel to approximately 55,000 counts
-                max_val = intensity.max().item()
-                if max_val > 0:
-                    # Calculate scale to achieve 55000 after adding ADC
-                    scale = (55000.0 - adc_offset) / max_val if adc_offset < 55000 else 55000.0 / max_val
-                else:
-                    scale = 1.0
+            scale = intfile_scale
 
             # Apply scaling per spec: integer pixel = floor(min(65535, float*scale + adc))
             # Only apply to non-zero pixels (AT-CLI-005)
@@ -1720,9 +1789,16 @@ def main():
             scaled = intensity * scale + adc_offset
             # Only apply scaling where intensity > 0 (inside ROI)
             scaled = torch.where(roi_mask, scaled, torch.zeros_like(scaled))
-            # Clip to valid range and floor
+            # C rounds: intimage = (unsigned short)(floorf(test + 0.5))
+            # (nanoBragg.c:3167). This used to truncate, a systematic -0.5 ADU
+            # bias on every pixel. floor(x + 0.5) is round-half-UP, which is not
+            # torch.round's round-half-to-even, so spell it out.
             scaled = scaled.clip(0, 65535)
-            scaled_int = torch.floor(scaled).to(torch.int16).cpu().numpy().astype(np.uint16)
+            # int32 then uint16: the old int16 cast relied on two's-complement
+            # wrapping for values above 32767 and happened to round-trip.
+            scaled_int = (
+                torch.floor(scaled + 0.5).to(torch.int32).cpu().numpy().astype(np.uint16)
+            )
 
             write_smv(
                 filepath=config['intfile'],
@@ -1744,9 +1820,40 @@ def main():
             print(f"Wrote SMV image to {config['intfile']}")
 
         if config.get('pgmfile'):
-            # Write PGM per AT-CLI-006
-            # If pgmscale not provided, default to 1.0 per spec
-            pgmscale = config.get('pgmscale', 1.0) if config.get('pgmscale') is not None else 1.0
+            # Auto-expose the preview exactly as C does (nanoBragg.c:3203-3206):
+            #
+            #     if(pgm_scale <= 0.0){
+            #         pgm_scale = intfile_scale;
+            #         if(rmsd > 0.0) pgm_scale = 250.0/(5.0*rmsd);
+            #     }
+            #
+            # This used to hardcode 1.0, citing spec AT-IO-002. That spec text
+            # does not exist anywhere in this repository's history, so it could
+            # not be checked against its source, and C is the accuracy oracle.
+            # Deliberate spec amendment, approved 2026-10-02.
+            #
+            # 1.0 is not a neutral default: it silently assumes intensities
+            # happen to land in 0-255, which stops holding as soon as fluence,
+            # exposure or crystal size change. C's form measures the image, so it
+            # makes no such assumption. Measured on a 32x32 default run, C chose
+            # 25.1377 and reached max=182 mean=65.23 of 255, where 1.0 reached
+            # max=7 mean=2.14 -- about 26x under-exposed, rendering near-black.
+            #
+            # torch's RMSD matches C's rmsd definition exactly, sqrt(sum((x -
+            # mean)^2)/(N-1)): measured 1.989 against C's 1.98905 on that run.
+            pgmscale = config.get('pgmscale')
+            if pgmscale is None or pgmscale <= 0.0:
+                rmsd = float(stats['RMSD'])
+                if rmsd > 0.0:
+                    pgmscale = 250.0 / (5.0 * rmsd)
+                else:
+                    # rmsd == 0 (a uniform image, or a single-pixel ROI). C falls
+                    # back to the *resolved* intfile_scale, which is already
+                    # 55000/max_I by this point -- not 1.0, which is what an
+                    # earlier version of this comment claimed. Measured with
+                    # -roi 17 17 17 17 (one pixel, so rmsd is 0 in both): C wrote
+                    # "# pixels scaled by 7570.47" where torch wrote 1.
+                    pgmscale = intfile_scale
             write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 
