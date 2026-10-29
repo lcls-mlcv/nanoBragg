@@ -31,7 +31,9 @@ cd src
 git fetch -q origin
 git checkout -q --detach "origin/$BASE_REF"
 for b in "${FIX_BRANCHES[@]}"; do
-  git merge -q --no-edit "origin/$b" >/dev/null
+  # Throwaway identity: merge commits need one, and CI runners / fresh machines have none.
+  git -c user.name=oracle-build -c user.email=oracle-build@localhost \
+    merge -q --no-edit "origin/$b" >/dev/null
 done
 BASE_SHA=$(git rev-parse --short "origin/$BASE_REF")
 
