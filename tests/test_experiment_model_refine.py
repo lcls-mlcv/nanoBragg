@@ -1,9 +1,11 @@
 """ExperimentModel parameters: trainable by default, chosen with refine()/freeze() (plan C2)."""
 import pytest
 import torch
+from torch.autograd import gradcheck
+from torch.func import functional_call
 
 from nanobrag_torch.config import (
-    BeamConfig, CrystalConfig, DetectorConfig, DetectorConvention, DetectorPivot,
+    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
 )
 from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.models.detector import Detector
@@ -13,11 +15,12 @@ from nanobrag_torch.simulator import Simulator
 DTYPE = torch.float64
 
 
-def _configs():
+def _configs(shape=CrystalShape.GAUSS):
+    # GAUSS so continuous Ncells is refinable (it is not under SQUARE).
     crystal = CrystalConfig(cell_a=70.0, cell_b=80.0, cell_c=90.0,
                             cell_alpha=88.0, cell_beta=91.0, cell_gamma=93.0,
                             misset_deg=(5.0, -3.0, 2.0), N_cells=(4, 4, 4),
-                            default_F=100.0)
+                            default_F=100.0, shape=shape)
     detector = DetectorConfig(distance_mm=80.0, pixel_size_mm=0.2, spixels=48, fpixels=48,
                               detector_convention=DetectorConvention.MOSFLM,
                               detector_pivot=DetectorPivot.BEAM, oversample=1)
@@ -93,3 +96,46 @@ def test_bad_names_are_rejected():
 def test_stage_a_is_an_alias_for_trainable():
     model = ExperimentModel(*_configs(), dtype=DTYPE, param_init="stage_a")
     assert all(p.requires_grad for p in model.parameters())
+
+
+def test_scale_multiplies_the_image():
+    model = ExperimentModel(*_configs(), dtype=DTYPE)
+    with torch.no_grad():
+        base = model()
+        model.beam_params.delta_log_spot_scale.fill_(torch.log(torch.tensor(2.5, dtype=DTYPE)))
+        scaled = model()
+    torch.testing.assert_close(scaled, 2.5 * base, rtol=1e-12, atol=0.0)
+
+
+@pytest.mark.parametrize("name", ["beam_params.delta_log_spot_scale",
+                                  "crystal_params.delta_log_N_cells"])
+def test_gradcheck_scale_and_ncells(name):
+    model = ExperimentModel(*_configs(), dtype=DTYPE)
+    start = torch.full_like(dict(model.named_parameters())[name], 0.05).requires_grad_(True)
+
+    def loss(value):
+        return functional_call(model, {name: value}, ()).sum()
+
+    assert gradcheck(loss, (start,), eps=1e-6, atol=1e-8, rtol=1e-4)
+
+
+def test_continuous_ncells_moves_the_image_smoothly():
+    model = ExperimentModel(*_configs(), dtype=DTYPE)
+    sums = []
+    with torch.no_grad():
+        for n in (4.0, 4.3, 4.6):
+            model.crystal_params.delta_log_N_cells.fill_(torch.log(torch.tensor(n / 4.0, dtype=DTYPE)))
+            sums.append(model().sum().item())
+    assert sums[0] < sums[1] < sums[2] < 2 * sums[0]
+
+
+def test_ncells_frozen_and_unrefinable_under_square():
+    model = ExperimentModel(*_configs(CrystalShape.SQUARE), dtype=DTYPE)
+    ncells = model.crystal_params.delta_log_N_cells
+    assert not ncells.requires_grad
+    assert all(p.requires_grad for p in model.parameters() if p is not ncells)
+    with pytest.raises(ValueError, match="not refinable with shape=SQUARE"):
+        model.refine("Ncells")
+    model.freeze().refine()  # refine-all skips it instead of raising
+    assert not ncells.requires_grad
+    assert len(model.trainable_parameters()) == len(list(model.parameters())) - 1
