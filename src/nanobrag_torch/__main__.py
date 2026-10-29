@@ -1207,7 +1207,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['exposure'] = args.exposure
     if args.beamsize is not None:
         config['beamsize_mm'] = args.beamsize
-    elif args.fluence:
+    # An explicit -fluence stands unless -flux is non-zero (nanoBragg.c:1131), whatever
+    # -beamsize and -exposure say; BeamConfig.__post_init__ applies that override.
+    if args.fluence is not None:
         config['fluence'] = args.fluence
 
     # Polarization

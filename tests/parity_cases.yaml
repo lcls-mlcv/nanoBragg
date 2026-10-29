@@ -960,7 +960,8 @@ cases:
       Fluence from flux/exposure/beamsize (C ↔ PyTorch). nanoBragg.c defaults to
       exposure = 1 s and beamsize = 0.1 mm and computes fluence = flux*exposure/beamsize^2
       whenever flux != 0, so -flux alone changes the scale and overrides an explicit
-      -fluence. These runs differ in absolute scale by ~9 orders of magnitude.
+      -fluence; with flux = 0 an explicit -fluence stands whatever -beamsize and
+      -exposure say. These runs differ in absolute scale by ~9 orders of magnitude.
     base_args: >-
       -default_F 100
       -cell 70 80 90 75 85 95
@@ -1001,6 +1002,21 @@ cases:
         extra_args: >-
           -fluence 1e24
           -flux 1e12
+      # -beamsize without -flux must not drop -fluence (C keeps it: flux = 0 skips
+      # nanoBragg.c:1131). PyTorch used the default fluence here, 1.26e5x too bright.
+      - name: fluence-with-beamsize
+        extra_args: >-
+          -fluence 1e24
+          -beamsize 0.05
+      - name: beamsize-then-fluence
+        extra_args: >-
+          -beamsize 0.05
+          -fluence 1e24
+      - name: fluence-beamsize-exposure
+        extra_args: >-
+          -fluence 1e24
+          -beamsize 0.05
+          -exposure 3
 
   - id: PARITY-DENZO-001
     description: >-
