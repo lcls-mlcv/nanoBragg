@@ -14,7 +14,7 @@ from typing import Optional
 import torch
 from torch import nn
 
-from ..config import BeamConfig, CrystalConfig, DetectorConfig
+from ..config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig
 from ..models.crystal import Crystal
 from ..models.detector import Detector
 from ..utils.tensor_utils import as_tensor_preserving_grad
@@ -135,6 +135,25 @@ class CrystalStageAParams(nn.Module):
             torch.zeros((3,), device=self.device, dtype=self.dtype)
         )
 
+        # Mosaic block size Na, Nb, Nc: log deltas (continuous, positive).
+        self.register_buffer(
+            "base_N_cells",
+            torch.as_tensor(
+                [float(n) for n in base_config.N_cells], device=self.device, dtype=self.dtype
+            ),
+        )
+        self.delta_log_N_cells = param_cls(
+            torch.zeros((3,), device=self.device, dtype=self.dtype)
+        )
+        # SQUARE's sincg(pi*h, N) = sin(N*pi*h)/sin(pi*h) only has a finite limit at
+        # integer h for integer N: at N = 5.3 the image sum is 157x and the peak 4000x
+        # the N = 5 values, and d(sum)/dN changes sign between 5.0 and 5.001. Continuous
+        # Ncells is only meaningful for the smooth shapes (GAUSS, ROUND, TOPHAT), which
+        # is also what diffBragg refines.
+        self.ncells_refinable = base_config.shape != CrystalShape.SQUARE
+        if not self.ncells_refinable:
+            self.delta_log_N_cells.requires_grad_(False)
+
     def build_config(self) -> CrystalConfig:
         """Return a CrystalConfig with physical values derived from raw parameters."""
         # Exponentiate log-length deltas to maintain positivity.
@@ -164,6 +183,8 @@ class CrystalStageAParams(nn.Module):
         cfg.cell_beta = cell_beta
         cfg.cell_gamma = cell_gamma
         cfg.misset_deg = (misset_x, misset_y, misset_z)
+        n_cells = self.base_N_cells * torch.exp(self.delta_log_N_cells)
+        cfg.N_cells = (n_cells[0], n_cells[1], n_cells[2])
         return cfg
 
 
@@ -315,12 +336,22 @@ class BeamStageAParams(nn.Module):
             torch.zeros((), device=self.device, dtype=self.dtype)
         )
 
+        # Overall scale G (cctbx/diffBragg spot_scale; C has none): log delta.
+        self.register_buffer(
+            "base_spot_scale",
+            torch.as_tensor(base_config.spot_scale, device=self.device, dtype=self.dtype),
+        )
+        self.delta_log_spot_scale = param_cls(
+            torch.zeros((), device=self.device, dtype=self.dtype)
+        )
+
     def build_config(self) -> BeamConfig:
         """Return a BeamConfig with physical values derived from raw parameters."""
         fluence = self.base_fluence * torch.exp(self.delta_log_fluence)
 
         cfg = replace(self._base_config)
         cfg.fluence = fluence
+        cfg.spot_scale = self.base_spot_scale * torch.exp(self.delta_log_spot_scale)
         return cfg
 
 
@@ -361,6 +392,8 @@ class ExperimentModel(nn.Module):
             "detector_params.delta_beam_s_raw", "detector_params.delta_beam_f_raw",
         ),
         "fluence": ("beam_params.delta_log_fluence",),
+        "scale": ("beam_params.delta_log_spot_scale",),
+        "Ncells": ("crystal_params.delta_log_N_cells",),
     }
 
     def __init__(
@@ -432,8 +465,21 @@ class ExperimentModel(nn.Module):
         return resolved
 
     def refine(self, *names: str) -> "ExperimentModel":
-        """Turn gradients on for these groups/parameters (all of them if none given)."""
+        """Turn gradients on for these groups/parameters (all of them if none given).
+
+        Ncells cannot be refined with the SQUARE crystal shape (see
+        CrystalStageAParams): naming it raises, and refine() with no names skips it.
+        """
+        ncells = self.crystal_params.delta_log_N_cells
         for p in self._resolve(names):
+            if p is ncells and not self.crystal_params.ncells_refinable:
+                if names:
+                    raise ValueError(
+                        "Ncells is not refinable with shape=SQUARE: sin(N*pi*h)/sin(pi*h) "
+                        "diverges next to every Bragg peak for non-integer N. Use "
+                        "CrystalShape.GAUSS (as diffBragg does), ROUND or TOPHAT."
+                    )
+                continue
             p.requires_grad_(True)
         return self
 
@@ -519,11 +565,19 @@ class ExperimentModel(nn.Module):
             # The config copy feeds Simulator's auto-oversample choice.
             setattr(crystal.config, name, value)
         crystal.config.misset_deg = crystal_cfg.misset_deg
+        crystal.N_cells_a, crystal.N_cells_b, crystal.N_cells_c = (
+            torch.as_tensor(n, device=self.device, dtype=self.dtype)
+            for n in crystal_cfg.N_cells
+        )
+        # Simulator's auto-oversample choice reads the config copy.
+        crystal.config.N_cells = crystal_cfg.N_cells
 
         for name in self._DETECTOR_FIELDS:
             setattr(self._detector.config, name, getattr(detector_cfg, name))
 
         self._beam_config.fluence = beam_cfg.fluence
+        # Simulator.run() reads spot_scale from this config on every run.
+        self._beam_config.spot_scale = beam_cfg.spot_scale
         self._simulator.fluence = as_tensor_preserving_grad(
             beam_cfg.fluence, device=self.device, dtype=self.dtype
         )

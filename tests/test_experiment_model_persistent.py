@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from nanobrag_torch.config import (
-    BeamConfig, CrystalConfig, DetectorConfig, DetectorConvention, DetectorPivot,
+    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
 )
 from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.models.detector import Detector
@@ -17,11 +17,12 @@ from nanobrag_torch.simulator import Simulator
 DTYPE = torch.float64
 
 
-def _configs():
+def _configs(shape=CrystalShape.GAUSS):
+    # GAUSS so continuous Ncells is refinable (it is not under SQUARE).
     crystal = CrystalConfig(cell_a=70.0, cell_b=80.0, cell_c=90.0,
                             cell_alpha=88.0, cell_beta=91.0, cell_gamma=93.0,
                             misset_deg=(5.0, -3.0, 2.0), N_cells=(4, 4, 4),
-                            default_F=100.0)
+                            default_F=100.0, shape=shape)
     detector = DetectorConfig(distance_mm=80.0, pixel_size_mm=0.2, spixels=48, fpixels=48,
                               detector_convention=DetectorConvention.MOSFLM,
                               detector_pivot=DetectorPivot.BEAM, oversample=1)
