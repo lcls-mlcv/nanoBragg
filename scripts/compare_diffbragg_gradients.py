@@ -98,6 +98,59 @@ def diffbragg_forward_and_derivs(SIM, param_ids):
     return img, derivs
 
 
+def diffbragg_ucell_forward_and_derivs(SIM):
+    """diffBragg image and d(image)/d(unit-cell variable) from its crystal-system manager.
+
+    Returns (image, {variable name: per-pixel derivative}); names are diffBragg's
+    (a_Ang, c_Ang, beta_rad, ...). Raises NotImplementedError for systems diffBragg
+    has no manager for (triclinic, rhombohedral, cubic).
+    """
+    from simtbx.diffBragg import utils as db_utils
+    from simtbx.diffBragg.hopper_utils import UCELL_ID_OFFSET
+
+    manager = db_utils.manager_from_crystal(SIM.crystal.dxtbx_crystal)
+    D = SIM.D
+    ids = [UCELL_ID_OFFSET + i for i in range(len(manager.variables))]
+    for pid in ids:
+        D.refine(pid)
+    for pid, dB in zip(ids, manager.derivative_matrices):
+        D.set_ucell_derivative_matrix(pid, dB)
+    D.initialize_managers()
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[0].get_image_size()
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+    derivs = {name: D.get_derivative_pixels(pid).as_numpy_array().reshape(slow, fast).copy()
+              for name, pid in zip(manager.variable_names, ids)}
+    return img, derivs
+
+
+def torch_experiment_model(SIM, args, **kwargs):
+    """ExperimentModel for SIM's experiment, oriented by its A matrix (float64)."""
+    import torch
+    from nanobrag_torch.compat.cctbx import (
+        crystal_config_from_A, detector_config_from_dxtbx_panel, beam_config_from_dxtbx,
+    )
+    from nanobrag_torch.config import SpotMetric
+    from nanobrag_torch.models.experiment import ExperimentModel
+
+    xtal = SIM.crystal.dxtbx_crystal
+    beam = SIM.beam.nanoBragg_constructor_beam
+    det_cfg = detector_config_from_dxtbx_panel(SIM.detector[0], beam.get_s0(), oversample=max(args.oversample, 1))
+    det_cfg.oversample_omega = args.oversample_omega
+    beam_cfg = beam_config_from_dxtbx(beam, fluence=float(SIM.D.fluence), spot_scale=float(SIM.D.spot_scale))
+    beam_cfg.nopolar = beam_cfg.nopolar or args.nopolar
+    cfg = crystal_config_from_A(xtal.get_unit_cell().parameters(), xtal.get_A(), Ncells_abc=args.ncells,
+                                shape=args.shape, default_F=args.default_F,
+                                spot_metric=SpotMetric(args.spot_metric))
+    model = ExperimentModel(cfg, det_cfg, beam_cfg, device=torch.device(args.device), dtype=torch.float64,
+                            **kwargs)
+    # cctbx: F(0,0,0) = F000 (0), every other reflection default_F
+    model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
+                                dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
+    return model
+
+
 def torch_image_fn(SIM, args):
     """Return image(rotx, roty, rotz, ncells) rendering SIM with the torch port.
 

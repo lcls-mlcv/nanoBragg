@@ -18,6 +18,9 @@ from ..config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig
 from ..models.crystal import Crystal
 from ..models.detector import Detector
 from ..utils.tensor_utils import as_tensor_preserving_grad
+from ..utils.unit_cell import (
+    B_matrix, FREE_VARIABLES, check_cell, constrained_cell, normalize_crystal_system,
+)
 
 
 _PARAM_INIT_MODES = ("trainable", "stage_a", "frozen")
@@ -36,7 +39,23 @@ def _param_factory(param_init: str):
 
 
 class CrystalStageAParams(nn.Module):
-    """Stage-A learnable parameterization for crystal geometry."""
+    """Stage-A learnable parameterization for crystal geometry.
+
+    ``crystal_system`` constrains the cell (see utils/unit_cell.py): only its free
+    variables move, tied lengths follow the free one and fixed angles stay put. The
+    parameters of tied quantities stay frozen and are listed in ``unrefinable``.
+
+    When the base config carries an orientation matrix (``mosflm_*_star``, as the
+    dxtbx/cctbx path and ``-mat`` produce) Crystal ignores the cell parameters, so the
+    orientation is held as U = A0·B(cell0)⁻¹ and every step rebuilds A = U·B(cell),
+    B being cctbx's. That is diffBragg's unit-cell derivative.
+    """
+
+    # cell variable -> its delta parameter
+    _CELL_PARAMS = {
+        "a": "delta_log_a", "b": "delta_log_b", "c": "delta_log_c",
+        "alpha": "delta_alpha_raw", "beta": "delta_beta_raw", "gamma": "delta_gamma_raw",
+    }
 
     def __init__(
         self,
@@ -46,6 +65,7 @@ class CrystalStageAParams(nn.Module):
         param_init: str = "trainable",
         max_angle_delta_deg: float = 10.0,
         max_misset_delta_deg: float = 10.0,
+        crystal_system: str = "triclinic",
     ) -> None:
         super().__init__()
         if device is None:
@@ -145,6 +165,9 @@ class CrystalStageAParams(nn.Module):
         self.delta_log_N_cells = param_cls(
             torch.zeros((3,), device=self.device, dtype=self.dtype)
         )
+        # Parameters that must not move, with the reason; refine() refuses them.
+        self.unrefinable = {}
+
         # SQUARE's sincg(pi*h, N) = sin(N*pi*h)/sin(pi*h) only has a finite limit at
         # integer h for integer N: at N = 5.3 the image sum is 157x and the peak 4000x
         # the N = 5 values, and d(sum)/dN changes sign between 5.0 and 5.001. Continuous
@@ -152,20 +175,64 @@ class CrystalStageAParams(nn.Module):
         # is also what diffBragg refines.
         self.ncells_refinable = base_config.shape != CrystalShape.SQUARE
         if not self.ncells_refinable:
-            self.delta_log_N_cells.requires_grad_(False)
+            self.unrefinable["delta_log_N_cells"] = (
+                "Ncells is not refinable with shape=SQUARE: sin(N*pi*h)/sin(pi*h) "
+                "diverges next to every Bragg peak for non-integer N. Use "
+                "CrystalShape.GAUSS (as diffBragg does), ROUND or TOPHAT."
+            )
+
+        self.crystal_system = normalize_crystal_system(crystal_system)
+        base_cell = tuple(float(getattr(base_config, f"cell_{n}"))
+                          for n in ("a", "b", "c", "alpha", "beta", "gamma"))
+        check_cell(self.crystal_system, base_cell)
+        free = FREE_VARIABLES[self.crystal_system]
+        for var, pname in self._CELL_PARAMS.items():
+            if var not in free:
+                self.unrefinable[pname] = (
+                    f"{var} is not a free variable of a {self.crystal_system} cell "
+                    f"(free: {', '.join(free)})"
+                )
+        for pname in self.unrefinable:
+            getattr(self, pname).requires_grad_(False)
+
+        # Orientation held as U when the config gives an orientation matrix.
+        self.oriented_by_matrix = all(
+            getattr(base_config, f"mosflm_{x}_star", None) is not None for x in "abc"
+        )
+        if self.oriented_by_matrix:
+            A0 = torch.stack([
+                torch.as_tensor(getattr(base_config, f"mosflm_{x}_star"), device=self.device,
+                                dtype=torch.float64).detach()
+                for x in "abc"
+            ], dim=1)
+            B0 = B_matrix(*base_cell, device=self.device)
+            U = A0 @ torch.linalg.inv(B0)
+            err = (U @ U.T - torch.eye(3, dtype=U.dtype, device=self.device)).abs().max()
+            if err > 1e-6:
+                raise ValueError(
+                    f"the cell {base_cell} does not match the orientation matrix "
+                    f"(U = A·B⁻¹ is off orthogonal by {float(err):.2g})"
+                )
+            self.register_buffer("U", U.to(self.dtype))
 
     def build_config(self) -> CrystalConfig:
         """Return a CrystalConfig with physical values derived from raw parameters."""
-        # Exponentiate log-length deltas to maintain positivity.
-        cell_a = self.base_cell_a * torch.exp(self.delta_log_a)
-        cell_b = self.base_cell_b * torch.exp(self.delta_log_b)
-        cell_c = self.base_cell_c * torch.exp(self.delta_log_c)
-
-        # Bounded angle deltas using tanh window.
+        # Free variables only: log-length deltas keep lengths positive, tanh windows
+        # bound the angle deltas. Tied and fixed quantities come from the crystal system.
         max_angle = self.max_angle_delta_deg
-        cell_alpha = self.base_cell_alpha + max_angle * torch.tanh(self.delta_alpha_raw)
-        cell_beta = self.base_cell_beta + max_angle * torch.tanh(self.delta_beta_raw)
-        cell_gamma = self.base_cell_gamma + max_angle * torch.tanh(self.delta_gamma_raw)
+        free = {}
+        for var in FREE_VARIABLES[self.crystal_system]:
+            base = getattr(self, f"base_cell_{var}")
+            delta = getattr(self, self._CELL_PARAMS[var])
+            if var in ("a", "b", "c"):
+                free[var] = base * torch.exp(delta)
+            else:
+                free[var] = base + max_angle * torch.tanh(delta)
+        fixed = {var: getattr(self, f"base_cell_{var}") for var in self._CELL_PARAMS}
+        cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma = (
+            torch.as_tensor(x, device=self.device, dtype=self.dtype)
+            for x in constrained_cell(self.crystal_system, free, fixed)
+        )
 
         # Bounded misset deltas.
         max_misset = self.max_misset_delta_deg
@@ -183,6 +250,9 @@ class CrystalStageAParams(nn.Module):
         cfg.cell_beta = cell_beta
         cfg.cell_gamma = cell_gamma
         cfg.misset_deg = (misset_x, misset_y, misset_z)
+        if self.oriented_by_matrix:
+            A = self.U @ B_matrix(cell_a, cell_b, cell_c, cell_alpha, cell_beta, cell_gamma)
+            cfg.mosflm_a_star, cfg.mosflm_b_star, cfg.mosflm_c_star = A[:, 0], A[:, 1], A[:, 2]
         n_cells = self.base_N_cells * torch.exp(self.delta_log_N_cells)
         cfg.N_cells = (n_cells[0], n_cells[1], n_cells[2])
         return cfg
@@ -372,6 +442,9 @@ class ExperimentModel(nn.Module):
         optimizer = torch.optim.Adam(model.trainable_parameters(), lr=1e-2)
 
     For images only, run under torch.no_grad() so no autograd graph is kept.
+
+    ``crystal_system`` (default "triclinic", six free cell parameters) constrains
+    the cell refinement; see nanobrag_torch.utils.unit_cell and ``unrefinable``.
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -406,6 +479,7 @@ class ExperimentModel(nn.Module):
         param_init: str = "trainable",
         hkl_data: Optional[torch.Tensor] = None,
         hkl_metadata: Optional[dict] = None,
+        crystal_system: str = "triclinic",
     ) -> None:
         super().__init__()
         if device is None:
@@ -419,6 +493,7 @@ class ExperimentModel(nn.Module):
             device=self.device,
             dtype=self.dtype,
             param_init=param_init,
+            crystal_system=crystal_system,
         )
         self.detector_params = DetectorStageAParams(
             base_config=detector_config,
@@ -448,15 +523,16 @@ class ExperimentModel(nn.Module):
         self._beam_config: Optional[BeamConfig] = None
 
     def _resolve(self, names) -> list:
+        """Parameter names for these groups/parameters (all of them if none given)."""
         params = dict(self.named_parameters())
         if not names:
-            return list(params.values())
+            return list(params)
         resolved = []
         for name in names:
             if name in self.PARAMETER_GROUPS:
-                resolved.extend(params[n] for n in self.PARAMETER_GROUPS[name])
+                resolved.extend(self.PARAMETER_GROUPS[name])
             elif name in params:
-                resolved.append(params[name])
+                resolved.append(name)
             else:
                 raise KeyError(
                     f"unknown parameter or group {name!r}; groups: "
@@ -464,23 +540,28 @@ class ExperimentModel(nn.Module):
                 )
         return resolved
 
+    @property
+    def unrefinable(self) -> dict:
+        """Parameter name -> why it cannot be refined (crystal shape, crystal system)."""
+        return {f"crystal_params.{n}": why for n, why in self.crystal_params.unrefinable.items()}
+
     def refine(self, *names: str) -> "ExperimentModel":
         """Turn gradients on for these groups/parameters (all of them if none given).
 
-        Ncells cannot be refined with the SQUARE crystal shape (see
-        CrystalStageAParams): naming it raises, and refine() with no names skips it.
+        Parameters in ``unrefinable`` stay frozen: Ncells under the SQUARE shape, and
+        the cell parameters a crystal system ties or fixes. A group refines its
+        refinable members; naming an unrefinable parameter, or a group with no
+        refinable member, raises ValueError with the reason.
         """
-        ncells = self.crystal_params.delta_log_N_cells
-        for p in self._resolve(names):
-            if p is ncells and not self.crystal_params.ncells_refinable:
-                if names:
-                    raise ValueError(
-                        "Ncells is not refinable with shape=SQUARE: sin(N*pi*h)/sin(pi*h) "
-                        "diverges next to every Bragg peak for non-integer N. Use "
-                        "CrystalShape.GAUSS (as diffBragg does), ROUND or TOPHAT."
-                    )
-                continue
-            p.requires_grad_(True)
+        params = dict(self.named_parameters())
+        blocked = self.unrefinable
+        for name in names:
+            members = self.PARAMETER_GROUPS.get(name, (name,))
+            if all(m in blocked for m in members):
+                raise ValueError(blocked[members[0]])
+        for name in self._resolve(names):
+            if name not in blocked:
+                params[name].requires_grad_(True)
         return self
 
     def freeze(self, *names: str) -> "ExperimentModel":
@@ -489,8 +570,9 @@ class ExperimentModel(nn.Module):
         A frozen parameter keeps its current value, so freezing mid-refinement
         holds it where the optimizer left it.
         """
-        for p in self._resolve(names):
-            p.requires_grad_(False)
+        params = dict(self.named_parameters())
+        for name in self._resolve(names):
+            params[name].requires_grad_(False)
         return self
 
     def trainable_parameters(self) -> list:
@@ -565,6 +647,10 @@ class ExperimentModel(nn.Module):
             # The config copy feeds Simulator's auto-oversample choice.
             setattr(crystal.config, name, value)
         crystal.config.misset_deg = crystal_cfg.misset_deg
+        if self.crystal_params.oriented_by_matrix:
+            for x in "abc":
+                name = f"mosflm_{x}_star"
+                setattr(crystal.config, name, getattr(crystal_cfg, name))
         crystal.N_cells_a, crystal.N_cells_b, crystal.N_cells_c = (
             torch.as_tensor(n, device=self.device, dtype=self.dtype)
             for n in crystal_cfg.N_cells
