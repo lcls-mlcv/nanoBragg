@@ -42,9 +42,11 @@ def _grads(model):
 
 def test_default_is_trainable_and_reproduces_the_config_image():
     model = ExperimentModel(*_configs(), dtype=DTYPE)
-    assert all(p.requires_grad for p in model.parameters())
+    # eta has nothing to refine without mosaic spread; every other parameter trains
+    assert set(model.unrefinable) == {"crystal_params.delta_log_eta"}
+    assert all(p.requires_grad for n, p in model.named_parameters() if n not in model.unrefinable)
     torch.testing.assert_close(model(), _config_image(), rtol=1e-12, atol=0.0)
-    assert all(g is not None for g in _grads(model).values())
+    assert all(g is not None for n, g in _grads(model).items() if n not in model.unrefinable)
 
 
 def test_groups_cover_every_parameter_exactly_once():
@@ -95,7 +97,7 @@ def test_bad_names_are_rejected():
 
 def test_stage_a_is_an_alias_for_trainable():
     model = ExperimentModel(*_configs(), dtype=DTYPE, param_init="stage_a")
-    assert all(p.requires_grad for p in model.parameters())
+    assert all(p.requires_grad for n, p in model.named_parameters() if n not in model.unrefinable)
 
 
 def test_scale_multiplies_the_image():
@@ -133,9 +135,11 @@ def test_ncells_frozen_and_unrefinable_under_square():
     model = ExperimentModel(*_configs(CrystalShape.SQUARE), dtype=DTYPE)
     ncells = model.crystal_params.delta_log_N_cells
     assert not ncells.requires_grad
-    assert all(p.requires_grad for p in model.parameters() if p is not ncells)
+    assert all(p.requires_grad for n, p in model.named_parameters()
+               if p is not ncells and n not in model.unrefinable)
     with pytest.raises(ValueError, match="not refinable with shape=SQUARE"):
         model.refine("Ncells")
     model.freeze().refine()  # refine-all skips it instead of raising
     assert not ncells.requires_grad
-    assert len(model.trainable_parameters()) == len(list(model.parameters())) - 1
+    assert set(model.unrefinable) == {"crystal_params.delta_log_N_cells", "crystal_params.delta_log_eta"}
+    assert len(model.trainable_parameters()) == len(list(model.parameters())) - 2

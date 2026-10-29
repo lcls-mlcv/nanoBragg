@@ -184,3 +184,40 @@ def test_unit_cell_gradients_match_diffbragg(system, device):
             scale = float(np.abs(w * db_derivs[name]).sum())
             got = float(g) / factor
             assert abs(got - ref) <= 1e-7 * scale, f"d(w·I)/d{name} ({wname} w): torch {got!r} vs diffBragg {ref!r}"
+
+
+# Mosaic spread (plan C3): ExperimentModel's eta against diffBragg's ETA_ID (19), isotropic and
+# anisotropic. Both use diffBragg's deterministic domain ensemble (utils/mosaic.py); anisotropic
+# eta lies along the starting crystal's a, b, c axes as in diffBragg's refinement path.
+ETA_CASES = {
+    "isotropic": ["--eta", "0.3"],
+    "anisotropic": ["--eta", "0.2", "0.5", "0.08"],
+    "anisotropic-triclinic": ["--eta", "0.4", "0.1", "0.25", "--ucell", "61", "73", "84", "87", "95", "101",
+                              "--symbol", "P1", "--randomrotate", "2"],
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("case", list(ETA_CASES))
+def test_eta_gradients_match_diffbragg(case, device):
+    args = cmp.build_parser().parse_args(["--detpixels", "128", "--mosaic-domains", "20"] + ETA_CASES[case])
+    args.device = device
+    sim = cmp.build_sim(args)
+    db_img, db_derivs = cmp.diffbragg_eta_forward_and_derivs(sim)
+    model = cmp.torch_experiment_model(sim, args)
+    assert len(db_derivs) == len(args.eta) == model.crystal_params.delta_log_eta.numel()
+
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-9, atol=1e-12 * db_img.max())
+
+    # eta_i = eta0·exp(delta_i), so d/d(eta_i) = d/d(delta_i) / eta_i
+    eta = model.crystal_params.eta().detach().cpu().numpy()
+    rng = np.random.default_rng(2)
+    for wname, w in {"uniform": np.ones_like(db_img), "random": rng.uniform(0.0, 1.0, db_img.shape)}.items():
+        (g,) = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                                   [model.crystal_params.delta_log_eta], retain_graph=True)
+        for i, ref_pixels in enumerate(db_derivs):
+            ref = float((w * ref_pixels).sum())
+            scale = float(np.abs(w * ref_pixels).sum())
+            got = float(g[i]) / eta[i]
+            assert abs(got - ref) <= 1e-7 * scale, f"d(w·I)/d(eta{i}) ({wname} w): torch {got!r} vs diffBragg {ref!r}"
