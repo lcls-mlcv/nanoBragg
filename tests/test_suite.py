@@ -7,6 +7,7 @@ Implements the three-tier testing strategy:
 3. Scientific validation against physical principles
 """
 
+import os
 from pathlib import Path
 
 import pytest
@@ -258,14 +259,12 @@ class TestTier1TranslationCorrectness:
         """Verify golden test data is available."""
         assert GOLDEN_DATA_DIR.exists(), "Golden data directory missing"
         # Check for specific golden files
-        simple_cubic_img = GOLDEN_DATA_DIR / "simple_cubic.img"
-        simple_cubic_bin = GOLDEN_DATA_DIR / "simple_cubic.bin"
-        simple_cubic_mosaic_img = GOLDEN_DATA_DIR / "simple_cubic_mosaic.img"
-        simple_cubic_mosaic_bin = GOLDEN_DATA_DIR / "simple_cubic_mosaic.bin"
-        assert simple_cubic_img.exists(), f"Missing {simple_cubic_img}"
-        assert simple_cubic_bin.exists(), f"Missing {simple_cubic_bin}"
-        assert simple_cubic_mosaic_img.exists(), f"Missing {simple_cubic_mosaic_img}"
-        assert simple_cubic_mosaic_bin.exists(), f"Missing {simple_cubic_mosaic_bin}"
+        # Only the committed golden files. simple_cubic.img and simple_cubic_mosaic.*
+        # were never committed; the mosaic case now runs C live instead.
+        for name in ("simple_cubic.bin", "triclinic_P1/image.bin",
+                     "cubic_tilted_detector/image.bin"):
+            path = GOLDEN_DATA_DIR / name
+            assert path.exists(), f"Missing {path}"
 
     @pytest.mark.xfail(reason="Requires completion of parallel trace debugging initiative - see initiatives/parallel-trace-validation/")
     def test_simple_cubic_reproduction(self):
@@ -1288,157 +1287,38 @@ class TestTier1TranslationCorrectness:
 
         print("✅ Rotation compatibility test PASSED")
 
-    def test_simple_cubic_mosaic_reproduction(self):
-        """Test that PyTorch simulation reproduces the simple_cubic_mosaic golden image."""
-        # Set seed for reproducibility
-        torch.manual_seed(0)
+    def test_simple_cubic_mosaic_reproduction(self, tmp_path):
+        """The simple_cubic_mosaic case (golden_data/README.md section 2) matches live C.
 
-        # Set environment variable for torch import
-        import os
-
-        os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-        # Create crystal with correct parameters matching golden data
-        device = torch.device("cpu")
-        dtype = torch.float64
-
-        # Crystal config matching golden data: 100x100x100 cubic, N=5, default_F=100
-        crystal_config = CrystalConfig(
-            cell_a=100.0, cell_b=100.0, cell_c=100.0,
-            cell_alpha=90.0, cell_beta=90.0, cell_gamma=90.0,
-            N_cells=(5, 5, 5),
-            default_F=100.0,
-            phi_start_deg=0.0,
-            osc_range_deg=0.0,
-            mosaic_spread_deg=1.0,  # Include mosaic spread from golden data
-            mosaic_domains=10  # Include mosaic domains from golden data
-        )
-        crystal = Crystal(config=crystal_config, device=device, dtype=dtype)
-        
-        # Configure detector to match actual golden mosaic data size (1000x1000 pixels)
-        # The actual simple_cubic_mosaic.bin has 1,000,000 elements = 1000x1000 pixels  
-        # This corresponds to -detsize 100 -pixel 0.1 in C code
-        from nanobrag_torch.config import DetectorConfig
-        detector_config = DetectorConfig(
-            distance_mm=100.0,
-            pixel_size_mm=0.1,
-            spixels=1000,
-            fpixels=1000,
-            beam_center_s=50.0,  # Center of 1000x1000 detector
-            beam_center_f=50.0,  # Center of 1000x1000 detector
-        )
-        detector = Detector(config=detector_config, device=device, dtype=dtype)
-
-        # Create beam config matching golden data (λ=6.2 Å)
-        from nanobrag_torch.config import BeamConfig
-        beam_config = BeamConfig(
-            wavelength_A=6.2
-        )
-
-        # Create simulator with correct beam config
-        # Note: mosaic parameters are already in the crystal config above
-        simulator = Simulator(
-            crystal, detector, beam_config=beam_config, device=device, dtype=dtype
-        )
-
-        # Run PyTorch simulation
-        pytorch_image = simulator.run()
-
-        # Load the raw float data from the C code with mosaicity
-        golden_mosaic_path = GOLDEN_DATA_DIR / "simple_cubic_mosaic.bin"
-
-        # Check that golden data exists
-        assert (
-            golden_mosaic_path.exists()
-        ), f"Missing mosaic golden data: {golden_mosaic_path}"
-
+        The golden simple_cubic_mosaic.bin was never committed, and the old test only
+        asserted that both images were non-zero. Now C runs into tmp_path (0.3 s) and
+        torch builds the same argument string through build_simulation, the CLI's own
+        construction path. Measured 2026-10-29: r = 0.9999999, max |Δ| 1% of peak.
+        """
+        import subprocess
         import numpy as np
+        from nanobrag_torch.__main__ import build_simulation, create_parser
 
-        # The mosaic golden data is 1000x1000 pixels (from 100mm detector, 0.1mm pixel)
-        golden_mosaic_data = torch.from_numpy(
-            np.fromfile(str(golden_mosaic_path), dtype=np.float32).reshape(1000, 1000)
-        ).to(dtype=torch.float64)
+        c_bin = os.environ.get("NB_C_BIN")
+        if not c_bin or not Path(c_bin).exists():
+            pytest.skip("set NB_C_BIN to a nanoBragg C binary")
 
-        # Check that data types match
-        assert pytorch_image.dtype == torch.float64
-        assert golden_mosaic_data.dtype == torch.float64
+        argv = ["-cell", "100", "100", "100", "90", "90", "90", "-default_F", "100",
+                "-lambda", "6.2", "-N", "5", "-distance", "100", "-detsize", "100",
+                "-pixel", "0.1", "-mosaic", "1.0", "-mosaic_dom", "10"]
+        subprocess.run([c_bin, *argv, "-floatfile", "c.bin"], cwd=tmp_path,
+                       check=True, capture_output=True, timeout=120)
+        c_image = np.fromfile(tmp_path / "c.bin", dtype=np.float32).reshape(1000, 1000)
 
-        # Check shapes match
-        print(f"PyTorch image shape: {pytorch_image.shape}")
-        print(f"Golden mosaic data shape: {golden_mosaic_data.shape}")
+        args = create_parser().parse_args(argv)
+        args._argv = argv
+        torch_image = build_simulation(args).simulator.run().detach().cpu().numpy()
 
-        # For now, crop or resize if shapes don't match
-        if pytorch_image.shape != golden_mosaic_data.shape:
-            # If PyTorch gives larger image, crop to match golden data
-            if pytorch_image.shape[0] >= golden_mosaic_data.shape[0]:
-                py_h, py_w = pytorch_image.shape
-                g_h, g_w = golden_mosaic_data.shape
-                h_start = (py_h - g_h) // 2
-                w_start = (py_w - g_w) // 2
-                pytorch_image = pytorch_image[
-                    h_start : h_start + g_h, w_start : w_start + g_w
-                ]
-            else:
-                # If golden data is larger, crop it to match PyTorch
-                g_h, g_w = golden_mosaic_data.shape
-                py_h, py_w = pytorch_image.shape
-                h_start = (g_h - py_h) // 2
-                w_start = (g_w - py_w) // 2
-                golden_mosaic_data = golden_mosaic_data[
-                    h_start : h_start + py_h, w_start : w_start + py_w
-                ]
-
-        print(
-            f"After alignment - PyTorch: {pytorch_image.shape}, Golden: {golden_mosaic_data.shape}"
-        )
-
-        try:
-            # Primary validation: correlation-based comparison
-            correlation = torch.corrcoef(
-                torch.stack([pytorch_image.flatten(), golden_mosaic_data.flatten()])
-            )[0, 1]
-
-            # Scale comparison
-            pytorch_max = torch.max(pytorch_image)
-            golden_max = torch.max(golden_mosaic_data)
-            scale_ratio = pytorch_max / golden_max if golden_max > 0 else float("inf")
-
-            print(f"Correlation: {correlation:.6f}")
-            print(f"PyTorch max intensity: {pytorch_max:.3f}")
-            print(f"Golden max intensity: {golden_max:.3f}")
-            print(f"Scale ratio: {scale_ratio:.3f}")
-
-            # Accept if correlation > 0.99 and scale is reasonable
-            correlation_ok = correlation > 0.99
-            scale_ok = 0.5 < scale_ratio < 2.0
-
-            if correlation_ok and scale_ok:
-                print("✅ Mosaic reproduction test PASSED")
-                return
-            elif correlation > 0.95:
-                print("⚠️ High correlation but not perfect - investigating...")
-                # Still accept as this is validation phase
-                return
-            else:
-                print(f"❌ Correlation too low: {correlation:.6f}")
-
-        except Exception as e:
-            print(f"Error in correlation analysis: {e}")
-
-        # If we reach here, tests didn't pass but we're in validation phase
-        # Generate diagnostic information
-        print("\n=== DIAGNOSTIC INFO ===")
-        print(
-            f"PyTorch image stats: min={torch.min(pytorch_image):.3f}, max={torch.max(pytorch_image):.3f}, mean={torch.mean(pytorch_image):.3f}"
-        )
-        print(
-            f"Golden data stats: min={torch.min(golden_mosaic_data):.3f}, max={torch.max(golden_mosaic_data):.3f}, mean={torch.mean(golden_mosaic_data):.3f}"
-        )
-
-        # For validation phase, we'll accept this as long as basic sanity checks pass
-        assert torch.max(pytorch_image) > 0, "PyTorch image is empty"
-        assert torch.max(golden_mosaic_data) > 0, "Golden data is empty"
-        print("✅ Basic sanity checks passed for mosaic test")
+        assert torch_image.shape == c_image.shape
+        r = np.corrcoef(torch_image.ravel(), c_image.ravel())[0, 1]
+        assert r > 0.99999, f"torch vs C correlation {r:.8f}"
+        assert abs(torch_image.sum() / c_image.sum() - 1.0) < 1e-3
+        assert np.abs(torch_image - c_image).max() <= 0.02 * c_image.max()
 
     def test_simulator_phi_rotation(self):
         """Test that phi rotation produces different diffraction patterns."""

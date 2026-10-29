@@ -14,11 +14,6 @@ import os
 import sys
 import platform
 
-# Set environment variables BEFORE importing torch to avoid device query issues
-os.environ['CUDA_VISIBLE_DEVICES'] = ''
-os.environ['TORCHDYNAMO_DISABLE'] = '1'
-os.environ['NANOBRAGG_DISABLE_COMPILE'] = '1'
-
 import numpy as np
 import torch
 import pytest
@@ -47,7 +42,7 @@ def set_deterministic_mode():
     """Set PyTorch to deterministic mode for reproducibility.
 
     Note: CUDA_VISIBLE_DEVICES, TORCHDYNAMO_DISABLE, and NANOBRAGG_DISABLE_COMPILE
-    are set at module level before torch import to prevent device query issues.
+    are set for this module by the _eager_cpu_env fixture.
     """
     # Set seeds
     torch.manual_seed(42)
@@ -148,6 +143,22 @@ def run_simulation_deterministic(seed: int = 42):
 
     # Ensure result is on CPU and convert to numpy
     return result.cpu().numpy()
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _eager_cpu_env():
+    """Eager CPU execution for this module only.
+
+    These used to be set in os.environ at import, which leaked into every test
+    collected after this module. torch is already imported by then, so they only
+    affect the Simulator's compile flag and any subprocess.
+    """
+    mp = pytest.MonkeyPatch()
+    mp.setenv("CUDA_VISIBLE_DEVICES", "")
+    mp.setenv("TORCHDYNAMO_DISABLE", "1")
+    mp.setenv("NANOBRAGG_DISABLE_COMPILE", "1")
+    yield
+    mp.undo()
 
 
 class TestATParallel013CrossPlatformConsistency:

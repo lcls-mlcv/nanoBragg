@@ -121,7 +121,16 @@ class TestATParallel015MixedUnits:
         det = Detector(detector_config)
         crystal = Crystal(crystal_config)
 
-        peak_positions = []
+        # The brightest pixel is the 000 spot at the beam centre, which sits between
+        # four pixels, so argmax over the whole image only measured float noise. Mask a
+        # disc around the centre and find the first-order (100) spots instead: they sit
+        # at distance * tan(2*theta), sin(theta) = lambda / (2 * 100 A), i.e. ~10*lambda
+        # pixels out. (Image checked against nanoBragg.c for all four wavelengths: r = 1.0.)
+        yy, xx = torch.meshgrid(torch.arange(64), torch.arange(64), indexing="ij")
+        centre = 32.5  # beam centre in pixel-index units: the 000 spot ties pixels 32 and 33
+        radius = torch.sqrt((xx - centre) ** 2 + (yy - centre) ** 2)
+
+        peak_radii = []
         for wavelength in wavelengths_A:
             beam_config = BeamConfig(
                 wavelength_A=wavelength,
@@ -130,28 +139,19 @@ class TestATParallel015MixedUnits:
             sim = Simulator(detector=det, crystal=crystal, beam_config=beam_config)
             intensity = sim.run(oversample=1)
 
-            # Find peak position
-            peak_idx = torch.argmax(intensity).item()
-            peak_y, peak_x = divmod(peak_idx, 64)
-
-            # Calculate expected Bragg angle
-            # For (1,0,0) reflection: sin(theta) = λ/(2d) where d = 100Å
-            sin_theta = wavelength / (2 * 100.0)
-
-            # Store peak position relative to beam center
-            beam_center = 32  # For 64x64 detector with MOSFLM
-            radial_distance = np.sqrt((peak_x - beam_center)**2 + (peak_y - beam_center)**2)
-            peak_positions.append(radial_distance)
-
-            # Verify intensity is reasonable
             assert intensity.max() > 0, f"Zero intensity for wavelength {wavelength}Å"
             assert not torch.isnan(intensity).any(), f"NaN values for wavelength {wavelength}Å"
 
-        # Peak positions should increase with wavelength (larger Bragg angle)
-        for i in range(len(peak_positions) - 1):
-            # Allow for discretization effects
-            assert peak_positions[i+1] >= peak_positions[i] - 1, \
-                f"Peak positions not increasing with wavelength: {peak_positions}"
+            masked = torch.where(radius > 2.5, intensity, torch.zeros_like(intensity))
+            peak_radius = radius.flatten()[torch.argmax(masked)].item()
+            two_theta = 2 * np.arcsin(wavelength / (2 * 100.0))
+            expected = 100.0 * np.tan(two_theta) / 0.1  # mm -> pixels
+            assert abs(peak_radius - expected) < 1.0, \
+                f"λ={wavelength}Å: (100) spot at {peak_radius:.2f} px, expected {expected:.2f} px"
+            peak_radii.append(peak_radius)
+
+        assert peak_radii == sorted(peak_radii), \
+            f"Spot radius should grow with wavelength: {peak_radii}"
 
     def test_angle_units_consistency(self):
         """Test that angles specified in degrees are handled correctly."""

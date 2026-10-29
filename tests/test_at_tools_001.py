@@ -34,7 +34,7 @@ os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 class TestAT_TOOLS_001_DualRunnerComparison:
     """Test the dual-runner comparison utility per AT-TOOLS-001."""
 
-    def test_find_c_binary_resolution(self):
+    def test_find_c_binary_resolution(self, monkeypatch):
         """Test C binary resolution order."""
         # Test with explicit path
         with tempfile.NamedTemporaryFile(suffix='_nanoBragg', delete=False) as f:
@@ -48,24 +48,24 @@ class TestAT_TOOLS_001_DualRunnerComparison:
             Path(temp_path).unlink()
 
         # Test with environment variable
-        os.environ['NB_C_BIN'] = temp_path
+        monkeypatch.setenv('NB_C_BIN', temp_path)
         with tempfile.NamedTemporaryFile(suffix='_nanoBragg', delete=False) as f:
             f.write(b"dummy")
             temp_path = f.name
 
         try:
-            os.environ['NB_C_BIN'] = temp_path
+            monkeypatch.setenv('NB_C_BIN', temp_path)
             result = find_c_binary()
             assert result == Path(temp_path).resolve()
         finally:
-            del os.environ['NB_C_BIN']
+            monkeypatch.delenv('NB_C_BIN')
             Path(temp_path).unlink()
 
         # Test error case
         with pytest.raises(FileNotFoundError):
             find_c_binary("nonexistent_binary")
 
-    def test_find_py_binary_resolution(self):
+    def test_find_py_binary_resolution(self, monkeypatch):
         """Test PyTorch binary resolution order."""
         # Test with explicit path
         result = find_py_binary("custom_script.py")
@@ -75,10 +75,10 @@ class TestAT_TOOLS_001_DualRunnerComparison:
         assert result == ['custom_binary']
 
         # Test with environment variable
-        os.environ['NB_PY_BIN'] = 'env_script.py'
+        monkeypatch.setenv('NB_PY_BIN', 'env_script.py')
         result = find_py_binary()
         assert result == ['python', 'env_script.py']
-        del os.environ['NB_PY_BIN']
+        monkeypatch.delenv('NB_PY_BIN')
 
         # Test default fallback
         result = find_py_binary()

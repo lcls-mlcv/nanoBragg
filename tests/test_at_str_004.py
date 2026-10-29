@@ -160,12 +160,12 @@ class TestAT_STR_004:
         ).item()
         assert f_234 == 10.0
 
-    def test_fdump_preserves_sparse_behavior(self, sparse_hkl_file, test_crystal_config, tmp_path):
+    def test_fdump_preserves_sparse_behavior(self, sparse_hkl_file, test_crystal_config, tmp_path, monkeypatch):
         """Test that Fdump.bin cache preserves sparse HKL behavior."""
         from nanobrag_torch.io.hkl import write_fdump
 
         # Change to temp directory for this test
-        os.chdir(tmp_path)
+        monkeypatch.chdir(tmp_path)
 
         # Load HKL data
         hkl_data_1, metadata_1 = read_hkl_file(str(sparse_hkl_file), default_F=test_crystal_config.default_F)
