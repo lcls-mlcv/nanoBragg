@@ -286,11 +286,15 @@ def rotate_A(A, rotx_deg=0.0, roty_deg=0.0, rotz_deg=0.0) -> torch.Tensor:
     A' = Rx(θx)·Ry(θy)·Rz(θz)·A, with rotations about the lab axes. Angles may
     be tensors requiring grad; the result is a (3,3) tensor.
     """
+    # the result lives where the inputs do: A if it is a tensor, else the first tensor angle
+    tensors = [x for x in (A, rotx_deg, roty_deg, rotz_deg) if isinstance(x, torch.Tensor)]
+    device = tensors[0].device if tensors else None
     A_t = torch.as_tensor(np.asarray(A, dtype=np.float64).reshape(3, 3)) if not isinstance(A, torch.Tensor) else A.reshape(3, 3)
+    A_t = A_t.to(device) if device is not None else A_t
     dtype = A_t.dtype
-    angles = [torch.as_tensor(x, dtype=dtype) for x in (rotx_deg, roty_deg, rotz_deg)]
+    angles = [torch.as_tensor(x, dtype=dtype, device=A_t.device) for x in (rotx_deg, roty_deg, rotz_deg)]
     tx, ty, tz = (torch.deg2rad(x) for x in angles)
-    one, zero = torch.ones((), dtype=dtype), torch.zeros((), dtype=dtype)
+    one, zero = torch.ones((), dtype=dtype, device=A_t.device), torch.zeros((), dtype=dtype, device=A_t.device)
     Rx = torch.stack([torch.stack([one, zero, zero]),
                       torch.stack([zero, torch.cos(tx), -torch.sin(tx)]),
                       torch.stack([zero, torch.sin(tx), torch.cos(tx)])])
