@@ -17,6 +17,7 @@ from torch import nn
 from ..config import BeamConfig, CrystalConfig, DetectorConfig
 from ..models.crystal import Crystal
 from ..models.detector import Detector
+from ..utils.tensor_utils import as_tensor_preserving_grad
 
 
 class CrystalStageAParams(nn.Module):
@@ -362,6 +363,14 @@ class ExperimentModel(nn.Module):
         self._external_hkl_data: Optional[torch.Tensor] = hkl_data
         self._external_hkl_metadata: Optional[dict] = hkl_metadata
 
+        # Crystal, Detector and Simulator are built on the first forward() and then
+        # kept: every later step writes the new parameter tensors into them instead
+        # of rebuilding (and re-compiling) all three.
+        self._simulator = None
+        self._crystal: Optional[Crystal] = None
+        self._detector: Optional[Detector] = None
+        self._beam_config: Optional[BeamConfig] = None
+
     def set_structure_factors(
         self, hkl_data: torch.Tensor, hkl_metadata: dict
     ) -> None:
@@ -383,45 +392,71 @@ class ExperimentModel(nn.Module):
         """
         self._external_hkl_data = hkl_data
         self._external_hkl_metadata = hkl_metadata
+        if self._crystal is not None:
+            self._apply_structure_factors(self._crystal)
 
-    def _build_simulator(self):
+    def _apply_structure_factors(self, crystal: Crystal) -> None:
+        if self._external_hkl_data is None:
+            return
+        hkl_tensor = torch.as_tensor(self._external_hkl_data)
+        crystal.hkl_data = hkl_tensor.to(device=self.device, dtype=self.dtype)
+        crystal.hkl_metadata = (
+            dict(self._external_hkl_metadata)
+            if self._external_hkl_metadata is not None
+            else None
+        )
+
+    # Fields the Stage-A blocks produce. Everything else in the configs is fixed at
+    # construction.
+    _CRYSTAL_CELL_FIELDS = (
+        "cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",
+    )
+    _DETECTOR_FIELDS = (
+        "distance_mm", "detector_rotx_deg", "detector_roty_deg", "detector_rotz_deg",
+        "detector_twotheta_deg", "beam_center_s", "beam_center_f",
+    )
+
+    def _sync(self):
+        """Return the persistent Simulator with the current parameter values in it.
+
+        Crystal re-derives its vectors from its cell tensors and config.misset_deg on
+        every access; Detector rebuilds its geometry when a config field changes
+        (Detector._ensure_geometry_current, called by Simulator.run); Simulator takes
+        fluence from its own tensor. So writing the new tensors in is enough.
         """
-        Internal helper to build Crystal/Detector/Simulator for the current parameters.
-
-        Returns:
-            (simulator, crystal, detector, beam_config)
-
-        Note: This is primarily intended for tests and tooling; callers should
-        prefer ExperimentModel.forward() for normal use.
-        """
-        # Build configs from raw parameters.
         crystal_cfg = self.crystal_params.build_config()
         detector_cfg = self.detector_params.build_config()
         beam_cfg = self.beam_params.build_config()
 
-        # Instantiate core models on the requested device/dtype.
+        if self._simulator is None:
+            self._construct(crystal_cfg, detector_cfg, beam_cfg)
+            return self._simulator
+
+        crystal = self._crystal
+        for name in self._CRYSTAL_CELL_FIELDS:
+            value = getattr(crystal_cfg, name)
+            setattr(crystal, name, torch.as_tensor(value, device=self.device, dtype=self.dtype))
+            # The config copy feeds Simulator's auto-oversample choice.
+            setattr(crystal.config, name, value)
+        crystal.config.misset_deg = crystal_cfg.misset_deg
+
+        for name in self._DETECTOR_FIELDS:
+            setattr(self._detector.config, name, getattr(detector_cfg, name))
+
+        self._beam_config.fluence = beam_cfg.fluence
+        self._simulator.fluence = as_tensor_preserving_grad(
+            beam_cfg.fluence, device=self.device, dtype=self.dtype
+        )
+        return self._simulator
+
+    def _construct(self, crystal_cfg, detector_cfg, beam_cfg) -> None:
         crystal = Crystal(
             config=crystal_cfg,
             beam_config=beam_cfg,
             device=self.device,
             dtype=self.dtype,
         )
-
-        # Apply external HKL grid if provided.
-        if self._external_hkl_data is not None:
-            if isinstance(self._external_hkl_data, torch.Tensor):
-                hkl_tensor = self._external_hkl_data
-            else:
-                hkl_tensor = torch.as_tensor(self._external_hkl_data)
-            crystal.hkl_data = hkl_tensor.to(
-                device=self.device,
-                dtype=self.dtype,
-            )
-            crystal.hkl_metadata = (
-                dict(self._external_hkl_metadata)
-                if self._external_hkl_metadata is not None
-                else None
-            )
+        self._apply_structure_factors(crystal)
 
         detector = Detector(
             config=detector_cfg,
@@ -433,15 +468,26 @@ class ExperimentModel(nn.Module):
         # time (Simulator imports models.crystal / models.detector).
         from ..simulator import Simulator
 
-        simulator = Simulator(
+        self._simulator = Simulator(
             crystal=crystal,
             detector=detector,
             beam_config=beam_cfg,
             device=self.device,
             dtype=self.dtype,
         )
+        self._crystal, self._detector, self._beam_config = crystal, detector, beam_cfg
 
-        return simulator, crystal, detector, beam_cfg
+    def _build_simulator(self):
+        """
+        Return (simulator, crystal, detector, beam_config) holding the current
+        parameter values. These are the persistent objects forward() runs, not
+        fresh copies.
+
+        Note: This is primarily intended for tests and tooling; callers should
+        prefer ExperimentModel.forward() for normal use.
+        """
+        simulator = self._sync()
+        return simulator, self._crystal, self._detector, self._beam_config
 
     def forward(
         self,
@@ -457,7 +503,7 @@ class ExperimentModel(nn.Module):
         Returns:
             Float image tensor with shape (spixels, fpixels).
         """
-        simulator, _, _, _ = self._build_simulator()
+        simulator = self._sync()
 
         return simulator.run(
             pixel_batch_size=pixel_batch_size,
