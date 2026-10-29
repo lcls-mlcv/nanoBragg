@@ -90,3 +90,38 @@ def test_simulator_attempts_compile_when_not_disabled(monkeypatch):
     # And the compiled function should not be the raw function object
     assert simulator._compiled_compute_physics is not compute_physics_for_position
 
+
+
+_PHYSICS_COMPILED_PROBE = (
+    "from nanobrag_torch.utils import physics; "
+    "print(hasattr(physics.sincg, '_torchdynamo_orig_callable'))"
+)
+
+
+@pytest.mark.skipif(torch.cuda.is_available(),
+                    reason="physics helpers are never compiled when CUDA is available")
+@pytest.mark.parametrize("env_var", [None, "NANOBRAGG_DISABLE_COMPILE", "NANOBRAG_DISABLE_COMPILE"])
+def test_physics_helpers_honour_both_spellings(env_var):
+    """Either spelling must leave the physics helpers eager, not only the Simulator kernel.
+
+    The helpers are decorated at import time, so each case imports them in a fresh
+    interpreter. The None case is the control: with no flag set they are compiled.
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    # TORCHDYNAMO_DISABLE also makes torch.compile a no-op; test_at_parallel_013 sets it
+    # in os.environ at import, so drop it or the control case fails in a full run.
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("NANOBRAGG_DISABLE_COMPILE", "NANOBRAG_DISABLE_COMPILE",
+                        "TORCHDYNAMO_DISABLE")}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    if env_var is not None:
+        env[env_var] = "1"
+
+    result = subprocess.run([sys.executable, "-c", _PHYSICS_COMPILED_PROBE],
+                            env=env, capture_output=True, text=True, check=True)
+    compiled = result.stdout.strip().splitlines()[-1] == "True"
+    assert compiled is (env_var is None)

@@ -1,23 +1,22 @@
 """
-Acceptance test for AT-FLU-001: Fluence calculation and sample clipping.
+Acceptance test for AT-FLU-001: Fluence calculation.
 
 Per spec: Provide -flux, -exposure, -beamsize, and also -fluence; set beamsize smaller than sample_y/z.
 Expectation: fluence SHALL be recomputed as flux·exposure/beamsize^2 whenever flux != 0 and exposure > 0
-and beamsize ≥ 0; exposure > 0 SHALL recompute flux consistently; when beamsize > 0 and smaller than
-sample_y or sample_z, those sample dimensions SHALL be clipped to beamsize and a warning printed.
+and beamsize ≥ 0; exposure > 0 SHALL recompute flux consistently.
+
+Sample clipping by the beam is done by the CLI, as in nanoBragg.c:1134-1143, and is covered by
+the parity case samplesize-clipped-by-beam in tests/parity_cases.yaml.
 """
 
 import pytest
 import torch
-from io import StringIO
-import sys
 
-from nanobrag_torch.config import BeamConfig, CrystalConfig
-from nanobrag_torch.models.crystal import Crystal
+from nanobrag_torch.config import BeamConfig
 
 
 class TestAT_FLU_001:
-    """Test fluence calculation and sample clipping per AT-FLU-001."""
+    """Test fluence calculation per AT-FLU-001."""
 
     def test_fluence_calculation_from_flux_exposure_beamsize(self):
         """Test fluence is recomputed from flux, exposure, and beamsize."""
@@ -95,87 +94,3 @@ class TestAT_FLU_001:
         beamsize_m = 0.002
         expected_flux = 1e20 * (beamsize_m * beamsize_m) / 0.5
         assert config.flux == pytest.approx(expected_flux)
-
-    def test_sample_clipping_warning(self, capsys):
-        """Test sample dimensions are clipped to beamsize when beamsize is smaller."""
-
-        # Create crystal config with 10x10x10 cells of 100 Å each
-        # This gives sample dimensions of 10 * 100 * 1e-10 = 1e-7 m = 0.0001 mm
-        crystal_config = CrystalConfig(
-            cell_a=100.0,  # Angstroms
-            cell_b=100.0,
-            cell_c=100.0,
-            N_cells=(10, 10, 10)
-        )
-
-        # Beam config with small beamsize (smaller than sample)
-        # Sample dimensions: 10 * 100 Å = 1000 Å = 1e-7 m = 0.0001 mm
-        # Set beamsize smaller: 0.00005 mm = 5e-8 m
-        beam_config = BeamConfig(
-            beamsize_mm=0.00005  # 5e-8 m, smaller than sample
-        )
-
-        # Create crystal with beam config to trigger clipping
-        crystal = Crystal(config=crystal_config, beam_config=beam_config)
-
-        # Check that sample dimensions were clipped
-        beamsize_m = 5e-8
-        assert crystal.config.sample_y == pytest.approx(beamsize_m)
-        assert crystal.config.sample_z == pytest.approx(beamsize_m)
-
-        # Check warning was printed
-        captured = capsys.readouterr()
-        assert "Warning: Clipping sample_y" in captured.out
-        assert "Warning: Clipping sample_z" in captured.out
-        assert f"to beamsize {beamsize_m:.6e} m" in captured.out
-
-    def test_no_clipping_when_beamsize_larger(self):
-        """Test sample dimensions are NOT clipped when beamsize is larger."""
-
-        crystal_config = CrystalConfig(
-            cell_a=100.0,
-            cell_b=100.0,
-            cell_c=100.0,
-            N_cells=(10, 10, 10)
-        )
-
-        # Beam config with large beamsize (larger than sample)
-        # Sample: 1e-7 m = 0.0001 mm
-        # Beamsize: 1 mm = 0.001 m (much larger)
-        beam_config = BeamConfig(
-            beamsize_mm=1.0  # 0.001 m, larger than sample
-        )
-
-        crystal = Crystal(config=crystal_config, beam_config=beam_config)
-
-        # Sample dimensions should not be changed
-        expected_sample_y = 10 * 100 * 1e-10  # 1e-7 m
-        expected_sample_z = 10 * 100 * 1e-10
-        assert crystal.config.sample_y == expected_sample_y
-        assert crystal.config.sample_z == expected_sample_z
-
-    def test_no_clipping_when_beamsize_zero(self):
-        """Test no clipping occurs when beamsize is 0."""
-
-        crystal_config = CrystalConfig(
-            cell_a=100.0,
-            cell_b=100.0,
-            cell_c=100.0,
-            N_cells=(5, 5, 5)
-        )
-
-        beam_config = BeamConfig(
-            beamsize_mm=0.0  # No beamsize set
-        )
-
-        crystal = Crystal(config=crystal_config, beam_config=beam_config)
-
-        # Sample dimensions should be unchanged
-        expected_sample_y = 5 * 100 * 1e-10
-        expected_sample_z = 5 * 100 * 1e-10
-        assert crystal.config.sample_y == expected_sample_y
-        assert crystal.config.sample_z == expected_sample_z
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])
