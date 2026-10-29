@@ -375,21 +375,63 @@ def test_gradient_health(grad_case):
 # So degeneracy is reached by construction, not by enumeration: these cases
 # set `beam_center_f/s` on DetectorConfig directly, the way the geometry ends
 # up when a caller drives the models as a library rather than through the CLI.
-# Verified to fail with PR #25's guard reverted.
+#
+# Newer torch (2.10 measured) defines the backward of atan2(0, 0) as 0 rather
+# than NaN, so on those versions removing PR #25's guard no longer produces a
+# NaN and a plain finiteness check passes vacuously. The tests therefore swap
+# in an atan2 whose backward is the textbook x/(x^2+y^2), -y/(x^2+y^2) -- NaN
+# at the origin on every torch -- so what they pin is the guard's actual
+# contract: no sample reaches atan2 at exactly (0, 0). Verified to fail with
+# the guard reverted on torch 2.10.
 
 DEGENERATE_GEOMETRIES = [
     # (id, spixels, beam_centre_mm, oversample, kahn)
     ("beam-on-pixel-centre-32", 32, 1.6, 1, 1.0),
     ("beam-on-pixel-centre-64", 64, 3.2, 1, 1.0),
     ("beam-on-pixel-centre-kahn-partial", 32, 1.6, 1, 0.5),
-    ("beam-on-pixel-centre-oversample-3", 32, 1.6, 3, 1.0),
+    # oversample=5, not 3: the middle offset is -0.5 + step/2 + k*step, which
+    # is exactly 0.0 for step=1/5 but rounds to ~5e-17 for step=1/3, so an
+    # oversample=3 case never reaches the degeneracy (measured: 0 exact-origin
+    # samples at 2 and 3, 1 at 1 and 5).
+    ("beam-on-pixel-centre-oversample-5", 32, 1.6, 5, 1.0),
 ]
+
+
+_real_atan2 = torch.atan2
+
+
+class _TextbookAtan2(torch.autograd.Function):
+    """atan2 with the analytic derivative, which is 0/0 = NaN at the origin."""
+
+    @staticmethod
+    def forward(ctx, y, x):
+        ctx.save_for_backward(y, x)
+        return _real_atan2(y, x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        y, x = ctx.saved_tensors
+        r2 = x * x + y * y
+        return (grad * x / r2).sum_to_size(y.shape), (-grad * y / r2).sum_to_size(x.shape)
+
+
+@pytest.fixture
+def textbook_atan2(monkeypatch):
+    monkeypatch.setattr(torch, "atan2", _TextbookAtan2.apply)
+
+
+def test_textbook_atan2_is_nan_at_the_origin():
+    """Guard against the fixture itself going vacuous on some future torch."""
+    y = torch.zeros((), dtype=torch.float64, requires_grad=True)
+    x = torch.zeros((), dtype=torch.float64, requires_grad=True)
+    _TextbookAtan2.apply(y, x).backward()
+    assert torch.isnan(y.grad) and torch.isnan(x.grad)
 
 
 @pytest.mark.parametrize(
     "case", DEGENERATE_GEOMETRIES, ids=[c[0] for c in DEGENERATE_GEOMETRIES]
 )
-def test_degenerate_geometry_gradient_health(case):
+def test_degenerate_geometry_gradient_health(case, textbook_atan2):
     """Gradients stay finite where the diffracted ray is exactly on the beam axis."""
     from nanobrag_torch.config import BeamConfig, CrystalConfig, DetectorConfig
     from nanobrag_torch.models import Crystal
@@ -418,7 +460,8 @@ def test_degenerate_geometry_gradient_health(case):
     beam = BeamConfig(wavelength_A=1.0, fluence=1e24, polarization_factor=kahn)
 
     simulator = Simulator(
-        crystal, detector, crystal_config=crystal_config, beam_config=beam
+        crystal, detector, crystal_config=crystal_config, beam_config=beam,
+        dtype=torch.float64,
     )
     image = simulator.run(oversample=oversample)
 
@@ -431,8 +474,6 @@ def test_degenerate_geometry_gradient_health(case):
         f"exactly on the beam axis poisoned the backward pass while the "
         f"rendered image stayed clean"
     )
-
-
 
 
 # --- The TOPHAT warning ----------------------------------------------------
@@ -554,6 +595,41 @@ def test_tophat_with_interpolated_hkl_keeps_cell_gradients_and_is_silent():
         and getattr(sim.crystal, f"cell_{n}").grad.abs().item() > 0
     ]
     assert len(live) == 6, f"expected all six cell gradients live, got {sorted(live)}"
+
+
+@pytest.mark.skipif(not HKL_INTERP.exists(), reason="P1_interp.hkl not present")
+def test_tophat_small_crystal_auto_interpolates_and_keeps_cell_gradients():
+    """N_cells <= 2 turns interpolation on with no flag, so the live path is the default.
+
+    Same regime as the explicit-interpolate test above, reached the way most
+    users would hit it: a small crystal, an hkl file, and no -interpolate.
+    """
+    import warnings as _w
+
+    sim = _tophat_sim(hkl=True, interpolate=None, n_cells=(2, 2, 2))
+    assert sim.crystal.interpolate, "N_cells=2 should auto-enable interpolation"
+    with _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        image = sim.run(oversample=1)
+    image.sum().backward()
+    live = [
+        n for n in ("a", "b", "c", "alpha", "beta", "gamma")
+        if getattr(sim.crystal, f"cell_{n}").grad is not None
+        and getattr(sim.crystal, f"cell_{n}").grad.abs().item() > 0
+    ]
+    assert len(live) == 6, f"expected all six cell gradients live, got {sorted(live)}"
+
+
+def test_tophat_warning_skipped_under_no_grad_but_not_used_up():
+    """Forward-only evaluation under no_grad() never calls backward()."""
+    import warnings as _w
+
+    sim = _tophat_sim()
+    with torch.no_grad(), _w.catch_warnings():
+        _w.simplefilter("error", UserWarning)
+        sim.run(oversample=1)
+    with pytest.warns(UserWarning, match="TOPHAT crystal shape has no gradient path"):
+        sim.run(oversample=1)
 
 
 def test_cell_only_tophat_backward_raises():

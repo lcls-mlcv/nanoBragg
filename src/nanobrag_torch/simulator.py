@@ -1145,6 +1145,11 @@ class Simulator:
         """
         if getattr(self, "_tophat_gradient_warning_issued", False):
             return
+        # A forward-only evaluation under no_grad() will never call backward();
+        # don't warn it, and don't use up the one warning a later grad-enabled
+        # run() on this Simulator should still get.
+        if not torch.is_grad_enabled():
+            return
 
         shape = getattr(self.crystal.config, "shape", None)
         if shape is None or getattr(shape, "name", "") != "TOPHAT":
