@@ -349,3 +349,20 @@ def test_public_getters_sync_before_reading():
         _detector(distance_mm=150.0).get_solid_angle(pixel_coords=coords),
         rtol=1e-12,
     ), "get_solid_angle(pixel_coords=...) used the stale close_distance"
+
+
+def test_replaced_mask_is_seen_even_if_the_old_one_was_freed():
+    """CPython reuses a freed tensor's id(), so the mask is tracked by reference.
+
+    Keyed on id(mask_array), clearing the mask and installing a new one with no
+    run() in between reused the old id on the first try, and the re-run kept the
+    old mask: summed 0.02124 against 0.0 for a fresh build.
+    """
+    cfg = DetectorConfig(**BASE, beam_center_s=1.6, beam_center_f=1.7)
+    cfg.mask_array = torch.ones(32, 32, dtype=torch.float64)
+    sim = _simulator(cfg)
+    sim.run(oversample=1)
+
+    sim.detector.config.mask_array = None
+    sim.detector.config.mask_array = torch.zeros(32, 32, dtype=torch.float64)
+    assert sim.run(oversample=1).sum().item() == 0.0

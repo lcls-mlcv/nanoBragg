@@ -669,17 +669,25 @@ class Simulator:
         self._compile_physics_fn()
 
     def _roi_mask_key(self) -> tuple:
-        """What the cached ROI mask was built from.
+        """What the cached ROI mask was built from, apart from mask_array.
 
-        `mask_array` is compared by identity: replacing it is detected, editing
-        it in place is not (hashing its contents every run would cost a full
-        pass over the image).
+        `mask_array` is tracked separately, by holding a reference to the
+        tensor and comparing with `is` (see _roi_mask_is_current): replacing
+        it is detected, editing it in place is not (hashing its contents every
+        run would cost a full pass over the image). Not `id()`: CPython reuses
+        the id of a freed tensor, so `cfg.mask_array = None` followed by a new
+        mask could land on the old id and keep the stale mask.
         """
         cfg = self.detector.config
         return (
             cfg.spixels, cfg.fpixels,
             cfg.roi_xmin, cfg.roi_xmax, cfg.roi_ymin, cfg.roi_ymax,
-            id(cfg.mask_array),
+        )
+
+    def _roi_mask_is_current(self) -> bool:
+        return (
+            self._roi_mask_key() == self._roi_mask_built_from
+            and self.detector.config.mask_array is self._roi_mask_source
         )
 
     def _refresh_roi_mask(self) -> None:
@@ -718,6 +726,7 @@ class Simulator:
             mask_array = self.detector.config.mask_array.to(device=self.device, dtype=self.dtype)
             self._cached_roi_mask = self._cached_roi_mask * mask_array
         self._roi_mask_built_from = self._roi_mask_key()
+        self._roi_mask_source = self.detector.config.mask_array
 
     def _compile_physics_fn(self) -> None:
         # The wrapper method _compute_physics_for_position should NOT be compiled
@@ -1178,7 +1187,7 @@ class Simulator:
             self.incident_beam_direction = self.detector.beam_vector.clone()
             self._refresh_pixel_coords()
         # The ROI and mask are not geometry fields, so they get their own key.
-        if self._roi_mask_key() != self._roi_mask_built_from:
+        if not self._roi_mask_is_current():
             self._refresh_roi_mask()
 
     def run(
