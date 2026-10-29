@@ -389,10 +389,12 @@ DEGENERATE_GEOMETRIES = [
     ("beam-on-pixel-centre-32", 32, 1.6, 1, 1.0),
     ("beam-on-pixel-centre-64", 64, 3.2, 1, 1.0),
     ("beam-on-pixel-centre-kahn-partial", 32, 1.6, 1, 0.5),
-    # oversample=5, not 3: the middle offset is -0.5 + step/2 + k*step, which
-    # is exactly 0.0 for step=1/5 but rounds to ~5e-17 for step=1/3, so an
-    # oversample=3 case never reaches the degeneracy (measured: 0 exact-origin
-    # samples at 2 and 3, 1 at 1 and 5).
+    # oversample=5, not 3. Whether the middle offset -0.5 + step/2 + k*step is
+    # exactly 0.0 depends on the dtype: in float64 it is 0.0 for step=1/5 but
+    # ~5e-17 for step=1/3 (and for 1/7), so with the float64 Simulator below an
+    # oversample=3 case never reaches the degeneracy. In float32, 3 does reach
+    # it. Measured float64, guard reverted: 1 exact-origin sample at
+    # oversample 1 and 5, 0 at 2, 3 and 7.
     ("beam-on-pixel-centre-oversample-5", 32, 1.6, 5, 1.0),
 ]
 
@@ -459,6 +461,8 @@ def test_degenerate_geometry_gradient_health(case, textbook_atan2):
     crystal = Crystal(crystal_config)
     beam = BeamConfig(wavelength_A=1.0, fluence=1e24, polarization_factor=kahn)
 
+    # float64 for the detector geometry and the image, which is where the
+    # degeneracy lives; the Crystal is left at its float32 default.
     simulator = Simulator(
         crystal, detector, crystal_config=crystal_config, beam_config=beam,
         dtype=torch.float64,
