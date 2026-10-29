@@ -26,7 +26,7 @@ numbers from the wrong geometry.
 import pytest
 import torch
 
-from nanobrag_torch.config import DetectorConfig
+from nanobrag_torch.config import DetectorConfig, DetectorConvention
 from nanobrag_torch.models.detector import Detector
 
 BASE = dict(distance_mm=100.0, pixel_size_mm=0.1, spixels=32, fpixels=32)
@@ -261,3 +261,91 @@ def test_invalidate_cache_does_not_leave_a_redundant_recompute():
         "get_pixel_coords() rebuilt the geometry again after invalidate_cache() "
         "had already done it"
     )
+
+
+def _simulator(det_cfg, dtype=torch.float64):
+    from nanobrag_torch.config import BeamConfig, CrystalConfig
+    from nanobrag_torch.models import Crystal
+    from nanobrag_torch.simulator import Simulator
+
+    ccfg = CrystalConfig(
+        cell_a=100.0, cell_b=100.0, cell_c=100.0,
+        cell_alpha=90.0, cell_beta=90.0, cell_gamma=90.0,
+        default_F=100.0, N_cells=(3, 3, 3),
+    )
+    return Simulator(
+        Crystal(ccfg), Detector(det_cfg), crystal_config=ccfg,
+        beam_config=BeamConfig(wavelength_A=6.2, fluence=1e24), dtype=dtype,
+    )
+
+
+def _set_roi(cfg):
+    cfg.roi_xmin, cfg.roi_xmax, cfg.roi_ymin, cfg.roi_ymax = 0, 10, 0, 10
+
+
+# (id, initial config overrides, mutation). Each is something else the Simulator
+# took from the detector in __init__, besides the pixel coordinates.
+SIMULATOR_SNAPSHOTS = [
+    ("convention_mosflm_to_xds", {},
+     lambda c: setattr(c, "detector_convention", DetectorConvention.XDS)),
+    ("custom_beam_vector",
+     dict(detector_convention="CUSTOM", custom_beam_vector=(1.0, 0.0, 0.0),
+          custom_fdet_vector=(0.0, 0.0, 1.0), custom_sdet_vector=(0.0, -1.0, 0.0),
+          custom_odet_vector=(1.0, 0.0, 0.0)),
+     lambda c: setattr(c, "custom_beam_vector", (0.9961946980917455, 0.08715574274765817, 0.0))),
+    ("curved_on_to_off", dict(curved_detector=True),
+     lambda c: setattr(c, "curved_detector", False)),
+    ("roi", {}, _set_roi),
+]
+
+
+@pytest.mark.parametrize(
+    "overrides,mutate",
+    [s[1:] for s in SIMULATOR_SNAPSHOTS],
+    ids=[s[0] for s in SIMULATOR_SNAPSHOTS],
+)
+def test_simulator_rerun_matches_fresh_beyond_pixel_coords(overrides, mutate):
+    """The beam direction, the curved flag and the ROI mask were snapshotted too.
+
+    Measured before, re-running the same Simulator after the edit vs a fresh one
+    (32x32, float64): MOSFLM->XDS summed to 0.00566 vs 0.0213, a tilted custom
+    beam vector to 0.00334 vs 0.0213, curved_detector True->False kept the curved
+    image, and a 10x10 ROI kept the full-detector image (0.0212 vs 0.000986).
+    """
+    import copy
+
+    cfg = dict(BASE, beam_center_s=1.6, beam_center_f=1.7)
+    cfg.update(overrides)
+    if cfg.get("detector_convention") == "CUSTOM":
+        cfg["detector_convention"] = DetectorConvention.CUSTOM
+    sim = _simulator(DetectorConfig(**cfg))
+    sim.run(oversample=1)
+
+    mutate(sim.detector.config)
+    mutated = sim.run(oversample=1)
+    fresh = _simulator(copy.deepcopy(sim.detector.config)).run(oversample=1)
+
+    assert torch.allclose(mutated, fresh, rtol=1e-10, atol=0), (
+        f"re-run sum {mutated.sum().item():.6g}, fresh {fresh.sum().item():.6g}"
+    )
+
+
+def test_public_getters_sync_before_reading():
+    """get_r_factor & co. read plain attributes, so they must sync first."""
+    det = _detector(detector_rotx_deg=0.0)
+    det.config.detector_rotx_deg = 5.0
+    det.config.distance_mm = 150.0
+    fresh = _detector(detector_rotx_deg=5.0, distance_mm=150.0)
+
+    for name in ("get_r_factor", "get_corrected_distance", "get_effective_distance"):
+        got, want = getattr(det, name)(), getattr(fresh, name)()
+        assert torch.allclose(got, want, rtol=1e-12), f"{name}: {got} vs fresh {want}"
+
+    det2 = _detector()
+    det2.config.distance_mm = 150.0
+    coords = _detector(distance_mm=150.0).get_pixel_coords()
+    assert torch.allclose(
+        det2.get_solid_angle(pixel_coords=coords),
+        _detector(distance_mm=150.0).get_solid_angle(pixel_coords=coords),
+        rtol=1e-12,
+    ), "get_solid_angle(pixel_coords=...) used the stale close_distance"

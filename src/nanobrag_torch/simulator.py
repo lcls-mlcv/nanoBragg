@@ -582,6 +582,7 @@ class Simulator:
             # NOTE: beam_vector IS the incident direction (photon propagation direction)
             # C-code reference: nanoBragg.c line 2989 shows incident[1] = -source_X
             # where source_X = -distance * beam_vector[1], so incident = beam_vector
+            # Re-read by _ensure_pixel_coords_current() when the detector geometry changes.
             self.incident_beam_direction = self.detector.beam_vector.clone()
         else:
             # If no detector provided, default to MOSFLM beam direction (photon propagation)
@@ -658,6 +659,30 @@ class Simulator:
         self._curved_detector = bool(getattr(self.detector.config, "curved_detector", False))
         self._refresh_pixel_coords()
 
+        self._refresh_roi_mask()
+
+        # Compile the physics computation function with appropriate mode
+        # Use max-autotune on GPU to avoid CUDA graph issues with nested compilation
+        # Use reduce-overhead on CPU for better performance
+        # PERF-PYTORCH-005: Create compiled version of the pure function
+        # The wrapper method _compute_physics_for_position should NOT be compiled
+        self._compile_physics_fn()
+
+    def _roi_mask_key(self) -> tuple:
+        """What the cached ROI mask was built from.
+
+        `mask_array` is compared by identity: replacing it is detected, editing
+        it in place is not (hashing its contents every run would cost a full
+        pass over the image).
+        """
+        cfg = self.detector.config
+        return (
+            cfg.spixels, cfg.fpixels,
+            cfg.roi_xmin, cfg.roi_xmax, cfg.roi_ymin, cfg.roi_ymax,
+            id(cfg.mask_array),
+        )
+
+    def _refresh_roi_mask(self) -> None:
         # Build ROI mask once and cache it (AT-ROI-001)
         # Start with all pixels enabled
         self._cached_roi_mask = torch.ones(
@@ -692,11 +717,9 @@ class Simulator:
             # Pre-convert mask_array to correct device/dtype and combine with ROI mask
             mask_array = self.detector.config.mask_array.to(device=self.device, dtype=self.dtype)
             self._cached_roi_mask = self._cached_roi_mask * mask_array
+        self._roi_mask_built_from = self._roi_mask_key()
 
-        # Compile the physics computation function with appropriate mode
-        # Use max-autotune on GPU to avoid CUDA graph issues with nested compilation
-        # Use reduce-overhead on CPU for better performance
-        # PERF-PYTORCH-005: Create compiled version of the pure function
+    def _compile_physics_fn(self) -> None:
         # The wrapper method _compute_physics_for_position should NOT be compiled
         # because it needs to clone incident_beam_direction before passing to the
         # compiled pure function (required for CUDA graphs compatibility)
@@ -1145,7 +1168,18 @@ class Simulator:
         if self.detector._geometry_version != getattr(
             self, "_pixel_coords_geometry_version", None
         ):
+            # Pixel coordinates are not the only thing __init__ took from the
+            # detector. Refreshing only them left two silent errors, measured on
+            # a 32x32 run against a freshly built Simulator: switching the
+            # convention MOSFLM->XDS gave a sum of 0.00566 vs 0.0213 (the
+            # detector moved, the beam direction did not), and turning
+            # curved_detector off kept rendering the curved image.
+            self._curved_detector = bool(getattr(self.detector.config, "curved_detector", False))
+            self.incident_beam_direction = self.detector.beam_vector.clone()
             self._refresh_pixel_coords()
+        # The ROI and mask are not geometry fields, so they get their own key.
+        if self._roi_mask_key() != self._roi_mask_built_from:
+            self._refresh_roi_mask()
 
     def run(
         self,

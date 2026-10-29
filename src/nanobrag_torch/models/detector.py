@@ -393,10 +393,20 @@ class Detector:
         """Rebuild the derived geometry if the config has changed since last time.
 
         Returns True when a rebuild happened, so callers can also drop whatever
-        they cached off the back of the old geometry. Every public entry point
-        that reads a derived attribute should go through this; `distance` and
-        `pixel_size` are properties and need no help, but `pix0_vector`, the
-        basis vectors and the beam centres in pixels are plain attributes.
+        they cached off the back of the old geometry. `distance` and
+        `pixel_size` are properties that read the config directly and need no
+        help. Every public method that derives from the geometry --
+        get_pixel_coords, get_planar_pixel_coords, get_solid_angle,
+        get_r_factor, get_corrected_distance, get_effective_distance,
+        verify_beam_center_preservation -- calls this first, as does
+        Simulator.run().
+
+        The plain attributes (`pix0_vector`, `fdet_vec`/`sdet_vec`/`odet_vec`,
+        `beam_center_f`/`beam_center_s`) and the `close_distance` property are
+        NOT guarded: after a config edit they keep the old values until one of
+        the methods above runs. They are read several times inside every
+        Simulator.run(), after run() has already synced, and fingerprinting the
+        config on each read would cost a device sync per read on CUDA.
         """
         fingerprint = self._current_geometry_fingerprint()
         if fingerprint == self._geometry_fingerprint:
@@ -490,6 +500,7 @@ class Detector:
         Returns:
             torch.Tensor: Effective distance in meters
         """
+        self._ensure_geometry_current()
         # Get the rotated detector normal vector (after all rotations)
         detector_normal = self.odet_vec  # Should already be normalized
         
@@ -1122,6 +1133,8 @@ class Detector:
         Returns:
             torch.Tensor: Solid angle factor for each pixel, shape (spixels, fpixels)
         """
+        # Guard even when pixel_coords is supplied: close_distance below is derived state.
+        self._ensure_geometry_current()
         # Get pixel coordinates if not provided
         if pixel_coords is None:
             pixel_coords = self.get_pixel_coords()
@@ -1192,6 +1205,7 @@ class Detector:
         Returns:
             torch.Tensor: r-factor value
         """
+        self._ensure_geometry_current()
         if not hasattr(self, 'r_factor'):
             # Calculate on demand if not already computed
             self._calculate_pix0_vector()
@@ -1212,6 +1226,7 @@ class Detector:
         Returns:
             torch.Tensor: Corrected distance in meters
         """
+        self._ensure_geometry_current()
         if not hasattr(self, 'distance_corrected'):
             # Calculate on demand if not already computed
             self._calculate_pix0_vector()
@@ -1248,6 +1263,7 @@ class Detector:
         """
         from ..config import DetectorConvention, DetectorPivot
 
+        self._ensure_geometry_current()
         # Get beam vector (honours every convention plus CUSTOM overrides)
         beam_vector = self.beam_vector
 
