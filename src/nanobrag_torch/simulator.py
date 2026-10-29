@@ -662,6 +662,7 @@ class Simulator:
         self._curved_detector = bool(getattr(self.detector.config, "curved_detector", False))
         self._refresh_pixel_coords()
 
+        self._frozen_auto_oversample = None  # see _auto_oversample
         self._refresh_roi_mask()
 
         # Compile the physics computation function with appropriate mode
@@ -1143,6 +1144,47 @@ class Simulator:
             capture_fraction_for_trace,
         )
 
+    def _auto_oversample(self) -> int:
+        """nanoBragg.c's auto oversample, frozen once any of its inputs requires grad.
+
+        C picks ceil(3 * xtalsize / reciprocal_pixel_size) per run. That is a step
+        function of the cell, wavelength, distance and pixel size: recomputing it while
+        one of them is being refined makes the loss jump wherever the argument crosses
+        an integer (cell_a = 200 A with the default geometry flips 3 -> 4 across 1e-6).
+        So when any input requires grad, the first value chosen is kept for the life of
+        this Simulator and a warning says so; pass oversample explicitly to choose it.
+        With no differentiable inputs it is recomputed every run, as C does.
+        """
+        if self._frozen_auto_oversample is not None:
+            return self._frozen_auto_oversample
+
+        cfg = self.crystal.config
+        cells = (cfg.cell_a, cfg.cell_b, cfg.cell_c)
+        geometry = (self.wavelength, self.detector.config.distance_mm,
+                    self.detector.config.pixel_size_mm)
+
+        def value(x):
+            return float(x.detach()) if isinstance(x, torch.Tensor) else float(x)
+
+        # Maximum crystal dimension in meters (a*Na, b*Nb, c*Nc)
+        xtalsize_max = max(abs(value(c) * 1e-10 * n) for c, n in zip(cells, cfg.N_cells))
+        # reciprocal_pixel_size = lambda * distance / pixel_size (all in meters)
+        wavelength, distance_mm, pixel_size_mm = (value(x) for x in geometry)
+        reciprocal_pixel_size = (wavelength * 1e-10) * (distance_mm / 1000.0) / (pixel_size_mm / 1000.0)
+        oversample = max(1, math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size))
+        print(f"auto-selected {oversample}-fold oversampling")
+
+        if any(isinstance(x, torch.Tensor) and x.requires_grad for x in cells + geometry):
+            self._frozen_auto_oversample = oversample
+            warnings.warn(
+                f"oversample=-1 (auto) with differentiable cell/wavelength/detector inputs: "
+                f"keeping the auto-selected {oversample}-fold oversampling for this Simulator, "
+                f"since re-selecting it as the parameters move would make the loss "
+                f"discontinuous. Pass oversample explicitly to choose the value.",
+                stacklevel=3,
+            )
+        return oversample
+
     def _warn_if_tophat_severs_cell_gradients(self) -> None:
         """Warn once when TOPHAT leaves differentiable cell parameters with no path.
 
@@ -1342,30 +1384,7 @@ class Simulator:
 
         # Auto-select oversample if set to -1 (matches C behavior)
         if oversample == -1:
-            # Calculate maximum crystal dimension in meters
-            xtalsize_max = max(
-                abs(self.crystal.config.cell_a * 1e-10 * self.crystal.config.N_cells[0]),  # a*Na in meters
-                abs(self.crystal.config.cell_b * 1e-10 * self.crystal.config.N_cells[1]),  # b*Nb in meters
-                abs(self.crystal.config.cell_c * 1e-10 * self.crystal.config.N_cells[2])   # c*Nc in meters
-            )
-
-            # Calculate reciprocal pixel size in meters
-            # reciprocal_pixel_size = λ * distance / pixel_size (all in meters)
-            wavelength_m = self.wavelength * 1e-10  # Convert from Angstroms to meters
-            distance_m = self.detector.config.distance_mm / 1000.0  # Convert from mm to meters
-            pixel_size_m = self.detector.config.pixel_size_mm / 1000.0  # Convert from mm to meters
-            reciprocal_pixel_size = wavelength_m * distance_m / pixel_size_m
-
-            # Calculate recommended oversample using C formula
-            import math
-            recommended_oversample = math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size)
-
-            # Ensure at least 1
-            if recommended_oversample <= 0:
-                recommended_oversample = 1
-
-            oversample = recommended_oversample
-            print(f"auto-selected {oversample}-fold oversampling")
+            oversample = self._auto_oversample()
 
         # For now, we'll implement the base case without oversampling for this test
         # The full subpixel implementation will come later
