@@ -73,7 +73,7 @@ def test_stagea_frozen_matches_config_path():
     )
     baseline = simulator.run()
 
-    # Stage-A wrapper in "frozen" mode (no learnable parameters).
+    # Stage-A wrapper in "frozen" mode (parameters registered, gradients off).
     experiment = ExperimentModel(
         crystal_config=crystal_cfg,
         detector_config=detector_cfg,
@@ -82,7 +82,8 @@ def test_stagea_frozen_matches_config_path():
         dtype=dtype,
         param_init="frozen",
     )
-    assert sum(1 for _ in experiment.parameters()) == 0
+    assert sum(1 for _ in experiment.parameters()) > 0
+    assert not any(p.requires_grad for p in experiment.parameters())
 
     wrapped = experiment()
 

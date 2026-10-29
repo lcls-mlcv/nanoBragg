@@ -20,6 +20,21 @@ from ..models.detector import Detector
 from ..utils.tensor_utils import as_tensor_preserving_grad
 
 
+_PARAM_INIT_MODES = ("trainable", "stage_a", "frozen")
+
+
+def _param_factory(param_init: str):
+    """Every Stage-A delta is an nn.Parameter; "frozen" only turns its gradient off.
+
+    One code path whatever the mode, so a frozen model can be unfrozen later with
+    ExperimentModel.refine(). "stage_a" is the old name for "trainable".
+    """
+    if param_init not in _PARAM_INIT_MODES:
+        raise ValueError(f"param_init must be one of {_PARAM_INIT_MODES}, got {param_init!r}")
+    requires_grad = param_init != "frozen"
+    return lambda x: nn.Parameter(x, requires_grad=requires_grad)
+
+
 class CrystalStageAParams(nn.Module):
     """Stage-A learnable parameterization for crystal geometry."""
 
@@ -28,7 +43,7 @@ class CrystalStageAParams(nn.Module):
         base_config: CrystalConfig,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
-        param_init: str = "frozen",
+        param_init: str = "trainable",
         max_angle_delta_deg: float = 10.0,
         max_misset_delta_deg: float = 10.0,
     ) -> None:
@@ -91,8 +106,7 @@ class CrystalStageAParams(nn.Module):
             torch.as_tensor(m0z, device=self.device, dtype=self.dtype),
         )
 
-        learnable = param_init == "stage_a"
-        param_cls = nn.Parameter if learnable else lambda x: x
+        param_cls = _param_factory(param_init)
 
         # Log-length deltas (unconstrained, start at zero).
         self.delta_log_a = param_cls(
@@ -161,7 +175,7 @@ class DetectorStageAParams(nn.Module):
         base_config: DetectorConfig,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
-        param_init: str = "frozen",
+        param_init: str = "trainable",
         max_tilt_delta_deg: float = 5.0,
         beam_shift_pixels: float = 5.0,
     ) -> None:
@@ -213,8 +227,7 @@ class DetectorStageAParams(nn.Module):
             torch.as_tensor(base_config.pixel_size_mm, device=self.device, dtype=self.dtype),
         )
 
-        learnable = param_init == "stage_a"
-        param_cls = nn.Parameter if learnable else lambda x: x
+        param_cls = _param_factory(param_init)
 
         # Log-distance delta.
         self.delta_log_distance_mm = param_cls(
@@ -282,7 +295,7 @@ class BeamStageAParams(nn.Module):
         base_config: BeamConfig,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
-        param_init: str = "frozen",
+        param_init: str = "trainable",
     ) -> None:
         super().__init__()
         if device is None:
@@ -296,8 +309,7 @@ class BeamStageAParams(nn.Module):
             torch.as_tensor(base_config.fluence, device=self.device, dtype=self.dtype),
         )
 
-        learnable = param_init == "stage_a"
-        param_cls = nn.Parameter if learnable else lambda x: x
+        param_cls = _param_factory(param_init)
 
         self.delta_log_fluence = param_cls(
             torch.zeros((), device=self.device, dtype=self.dtype)
@@ -318,7 +330,38 @@ class ExperimentModel(nn.Module):
 
     Owns parameter wrappers for crystal, detector, and beam, and delegates
     physics to the existing Simulator.
+
+    Every refinable quantity is an nn.Parameter holding a zero offset from the
+    config value, so a new model reproduces the config image exactly. All of them
+    are trainable by default (param_init="trainable"); choose what to refine with
+    refine()/freeze(), by group name (see PARAMETER_GROUPS) or full parameter name:
+
+        model.freeze()                      # nothing trains
+        model.refine("misset", "cell")      # then only orientation and cell
+        optimizer = torch.optim.Adam(model.trainable_parameters(), lr=1e-2)
+
+    For images only, run under torch.no_grad() so no autograd graph is kept.
     """
+
+    # Group name -> parameter names, for refine()/freeze().
+    PARAMETER_GROUPS = {
+        "cell": (
+            "crystal_params.delta_log_a", "crystal_params.delta_log_b",
+            "crystal_params.delta_log_c", "crystal_params.delta_alpha_raw",
+            "crystal_params.delta_beta_raw", "crystal_params.delta_gamma_raw",
+        ),
+        "misset": ("crystal_params.delta_misset_raw",),
+        "distance": ("detector_params.delta_log_distance_mm",),
+        "detector_rotation": (
+            "detector_params.delta_rotx_raw", "detector_params.delta_roty_raw",
+            "detector_params.delta_rotz_raw",
+        ),
+        "twotheta": ("detector_params.delta_twotheta_raw",),
+        "beam_center": (
+            "detector_params.delta_beam_s_raw", "detector_params.delta_beam_f_raw",
+        ),
+        "fluence": ("beam_params.delta_log_fluence",),
+    }
 
     def __init__(
         self,
@@ -327,7 +370,7 @@ class ExperimentModel(nn.Module):
         beam_config: BeamConfig,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
-        param_init: str = "frozen",
+        param_init: str = "trainable",
         hkl_data: Optional[torch.Tensor] = None,
         hkl_metadata: Optional[dict] = None,
     ) -> None:
@@ -370,6 +413,43 @@ class ExperimentModel(nn.Module):
         self._crystal: Optional[Crystal] = None
         self._detector: Optional[Detector] = None
         self._beam_config: Optional[BeamConfig] = None
+
+    def _resolve(self, names) -> list:
+        params = dict(self.named_parameters())
+        if not names:
+            return list(params.values())
+        resolved = []
+        for name in names:
+            if name in self.PARAMETER_GROUPS:
+                resolved.extend(params[n] for n in self.PARAMETER_GROUPS[name])
+            elif name in params:
+                resolved.append(params[name])
+            else:
+                raise KeyError(
+                    f"unknown parameter or group {name!r}; groups: "
+                    f"{sorted(self.PARAMETER_GROUPS)}, parameters: {sorted(params)}"
+                )
+        return resolved
+
+    def refine(self, *names: str) -> "ExperimentModel":
+        """Turn gradients on for these groups/parameters (all of them if none given)."""
+        for p in self._resolve(names):
+            p.requires_grad_(True)
+        return self
+
+    def freeze(self, *names: str) -> "ExperimentModel":
+        """Turn gradients off for these groups/parameters (all of them if none given).
+
+        A frozen parameter keeps its current value, so freezing mid-refinement
+        holds it where the optimizer left it.
+        """
+        for p in self._resolve(names):
+            p.requires_grad_(False)
+        return self
+
+    def trainable_parameters(self) -> list:
+        """The parameters that currently require grad, for handing to an optimizer."""
+        return [p for p in self.parameters() if p.requires_grad]
 
     def set_structure_factors(
         self, hkl_data: torch.Tensor, hkl_metadata: dict
