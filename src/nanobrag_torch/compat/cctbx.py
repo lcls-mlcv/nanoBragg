@@ -280,6 +280,20 @@ def crystal_config_from_dxtbx(crystal, **kwargs) -> CrystalConfig:
     return crystal_config_from_A(cell, crystal.get_A(), **kwargs)
 
 
+def crystal_system_of(crystal) -> str:
+    """
+    Crystal system of a dxtbx Crystal, as ExperimentModel(crystal_system=...) takes it.
+
+    Trigonal groups refine like hexagonal ones in hexagonal axes (gamma = 120) and
+    as "rhombohedral" in rhombohedral axes.
+    """
+    system = crystal.get_space_group().crystal_system().lower()
+    if system == "trigonal":
+        gamma = crystal.get_unit_cell().parameters()[5]
+        return "hexagonal" if abs(gamma - 120.0) < 1e-3 else "rhombohedral"
+    return system
+
+
 def rotate_A(A, rotx_deg=0.0, roty_deg=0.0, rotz_deg=0.0) -> torch.Tensor:
     """
     Apply diffBragg's RotX·RotY·RotZ small-rotation convention to an A matrix:
