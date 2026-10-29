@@ -151,10 +151,12 @@ class TestCellParameterGradients:
             )
 
     @pytest.mark.xfail(strict=True, reason=(
-        "Plan item B2: auto-oversample is math.ceil(3*xtalsize/reciprocal_pixel_size) "
-        "of the live cell. At cell_a=200 the argument is exactly 3.0, so a 1e-6 step "
-        "switches oversample 3 -> 4 and the loss jumps (numerical d/da = -3.3e5 vs "
-        "analytical -71). Remove this mark when B2 freezes the auto-selected value."))
+        "Auto-oversample is math.ceil(3*xtalsize/reciprocal_pixel_size) of the cell. "
+        "At cell_a=200 the argument is exactly 3.0, so a 1e-6 step switches oversample "
+        "3 -> 4 and the loss jumps (numerical d/da = -3.3e5 vs analytical -71). This "
+        "helper builds a new Simulator per evaluation, so it re-selects every time; "
+        "B2 freezes the value within one Simulator (tests/test_auto_oversample.py), and "
+        "C1's persistent ExperimentModel removes the rebuild-per-step pattern."))
     def test_gradcheck_cell_a_at_auto_oversample_boundary(self):
         """The loss must stay continuous where the auto-selected oversample would change."""
         cell_a = torch.tensor(200.0, dtype=torch.float64, requires_grad=True)
