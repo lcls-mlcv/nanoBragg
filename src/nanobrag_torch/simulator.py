@@ -16,6 +16,7 @@ import torch
 from .config import BeamConfig, CrystalConfig, CrystalShape, SpotMetric
 from .models.crystal import Crystal
 from .models.detector import Detector
+from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sinc3, polarization_factor
 from .utils.tensor_utils import as_tensor_preserving_grad
@@ -736,17 +737,9 @@ class Simulator:
         # compiled pure function (required for CUDA graphs compatibility)
         #
         # Allow disabling compilation via environment variable for debugging/gradcheck and
-        # external tooling (e.g., DBEX) that explicitly requests eager execution.
-        # Both spellings are accepted for backward compatibility:
-        #   - NANOBRAGG_DISABLE_COMPILE (legacy nanoBragg spelling)
-        #   - NANOBRAG_DISABLE_COMPILE  (DBEX/runtime-checklist spelling)
-        import os
-        disable_compile = (
-            os.environ.get("NANOBRAGG_DISABLE_COMPILE", "0") == "1"
-            or os.environ.get("NANOBRAG_DISABLE_COMPILE", "0") == "1"
-        )
-
-        if disable_compile:
+        # external tooling (e.g., DBEX) that explicitly requests eager execution. Both
+        # spellings are read in utils/compile_env.py, shared with the physics helpers.
+        if compile_disabled():
             self._compiled_compute_physics = compute_physics_for_position
         else:
             try:

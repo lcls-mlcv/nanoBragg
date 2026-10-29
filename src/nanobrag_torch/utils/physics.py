@@ -7,6 +7,8 @@ calculations from the original C code.
 
 import torch
 
+from .compile_env import compile_disabled
+
 
 def _get_compile_decorator():
     """Get appropriate compile decorator based on available hardware.
@@ -17,10 +19,7 @@ def _get_compile_decorator():
     The hot paths are still fully vectorized; only Dynamo compilation is
     disabled for these small helpers.
     """
-    import os
-    disable_compile = os.environ.get("NANOBRAGG_DISABLE_COMPILE", "0") == "1"
-
-    if disable_compile:
+    if compile_disabled():
         # Return identity decorator when compilation is disabled (for gradient testing)
         def identity_decorator(fn):
             return fn

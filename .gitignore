@@ -45,3 +45,7 @@ __pycache__/
 /build/
 /dist/
 *.egg
+
+# Editor/merge leftovers
+*.orig
+*.backup

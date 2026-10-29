@@ -173,7 +173,8 @@ class CrystalConfig:
     spot_metric: SpotMetric = SpotMetric.RECIPROCAL
 
     # Sample size in meters (calculated from N_cells and unit cell dimensions)
-    # These are computed in __post_init__ and potentially clipped by beam size
+    # Computed in __post_init__. Not used by the simulator: the CLI clips the sample to the
+    # beam and turns it into N_cells (__main__.resolve_n_cells_from_sample, nanoBragg.c:1134).
     sample_x: Optional[float] = None  # Sample size along a-axis (meters)
     sample_y: Optional[float] = None  # Sample size along b-axis (meters)
     sample_z: Optional[float] = None  # Sample size along c-axis (meters)
