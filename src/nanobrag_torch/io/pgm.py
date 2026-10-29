@@ -61,7 +61,11 @@ def write_pgm(
         # Write header in ASCII
         f.write(b"P5\n")  # Magic number for binary PGM
         f.write(f"{width} {height}\n".encode("ascii"))  # Width Height
-        f.write(f"# pixels scaled by {pgm_scale}\n".encode("ascii"))  # Comment with scale
+        # C writes this with %lg (nanoBragg.c:3233), i.e. 6 significant digits.
+        # Python's default float formatting gave the full repr, so an otherwise
+        # byte-identical image differed in the header: "25.13766729885855"
+        # against C's "25.1377".
+        f.write(f"# pixels scaled by {pgm_scale:g}\n".encode("ascii"))
         f.write(b"255\n")  # Maximum gray value
 
         # Write binary pixel data in row-major order

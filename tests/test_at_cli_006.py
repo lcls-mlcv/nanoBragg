@@ -12,6 +12,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import numpy as np
+import pytest
 import struct
 import sys
 
@@ -128,18 +129,24 @@ def test_autoscale_without_scale_flag():
         # Allow for rounding errors
         assert 54900 <= max_int <= 55100, f"Max int value {max_int} not near 55,000"
 
-        # Verify the scaling relationship
-        # With ADC=40, scale should be (55000 - 40) / max_float
-        expected_scale = (55000 - 40) / max_float if max_float > 0 else 1.0
+        # C: intfile_scale = 55000.0/max_I (nanoBragg.c:3149), and adc_offset is
+        # added per pixel AFTERWARDS (:3164). This previously expected
+        # (55000 - adc)/max_float, folding the offset into the scale, which made
+        # every pixel disagree with C -- measured 1024/1024 differing on a default
+        # 32x32 run, max |delta| = 41 counts. With the formula corrected and the
+        # rounding below, intimage.img pixel data is byte-identical to the oracle.
+        expected_scale = 55000.0 / max_float if max_float > 0 else 1.0
 
-        # Check a few pixels
+        # Check a few pixels. C rounds: (unsigned short)(floorf(test + 0.5)).
         for i in range(min(5, float_data.size)):
             flat_idx = i
             float_val = float_data.flat[flat_idx]
             int_val = int_data.flat[flat_idx]
 
             if float_val > 1e-10:  # Non-zero pixel
-                expected_int = min(65535, int(float_val * expected_scale + 40))
+                expected_int = min(
+                    65535, int(np.floor(float_val * expected_scale + 40 + 0.5))
+                )
                 assert abs(int_val - expected_int) <= 1, f"Pixel {i}: expected {expected_int}, got {int_val}"
 
 
@@ -174,14 +181,18 @@ def test_explicit_scale_flag():
         float_data = read_float_image(floatfile, (10, 10))
         int_data, _ = read_smv_data(intfile)
 
-        # Verify scaling formula: integer pixel = floor(min(65535, float*scale + adc))
+        # C rounds rather than truncates: intimage = (unsigned short int)
+        # (floorf(test + 0.5)) at nanoBragg.c:3167. This previously expected
+        # truncation via int(), a systematic -0.5 ADU bias on every pixel.
         for i in range(10):
             for j in range(10):
                 float_val = float_data[i, j]
                 int_val = int_data[i, j]
 
                 if float_val > 1e-10:  # Non-zero pixel
-                    expected = min(65535, int(float_val * scale_value + adc_value))
+                    expected = min(
+                        65535, int(np.floor(float_val * scale_value + adc_value + 0.5))
+                    )
                     assert int_val == expected, f"Pixel ({i},{j}): expected {expected}, got {int_val}"
                 else:
                     # Zero pixels should remain zero (ROI behavior)
@@ -214,8 +225,24 @@ def test_pgm_without_pgmscale():
         float_data = read_float_image(floatfile, (10, 10))
         pgm_data, scale = read_pgm(pgmfile)
 
-        # Without -pgmscale, default should be 1.0
-        assert scale == 1.0, f"Expected default pgmscale=1.0, got {scale}"
+        # Without -pgmscale the CLI auto-exposes the preview as C does,
+        # pgm_scale = 250/(5*rmsd) (nanoBragg.c:3203-3206), where rmsd is
+        # sqrt(sum((x - mean)^2)/(N - 1)) over the ROI. This previously asserted
+        # 1.0, citing spec AT-IO-002; that spec text is not in this repository
+        # and 1.0 leaves the preview ~26x under-exposed, so the behaviour was
+        # changed to follow the C oracle (deliberate spec amendment, 2026-10-02).
+        #
+        # Note write_pgm()'s own `pgm_scale` parameter still defaults to 1.0 --
+        # the auto-exposure lives in the CLI, which is the layer C implements it
+        # in. tests/test_at_io_002.py covers the library default.
+        n = float_data.size
+        mean = float_data.mean()
+        rmsd = np.sqrt(((float_data - mean) ** 2).sum() / (n - 1))
+        expected_scale = 250.0 / (5.0 * rmsd) if rmsd > 0 else 1.0
+        assert scale == pytest.approx(expected_scale, rel=1e-4), (
+            f"Expected auto-exposed pgmscale=250/(5*rmsd)={expected_scale:g} "
+            f"(rmsd={rmsd:g}), got {scale}"
+        )
 
         # Verify PGM formula: min(255, floor(float*pgmscale))
         for i in range(10):
@@ -305,7 +332,9 @@ def test_pgm_format_compliance():
 
             # Line 3: Comment with scale
             line3 = f.readline().decode().strip()
-            expected_comment = f"# pixels scaled by {pgmscale_value}"
+            # C uses %lg (nanoBragg.c:3233), so match that formatting rather
+            # than Python's default float repr.
+            expected_comment = f"# pixels scaled by {pgmscale_value:g}"
             assert line3 == expected_comment, f"Expected '{expected_comment}', got '{line3}'"
 
             # Line 4: Max value
