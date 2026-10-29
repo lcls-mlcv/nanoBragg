@@ -73,7 +73,13 @@ def build_sim(args):
     SIM.crystal = nb
     SIM.instantiate_diffBragg(oversample=args.oversample, verbose=0, interpolate=0, default_F=args.default_F,
                               auto_set_spotscale=False)
+    SIM.D.oversample_omega = args.oversample_omega
+    SIM.D.nopolar = args.nopolar
     return SIM
+
+
+# central finite-difference steps per diffBragg parameter id
+FD_STEPS = {0: 2e-4, 1: 2e-4, 2: 2e-4, 9: 1e-3}
 
 
 def diffbragg_forward_and_derivs(SIM, param_ids):
@@ -92,7 +98,12 @@ def diffbragg_forward_and_derivs(SIM, param_ids):
     return img, derivs
 
 
-def torch_forward_and_derivs(SIM, args):
+def torch_image_fn(SIM, args):
+    """Return image(rotx, roty, rotz, ncells) rendering SIM with the torch port.
+
+    Arguments may be floats or 0-d tensors; diffBragg's RotXYZ (radians) and
+    isotropic Ncells (id 9) are the parameters.
+    """
     import torch
     from nanobrag_torch.compat.cctbx import (
         crystal_config_from_A, detector_config_from_dxtbx_panel, beam_config_from_dxtbx, rotate_A,
@@ -110,14 +121,17 @@ def torch_forward_and_derivs(SIM, args):
     cell = xtal.get_unit_cell().parameters()
     beam = SIM.beam.nanoBragg_constructor_beam
     det_cfg = detector_config_from_dxtbx_panel(SIM.detector[0], beam.get_s0(), oversample=max(args.oversample, 1))
+    det_cfg.oversample_omega = args.oversample_omega
     beam_cfg = beam_config_from_dxtbx(beam, fluence=float(SIM.D.fluence), spot_scale=float(SIM.D.spot_scale))
+    beam_cfg.nopolar = beam_cfg.nopolar or args.nopolar
     detector = TDetector(det_cfg, device=device, dtype=dtype)
+
+    def neg_deg(theta):
+        return -torch.rad2deg(theta) if torch.is_tensor(theta) else -math.degrees(theta)
 
     def image(rotx, roty, rotz, ncells):
         # diffBragg's RotXYZ = θ is a −θ rotation in rotate_A's right-handed convention
-        A = rotate_A(A0, -math.degrees(rotx) if not torch.is_tensor(rotx) else -torch.rad2deg(rotx),
-                     -math.degrees(roty) if not torch.is_tensor(roty) else -torch.rad2deg(roty),
-                     -math.degrees(rotz) if not torch.is_tensor(rotz) else -torch.rad2deg(rotz))
+        A = rotate_A(A0, neg_deg(rotx), neg_deg(roty), neg_deg(rotz))
         n = ncells if torch.is_tensor(ncells) else float(ncells)
         cfg = crystal_config_from_A(cell, A, Ncells_abc=(1, 1, 1), shape=args.shape, default_F=args.default_F,
                                     spot_metric=SpotMetric(args.spot_metric))
@@ -128,6 +142,14 @@ def torch_forward_and_derivs(SIM, args):
         sim = Simulator(crystal, detector, crystal_config=cfg, beam_config=beam_cfg, device=device, dtype=dtype)
         return sim.run()
 
+    return image
+
+
+def torch_forward_and_derivs(SIM, args):
+    import torch
+
+    dtype = torch.float64
+    image = torch_image_fn(SIM, args)
     params = {
         0: torch.zeros((), dtype=dtype, requires_grad=True),
         1: torch.zeros((), dtype=dtype, requires_grad=True),
@@ -139,11 +161,10 @@ def torch_forward_and_derivs(SIM, args):
     # and autograd for the summed image (checks the chain end to end).
     grads_sum = torch.autograd.grad(img.sum(), list(params.values()), allow_unused=True)
     derivs = {}
-    steps = {0: 2e-4, 1: 2e-4, 2: 2e-4, 9: 1e-3}
     with torch.no_grad():
         base = [float(v) for v in params.values()]
         for i, pid in enumerate(params):
-            h = steps[pid]
+            h = FD_STEPS[pid]
             plus = list(base); plus[i] += h
             minus = list(base); minus[i] -= h
             derivs[pid] = ((image(*plus) - image(*minus)) / (2 * h)).cpu().numpy()
@@ -159,7 +180,7 @@ def report(name, ref, test, mask):
     return r, scale
 
 
-def main():
+def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ucell", type=float, nargs=6, default=(70, 60, 50, 90.0, 110, 90.0))
     p.add_argument("--symbol", default="P121")
@@ -173,9 +194,16 @@ def main():
     p.add_argument("--randomrotate", type=int, default=None)
     p.add_argument("--spot-metric", dest="spot_metric", choices=["hkl", "reciprocal"], default="hkl",
                    help="GAUSS/TOPHAT radius metric for the torch side; diffBragg always uses hkl")
+    p.add_argument("--oversample-omega", dest="oversample_omega", action="store_true",
+                   help="solid angle per subpixel on both sides (diffBragg otherwise takes it at the pixel centre)")
+    p.add_argument("--nopolar", action="store_true", help="polarization factor 1 on both sides")
     p.add_argument("--device", default="cpu")
     p.add_argument("--plot", action="store_true")
-    args = p.parse_args()
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
 
     try:
         SIM = build_sim(args)
