@@ -15,8 +15,43 @@ import subprocess
 # This must be set before importing torch in any test module
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# Add src to path for all tests
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Add src to path for all tests, and to PYTHONPATH (absolute) for the tests that run
+# `python -m nanobrag_torch` in a subprocess, so they work without a pip install and
+# from any working directory.
+_SRC = str(Path(__file__).resolve().parent.parent / "src")
+sys.path.insert(0, _SRC)
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    [_SRC] + [p for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p and p != _SRC]
+)
+
+
+# ============================================================================
+# Per-test isolation of process-global state
+# ============================================================================
+
+@pytest.fixture(autouse=True)
+def _restore_process_globals():
+    """Undo what a test changes in os.environ, the working directory and torch globals.
+
+    Several tests set environment variables, chdir, or call torch.set_default_dtype
+    without restoring them, which made later tests fail only in a full run (for
+    example a deleted NB_C_BIN, or float64 left as the default dtype).
+    """
+    import torch
+
+    env = dict(os.environ)
+    cwd = os.getcwd()
+    default_dtype = torch.get_default_dtype()
+    default_device = torch.get_default_device()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    deterministic_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    yield
+    os.environ.clear()
+    os.environ.update(env)
+    os.chdir(cwd)
+    torch.set_default_dtype(default_dtype)
+    torch.set_default_device(default_device)
+    torch.use_deterministic_algorithms(deterministic, warn_only=deterministic_warn_only)
 
 
 # ============================================================================
@@ -86,46 +121,6 @@ def _check_c_binary_executable(binary_path):
         return False, f"Binary execution failed: {binary_path} ({type(e).__name__}: {e})"
 
 
-def _check_golden_assets():
-    """
-    Verify golden asset files exist and are readable.
-
-    Returns:
-        list: Empty if all checks pass, otherwise list of error messages
-    """
-    errors = []
-
-    # Use absolute path resolution relative to repo root
-    repo_root = Path(__file__).parent.parent
-
-    # Asset 1: scaled.hkl
-    hkl_path = repo_root / 'scaled.hkl'
-    if not hkl_path.exists():
-        errors.append(
-            "Golden asset not found: scaled.hkl\n"
-            "  Generate via: python scripts/validation/create_scaled_hkl.py\n"
-            "  See: docs/fix_plan.md Attempt #6 for provenance"
-        )
-    elif hkl_path.stat().st_size < 1_000_000:  # Expect ~1.35 MB
-        errors.append(
-            f"Golden asset corrupted (size {hkl_path.stat().st_size} bytes, expected ~1.35 MB): scaled.hkl"
-        )
-
-    # Asset 2: pix0_expected.json
-    pix0_path = repo_root / 'reports/2025-10-cli-flags/phase_h/implementation/pix0_expected.json'
-    if not pix0_path.exists():
-        errors.append(
-            "Golden asset not found: reports/2025-10-cli-flags/phase_h/implementation/pix0_expected.json\n"
-            "  Regenerate via: plans/active/cli-noise-pix0/plan.md Phase H reproduction steps"
-        )
-    elif pix0_path.stat().st_size < 100:  # Expect ~438 bytes
-        errors.append(
-            f"Golden asset corrupted (size {pix0_path.stat().st_size} bytes, expected ~438 bytes): {pix0_path}"
-        )
-
-    return errors
-
-
 @pytest.fixture(scope="session", autouse=True)
 def session_infrastructure_gate():
     """
@@ -168,10 +163,6 @@ def session_infrastructure_gate():
         success, error_msg = _check_c_binary_executable(c_binary_path)
         if not success:
             errors.append(error_msg)
-
-    # Check 3: Golden assets
-    asset_errors = _check_golden_assets()
-    errors.extend(asset_errors)
 
     # Fail fast if any checks failed
     if errors:

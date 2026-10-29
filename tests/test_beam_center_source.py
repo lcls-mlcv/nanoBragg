@@ -1,9 +1,9 @@
 """
 DETECTOR-CONFIG-001: Beam Center Source Tracking Tests
 
-Tests for the beam_center_source attribute that distinguishes auto-calculated
-beam centers from explicit user-provided values, ensuring the MOSFLM +0.5 pixel
-offset is applied only to auto-calculated defaults per spec-a-core.md §72.
+Tests for the beam_center_source attribute. The spec (spec-a-core.md §72) applied the
+MOSFLM +0.5 pixel offset only to auto-calculated defaults; nanoBragg.c:1200 applies it
+to every MOSFLM beam centre, and the C-first ruling makes C the reference.
 """
 
 import pytest
@@ -44,12 +44,14 @@ class TestBeamCenterSource:
         assert abs(detector.beam_center_f.item() - expected_pixels) < 0.01, \
             f"MOSFLM auto beam_center_f should be 128.5, got {detector.beam_center_f.item()}"
 
-    def test_mosflm_explicit_no_offset(self):
-        """Test that MOSFLM convention does NOT apply +0.5 pixel offset for explicit beam centers.
+    def test_mosflm_explicit_gets_offset_like_c(self):
+        """MOSFLM adds +0.5 pixel to explicit beam centres too, as nanoBragg.c does.
 
-        Per DETECTOR-CONFIG-001 design, explicit user-provided beam centers should be
-        used as-is without implicit adjustments. The +0.5 pixel offset is only for
-        auto-calculated defaults.
+        nanoBragg.c:1200-1201 sets Fbeam = Ybeam + 0.5*pixel_size and
+        Sbeam = Xbeam + 0.5*pixel_size for every MOSFLM run, whether -Xbeam/-Ybeam
+        were given or defaulted. DETECTOR-CONFIG-001 specified no offset for explicit
+        values; C wins over the spec (C-first ruling), so beam_center_source does not
+        change the mapping.
         """
         # Setup: MOSFLM convention with explicit beam centers
         config = DetectorConfig(
@@ -65,13 +67,13 @@ class TestBeamCenterSource:
 
         detector = Detector(config)
 
-        # Expected: beam_center in pixels = 12.8 / 0.1 = 128.0 pixels (no offset)
-        expected_pixels = 128.0
+        # Expected: (12.8 / 0.1) + 0.5 = 128.5 pixels, same as the auto case
+        expected_pixels = 128.5
 
         assert abs(detector.beam_center_s.item() - expected_pixels) < 0.01, \
-            f"MOSFLM explicit beam_center_s should be 128.0, got {detector.beam_center_s.item()}"
+            f"MOSFLM explicit beam_center_s should be 128.5, got {detector.beam_center_s.item()}"
         assert abs(detector.beam_center_f.item() - expected_pixels) < 0.01, \
-            f"MOSFLM explicit beam_center_f should be 128.0, got {detector.beam_center_f.item()}"
+            f"MOSFLM explicit beam_center_f should be 128.5, got {detector.beam_center_f.item()}"
 
     def test_xds_no_offset_regardless_of_source(self):
         """Test that XDS convention never applies +0.5 pixel offset, regardless of source.
@@ -103,11 +105,11 @@ class TestBeamCenterSource:
                 f"XDS beam_center_f should be 128.0 for source={source}, got {detector.beam_center_f.item()}"
 
     def test_explicit_matches_default_value(self):
-        """Test that explicit beam center takes precedence even when value matches default.
+        """An explicit centre equal to C's MOSFLM default maps like the default.
 
-        Edge case: User provides explicit beam center that coincidentally equals the
-        MOSFLM default formula. The system should NOT apply the +0.5 offset because
-        the source flag indicates explicit input.
+        C's default is Xbeam = (detsize + pixel)/2 (nanoBragg.c:1191), and the +0.5
+        pixel is then added in both cases (nanoBragg.c:1200), so explicit and auto
+        must land on the same pixel.
         """
         # Calculate what would be the MOSFLM default for this detector
         detector_size = 256
@@ -129,16 +131,15 @@ class TestBeamCenterSource:
 
         detector = Detector(config)
 
-        # Expected: Use explicit value as-is, no offset
-        # 12.85 / 0.1 = 128.5 pixels (no additional offset)
-        expected_pixels = mosflm_default / pixel_size
+        # Expected: 12.85 / 0.1 + 0.5 = 129.0 pixels
+        expected_pixels = mosflm_default / pixel_size + 0.5
 
         assert abs(detector.beam_center_s.item() - expected_pixels) < 0.01, \
             f"Explicit beam_center_s should match provided value {expected_pixels}, got {detector.beam_center_s.item()}"
         assert abs(detector.beam_center_f.item() - expected_pixels) < 0.01, \
             f"Explicit beam_center_f should match provided value {expected_pixels}, got {detector.beam_center_f.item()}"
 
-        # Verify this is different from what auto-calculated would give
+        # The source flag must not change the mapping: auto gives the same pixel
         config_auto = DetectorConfig(
             detector_convention=DetectorConvention.MOSFLM,
             distance_mm=100.0,
@@ -147,20 +148,11 @@ class TestBeamCenterSource:
             fpixels=detector_size,
             beam_center_s=mosflm_default,
             beam_center_f=mosflm_default,
-            beam_center_source="auto",  # Auto applies additional offset
+            beam_center_source="auto",
         )
-
         detector_auto = Detector(config_auto)
-
-        # Auto should add +0.5 offset: 128.5 + 0.5 = 129.0 pixels
-        expected_auto_pixels = expected_pixels + 0.5
-
-        assert abs(detector_auto.beam_center_s.item() - expected_auto_pixels) < 0.01, \
-            f"Auto beam_center_s should be {expected_auto_pixels}, got {detector_auto.beam_center_s.item()}"
-
-        # Verify explicit != auto (proves source flag matters)
-        assert abs(detector.beam_center_s.item() - detector_auto.beam_center_s.item()) > 0.4, \
-            "Explicit and auto beam centers should differ by ~0.5 pixels"
+        assert abs(detector.beam_center_s.item() - detector_auto.beam_center_s.item()) < 1e-9
+        assert abs(detector.beam_center_f.item() - detector_auto.beam_center_f.item()) < 1e-9
 
     def test_default_beam_center_source_is_auto(self):
         """Test that beam_center_source defaults to 'auto' for backward compatibility.

@@ -503,18 +503,14 @@ class TestCLIPix0Override:
         Reference: plans/active/cli-noise-pix0/plan.md Phase H3b
         Evidence: reports/2025-10-cli-flags/phase_h/implementation/pix0_mapping_analysis.md
         """
-        import json
-
-        # Load expected C pix0 vector (use REPO_ROOT for path resolution)
-        expected_json_path = REPO_ROOT / "reports/2025-10-cli-flags/phase_h/implementation/pix0_expected.json"
-        with open(expected_json_path) as f:
-            expected_data = json.load(f)
-
-        expected_pix0_with_custom_vectors = torch.tensor([
-            expected_data["pix0_vector_m"]["x"],
-            expected_data["pix0_vector_m"]["y"],
-            expected_data["pix0_vector_m"]["z"]
-        ], device=device, dtype=torch.float32)
+        # Expected C pix0 (metres), from the phase_h C trace. It used to be read from
+        # reports/.../pix0_expected.json, which is gitignored and so missing on fresh
+        # checkouts. Cross-checked 2026-10-29 against nanoBragg.c:1740 (BEAM pivot,
+        # pix0 = -Fbeam*fdet - Sbeam*sdet + distance*beam with the Xbeam/Ybeam C prints
+        # for this command): (-0.2163362, 0.2152066, -0.2301980), within 3e-7 m.
+        expected_pix0_with_custom_vectors = torch.tensor(
+            [-0.216336514802265, 0.215206668836451, -0.230198010448577],
+            device=device, dtype=torch.float32)
 
         # Custom detector vectors from supervisor command
         custom_odet = (-0.000088, 0.004914, -0.999988)
@@ -860,119 +856,61 @@ class TestHKLFdumpParity:
     - reports/2025-10-cli-flags/phase_l/hkl_parity/layout_analysis.md
     """
 
-    def test_scaled_hkl_roundtrip(self):
+    def test_scaled_hkl_roundtrip(self, tmp_path):
         """
-        Roundtrip test: HKL text → PyTorch grid → Fdump → PyTorch grid.
+        Roundtrip test: HKL text → PyTorch grid, C Fdump → PyTorch grid, and
+        PyTorch grid → write_fdump → read_fdump.
 
-        Expected failure (before fix):
-        - read_fdump will fail to match HKL grid due to padding mismatch
-        - C allocates (range+1) dimensions but PyTorch currently uses range
-
-        After fix:
-        - Both readers should produce identical grids
-        - Max |ΔF| ≤ 1e-6 electrons (spec-a-core.md:460)
+        This used a real HKL file (scaled.hkl) that was never committed. A synthetic
+        sparse HKL with asymmetric, negative and positive index ranges and holes
+        exercises the same layout question (C pads every axis to range+1): grids from
+        the text file and from C's Fdump.bin must match exactly, including the holes,
+        which both fill with default_F = 0.
         """
-        from pathlib import Path
-        import tempfile
         import subprocess
-        import shutil
+        import numpy as np
         from nanobrag_torch.io.hkl import read_hkl_file, write_fdump, read_fdump
 
-        # Input files from Phase L1b analysis
-        hkl_path = Path("scaled.hkl")
-        c_fdump_path = Path("reports/2025-10-cli-flags/phase_l/hkl_parity/Fdump_scaled_20251006181401.bin")
+        c_bin = os.environ.get("NB_C_BIN")
+        if not c_bin or not Path(c_bin).exists():
+            pytest.skip("set NB_C_BIN to a nanoBragg C binary")
 
-        # Verify HKL file exists
-        assert hkl_path.exists(), f"Missing {hkl_path}"
+        rng = np.random.default_rng(7)
+        lines = []
+        for h in range(-7, 6):
+            for k in range(-3, 10):
+                for l in range(0, 5):
+                    if rng.random() < 0.6:
+                        lines.append(f"{h} {k} {l} {rng.uniform(1.0, 5000.0):.4f}")
+        hkl_path = tmp_path / "synthetic.hkl"
+        hkl_path.write_text("\n".join(lines) + "\n")
 
-        # Generate C-reference Fdump if missing
-        if not c_fdump_path.exists():
-            # Find C binary
-            c_bin_candidates = [
-                Path("golden_suite_generator/nanoBragg"),
-                Path("nanoBragg"),
-            ]
-            c_bin = None
-            for candidate in c_bin_candidates:
-                if candidate.exists():
-                    c_bin = candidate
-                    break
+        # C writes Fdump.bin into its working directory as a side effect of reading -hkl.
+        subprocess.run(
+            [c_bin, "-hkl", str(hkl_path), "-cell", "100", "100", "100", "90", "90", "90",
+             "-lambda", "1.0", "-distance", "100", "-detpixels", "17", "-N", "1"],
+            cwd=tmp_path, check=True, capture_output=True, timeout=60,
+        )
+        c_fdump_path = tmp_path / "Fdump.bin"
+        assert c_fdump_path.exists(), "C binary did not write Fdump.bin"
 
-            if c_bin is None:
-                pytest.skip(f"Missing C-generated Fdump cache and no C binary found to generate it")
-
-            # Generate Fdump.bin by running C binary with minimal params
-            # C binary creates Fdump.bin as a side effect when reading HKL file
-            try:
-                subprocess.run(
-                    [str(c_bin), "-hkl", str(hkl_path), "-cell", "100", "100", "100", "90", "90", "90",
-                     "-lambda", "1.0", "-distance", "100", "-detpixels", "17", "-N", "1"],
-                    check=True,
-                    capture_output=True,
-                    timeout=30
-                )
-
-                # Move generated Fdump.bin to expected location
-                c_fdump_path.parent.mkdir(parents=True, exist_ok=True)
-                if Path("Fdump.bin").exists():
-                    shutil.move("Fdump.bin", c_fdump_path)
-                else:
-                    pytest.skip(f"C binary did not generate Fdump.bin")
-
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
-                pytest.skip(f"Failed to generate C-reference Fdump: {e}")
-
-        assert c_fdump_path.exists(), f"Missing C-generated Fdump cache"
-
-        # Read HKL text file
         F_hkl, meta_hkl = read_hkl_file(hkl_path, default_F=0.0, dtype=torch.float64)
-
-        # Read C-generated Fdump cache
         F_c_fdump, meta_c = read_fdump(c_fdump_path, dtype=torch.float64)
 
-        # Metadata should match exactly
         for key in ['h_min', 'h_max', 'k_min', 'k_max', 'l_min', 'l_max']:
             assert meta_hkl[key] == meta_c[key], \
                 f"Metadata mismatch: {key} HKL={meta_hkl[key]} vs C={meta_c[key]}"
-
-        # Grid shapes should match (accounting for C padding)
-        # According to layout_analysis.md, C allocates (range+1)^3
-        # But only uses indices 0..range (inclusive), so we need to handle this
         assert F_hkl.shape == F_c_fdump.shape, \
             f"Shape mismatch: HKL={F_hkl.shape} vs C={F_c_fdump.shape}"
 
-        # Structure factors should match within tolerance
-        # Per spec-a-core.md:460, acceptable tolerance is <1e-6 electrons
-        delta_F = torch.abs(F_hkl - F_c_fdump)
-        max_delta = torch.max(delta_F).item()
+        max_delta = torch.max(torch.abs(F_hkl - F_c_fdump)).item()
+        assert max_delta <= 1e-6, f"Max |ΔF| HKL vs C Fdump = {max_delta:.2e}"
 
-        # Count mismatches beyond tolerance
-        mismatches = torch.sum(delta_F > 1e-6).item()
-
-        assert max_delta <= 1e-6, \
-            f"Max |ΔF| = {max_delta:.2e} exceeds tolerance (1e-6); {mismatches} mismatches"
-        assert mismatches == 0, \
-            f"Found {mismatches} mismatches beyond 1e-6 tolerance"
-
-        # Write roundtrip: HKL → PyTorch Fdump → read back
-        with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tmp:
-            tmp_path = tmp.name
-
-        try:
-            write_fdump(F_hkl, meta_hkl, tmp_path)
-            F_roundtrip, meta_roundtrip = read_fdump(tmp_path, dtype=torch.float64)
-
-            # Verify roundtrip preserves data exactly
-            assert F_hkl.shape == F_roundtrip.shape
-            delta_roundtrip = torch.abs(F_hkl - F_roundtrip)
-            max_roundtrip = torch.max(delta_roundtrip).item()
-
-            assert max_roundtrip == 0.0, \
-                f"Roundtrip introduced error: max |ΔF| = {max_roundtrip:.2e}"
-
-        finally:
-            # Cleanup
-            Path(tmp_path).unlink(missing_ok=True)
+        roundtrip_path = tmp_path / "torch_Fdump.bin"
+        write_fdump(F_hkl, meta_hkl, str(roundtrip_path))
+        F_roundtrip, _ = read_fdump(roundtrip_path, dtype=torch.float64)
+        assert F_hkl.shape == F_roundtrip.shape
+        assert torch.equal(F_hkl, F_roundtrip), "write_fdump/read_fdump roundtrip changed F"
 
 
 class TestInterpolateParity:
