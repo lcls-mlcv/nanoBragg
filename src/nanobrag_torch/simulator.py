@@ -351,16 +351,10 @@ def compute_physics_for_position(
                        l_frac * l_frac * Nc * Nc)
         else:
             # bl831 nanoBragg.c since 2023: "round in reciprocal space"
-            if is_multi_source:
-                # Multi-source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, 1, N_phi, N_mos, 3)
-                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                              k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                              l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0).unsqueeze(0))
-            else:
-                # Single source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, N_phi, N_mos, 3)
-                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0) +
-                              k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0) +
-                              l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0))
+            # rot_*_star (N_phi, N_mos, 3) broadcasts against any leading (sources, pixels) shape
+            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star +
+                            k_frac.unsqueeze(-1) * rot_b_star +
+                            l_frac.unsqueeze(-1) * rot_c_star)
             rad_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
             rad_sqr = rad_sqr * Na * Na * Nb * Nb * Nc * Nc
 
