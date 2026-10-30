@@ -455,3 +455,55 @@ def test_source_weight_gradients_match_diffbragg_differences(device):
     reference = np.array([(weighted(eps * np.eye(5)[i]) - weighted(-eps * np.eye(5)[i])) / (2 * eps) for i in range(5)])
     assert (reference > 0).any() and (reference < 0).any()
     np.testing.assert_allclose(g.cpu().numpy(), reference, rtol=1e-5)
+
+
+# ROI likelihood: hopper's target_func, its value and its gradient from diffBragg's Jacobian.
+@pytest.mark.parametrize("device", DEVICES)
+def test_gaussian_nll_matches_hopper_target_and_gradient(device):
+    from nanobrag_torch.utils.losses import gaussian_nll
+
+    args = cmp.build_parser().parse_args(["--detpixels", "128"])
+    args.device = device
+    sim = cmp.build_sim(args)
+    db_img, db_derivs = cmp.diffbragg_forward_and_derivs(sim, PARAM_IDS)
+    rois = [(10, 50, 20, 60), (60, 118, 70, 120)]
+    abc = [(0.02, -0.01, 0.5), (0.0, 0.03, 0.2)]
+    model = cmp.torch_experiment_model(sim, args, background_rois=rois, tilt_abc=abc)
+    rng = np.random.default_rng(7)
+    data_image = db_img + rng.normal(0, 0.4, db_img.shape) + 0.3
+    trusted_image = rng.uniform(size=db_img.shape) > 0.1
+    sigma_rdout = 0.5
+
+    # hopper_utils.target_func, on 1-D pixels as Modeler keeps them
+    Y, X = np.indices(db_img.shape)
+    background, selected = np.zeros(db_img.shape), np.zeros(db_img.shape, bool)
+    for (x1, x2, y1, y2), (a, b, c) in zip(rois, abc):
+        background[y1:y2, x1:x2] = a * (X[y1:y2, x1:x2] - x1) + b * (Y[y1:y2, x1:x2] - y1) + c
+        selected[y1:y2, x1:x2] = True
+    trusted = trusted_image[selected]
+    model_pix = (db_img + background)[selected]
+    resid = data_image[selected] - model_pix
+    V = model_pix + sigma_rdout**2
+    target = (.5 * (np.log(2 * np.pi * V) + resid**2 / V))[trusted].sum()
+    common_grad_term = (0.5 / V * (1 - 2 * resid - resid**2 / V))[trusted]
+
+    pred = model(roi_only=True)
+    loss = gaussian_nll(pred, model.roi_values(data_image), sigma_rdout, trusted=model.roi_values(trusted_image))
+    np.testing.assert_allclose(float(loss), target, rtol=1e-10)
+
+    # hopper's g[p] = Σ_trusted J_p·common_grad_term, for J_p from diffBragg's derivative
+    # pixels (Ncells), its image (G, d/d(log G) of the Bragg term) and the plane (offset c)
+    g_n, g_scale, g_abc = torch.autograd.grad(loss, [
+        model.crystal_params.delta_log_N_cells, model.beam_params.delta_log_spot_scale,
+        model.background_params.delta_tilt_abc])
+    first_roi = np.zeros(db_img.shape, bool)
+    x1, x2, y1, y2 = rois[0]
+    first_roi[y1:y2, x1:x2] = True
+    references = {
+        "log Ncells": (float(g_n.sum()), args.ncells * (db_derivs[9][selected][trusted] * common_grad_term).sum()),
+        "log G": (float(g_scale), (db_img[selected][trusted] * common_grad_term).sum()),
+        "plane c": (float(g_abc[0, 2]), (first_roi[selected][trusted] * common_grad_term).sum()),
+    }
+    for name, (got, ref) in references.items():
+        assert ref != 0
+        np.testing.assert_allclose(got, ref, rtol=1e-8, err_msg=name)
