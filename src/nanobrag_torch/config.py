@@ -547,7 +547,8 @@ class BeamConfig:
 
     # Multiple sources support (AT-SRC-001)
     source_directions: Optional[torch.Tensor] = None  # (N, 3) unit direction vectors from sample to sources
-    source_weights: Optional[torch.Tensor] = None  # (N,) source weights (ignored per spec, all equal)
+    source_weights: Optional[torch.Tensor] = None  # (N,) source weights (ignored unless use_source_weights)
+    use_source_weights: bool = False  # Weight sources as diffBragg does (source_I); C ignores the weights
     source_wavelengths: Optional[torch.Tensor] = None  # (N,) wavelengths in meters for each source
 
     # Beam polarization

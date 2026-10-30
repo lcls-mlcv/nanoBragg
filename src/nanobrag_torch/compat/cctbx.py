@@ -495,8 +495,10 @@ def beam_config_from_dxtbx(
     ``spectrum`` is an optional list of (wavelength_Å, flux) pairs like
     ``NBbeam.spectrum``; each entry becomes a source along −unit_s0. Note that
     nanoBragg (C and cctbx CPU kernel) weights sources equally regardless of
-    flux, and so does the torch simulator; the fluxes are kept in
-    ``source_weights`` for reference only.
+    flux, and so does the torch simulator unless ``use_source_weights`` is set on the
+    config; the fluxes are kept in ``source_weights``. diffBragg does weight them, and
+    so does ExperimentModel. To match a diffBragg image pass its ``D.fluence``, which
+    after ``D.xray_beams = ...`` is the total flux divided by the number of channels.
     """
     wavelength_A = float(beam.get_wavelength())
     kwargs = dict(wavelength_A=wavelength_A, spot_scale=float(spot_scale))
