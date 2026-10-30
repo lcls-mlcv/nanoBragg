@@ -5,6 +5,7 @@ This module orchestrates the entire diffraction simulation, taking Crystal and
 Detector objects as input and producing the final diffraction pattern.
 """
 
+from dataclasses import dataclass
 from typing import Optional, Callable
 
 import math
@@ -486,6 +487,22 @@ def compute_physics_for_position(
     return intensity, intensity_pre_polar
 
 
+@dataclass
+class PanelPixels:
+    """Pixels of several planar panels of one pixel size, for a single kernel call.
+
+    Each field has one entry per pixel: its position (m), its panel's axes and close
+    distance (m), and the ROI/mask value (0 or 1).
+    """
+
+    coords_m: torch.Tensor  # (N, 3)
+    fdet: torch.Tensor  # (N, 3)
+    sdet: torch.Tensor  # (N, 3)
+    odet: torch.Tensor  # (N, 3)
+    close_distance_m: torch.Tensor  # (N,)
+    mask: torch.Tensor  # (N,)
+
+
 class Simulator:
     """
     Main diffraction simulator class.
@@ -665,7 +682,7 @@ class Simulator:
         self._refresh_roi_mask()
 
         # Compile the physics computation function with appropriate mode
-        # Use max-autotune on GPU to avoid CUDA graph issues with nested compilation
+        # Use max-autotune without CUDA graphs on GPU (see _compile_physics_fn)
         # Use reduce-overhead on CPU for better performance
         # PERF-PYTORCH-005: Create compiled version of the pure function
         # The wrapper method _compute_physics_for_position should NOT be compiled
@@ -744,7 +761,10 @@ class Simulator:
         else:
             try:
                 if self.device.type == "cuda":
-                    self._compiled_compute_physics = torch.compile(mode="max-autotune")(
+                    # Not CUDA graphs: they reuse output buffers, so a second kernel call before
+                    # backward (pixel_batch_size, panels, shots) destroys the first call's tensors,
+                    # and on a 4090 they gain nothing here (105.1 vs 104.9 ms, 1000 mosaic domains).
+                    self._compiled_compute_physics = torch.compile(mode="max-autotune-no-cudagraphs")(
                         compute_physics_for_position
                     )
                 else:
@@ -810,11 +830,6 @@ class Simulator:
         # This wrapper method is intentionally NOT compiled to allow this clone operation.
         incident_beam_direction = incident_beam_direction.clone()
 
-        # Mark CUDA graph step boundary to prevent aliasing errors
-        # This tells torch.compile that we're starting a new step and tensors can be safely reused
-        if self.device.type == "cuda":
-            torch.compiler.cudagraph_mark_step_begin()
-
         # Forward to compiled pure function with explicit parameters
         return self._compiled_compute_physics(
             pixel_coords_angstroms=pixel_coords_angstroms,
@@ -857,6 +872,7 @@ class Simulator:
         oversample: int,
         oversample_omega: bool,
         oversample_thick: bool,
+        panel_axes: Optional[tuple] = None,
     ):
         """
         Accumulated per-pixel intensity for a block of pixels, before the
@@ -875,6 +891,16 @@ class Simulator:
         # t*step along odet, and its F^2 is added to the pixel without dividing by the layer count.
         n_layers, layer_step_m, mu = self.detector.thickness_layers()
         capture_fraction_for_trace = None
+
+        # Detector axes and close distance broadcast against (S, F, samples, 3) and (S, F):
+        # one panel's, or each pixel's own for PanelPixels.
+        if panel_axes is None:
+            f_axis, s_axis, o_axis = (
+                vec.view(1, 1, 1, 3) for vec in (self.detector.fdet_vec, self.detector.sdet_vec, self.detector.odet_vec)
+            )
+            close_distance_m = torch.as_tensor(self.detector.close_distance, device=self.device, dtype=self.dtype)
+        else:
+            f_axis, s_axis, o_axis, close_distance_m = panel_axes
 
         # Check if we're doing subpixel sampling (sensor layers use the same batched path)
         if oversample > 1 or n_layers > 1:
@@ -897,9 +923,6 @@ class Simulator:
             sub_s_flat = sub_s.flatten()
             sub_f_flat = sub_f.flatten()
 
-            # Get detector basis vectors for proper coordinate transformation
-            f_axis = self.detector.fdet_vec  # Shape: [3]
-            s_axis = self.detector.sdet_vec  # Shape: [3]
             S, F = pixel_coords_meters.shape[:2]
 
             # VECTORIZED: Create all subpixel positions at once
@@ -910,20 +933,20 @@ class Simulator:
             delta_s_all = sub_s_flat * pixel_size_m_tensor
             delta_f_all = sub_f_flat * pixel_size_m_tensor
 
-            # Shape: (oversample*oversample, 3)
+            # Shape: (S or 1, F or 1, oversample*oversample, 3)
             offset_vectors = delta_s_all.unsqueeze(-1) * s_axis + delta_f_all.unsqueeze(-1) * f_axis
             n_sub = oversample * oversample
             if n_layers > 1:
                 # Layer-major ordering: (layer 0: all subpixels), (layer 1: all subpixels), ...
                 layer_depths = torch.arange(n_layers, device=self.device, dtype=self.dtype) * layer_step_m
-                layer_offsets = layer_depths.unsqueeze(-1) * self.detector.odet_vec
-                offset_vectors = (layer_offsets.unsqueeze(1) + offset_vectors.unsqueeze(0)).reshape(-1, 3)
-            n_samples = offset_vectors.shape[0]
+                layer_offsets = layer_depths.unsqueeze(-1) * o_axis
+                offset_vectors = (layer_offsets.unsqueeze(-2) + offset_vectors.unsqueeze(-3)).flatten(-3, -2)
+            n_samples = offset_vectors.shape[-2]
 
             # Expand pixel_coords for all subpixels (and layers)
             # Shape: (S, F, n_samples, 3)
             pixel_coords_expanded = pixel_coords_meters.unsqueeze(2).expand(S, F, n_samples, 3)
-            offset_vectors_expanded = offset_vectors.unsqueeze(0).unsqueeze(0).expand(S, F, n_samples, 3)
+            offset_vectors_expanded = offset_vectors.expand(S, F, n_samples, 3)
 
             # All subpixel coordinates at once
             # Shape: (S, F, oversample*oversample, 3)
@@ -996,10 +1019,7 @@ class Simulator:
             sub_magnitudes_all = torch.sqrt(sub_squared_all)
             airpath_m_all = sub_magnitudes_all * 1e-10
 
-            # Get close_distance from detector (computed during init)
             # Convert detector properties to tensors with correct device/dtype (AT-PERF-DEVICE-001)
-            # Use as_tensor to avoid warnings when value might already be a tensor
-            close_distance_m = torch.as_tensor(self.detector.close_distance, device=airpath_m_all.device, dtype=airpath_m_all.dtype)
             pixel_size_m = torch.as_tensor(self.detector.pixel_size, device=airpath_m_all.device, dtype=airpath_m_all.dtype)
 
             # Calculate solid angle (omega) for all subpixels
@@ -1010,7 +1030,7 @@ class Simulator:
                 omega_all = (
                     (pixel_size_m * pixel_size_m)
                     / (airpath_m_all * airpath_m_all)
-                    * close_distance_m
+                    * (close_distance_m.unsqueeze(-1) if close_distance_m.dim() else close_distance_m)
                     / airpath_m_all
                 )
 
@@ -1023,10 +1043,7 @@ class Simulator:
 
             if n_layers > 1:
                 # capture fraction of each layer seen from each sample point (nanoBragg.c:2732-2739)
-                parallax = torch.sum(
-                    subpixel_coords_ang_all / sub_magnitudes_all.unsqueeze(-1) * self.detector.odet_vec,
-                    dim=-1,
-                )
+                parallax = torch.sum(subpixel_coords_ang_all / sub_magnitudes_all.unsqueeze(-1) * o_axis, dim=-1)
                 parallax = torch.where(parallax.abs() < 1e-10, torch.sign(parallax) * 1e-10, parallax)
                 layer_index = torch.arange(n_layers, device=self.device, dtype=self.dtype).repeat_interleave(n_sub)
                 capture_all = (
@@ -1131,8 +1148,6 @@ class Simulator:
             airpath = pixel_magnitudes.squeeze(-1)  # Remove last dimension for broadcasting
             airpath_m = airpath * 1e-10  # Å to meters
             # Convert detector properties to tensors with correct device/dtype (AT-PERF-DEVICE-001)
-            # Use as_tensor to avoid warnings when value might already be a tensor
-            close_distance_m = torch.as_tensor(self.detector.close_distance, device=airpath_m.device, dtype=airpath_m.dtype)
             pixel_size_m = torch.as_tensor(self.detector.pixel_size, device=airpath_m.device, dtype=airpath_m.dtype)
 
             # Calculate solid angle (omega) based on point_pixel mode
@@ -1319,6 +1334,7 @@ class Simulator:
         oversample_polar: Optional[bool] = None,
         oversample_thick: Optional[bool] = None,
         pixels: Optional[torch.Tensor] = None,
+        panel_pixels: Optional[PanelPixels] = None,
     ) -> torch.Tensor:
         """
         Run the diffraction simulation with crystal rotation and mosaicity.
@@ -1387,15 +1403,19 @@ class Simulator:
             pixels: Optional (N, 2) integer (slow, fast) indices: evaluate only these pixels.
                 They run as an N x 1 image, so every path gives the values the full image
                 has there, and pixel_batch_size chunks them.
+            panel_pixels: Optional PanelPixels: evaluate these pixels of several panels in
+                one kernel call. Replaces this Simulator's own detector geometry and mask.
 
         Returns:
             torch.Tensor: Final diffraction image with shape (spixels, fpixels), or the
-            (N,) values of ``pixels``.
+            (N,) values of ``pixels`` or ``panel_pixels``.
         """
-        if pixels is not None and (self.printout or self.trace_pixel):
+        selected = pixels is not None or panel_pixels is not None
+        if selected and (self.printout or self.trace_pixel):
             raise ValueError("printout and trace_pixel need the whole image; run without pixels=")
         self._warn_if_tophat_severs_cell_gradients()
-        self._ensure_pixel_coords_current()
+        if panel_pixels is None:
+            self._ensure_pixel_coords_current()
 
         # Unified vectorization path (spec-compliant fresh rotations)
         # Get oversampling parameters from detector config if not provided
@@ -1425,6 +1445,14 @@ class Simulator:
             slow, fast = pixels.to(self.device).unbind(dim=-1)
             pixel_coords_meters = pixel_coords_meters[slow, fast].unsqueeze(1)
             roi_mask = roi_mask[slow, fast].unsqueeze(1)
+        panel_axes = None
+        if panel_pixels is not None:
+            pixel_coords_meters = panel_pixels.coords_m.unsqueeze(1)
+            roi_mask = panel_pixels.mask.unsqueeze(1)
+            panel_axes = (
+                panel_pixels.fdet[:, None, None], panel_pixels.sdet[:, None, None],
+                panel_pixels.odet[:, None, None], panel_pixels.close_distance_m[:, None],
+            )
 
         # Get rotated lattice vectors for all phi steps and mosaic domains
         # Shape: (N_phi, N_mos, 3)
@@ -1518,7 +1546,11 @@ class Simulator:
         )
         if pixel_batch_size is not None and pixel_batch_size < S:
             chunks = [
-                self._pixel_intensity(pixel_coords_meters[s_start:s_start + pixel_batch_size], **kernel_args)
+                self._pixel_intensity(
+                    pixel_coords_meters[s_start:s_start + pixel_batch_size],
+                    panel_axes=None if panel_axes is None else tuple(a[s_start:s_start + pixel_batch_size] for a in panel_axes),
+                    **kernel_args,
+                )
                 for s_start in range(0, S, pixel_batch_size)
             ]
             (normalized_intensity, omega_pixel, I_before_normalization,
@@ -1528,7 +1560,7 @@ class Simulator:
         else:
             (normalized_intensity, omega_pixel, I_before_normalization,
              I_before_normalization_pre_polar, capture_fraction_for_trace) = self._pixel_intensity(
-                pixel_coords_meters, **kernel_args
+                pixel_coords_meters, panel_axes=panel_axes, **kernel_args
             )
 
         # Final intensity with all physical constants in meters
@@ -1655,7 +1687,7 @@ class Simulator:
 
         # PERF-PYTORCH-006: Ensure output matches requested dtype
         # Some intermediate operations may upcast for precision, but final output should match dtype
-        if pixels is not None:
+        if selected:
             physical_intensity = physical_intensity.squeeze(1)
         return physical_intensity.to(dtype=self.dtype)
 

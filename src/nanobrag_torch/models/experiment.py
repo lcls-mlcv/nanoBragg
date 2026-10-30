@@ -676,7 +676,9 @@ class BackgroundStageAParams(nn.Module):
     gives diffBragg's a, b, c. Everything here is in photons, unlike the log offsets of
     the other blocks, so it usually wants its own learning rate.
 
-    Without ``rois`` there is one region, the whole image, starting at zero.
+    Without ``rois`` every panel is one region, starting at zero. ``panels`` gives the
+    panel of each ROI (diffBragg's pids), panel 0 by default; ``pixels`` lists the covered
+    pixels panel by panel, and ``panel`` says which panel each one is on.
     """
 
     def __init__(
@@ -685,6 +687,8 @@ class BackgroundStageAParams(nn.Module):
         fpixels: int,
         rois=None,
         tilt_abc=None,
+        panels=None,
+        n_panels: int = 1,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
         param_init: str = "trainable",
@@ -693,28 +697,40 @@ class BackgroundStageAParams(nn.Module):
         if device is None:
             device = torch.device("cpu")
         if rois is None:
-            rois = [(0, fpixels, 0, spixels)]
+            rois = [(0, fpixels, 0, spixels)] * n_panels
+            panels = range(n_panels)
         rois = np.asarray(rois, dtype=np.int64).reshape(-1, 4)
         R = len(rois)
+        panels = np.zeros(R, dtype=np.int64) if panels is None else np.asarray(list(panels), dtype=np.int64)
+        if panels.shape != (R,) or (R and not 0 <= panels.min() <= panels.max() < n_panels):
+            raise ValueError(f"panels must give one of the {n_panels} panels for each of the {R} ROIs")
         abc = np.zeros((R, 3)) if tilt_abc is None else np.asarray(tilt_abc, dtype=np.float64)
         if abc.shape != (R, 3):
             raise ValueError(f"tilt_abc must have shape ({R}, 3), one (a, b, c) per ROI; got {abc.shape}")
 
-        self.spixels, self.fpixels = spixels, fpixels
-        region = np.full((spixels, fpixels), R, dtype=np.int64)  # R: no plane
-        x = np.zeros((spixels, fpixels))
-        y = np.zeros((spixels, fpixels))
-        for i, (x1, x2, y1, y2) in enumerate(rois):
-            if not (0 <= x1 < x2 <= fpixels and 0 <= y1 < y2 <= spixels):
-                raise ValueError(f"ROI {i} (x1, x2, y1, y2) = {tuple(rois[i])} is empty or outside "
-                                 f"the {fpixels}x{spixels} image")
-            region[y1:y2, x1:x2] = i
-            y[y1:y2, x1:x2], x[y1:y2, x1:x2] = np.indices((y2 - y1, x2 - x1))
+        self.spixels, self.fpixels, self.n_panels = spixels, fpixels, n_panels
         # Only the covered pixels are kept, so a detector of shoeboxes stays small.
-        slow, fast = np.nonzero(region < R)
-        self.register_buffer("pixels", torch.as_tensor(np.stack([slow, fast], axis=1), device=device))
-        self.register_buffer("region", torch.as_tensor(region[slow, fast], device=device))
-        basis = np.stack([x[slow, fast], y[slow, fast], np.ones_like(slow, dtype=np.float64)], axis=1)
+        kept = {key: [] for key in ("panel", "slow", "fast", "region", "x", "y")}
+        for panel in np.unique(panels):
+            region = np.full((spixels, fpixels), R, dtype=np.int64)  # R: no plane
+            x = np.zeros((spixels, fpixels))
+            y = np.zeros((spixels, fpixels))
+            for i in np.flatnonzero(panels == panel):
+                x1, x2, y1, y2 = rois[i]
+                if not (0 <= x1 < x2 <= fpixels and 0 <= y1 < y2 <= spixels):
+                    raise ValueError(f"ROI {i} (x1, x2, y1, y2) = {tuple(rois[i])} is empty or outside "
+                                     f"the {fpixels}x{spixels} image")
+                region[y1:y2, x1:x2] = i
+                y[y1:y2, x1:x2], x[y1:y2, x1:x2] = np.indices((y2 - y1, x2 - x1))
+            slow, fast = np.nonzero(region < R)
+            for key, values in zip(kept, (np.full(slow.shape, panel), slow, fast, region[slow, fast],
+                                          x[slow, fast], y[slow, fast])):
+                kept[key].append(values)
+        kept = {key: np.concatenate(values) for key, values in kept.items()}
+        self.register_buffer("panel", torch.as_tensor(kept["panel"], device=device))
+        self.register_buffer("pixels", torch.as_tensor(np.stack([kept["slow"], kept["fast"]], axis=1), device=device))
+        self.register_buffer("region", torch.as_tensor(kept["region"], device=device))
+        basis = np.stack([kept["x"], kept["y"], np.ones_like(kept["x"])], axis=1)
         self.register_buffer("basis", torch.as_tensor(basis, device=device, dtype=dtype))
         self.register_buffer("base_tilt_abc", torch.as_tensor(abc, device=device, dtype=dtype))
         extent = np.stack([rois[:, 1] - rois[:, 0], rois[:, 3] - rois[:, 2], np.ones(R, dtype=np.int64)], axis=1)
@@ -730,10 +746,11 @@ class BackgroundStageAParams(nn.Module):
         return (self.tilt_abc()[self.region] * self.basis).sum(dim=-1)
 
     def image(self) -> torch.Tensor:
-        """The background of every pixel, shape (spixels, fpixels)."""
+        """The background of every pixel, shape (spixels, fpixels), or (panels, spixels, fpixels)."""
         values = self.values()
-        image = torch.zeros((self.spixels, self.fpixels), device=values.device, dtype=values.dtype)
-        return image.index_put(tuple(self.pixels.T), values)
+        image = torch.zeros((self.n_panels, self.spixels, self.fpixels), device=values.device, dtype=values.dtype)
+        image = image.index_put((self.panel, *self.pixels.T), values)
+        return image if self.n_panels > 1 else image[0]
 
 
 class ExperimentModel(nn.Module):
@@ -764,7 +781,10 @@ class ExperimentModel(nn.Module):
     ``background_rois`` and ``tilt_abc`` give the regions and starting coefficients of
     the background planes (see BackgroundStageAParams); by default the whole image is
     one plane starting at zero. ``model(roi_only=True)`` evaluates just the pixels of
-    those regions (see roi_values). A beam with several sources is a spectrum, weighted as
+    those regions (see roi_values). ``detector_config`` may be a list of panels of one
+    size: they share the crystal, the beam and one set of detector offsets (hopper's
+    detz_shift is one number per shot), and images gain a leading panel dimension.
+    A beam with several sources is a spectrum, weighted as
     diffBragg weights it even though a plain Simulator ignores the weights as C does
     (see BeamStageAParams).
     """
@@ -800,7 +820,7 @@ class ExperimentModel(nn.Module):
     def __init__(
         self,
         crystal_config: CrystalConfig,
-        detector_config: DetectorConfig,
+        detector_config,
         beam_config: BeamConfig,
         device: Optional[torch.device] = None,
         dtype: torch.dtype = torch.float32,
@@ -812,6 +832,7 @@ class ExperimentModel(nn.Module):
         structure_factors: Optional[StructureFactors] = None,
         background_rois=None,
         tilt_abc=None,
+        background_panels=None,
     ) -> None:
         super().__init__()
         if structure_factors is not None and hkl_data is not None:
@@ -820,6 +841,9 @@ class ExperimentModel(nn.Module):
             device = torch.device("cpu")
         self.device = device
         self.dtype = dtype
+        panel_configs = list(detector_config) if isinstance(detector_config, (list, tuple)) else [detector_config]
+        if len({(cfg.spixels, cfg.fpixels) for cfg in panel_configs}) != 1:
+            raise ValueError("all panels must have the same size")
 
         # Stage-A parameter blocks.
         self.crystal_params = CrystalStageAParams(
@@ -831,11 +855,20 @@ class ExperimentModel(nn.Module):
             anisotropic_mosaicity=anisotropic_mosaicity,
         )
         self.detector_params = DetectorStageAParams(
-            base_config=detector_config,
+            base_config=panel_configs[0],
             device=self.device,
             dtype=self.dtype,
             param_init=param_init,
         )
+        # One block per further panel, for its own base geometry; every offset is the
+        # first panel's parameter object, so the panels move together.
+        self.panel_params = nn.ModuleList(
+            DetectorStageAParams(base_config=cfg, device=self.device, dtype=self.dtype, param_init=param_init)
+            for cfg in panel_configs[1:]
+        )
+        for block in self.panel_params:
+            for name, _ in list(block.named_parameters(recurse=False)):
+                setattr(block, name, getattr(self.detector_params, name))
         self.beam_params = BeamStageAParams(
             base_config=beam_config,
             device=self.device,
@@ -850,10 +883,12 @@ class ExperimentModel(nn.Module):
             param_init=param_init,
         )
         self.background_params = BackgroundStageAParams(
-            detector_config.spixels,
-            detector_config.fpixels,
+            panel_configs[0].spixels,
+            panel_configs[0].fpixels,
             background_rois,
             tilt_abc,
+            background_panels,
+            len(panel_configs),
             device=self.device,
             dtype=self.dtype,
             param_init=param_init,
@@ -869,9 +904,17 @@ class ExperimentModel(nn.Module):
         # kept: every later step writes the new parameter tensors into them instead
         # of rebuilding (and re-compiling) all three.
         self._simulator = None
+        self._simulators: list = []  # one per panel, for whole images; _simulator is the first
+        self._detectors: list = []
+        self._panel_pixels = None  # the PanelPixels of the ROIs
+        self._panel_pixels_key: Optional[tuple] = None
         self._crystal: Optional[Crystal] = None
         self._detector: Optional[Detector] = None
         self._beam_config: Optional[BeamConfig] = None
+        self._hkl_grid: Optional[torch.Tensor] = None  # from SerialExperiment, one grid per pass
+        self._shared_detectors_from: Optional["ExperimentModel"] = None  # SerialExperiment(share_detector=True)
+        self._detectors_synced_by_serial = False  # once per pass, not once per shot
+        self._detector_state: Optional[tuple] = None
 
     def _resolve(self, names) -> list:
         """Parameter names for these groups/parameters (all of them if none given)."""
@@ -963,7 +1006,7 @@ class ExperimentModel(nn.Module):
 
     def _apply_structure_factors(self, crystal: Crystal) -> None:
         if self.fhkl_params.active:
-            crystal.hkl_data = self.fhkl_params.hkl_grid()
+            crystal.hkl_data = self.fhkl_params.hkl_grid() if self._hkl_grid is None else self._hkl_grid
             crystal.hkl_metadata = dict(self.fhkl_params.hkl_metadata)
             return
         if self._external_hkl_data is None:
@@ -1001,11 +1044,11 @@ class ExperimentModel(nn.Module):
         fluence from its own tensor. So writing the new tensors in is enough.
         """
         crystal_cfg = self.crystal_params.build_config()
-        detector_cfg = self.detector_params.build_config()
         beam_cfg = self.beam_params.build_config()
 
         if self._simulator is None:
-            self._construct(crystal_cfg, detector_cfg, beam_cfg)
+            self._construct(crystal_cfg, [block.build_config() for block in self._panel_blocks], beam_cfg)
+            self._detector_state = self._detector_parameter_state()
             return self._simulator
 
         crystal = self._crystal
@@ -1029,24 +1072,51 @@ class ExperimentModel(nn.Module):
         if self.fhkl_params.active:
             self._apply_structure_factors(crystal)
 
-        for name in self._DETECTOR_FIELDS:
-            setattr(self._detector.config, name, getattr(detector_cfg, name))
+        if not self._detectors_synced_by_serial:
+            self._sync_detectors()
 
         self._beam_config.fluence = beam_cfg.fluence
         # Simulator.run() reads spot_scale from this config on every run.
         self._beam_config.spot_scale = beam_cfg.spot_scale
-        self._simulator.fluence = as_tensor_preserving_grad(
-            beam_cfg.fluence, device=self.device, dtype=self.dtype
-        )
-        self._simulator.set_spectrum(beam_cfg.wavelength_A, beam_cfg.source_wavelengths, beam_cfg.source_weights)
+        for simulator in self._simulators:
+            self._write_beam(simulator, beam_cfg)
         return self._simulator
 
     def roi_values(self, image) -> torch.Tensor:
         """The pixels of an image (data, a trusted mask), in the order of model(roi_only=True)."""
         image = torch.as_tensor(image, device=self.device)
-        return image[tuple(self.background_params.pixels.T)]
+        background = self.background_params
+        if len(self._panel_blocks) > 1:
+            return image[(background.panel, *background.pixels.T)]
+        return image[tuple(background.pixels.T)]
 
-    def _construct(self, crystal_cfg, detector_cfg, beam_cfg) -> None:
+    @property
+    def _panel_blocks(self) -> list:
+        return [self.detector_params, *self.panel_params]
+
+    def _write_beam(self, simulator, beam_cfg) -> None:
+        simulator.fluence = as_tensor_preserving_grad(beam_cfg.fluence, device=self.device, dtype=self.dtype)
+        simulator.set_spectrum(beam_cfg.wavelength_A, beam_cfg.source_wavelengths, beam_cfg.source_weights)
+
+    def _detector_parameter_state(self) -> tuple:
+        return tuple(p._version for p in self.detector_params.parameters())
+
+    def _sync_detectors(self) -> None:
+        """Write the detector offsets into the configs, if they can have changed.
+
+        A new tensor in a config rebuilds the whole panel's pixel coordinates, which is
+        most of the cost of a small ROI, so frozen offsets are written only after an edit.
+        """
+        state = self._detector_parameter_state()
+        if state == self._detector_state and not any(p.requires_grad for p in self.detector_params.parameters()):
+            return
+        self._detector_state = state
+        for detector, block in zip(self._detectors, self._panel_blocks):
+            detector_cfg = block.build_config()
+            for name in self._DETECTOR_FIELDS:
+                setattr(detector.config, name, getattr(detector_cfg, name))
+
+    def _construct(self, crystal_cfg, detector_cfgs, beam_cfg) -> None:
         crystal = Crystal(
             config=crystal_cfg,
             beam_config=beam_cfg,
@@ -1056,24 +1126,83 @@ class ExperimentModel(nn.Module):
         self._apply_structure_factors(crystal)
         self._apply_mosaicity(crystal)
 
-        detector = Detector(
-            config=detector_cfg,
-            device=self.device,
-            dtype=self.dtype,
-        )
+        source = self._shared_detectors_from
+        if source is not None and source._simulator is None:
+            with torch.no_grad():
+                source._sync()
+        self._detectors = [
+            Detector(config=detector_cfg, device=self.device, dtype=self.dtype) for detector_cfg in detector_cfgs
+        ] if source is None else source._detectors
+        self._crystal, self._detector, self._beam_config = crystal, self._detectors[0], beam_cfg
+        self._simulator = self._new_simulator(self._detectors[0])
+        self._simulators = [self._simulator]
 
-        # Import Simulator lazily here to avoid circular imports at module load
-        # time (Simulator imports models.crystal / models.detector).
+    def _new_simulator(self, detector):
+        # Import Simulator lazily to avoid circular imports at module load time
+        # (Simulator imports models.crystal / models.detector).
         from ..simulator import Simulator
 
-        self._simulator = Simulator(
-            crystal=crystal,
+        return Simulator(
+            crystal=self._crystal,
             detector=detector,
-            beam_config=beam_cfg,
+            beam_config=self._beam_config,
             device=self.device,
             dtype=self.dtype,
         )
-        self._crystal, self._detector, self._beam_config = crystal, detector, beam_cfg
+
+    def _whole_panel_simulators(self) -> list:
+        """A Simulator per panel, built when whole images are first asked for."""
+        for detector in self._detectors[len(self._simulators):]:
+            simulator = self._new_simulator(detector)
+            self._write_beam(simulator, self.beam_params.build_config())
+            self._simulators.append(simulator)
+        return self._simulators
+
+    def _roi_panel_pixels(self):
+        """The ROI pixels of all panels at the current geometry, rebuilt only when it moved."""
+        from ..simulator import PanelPixels
+
+        for detector in self._detectors:
+            detector._ensure_geometry_current()
+        key = tuple(detector._geometry_version for detector in self._detectors)
+        if key == self._panel_pixels_key:
+            return self._panel_pixels
+
+        def per_panel(values):
+            return torch.stack([torch.as_tensor(v, device=self.device, dtype=self.dtype) for v in values])
+
+        background = self.background_params
+        panel = background.panel
+        fdet = per_panel(d.fdet_vec for d in self._detectors)[panel]
+        sdet = per_panel(d.sdet_vec for d in self._detectors)[panel]
+        pix0 = per_panel(d.pix0_vector for d in self._detectors)[panel]
+        slow, fast = (index.to(self.dtype).unsqueeze(-1) + 0.5 for index in background.pixels.unbind(dim=-1))
+        pixel_size = self._detectors[0].pixel_size
+        self._panel_pixels = PanelPixels(
+            coords_m=pix0 + slow * pixel_size * sdet + fast * pixel_size * fdet,
+            fdet=fdet,
+            sdet=sdet,
+            odet=per_panel(d.odet_vec for d in self._detectors)[panel],
+            close_distance_m=per_panel(d.close_distance for d in self._detectors)[panel],
+            mask=self._roi_mask_values(),
+        )
+        self._panel_pixels_key = key
+        return self._panel_pixels
+
+    def _roi_mask_values(self) -> torch.Tensor:
+        """Each ROI pixel's ROI limits and mask_array, as Simulator's mask has them."""
+        background = self.background_params
+        mask = torch.ones(len(background.panel), device=self.device, dtype=self.dtype)
+        for index, detector in enumerate(self._detectors):
+            cfg = detector.config
+            on_panel = background.panel == index
+            slow, fast = background.pixels[on_panel].unbind(dim=-1)
+            kept = ((slow >= cfg.roi_ymin) & (slow <= cfg.roi_ymax)
+                    & (fast >= cfg.roi_xmin) & (fast <= cfg.roi_xmax)).to(self.dtype)
+            if cfg.mask_array is not None:
+                kept = kept * cfg.mask_array.to(device=self.device, dtype=self.dtype)[slow, fast]
+            mask[on_panel] = kept
+        return mask
 
     def _build_simulator(self):
         """
@@ -1102,22 +1231,96 @@ class ExperimentModel(nn.Module):
         With ``roi_only`` only the pixels of the background regions are evaluated.
 
         Returns:
-            Float image tensor with shape (spixels, fpixels), or with ``roi_only`` the
-            (N,) values of those pixels, in the order of roi_values().
+            Float image tensor with shape (spixels, fpixels), or (panels, spixels, fpixels)
+            for several panels, or with ``roi_only`` the (N,) values of those pixels, in
+            the order of roi_values().
         """
-        simulator = self._sync()
+        self._sync()
         background = self.background_params
-
-        image = simulator.run(
+        options = dict(
             pixel_batch_size=pixel_batch_size,
             oversample=oversample,
             oversample_omega=oversample_omega,
             oversample_polar=oversample_polar,
             oversample_thick=oversample_thick,
-            pixels=background.pixels if roi_only else None,
         )
-        # As diffBragg: Bragg model + background. run() has just refreshed the mask.
-        mask = simulator._cached_roi_mask
+        # As diffBragg: Bragg model + background. run() has just refreshed each mask.
+        if roi_only and len(self._detectors) > 1:
+            panel_pixels = self._roi_panel_pixels()
+            image = self._simulator.run(panel_pixels=panel_pixels, **options)
+            return image + background.values() * panel_pixels.mask
         if roi_only:
-            return image + background.values() * mask[tuple(background.pixels.T)]
-        return image + background.image() * mask
+            image = self._simulator.run(pixels=background.pixels, **options)
+            return image + background.values() * self._simulator._cached_roi_mask[tuple(background.pixels.T)]
+        simulators = self._whole_panel_simulators()
+        images = torch.stack([simulator.run(**options) for simulator in simulators])
+        masks = torch.stack([simulator._cached_roi_mask for simulator in simulators])
+        if len(simulators) == 1:
+            images, masks = images[0], masks[0]
+        return images + background.image() * masks
+
+
+class SerialExperiment(nn.Module):
+    """Several shots refined together, each an ExperimentModel, sharing structure factors.
+
+    Every shot keeps its own crystal and beam parameters, as hopper's per-shot refinement
+    does, and all shots share the first shot's Fhkl, as its ensemble stage does. With
+    ``share_detector`` (identical panels on every shot) they also share one Detector, so
+    the panels' pixel coordinates exist once, and one set of detector offsets.
+
+        serial = SerialExperiment(models)
+        serial.freeze().refine("Fhkl", "scale")
+        images = serial(roi_only=True)      # a list, one tensor per shot
+        images = serial([3, 7], roi_only=True)  # or a minibatch of shots
+    """
+
+    def __init__(self, shots, share_detector: bool = False) -> None:
+        super().__init__()
+        self.shots = nn.ModuleList(shots)
+        first = self.shots[0]
+        self.share_detector = share_detector
+        for shot in self.shots[1:]:
+            if shot._simulator is not None:
+                raise ValueError("give shots that have not run yet: they share state built on the first run")
+            if shot.fhkl_params.structure_factors is not first.fhkl_params.structure_factors:
+                raise ValueError("all shots must be built with the same StructureFactors object")
+            shot.fhkl_params = first.fhkl_params
+            if share_detector:
+                shot.detector_params = first.detector_params
+                shot.panel_params = first.panel_params
+                shot._shared_detectors_from = first
+                shot._detectors_synced_by_serial = True
+        first._detectors_synced_by_serial = share_detector
+
+    def refine(self, *names: str) -> "SerialExperiment":
+        """ExperimentModel.refine on every shot."""
+        for shot in self.shots:
+            shot.refine(*names)
+        return self
+
+    def freeze(self, *names: str) -> "SerialExperiment":
+        """ExperimentModel.freeze on every shot."""
+        for shot in self.shots:
+            shot.freeze(*names)
+        return self
+
+    def trainable_parameters(self) -> list:
+        """The parameters that currently require grad, each once."""
+        return [p for p in self.parameters() if p.requires_grad]
+
+    def forward(self, shots=None, **options) -> list:
+        """Each shot's ExperimentModel.forward (see there for ``options``), all shots by default."""
+        first = self.shots[0]
+        if self.share_detector:
+            if first._simulator is None:
+                first._sync()
+            first._sync_detectors()
+        fhkl = first.fhkl_params
+        grid = fhkl.hkl_grid() if fhkl.active else None
+        results = []
+        for i in range(len(self.shots)) if shots is None else shots:
+            shot = self.shots[i]
+            shot._hkl_grid = grid
+            results.append(shot(**options))
+            shot._hkl_grid = None
+        return results

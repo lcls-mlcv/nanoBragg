@@ -75,6 +75,8 @@ def build_sim(args):
     nb.xtal_shape = args.shape
     SIM = SimData(use_default_crystal=True)
     SIM.detector = SimData.simple_detector(args.distance, args.pixel, (args.detpixels, args.detpixels))
+    if args.panels > 1:
+        SIM.detector = panelled_detector(args.distance, args.pixel, args.detpixels, args.panels)
     if args.tilt_deg:
         # tilt the panel about (1, 1, 0) through its centre, so both axes get z components
         panel = SIM.detector[0]
@@ -100,6 +102,39 @@ def build_sim(args):
         offsets = np.linspace(-args.spectrum_width, args.spectrum_width, args.spectrum_channels)
         set_spectrum(SIM, wavelength * (1 + offsets), flux * rng.uniform(0.5, 1.5, offsets.size))
     return SIM
+
+
+def panelled_detector(distance, pixel, pixels, panels):
+    """A dxtbx detector of ``panels`` panels in a row around the beam, each turned a little."""
+    from dxtbx.model import Detector, Panel
+    from scitbx.matrix import col
+
+    detector = Detector()
+    side = pixel * pixels
+    for i in range(panels):
+        R = col((0, 0, 1)).axis_and_angle_as_r3_rotation_matrix(2.0 * (i - (panels - 1) / 2), deg=True)
+        fast, slow = R * col((1, 0, 0)), R * col((0, -1, 0))
+        centre = col((side * 1.05 * (i - (panels - 1) / 2), 0.0, -distance - i))
+        panel = Panel()
+        panel.set_image_size((pixels, pixels))
+        panel.set_pixel_size((pixel, pixel))
+        panel.set_frame(fast, slow, centre - fast * (side / 2) - slow * (side / 2))
+        detector.add_panel(panel)
+    return detector
+
+
+def diffbragg_shoeboxes(SIM, param_ids, panel, fast, slow):
+    """diffBragg's values and derivatives on (panel, fast, slow) pixels, as hopper calls it."""
+    from dials.array_family import flex
+
+    D = SIM.D
+    for pid in param_ids:
+        D.refine(pid)
+    D.initialize_managers()
+    pfs = flex.size_t(np.stack([panel, fast, slow], axis=1).ravel().tolist())
+    D.add_diffBragg_spots(pfs)
+    return (D.raw_pixels_roi.as_numpy_array()[:len(panel)].copy(),
+            {pid: D.get_derivative_pixels(pid).as_numpy_array()[:len(panel)].copy() for pid in param_ids})
 
 
 def set_spectrum(SIM, wavelengths, fluxes):
@@ -406,6 +441,7 @@ def build_parser():
     p.add_argument("--spectrum-width", dest="spectrum_width", type=float, default=0.002,
                    help="half width of the spectrum, as a fraction of the wavelength")
     p.add_argument("--spectrum-seed", dest="spectrum_seed", type=int, default=0)
+    p.add_argument("--panels", type=int, default=1, help="a row of panels instead of one")
     p.add_argument("--device", default="cpu")
     p.add_argument("--plot", action="store_true")
     return p

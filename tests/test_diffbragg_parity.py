@@ -507,3 +507,61 @@ def test_gaussian_nll_matches_hopper_target_and_gradient(device):
     for name, (got, ref) in references.items():
         assert ref != 0
         np.testing.assert_allclose(got, ref, rtol=1e-8, err_msg=name)
+
+
+# Panels: hopper simulates (panel, fast, slow) pixels of a multi-panel detector in one call.
+def _panelled(distance=150.0, device="cpu"):
+    from nanobrag_torch.compat.cctbx import experiment_model_from_dxtbx
+
+    args = cmp.build_parser().parse_args(["--detpixels", "128", "--distance", str(distance), "--pixel", "0.1",
+                                          "--panels", "3", "--randomrotate", "3"])
+    args.device = device
+    sim = cmp.build_sim(args)
+    rng = np.random.default_rng(0)
+    rois = [(int(x), int(x) + 15, int(y), int(y) + 15) for x, y in rng.integers(0, 110, (45, 2))]
+    model = experiment_model_from_dxtbx(
+        sim.detector, sim.beam.nanoBragg_constructor_beam, sim.crystal.dxtbx_crystal,
+        Ncells_abc=args.ncells, default_F=args.default_F, fluence=float(sim.D.fluence),
+        spot_scale=float(sim.D.spot_scale), rois=rois, tilt_abc=[(0.0, 0.0, 0.0)] * 45, panels=[i % 3 for i in range(45)],
+        device=torch.device(device),
+    )
+    model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
+                                dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
+    return args, sim, model
+
+
+def _shoeboxes(model):
+    background = model.background_params
+    slow, fast = background.pixels.cpu().numpy().T
+    return background.panel.cpu().numpy(), fast, slow
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_panel_shoeboxes_match_diffbragg(device):
+    args, sim, model = _panelled(device=device)
+    panel, fast, slow = _shoeboxes(model)
+    db, derivs = cmp.diffbragg_shoeboxes(sim, [9], panel, fast, slow)
+    image = model(roi_only=True)
+    got = image.detach().cpu().numpy()
+    for i in range(3):
+        assert db[panel == i].sum() > 0
+        np.testing.assert_allclose(got[panel == i], db[panel == i], rtol=1e-8, atol=1e-11 * db[panel == i].max())
+    w = np.random.default_rng(1).uniform(0.5, 1.5, db.shape)
+    (g_n,) = torch.autograd.grad((image * torch.as_tensor(w, device=image.device)).sum(),
+                                 [model.crystal_params.delta_log_N_cells])
+    np.testing.assert_allclose(float(g_n.sum()), args.ncells * (w * derivs[9]).sum(), rtol=1e-8)
+
+
+def test_shared_detz_shift_moves_every_panel_like_diffbragg():
+    # Nothing to difference in hopper's id 10 across panels, so shift the dxtbx detector itself
+    shift_mm = 0.5
+    _, sim, model = _panelled()
+    panel, fast, slow = _shoeboxes(model)
+    _, moved_sim, _ = _panelled(distance=150.0 - shift_mm)
+    db, _ = cmp.diffbragg_shoeboxes(moved_sim, [9], panel, fast, slow)
+    unmoved, _ = cmp.diffbragg_shoeboxes(sim, [9], panel, fast, slow)
+    assert not np.allclose(db, unmoved)
+    with torch.no_grad():
+        model.detector_params.delta_detz_shift_mm.fill_(shift_mm)
+        got = model(roi_only=True).numpy()
+    np.testing.assert_allclose(got, db, rtol=1e-8, atol=1e-11 * db.max())
