@@ -565,3 +565,24 @@ def test_shared_detz_shift_moves_every_panel_like_diffbragg():
         model.detector_params.delta_detz_shift_mm.fill_(shift_mm)
         got = model(roi_only=True).numpy()
     np.testing.assert_allclose(got, db, rtol=1e-8, atol=1e-11 * db.max())
+
+
+# Refinement: the same shot, start and pixels through hopper and through refine_lbfgsb.
+def test_refine_lbfgsb_reaches_hoppers_solution(tmp_path):
+    import json
+    import subprocess
+    import sys
+
+    script = str(_SCRIPT.parent / "refinement_demo.py")
+    env = dict(os.environ, NANOBRAGG_DISABLE_COMPILE="1", OMP_NUM_THREADS="4",
+               PYTHONPATH=f"{_SCRIPT.parents[1] / 'src'}{os.pathsep}{os.environ.get('PYTHONPATH', '')}")
+    for stage in (["hopper"], ["torch", "--device", "cpu"]):
+        subprocess.run([sys.executable, script, *stage, "--outdir", str(tmp_path)], env=env, check=True,
+                       capture_output=True, timeout=300)
+    hopper = json.loads((tmp_path / "hopper.json").read_text())
+    start, fitted = json.loads((tmp_path / "torch_cpu.json").read_text())
+    assert start["misset_deg"] > 0.1 and hopper["misset_deg"] < 0.01
+    np.testing.assert_allclose(fitted["misset_deg"], hopper["misset_deg"], atol=2e-4)
+    np.testing.assert_allclose(fitted["G_over_truth"], hopper["G_over_truth"], rtol=1e-3)
+    np.testing.assert_allclose(fitted["Ncells"], hopper["Ncells"], atol=2e-3)
+    np.testing.assert_allclose(fitted["ucell"], hopper["ucell"], atol=2e-3)
