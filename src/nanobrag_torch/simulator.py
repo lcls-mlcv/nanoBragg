@@ -351,16 +351,10 @@ def compute_physics_for_position(
                        l_frac * l_frac * Nc * Nc)
         else:
             # bl831 nanoBragg.c since 2023: "round in reciprocal space"
-            if is_multi_source:
-                # Multi-source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, 1, N_phi, N_mos, 3)
-                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                              k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0).unsqueeze(0) +
-                              l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0).unsqueeze(0))
-            else:
-                # Single source: rot_*_star (N_phi, N_mos, 3) -> (1, 1, N_phi, N_mos, 3)
-                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star.unsqueeze(0).unsqueeze(0) +
-                              k_frac.unsqueeze(-1) * rot_b_star.unsqueeze(0).unsqueeze(0) +
-                              l_frac.unsqueeze(-1) * rot_c_star.unsqueeze(0).unsqueeze(0))
+            # rot_*_star (N_phi, N_mos, 3) broadcasts against any leading (sources, pixels) shape
+            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star +
+                            k_frac.unsqueeze(-1) * rot_b_star +
+                            l_frac.unsqueeze(-1) * rot_c_star)
             rad_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
             rad_sqr = rad_sqr * Na * Na * Nb * Nb * Nc * Nc
 
@@ -473,10 +467,15 @@ def compute_physics_for_position(
 
     # Handle multi-source accumulation
     # SOURCE-WEIGHT-001 Phase C1: Per specs/spec-a-core.md:151, weights are "read but ignored"
-    # (equal weighting results). Always sum without applying weights.
-    # C-code reference: golden_suite_generator/nanoBragg.c:2620-2715 ignores source_I during accumulation.
+    # (equal weighting results). C-code reference: golden_suite_generator/nanoBragg.c:2620-2715
+    # ignores source_I during accumulation, so Simulator passes source_weights=None unless
+    # BeamConfig.use_source_weights asks for diffBragg's weighting (Simulator._weights_for_kernel).
     if is_multi_source:
-        # Sum over sources with equal weighting (ignore source_weights parameter)
+        if source_weights is not None:
+            per_source = source_weights.view(-1, *[1] * (intensity.dim() - 1))
+            intensity = intensity * per_source
+            if intensity_pre_polar is not None:
+                intensity_pre_polar = intensity_pre_polar * per_source
         # intensity: (n_sources, S, F) or (n_sources, batch)
         intensity = torch.sum(intensity, dim=0)
         # CLI-FLAGS-003 Phase M1: Apply same accumulation to pre-polar intensity
@@ -756,6 +755,26 @@ class Simulator:
                 # Fall back to uncompiled version if torch.compile fails
                 # (e.g., missing CUDA, Triton issues, or compilation errors)
                 self._compiled_compute_physics = compute_physics_for_position
+
+    def set_spectrum(self, wavelength_A, source_wavelengths=None, source_weights=None) -> None:
+        """Replace the wavelengths (A; sources in metres) and source weights of this Simulator."""
+        self.wavelength = as_tensor_preserving_grad(wavelength_A, device=self.device, dtype=self.dtype)
+        if self._source_directions is not None and source_wavelengths is not None:
+            self._source_wavelengths = source_wavelengths.to(device=self.device, dtype=self.dtype)
+            self._source_wavelengths_A = self._source_wavelengths * 1e10
+        if self._source_directions is not None and source_weights is not None:
+            self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+
+    def _weights_for_kernel(self) -> Optional[torch.Tensor]:
+        """Per-source multipliers, or None for C's equal weighting.
+
+        steps counts the sources, as in C, so n·w/Σw makes the image r_e²·fluence·Σ f_s·I_s
+        with fractions f_s = w/Σw, which is diffBragg's. Equal weights give 1, C's image.
+        """
+        if self._source_weights is None or not self.beam_config.use_source_weights:
+            return None
+        weights = self._source_weights
+        return len(weights) * weights / weights.sum()
 
     def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None):
         """Compatibility shim - calls the pure function compute_physics_for_position.
@@ -1452,7 +1471,7 @@ class Simulator:
             n_sources = len(self._source_directions)
             source_directions = self._source_directions
             source_wavelengths_A = self._source_wavelengths_A
-            source_weights = self._source_weights
+            source_weights = self._weights_for_kernel()
         else:
             # No explicit sources, use single beam configuration
             n_sources = 1
