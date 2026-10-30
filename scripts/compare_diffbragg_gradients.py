@@ -60,13 +60,17 @@ def build_sim(args):
         C.set_U(axis.axis_and_angle_as_r3_rotation_matrix(float(rng.uniform(0, 2 * math.pi))))
     nb = NBcrystal(init_defaults=True)
     nb.dxtbx_crystal = C
+    nb.symbol = args.symbol  # NBcrystal defaults to P43212, which sets diffBragg's ASU map
     nb.n_mos_domains = args.mosaic_domains if args.eta else 1
     nb.mos_spread_deg = args.eta[0] if args.eta else 0
     if args.eta and len(args.eta) == 3:
         nb.anisotropic_mos_spread_deg = tuple(args.eta)
     nb.thick_mm = 0.01
     nb.Ncells_abc = (args.ncells,) * 3
-    nb.miller_array = None  # constant default_F on both sides
+    if args.fhkl_dmin:
+        nb.miller_array = random_asu_amplitudes(ucell, args.symbol, args.fhkl_dmin, args.fhkl_seed, args.fhkl_friedel)
+    else:
+        nb.miller_array = None  # constant default_F on both sides
     # NBcrystal's setter takes lower-case names; a shapetype enum silently becomes Tophat
     nb.xtal_shape = args.shape
     SIM = SimData(use_default_crystal=True)
@@ -85,7 +89,35 @@ def build_sim(args):
                               auto_set_spotscale=False)
     SIM.D.oversample_omega = args.oversample_omega
     SIM.D.nopolar = args.nopolar
+    if args.fhkl_dmin:
+        # SimData.update_Fhkl_tuple's resolution filter drops reflections beyond the detector
+        # corner and also the lowest-resolution one (its d_max bound is exclusive); load all
+        SIM.D.Fhkl_tuple = SIM.crystal.miller_array.indices(), SIM.crystal.miller_array.data(), None
+        SIM.fhkl_asu_array = random_asu_amplitudes(ucell, args.symbol, args.fhkl_dmin, args.fhkl_seed, args.fhkl_friedel)
     return SIM
+
+
+def diffbragg_asu_key(space_group, hkl):
+    """The ASU index diffBragg files (h, k, l) under (linearize_Fhkl: asym_index, anomalous)."""
+    from cctbx import miller, sgtbx
+
+    asu = sgtbx.reciprocal_space_asu(space_group.type())
+    return tuple(miller.asym_index(space_group, asu, tuple(int(x) for x in hkl)).one_column(True).h())
+
+
+def random_asu_amplitudes(ucell, symbol, d_min, seed, friedel=False):
+    """Seeded random amplitudes on the anomalous ASU of (ucell, symbol) to d_min (what diffBragg refines).
+
+    With ``friedel`` each Bijvoet pair has one amplitude (F+ = F-).
+    """
+    from cctbx import crystal as cctbx_crystal
+    from scitbx.array_family import flex
+
+    mset = cctbx_crystal.symmetry(unit_cell=ucell, space_group_symbol=symbol).build_miller_set(
+        anomalous_flag=not friedel, d_min=d_min)
+    data = np.random.RandomState(seed).uniform(100.0, 2000.0, mset.size())
+    ma = mset.array(data=flex.double(data)).set_observation_type_xray_amplitude()
+    return ma.generate_bijvoet_mates() if friedel else ma
 
 
 # central finite-difference steps per diffBragg parameter id
@@ -164,6 +196,32 @@ def diffbragg_detz_forward_and_derivs(SIM):
     return img, D.get_derivative_pixels(DETZ_ID).as_numpy_array().reshape(slow, fast).copy()
 
 
+def diffbragg_fhkl_forward_and_gradients(SIM, weights):
+    """diffBragg image, and Σ_pix w·dI/ds_i for its per-ASU intensity scales s_i (at s = 1).
+
+    diffBragg's Fhkl gradient mode (hopper's add_Fhkl_gradients) returns
+    Σ_pix c_pix·dI_pix/ds_i with c = (1 - 2u - u²/v)/(2v·freq) for residual u and
+    variance v; u = 0, v = 1/(2w), freq = 1 makes c = w (w > 0). Returns
+    (image, gradient by ASU id, {(h, k, l) ASU key: id}).
+    """
+    D = SIM.D
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[0].get_image_size()
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+
+    asu_map = {tuple(map(int, k.split(","))): v for k, v in D.get_ASUid_map().items()}
+    D.update_Fhkl_scale_factors(np.ones(len(asu_map)), 1)
+    from scitbx.array_family import flex
+    pfs = flex.size_t(np.array([(0, f, s_) for s_ in range(slow) for f in range(fast)]).ravel())
+    w = np.ascontiguousarray(np.asarray(weights, dtype=np.float64).reshape(-1))
+    assert np.all(w > 0)
+    assert D.spot_scale == 1
+    grad = D.add_Fhkl_gradients(pfs, np.zeros_like(w), 0.5 / w, np.ones(w.size, dtype=bool),
+                                np.ones(w.size, dtype=np.int32), 1, 1.0)
+    return img, np.asarray(grad), asu_map
+
+
 def torch_experiment_model(SIM, args, **kwargs):
     """ExperimentModel for SIM's experiment, oriented by its A matrix (float64).
 
@@ -192,9 +250,10 @@ def torch_experiment_model(SIM, args, **kwargs):
     if len(eta) == 3:
         with torch.no_grad():
             model.crystal_params.delta_log_eta.copy_(torch.log(torch.tensor(eta, dtype=torch.float64) / eta[0]))
-    # cctbx: F(0,0,0) = F000 (0), every other reflection default_F
-    model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
-                                dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
+    if not model.fhkl_params.active:
+        # cctbx: F(0,0,0) = F000 (0), every other reflection default_F
+        model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
+                                    dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
     return model
 
 
@@ -303,6 +362,11 @@ def build_parser():
                    help="mosaic spread in degrees: one value, or three for anisotropic (crystal a, b, c)")
     p.add_argument("--mosaic-domains", dest="mosaic_domains", type=int, default=20,
                    help="number of mosaic domains with --eta (even)")
+    p.add_argument("--fhkl-dmin", dest="fhkl_dmin", type=float, default=None,
+                   help="random structure factors on the anomalous ASU to this resolution (Å) instead of default_F")
+    p.add_argument("--fhkl-seed", dest="fhkl_seed", type=int, default=0)
+    p.add_argument("--fhkl-friedel", dest="fhkl_friedel", action="store_true",
+                   help="with --fhkl-dmin, equal amplitudes for each Friedel pair")
     p.add_argument("--device", default="cpu")
     p.add_argument("--plot", action="store_true")
     return p

@@ -342,6 +342,41 @@ def structure_factors_from_miller_array(miller_array) -> Tuple[np.ndarray, np.nd
     return idx, amp
 
 
+def asu_structure_factors(miller_array, anomalous: Optional[bool] = None, default_F: Optional[float] = None,
+                          F000: Optional[float] = 0.0):
+    """
+    A cctbx miller array as refinable StructureFactors (for ExperimentModel(structure_factors=)).
+
+    The array is mapped to its asymmetric unit; its space group's rotations generate
+    the P1 box. ``anomalous`` defaults to the array's anomalous_flag; False on an
+    anomalous array averages each Bijvoet pair into one amplitude. diffBragg's
+    Fhkl refinement keeps Friedel mates separate (anomalous=True). Intensities are
+    converted to amplitudes, complex data to their moduli.
+    """
+    from ..utils.structure_factors import StructureFactors
+
+    ma = miller_array
+    if ma.is_complex_array():
+        ma = ma.amplitudes()
+    elif ma.is_xray_intensity_array():
+        ma = ma.as_amplitude_array()
+    if anomalous is None:
+        anomalous = bool(ma.anomalous_flag())
+    if ma.anomalous_flag() and not anomalous:
+        ma = ma.average_bijvoet_mates()
+    elif anomalous and not ma.anomalous_flag():
+        ma = ma.generate_bijvoet_mates()
+    ma = ma.map_to_asu()
+    if not ma.is_unique_set_under_symmetry():
+        raise ValueError("the miller array lists symmetry-equivalent reflections more than once; merge it first")
+    rotations = [np.asarray(op.r().as_double()).reshape(3, 3) for op in ma.space_group().all_ops()]
+    return StructureFactors(
+        indices=np.asarray([tuple(h) for h in ma.indices()], dtype=np.int64),
+        amplitudes=np.asarray(list(ma.data()), dtype=np.float64),
+        rotations=np.asarray(rotations), anomalous=anomalous, default_F=default_F, F000=F000,
+    )
+
+
 def set_structure_factors(
     crystal: Crystal,
     indices,
