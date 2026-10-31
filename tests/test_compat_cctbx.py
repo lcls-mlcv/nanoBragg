@@ -428,3 +428,12 @@ def test_spot_metric_switch_changes_gauss_and_tophat(shape):
     # the compat layer must default to cctbx's metric
     default_cfg = crystal_config_from_dxtbx(xtal, Ncells_abc=6, shape=shape)
     assert default_cfg.spot_metric is SpotMetric.HKL
+
+
+def test_fractional_ncells_survive_the_config():
+    """hopper's Ncells are continuous, and F_latt goes as (Na·Nb·Nc)², so int() costs 2x at N≈4.8."""
+    cell = (56.3, 70.2, 102.4, 90, 90, 90)
+    A = np.diag([1 / 56.3, 1 / 70.2, 1 / 102.4]).ravel()
+    assert crystal_config_from_A(cell, A, Ncells_abc=(4.87, 10.65, 4.52)).N_cells == (4.87, 10.65, 4.52)
+    assert crystal_config_from_A(cell, A, Ncells_abc=4.87).N_cells == (4.87,) * 3
+    assert crystal_config_from_A(cell, A, Ncells_abc=(5,)).N_cells == (5,) * 3

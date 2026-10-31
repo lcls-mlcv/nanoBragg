@@ -207,7 +207,7 @@ def crystal_config_from_A(
     unit_cell: Sequence[float],
     A,
     *,
-    Ncells_abc: Union[int, Sequence[int]] = (10, 10, 10),
+    Ncells_abc: Union[float, Sequence[float]] = (10, 10, 10),
     shape="square",
     mosaic_spread_deg: float = 0.0,
     mosaic_domains: int = 1,
@@ -237,8 +237,8 @@ def crystal_config_from_A(
         a_star, b_star, c_star = A_np[:, 0].copy(), A_np[:, 1].copy(), A_np[:, 2].copy()
 
     if isinstance(Ncells_abc, (int, float)):
-        Ncells_abc = (int(Ncells_abc),) * 3
-    Ncells_abc = tuple(int(n) for n in Ncells_abc)
+        Ncells_abc = (Ncells_abc,) * 3
+    Ncells_abc = tuple(float(n) for n in Ncells_abc)  # continuous, as diffBragg refines them
     if len(Ncells_abc) == 1:
         Ncells_abc = Ncells_abc * 3
 
@@ -705,7 +705,8 @@ def experiment_model_from_dxtbx(
     ``tilt_abc`` and ``panels`` are diffBragg's rois, tilt_abc and pids. ``spectrum`` is a
     list of (wavelength_Å, flux) as in beam_config_from_dxtbx, and ``fluence`` matches a
     diffBragg image when it is that simulator's D.fluence. ``detector_thick_mm`` overrides
-    the panels' sensor thickness: hopper's simulator ignores it, so pass 0.0 to compare.
+    the panels' sensor thickness. diffBragg applies the sensor too, with its own thicksteps,
+    so to compare with hopper pass 0.0 and set simulator.detector.force_zero_thickness.
     """
     from ..models.experiment import ExperimentModel
 
