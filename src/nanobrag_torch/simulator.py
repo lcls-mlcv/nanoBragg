@@ -2519,7 +2519,7 @@ class Simulator:
             polar = 1.0 if self.beam_config.nopolar else self._pixel_polarization(coords, incident)
             for vectors in cell:
                 hkl = q.reshape(-1, 3) @ vectors.T
-                total = total + polar * self.diffuse(hkl).to(torch.float64).to(self.device).reshape(q.shape[:2])
+                total = total + polar * self.diffuse(hkl).to(self.device).to(torch.float64).reshape(q.shape[:2])
         mean = total / (len(beams) * len(cell))
 
         pixel_size = torch.as_tensor(self.detector.pixel_size, device=self.device, dtype=torch.float64)
