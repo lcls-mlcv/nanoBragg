@@ -564,6 +564,8 @@ class Simulator:
         device=None,
         dtype=torch.float32,
         debug_config: Optional[dict] = None,
+        diffuse: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+        diffuse_orientations: str = "all",
     ):
         """
         Initialize simulator with crystal, detector, and configurations.
@@ -576,7 +578,17 @@ class Simulator:
             device: PyTorch device (cpu/cuda)
             dtype: PyTorch data type
             debug_config: Debug configuration with printout, printout_pixel, trace_pixel options
+            diffuse: Optional extension, not in nanoBragg.c. Maps Miller indices (n, 3), float64,
+                to scattering per unit cell (n,) in electrons squared, finite everywhere. run()
+                adds it to the image and fills self.components. None leaves the image untouched.
+            diffuse_orientations: "all" averages the term over every phi step and mosaic domain,
+                "first" uses the first, which is cheaper and exact for one orientation.
         """
+        if diffuse_orientations not in ("all", "first"):
+            raise ValueError(f"diffuse_orientations must be 'all' or 'first', got {diffuse_orientations!r}.")
+        self.diffuse = diffuse
+        self.diffuse_orientations = diffuse_orientations
+        self.components = None
         self.crystal = crystal
         self.detector = detector
         # If crystal_config is provided, update only the rotation-related parameters
@@ -1772,6 +1784,10 @@ class Simulator:
             * self._r_e_sqr_fluence()
             * getattr(self.beam_config, "spot_scale", 1.0)
         ).to(self.dtype)
+        diffuse_intensity = None
+        if self.diffuse is not None:
+            diffuse_intensity = self._diffuse_intensity(pixel_coords_meters, rot_a, rot_b, rot_c, panel_axes,
+                                                        source_directions, source_wavelengths_A)
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -1814,6 +1830,11 @@ class Simulator:
         # Ensure roi_mask is on the same device as physical_intensity
         roi_mask = roi_mask.to(physical_intensity.device)
         physical_intensity = physical_intensity * roi_mask
+        if diffuse_intensity is not None:
+            bragg, diffuse_part = physical_intensity, diffuse_intensity * roi_mask
+            physical_intensity = bragg + diffuse_part
+            squeeze = (lambda x: x.squeeze(1)) if pixels is not None or panel_pixels is not None else (lambda x: x)
+            self.components = {"bragg": squeeze(bragg), "diffuse": squeeze(diffuse_part), "total": squeeze(physical_intensity)}
 
         # Apply debug output if requested
         if self.printout or self.trace_pixel:
@@ -2451,6 +2472,75 @@ class Simulator:
         if any_reached is not None:
             polar = polar * any_reached.to(polar.dtype)
         return I_bg * polar
+
+    def _pixel_polarization(self, pixel_coords_meters: torch.Tensor, incident: torch.Tensor) -> torch.Tensor:
+        """Polarization factor per pixel for one incident direction, in the precision of the coordinates."""
+        dtype = pixel_coords_meters.dtype
+        diffracted = pixel_coords_meters / torch.linalg.norm(
+            pixel_coords_meters, dim=-1, keepdim=True
+        ).clamp_min(1e-30)
+        return polarization_factor(
+            torch.as_tensor(self.beam_config.polarization_factor, device=self.device, dtype=dtype),
+            incident.to(dtype).expand_as(diffracted).reshape(-1, 3).contiguous(),
+            diffracted.reshape(-1, 3).contiguous(),
+            torch.as_tensor(self.beam_config.polarization_axis, device=self.device, dtype=dtype),
+        ).reshape(pixel_coords_meters.shape[:2])
+
+    def _diffuse_intensity(self, pixel_coords_meters, rot_a, rot_b, rot_c, panel_axes,
+                           source_directions, source_wavelengths_A) -> torch.Tensor:
+        """
+        Photons per pixel from self.diffuse, evaluated at pixel centres in float64.
+
+        photons = N_cells * mean(I_cell * polar) * omega * capture * r_e^2 * fluence.
+
+        This is the Bragg tail without F_latt^2, because diffuse scattering adds incoherently from
+        each cell. It is written out, not added to the accumulator as the water term is: that
+        term is divided by steps and takes r_e^2*fluence twice to match C. Capture is the true
+        absorbed fraction of the sensor, which equals the Bragg result with oversample_thick.
+        """
+        coords = pixel_coords_meters
+        if self._curved_detector:
+            coords = self.detector.apply_curved_mapping(coords)
+        coords = coords.to(torch.float64)
+        distance = torch.linalg.norm(coords, dim=-1, keepdim=True).clamp_min(1e-30)
+        diffracted = coords / distance
+        if source_directions is None:
+            beams = [(self.incident_beam_direction, self.wavelength)]
+        else:
+            beams = list(zip(-source_directions, source_wavelengths_A))
+        if self.diffuse_orientations == "first":
+            rot_a, rot_b, rot_c = rot_a[:1, :1], rot_b[:1, :1], rot_c[:1, :1]
+        cell = torch.stack([rot_a, rot_b, rot_c], dim=-2).to(torch.float64).reshape(-1, 3, 3)
+
+        total = 0.0
+        for incident, wavelength in beams:
+            incident = incident.to(torch.float64)
+            q = (diffracted - incident) / (wavelength.to(torch.float64) * 1e-10)
+            polar = 1.0 if self.beam_config.nopolar else self._pixel_polarization(coords, incident)
+            for vectors in cell:
+                hkl = q.reshape(-1, 3) @ vectors.T
+                total = total + polar * self.diffuse(hkl).to(torch.float64).to(self.device).reshape(q.shape[:2])
+        mean = total / (len(beams) * len(cell))
+
+        pixel_size = torch.as_tensor(self.detector.pixel_size, device=self.device, dtype=torch.float64)
+        if self.detector.config.point_pixel:
+            omega = 1.0 / distance[..., 0] ** 2
+        else:
+            close = self.detector.close_distance if panel_axes is None else panel_axes[3]
+            omega = pixel_size ** 2 / distance[..., 0] ** 2 * close.to(torch.float64) / distance[..., 0]
+
+        capture = 1.0
+        n_layers, layer_step_m, mu = self.detector.thickness_layers()
+        if n_layers > 1:
+            normal = self.detector.odet_vec if panel_axes is None else panel_axes[2].squeeze(1).squeeze(1)
+            parallax = torch.sum(diffracted * normal.to(torch.float64), dim=-1)
+            parallax = torch.where(parallax.abs() < 1e-10, torch.sign(parallax) * 1e-10, parallax)
+            capture = 1 - torch.exp(-n_layers * layer_step_m * mu / parallax)
+
+        n_cells = self.crystal.N_cells_a * self.crystal.N_cells_b * self.crystal.N_cells_c
+        scale = getattr(self.beam_config, "spot_scale", 1.0)
+        return (n_cells.to(torch.float64) * mean * omega * capture
+                * self._r_e_sqr_fluence().to(torch.float64) * scale).to(self.dtype)
 
     def _calculate_water_background_amplitude(self) -> torch.Tensor:
         """Calculate water background contribution (AT-BKG-001).
