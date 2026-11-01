@@ -5,6 +5,7 @@ This module implements Tier 2 testing from the Testing Strategy:
 gradient correctness verification using torch.autograd.gradcheck.
 """
 
+import math
 import os
 import torch
 import pytest
@@ -1366,3 +1367,26 @@ class TestMosaicGradients:
         assert gradcheck(
             loss_fn, (mosaic_spread,), eps=1e-4, atol=1e-3, rtol=0.05, raise_exception=True
         ), "Simulator-level mosaic spread gradcheck failed"
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
+@pytest.mark.parametrize("fluence", [1e-17, 1e-5, 1e24, 1e45], ids=lambda value: f"{value:g}")
+def test_scale_gradient_survives_a_fluence_float32_cannot_multiply(dtype, fluence):
+    """The double scale stays on the graph: d(sum)/d(log fluence) = sum, in either dtype."""
+    from nanobrag_torch.config import BeamConfig, CrystalConfig, DetectorConfig, DetectorConvention
+    from nanobrag_torch.models.crystal import Crystal
+    from nanobrag_torch.models.detector import Detector
+    from nanobrag_torch.simulator import Simulator
+
+    crystal = Crystal(CrystalConfig(cell_a=70, cell_b=80, cell_c=90, cell_alpha=75, cell_beta=85, cell_gamma=95,
+                                    N_cells=(5, 5, 5), default_F=1e5), dtype=dtype)
+    detector = Detector(DetectorConfig(distance_mm=100, pixel_size_mm=0.1, spixels=8, fpixels=8,
+                                       detector_convention=DetectorConvention.MOSFLM), dtype=dtype)
+    log_fluence = torch.tensor(math.log(fluence), dtype=torch.float64, requires_grad=True)
+    beam = BeamConfig(wavelength_A=1.0, fluence=torch.exp(log_fluence))
+    image = Simulator(crystal, detector, beam_config=beam, dtype=dtype).run()
+    assert image.dtype == dtype
+    total = image.to(torch.float64).sum()
+    assert 0 < total < float("inf")
+    total.backward()
+    assert log_fluence.grad.item() == pytest.approx(total.item(), rel=1e-6)

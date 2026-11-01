@@ -490,6 +490,9 @@ def compute_physics_for_position(
     return intensity, intensity_pre_polar
 
 
+R_E_SQR = 7.94079248018965e-30  # classical electron radius squared (meters squared)
+
+
 @dataclass
 class PanelPixels:
     """Pixels of several planar panels of one pixel size, for a single kernel call.
@@ -620,13 +623,14 @@ class Simulator:
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
-        self.r_e_sqr = torch.tensor(
-            7.94079248018965e-30, device=self.device, dtype=self.dtype  # classical electron radius squared (meters squared)
-        )
+        self.r_e_sqr = torch.tensor(R_E_SQR, device=self.device, dtype=self.dtype)
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
         self.fluence = as_tensor_preserving_grad(
             self.beam_config.fluence, device=self.device, dtype=self.dtype
+        )
+        self._fluence_double = as_tensor_preserving_grad(
+            self.beam_config.fluence, device=self.device, dtype=torch.float64
         )
         # Polarization setup from beam config
         # PERF-PYTORCH-006: Store as tensor with correct dtype
@@ -786,6 +790,20 @@ class Simulator:
             self._source_wavelengths_A = self._source_wavelengths * 1e10
         if self._source_directions is not None and source_weights is not None:
             self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+
+    @property
+    def fluence(self) -> torch.Tensor:
+        """Photons per square metre, in the run's dtype. The scale uses it in double."""
+        return self._fluence
+
+    @fluence.setter
+    def fluence(self, value: torch.Tensor) -> None:
+        self._fluence = value
+        self._fluence_double = value.to(torch.float64)
+
+    def _r_e_sqr_fluence(self) -> torch.Tensor:
+        """r_e^2*fluence as a double tensor, whatever the run's dtype."""
+        return torch.tensor(R_E_SQR, device=self.device, dtype=torch.float64) * self._fluence_double
 
     def _weights_for_kernel(self) -> Optional[torch.Tensor]:
         """Per-source multipliers, or None for C's equal weighting.
@@ -1583,13 +1601,14 @@ class Simulator:
         # ```
         #
         # Units: [dimensionless] / [dimensionless] × [m²] × [photons/m²] = [photons·m²]
-        # r_e^2*fluence first: normalized_intensity*r_e^2 underflows float32 for weak F.
+        # In double, as in C: r_e^2*fluence, or either factor with the image, can leave float32
+        # at a weak F or a low or high fluence while the pixel itself fits.
         physical_intensity = (
-            normalized_intensity
+            normalized_intensity.to(torch.float64)
             / steps
-            * (self.r_e_sqr * self.fluence)
+            * self._r_e_sqr_fluence()
             * getattr(self.beam_config, "spot_scale", 1.0)
-        )
+        ).to(self.dtype)
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -2268,8 +2287,7 @@ class Simulator:
         # Note: The 1e6 factor creates unit inconsistency but matches C code
         I_bg = (
             F_bg * F_bg
-            * self.r_e_sqr
-            * self.fluence
+            * self._r_e_sqr_fluence()
             * (water_size_m ** 3)
             * 1e6
             * Avogadro

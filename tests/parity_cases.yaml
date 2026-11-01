@@ -985,6 +985,28 @@ cases:
       - name: weak-structure-factor-below-float32-underflow
         extra_args: >-
           -default_F 1e-8
+      # r_e^2*fluence alone leaves float32 in the rest of these, and the pixels don't:
+      # all zero at 1e-17, 1.76x too bright at 1e-16, inf at 1e45.
+      - name: low-fluence-below-float32-underflow
+        extra_args: >-
+          -default_F 1e5
+          -fluence 1e-17
+      - name: low-fluence-subnormal-product
+        extra_args: >-
+          -default_F 1e4
+          -fluence 1e-16
+      - name: low-fluence-weak-structure-factor
+        extra_args: >-
+          -default_F 1
+          -fluence 1e-16
+      - name: high-fluence-above-float32
+        extra_args: >-
+          -fluence 1e45
+      - name: low-fluence-water
+        extra_args: >-
+          -default_F 1e5
+          -fluence 1e-17
+          -water 100
       - name: flux-only
         extra_args: >-
           -flux 1e12
