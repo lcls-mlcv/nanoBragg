@@ -571,6 +571,26 @@ _C_SAMPLE_PARSER = (
 )
 
 
+def resolve_divsteps(args: argparse.Namespace) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Divergence steps per axis. nanoBragg.c:909-923 walks argv and -divsteps sets both axes,
+    so the last flag wins. Without ``args._argv`` -divsteps fills the axes left unset.
+    """
+    hsteps, vsteps = args.hdivsteps, args.vdivsteps
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        return (hsteps if hsteps is not None else args.divsteps,
+                vsteps if vsteps is not None else args.divsteps)
+    for token, value in zip(argv, argv[1:]):
+        if token == '-hdivsteps':
+            hsteps = int(value)
+        elif token == '-vdivsteps':
+            vsteps = int(value)
+        elif token == '-divsteps':
+            hsteps = vsteps = int(value)
+    return hsteps, vsteps
+
+
 def resolve_sample_dimensions(args: argparse.Namespace) -> Tuple[float, float, float]:
     """
     Crystal dimensions (x, y, z) in mm exactly as nanoBragg.c reads them.
@@ -1172,7 +1192,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
             config['misset_random'] = True
         else:
             config['misset_deg'] = [float(x) for x in args.misset[:3]]
-    if args.misset_seed:
+    if args.misset_seed is not None:
         config['misset_seed'] = args.misset_seed
 
     # Phi rotation: -osc/-phistep/-phisteps are resolved together, as in nanoBragg.c
@@ -1234,8 +1254,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['vdivstep'] = mrad_to_radians(args.vdivstep)
 
     # Store counts directly
-    config['hdivsteps'] = args.hdivsteps
-    config['vdivsteps'] = args.vdivsteps
+    config['hdivsteps'], config['vdivsteps'] = resolve_divsteps(args)
     config['dispsteps'] = args.dispsteps
 
     # Store round_div flag for elliptical trimming
@@ -1265,7 +1284,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['scale'] = args.scale
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
-    config['seed'] = args.seed if args.seed else int(-time.time())
+    config['seed'] = args.seed if args.seed is not None else int(-time.time())
 
     # Sourcefile (store path for later processing)
     if args.sourcefile:
