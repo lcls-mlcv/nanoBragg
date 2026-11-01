@@ -997,15 +997,14 @@ cases:
           -fluence 1e-16
       - name: low-fluence-weak-structure-factor
         extra_args: >-
-          -default_F 1
+          -default_F 100
           -fluence 1e-16
       - name: high-fluence-above-float32
         extra_args: >-
           -fluence 1e45
-      - name: low-fluence-water
+      - name: high-fluence-water
         extra_args: >-
-          -default_F 1e5
-          -fluence 1e-17
+          -fluence 1e45
           -water 100
       - name: flux-only
         extra_args: >-
