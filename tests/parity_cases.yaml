@@ -2052,10 +2052,17 @@ cases:
       -distance 201.6 -adxv -round_xtal -seed 8190010
     thresholds:
       corr_min: 0.99999
-      sum_ratio_min: 0.9999
-      sum_ratio_max: 1.0001
-      max_rel_max: 1.0e-4
+      sum_ratio_min: 0.99999
+      sum_ratio_max: 1.00001
+      max_rel_max: 1.0e-5
     runs:
       - name: peak-on-a-pixel
         extra_args: >-
           -adc 10 -dmin 2.72
+      - name: peak-on-a-pixel-double
+        thresholds:
+          sum_ratio_min: 0.999999
+          sum_ratio_max: 1.000001
+          max_rel_max: 2.0e-7
+        extra_args: >-
+          -adc 10 -dmin 2.72 -dtype float64

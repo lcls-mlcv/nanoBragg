@@ -339,11 +339,10 @@ def compute_physics_for_position(
         hrad_sqr = (h_frac * h_frac * Na * Na +
                    k_frac * k_frac * Nb * Nb +
                    l_frac * l_frac * Nc * Nc)
-        # Use clamp_min to avoid creating fresh tensors in compiled graph (PERF-PYTORCH-004 P1.1)
-        hrad_sqr = hrad_sqr.clamp_min(1e-12)
-        F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(
-            torch.pi * torch.sqrt(hrad_sqr * fudge)
-        )
+        # The where keeps sqrt's gradient finite at exactly 0
+        at_centre = hrad_sqr == 0
+        x = torch.pi * torch.sqrt(torch.where(at_centre, torch.ones_like(hrad_sqr), hrad_sqr) * fudge)
+        F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(torch.where(at_centre, torch.zeros_like(x), x))
     elif shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT):
         h_frac = h - h0
         k_frac = k - k0
