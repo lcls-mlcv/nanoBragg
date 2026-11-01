@@ -247,11 +247,6 @@ def test_default_pgm_uses_most_of_the_grey_range(tmp_path):
 def test_intimage_pixels_match_c(extra, label, tmp_path):
     """Integer-image PIXEL data must match C exactly.
 
-    Only the pixels: the 512-byte SMV header still diverges from C on a separate,
-    already-catalogued finding (C writes the beam centre in mm, torch in pixels --
-    `ADXV_CENTER_*`, `MOSFLM_CENTER_*`, `DENZO_*_BEAM` -- plus numeric formatting
-    and `BEAMLINE=`). That is out of scope here; this pins the arithmetic.
-
     Before the scale/rounding fix, all 1024 pixels of a default run disagreed with
     C by up to 41 counts, because the adc offset was folded into the scale
     ((55000-adc)/max instead of C's 55000/max) and the result was truncated
@@ -291,3 +286,24 @@ def test_intimage_pixels_match_c(extra, label, tmp_path):
         f"{label}: {differing}/{len(c_px)} integer pixels differ from C, "
         f"max |delta| = {worst} counts (C peak {c_px.max()}, torch peak {py_px.max()})"
     )
+
+
+@pytest.mark.parametrize("extra", [
+    [], ["-denzo"], ["-adxv"], ["-xds"], ["-dials"],
+    ["-Xbeam", "2", "-Ybeam", "4.5"], ["-Xbeam", "2", "-Ybeam", "4.5", "-adxv"], ["-Xbeam", "2", "-Ybeam", "4.5", "-xds"],
+    ["-twotheta", "10"], ["-twotheta", "10", "-xds"], ["-detector_rotx", "3", "-detector_roty", "2"],
+    ["-detector_rotz", "5", "-xds"], ["-ORGX", "10", "-ORGY", "12", "-xds"], ["-Xclose", "5", "-Yclose", "3", "-xds"],
+    ["-phi", "5", "-osc", "1", "-phisteps", "2"], ["-distance", "123.456", "-pixel", "0.172"],
+    ["-close_distance", "90", "-detector_rotx", "5"],
+], ids=lambda extra: " ".join(extra) or "defaults")
+def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
+    args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 32 "
+            "-oversample 1 -nopgm -nonoise -intfile i.img -floatfile f.bin").split() + extra
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), KMP_DUPLICATE_LIB_OK="TRUE", NANOBRAGG_DISABLE_COMPILE="1")
+    c_dir, py_dir = tmp_path / "c", tmp_path / "py"
+    c_dir.mkdir()
+    py_dir.mkdir()
+    subprocess.run([c_binary()] + args, cwd=c_dir, env=env, check=True, capture_output=True, timeout=300)
+    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args, cwd=py_dir, env=env, check=True,
+                   capture_output=True, timeout=300)
+    assert (py_dir / "i.img").read_bytes()[:512] == (c_dir / "i.img").read_bytes()[:512]

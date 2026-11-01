@@ -102,6 +102,40 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     return image_data, header
 
 
+def _smv_geometry_defaults(xbeam_mm, ybeam_mm, distance_mm, close_distance_mm, detsize_s_mm, pixel_size_mm) -> dict:
+    """Header geometry of an unrotated MOSFLM detector: Fbeam = Ybeam and Sbeam = Xbeam."""
+    return dict(
+        xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm, fbeam_mm=ybeam_mm, sbeam_mm=xbeam_mm,
+        distance_mm=distance_mm,
+        close_distance_mm=distance_mm if close_distance_mm is None else close_distance_mm,
+        detsize_s_mm=detsize_s_mm,
+        orgx=ybeam_mm / pixel_size_mm + 0.5, orgy=xbeam_mm / pixel_size_mm + 0.5,
+        dials_origin_mm=(-ybeam_mm, xbeam_mm, -distance_mm),
+    )
+
+
+def smv_geometry(detector, xbeam_mm: float, ybeam_mm: float, detsize_s_mm: float) -> dict:
+    """
+    Header values for write_smv, from the detector after its rotations (nanoBragg.c:1745-1770).
+
+    Fbeam, Sbeam and ORGX are read back off the final geometry, so they differ from the
+    beam centre that was asked for once the detector is rotated. Xbeam and Ybeam are as given.
+    """
+    pix0, fdet, sdet, odet = detector.pix0_vector, detector.fdet_vec, detector.sdet_vec, detector.odet_vec
+    close = torch.dot(pix0, odet)
+    distance = close / detector.r_factor
+    spot = distance * detector.beam_vector - pix0
+    pixel_m = detector.pixel_size
+    return dict(
+        xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm,
+        fbeam_mm=torch.dot(fdet, spot).item() * 1000, sbeam_mm=torch.dot(sdet, spot).item() * 1000,
+        distance_mm=distance.item() * 1000, close_distance_mm=close.item() * 1000,
+        detsize_s_mm=detsize_s_mm,
+        orgx=(-torch.dot(pix0, fdet) / pixel_m + 0.5).item(), orgy=(-torch.dot(pix0, sdet) / pixel_m + 0.5).item(),
+        dials_origin_mm=(pix0[2].item() * 1000, pix0[1].item() * 1000, -pix0[0].item() * 1000),
+    )
+
+
 def write_smv(
     filepath: Union[str, Path],
     image_data: Union[torch.Tensor, np.ndarray],
@@ -116,14 +150,15 @@ def write_smv(
     osc_range_deg: Optional[float] = None,
     twotheta_deg: float = 0.0,
     detector_sn: str = "000",
-    beamline: str = "nanoBragg",
+    beamline: str = "fake",
     convention: str = "MOSFLM",
     byte_order: str = "little_endian",
     data_type: str = "unsigned_short",
     scale: float = 1.0,
     adc_offset: float = 40.0,
+    geometry: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Write image data in SMV format per spec AT-IO-001.
+    """Write image data in SMV format, with the header nanoBragg.c writes.
 
     The SMV format consists of:
     1. A 512-byte text header with metadata
@@ -149,10 +184,11 @@ def write_smv(
         data_type: Data type for binary data
         scale: Scaling factor for float->int conversion
         adc_offset: ADC offset to add before conversion
+        geometry: Header values from the rotated detector, see smv_geometry(). Without it
+            they are worked out for an unrotated MOSFLM detector from the beam centre.
 
     Per spec AT-IO-001:
-    - Header includes all required keys exactly as listed
-    - Header closed with "}\\f" and padded to 512 bytes
+    - Header closed with "}\\f" and padded with spaces to 512 bytes
     - Data is fast-major (row-wise) with pixel index = slow*fpixels + fast
     """
     filepath = Path(filepath)
@@ -168,87 +204,35 @@ def write_smv(
     # Image dimensions (slow, fast)
     spixels, fpixels = image_data.shape
 
-    # Calculate detector size
-    detsize_f_mm = fpixels * pixel_size_mm
-    detsize_s_mm = spixels * pixel_size_mm
-
-    # Build header dictionary with all required keys per spec
-    # Use reduced precision to fit within 512 byte limit
-    header = {
-        "HEADER_BYTES": "512",
-        "DIM": "2",
-        "BYTE_ORDER": byte_order,
-        "TYPE": data_type,
-        "SIZE1": str(fpixels),  # Fast axis
-        "SIZE2": str(spixels),  # Slow axis
-        "PIXEL_SIZE": f"{pixel_size_mm:.3f}",
-        "DISTANCE": f"{distance_mm:.2f}",
-        "WAVELENGTH": f"{wavelength_angstrom:.3f}",
-        "BEAM_CENTER_X": f"{beam_center_x_mm:.2f}",
-        "BEAM_CENTER_Y": f"{beam_center_y_mm:.2f}",
-    }
-
-    # Write ALL convention-specific beam centers per spec AT-IO-001
-    # Use reduced precision to fit within 512 bytes
-    # ADXV origin at pixel (1,1)
-    adxv_x = beam_center_x_mm / pixel_size_mm + 1.0
-    adxv_y = beam_center_y_mm / pixel_size_mm + 1.0
-    header["ADXV_CENTER_X"] = f"{adxv_x:.1f}"
-    header["ADXV_CENTER_Y"] = f"{adxv_y:.1f}"
-
-    # MOSFLM: pixel coordinates with origin at (0,0)
-    mosflm_x = beam_center_x_mm / pixel_size_mm
-    mosflm_y = beam_center_y_mm / pixel_size_mm
-    header["MOSFLM_CENTER_X"] = f"{mosflm_x:.1f}"
-    header["MOSFLM_CENTER_Y"] = f"{mosflm_y:.1f}"
-
-    # DENZO: origin at center of pixel (0,0)
-    denzo_x = beam_center_x_mm / pixel_size_mm + 0.5
-    denzo_y = beam_center_y_mm / pixel_size_mm + 0.5
-    header["DENZO_X_BEAM"] = f"{denzo_x:.1f}"
-    header["DENZO_Y_BEAM"] = f"{denzo_y:.1f}"
-
-    # DIALS origin: offset from pixel (0,0) in mm
-    header["DIALS_ORIGIN"] = f"{beam_center_x_mm:.1f},{beam_center_y_mm:.1f},0.0"
-
-    # XDS origin (always included)
-    # XDS uses pixel coordinates with origin at pixel (1,1)
-    xds_orgx = beam_center_x_mm / pixel_size_mm + 1.0
-    xds_orgy = beam_center_y_mm / pixel_size_mm + 1.0
-    header["XDS_ORGX"] = f"{xds_orgx:.1f}"
-    header["XDS_ORGY"] = f"{xds_orgy:.1f}"
-
-    # CLOSE_DISTANCE is required per AT-IO-001
-    # If not provided, use the distance value as a default
-    if close_distance_mm is not None:
-        header["CLOSE_DISTANCE"] = f"{close_distance_mm:.2f}"
-    else:
-        header["CLOSE_DISTANCE"] = f"{distance_mm:.2f}"
-
-    # These fields are also required per AT-IO-001, default to 0.0 if not provided
-    header["PHI"] = f"{phi_deg:.1f}" if phi_deg is not None else "0.0"
-    header["OSC_START"] = f"{osc_start_deg:.1f}" if osc_start_deg is not None else "0.0"
-    header["OSC_RANGE"] = f"{osc_range_deg:.1f}" if osc_range_deg is not None else "0.0"
-
-    header["TWOTHETA"] = f"{twotheta_deg:.1f}"
-    header["DETECTOR_SN"] = detector_sn
-    header["BEAMLINE"] = beamline
-
-    # Build header string
-    header_lines = []
-    header_lines.append("{")
-    for key, value in header.items():
-        header_lines.append(f"{key}={value};")
-    header_str = "\n".join(header_lines)
-
-    # Close with "}\f" per spec and encode to bytes
-    header_str += "\n}\f"
+    g = _smv_geometry_defaults(beam_center_x_mm, beam_center_y_mm, distance_mm, close_distance_mm,
+                               spixels * pixel_size_mm, pixel_size_mm)
+    g.update(geometry or {})
+    dials = g['dials_origin_mm']
+    # The layout of nanoBragg.c:3178-3197. DIALS_ORIGIN has no semicolon there.
+    header_str = (
+        "{\nHEADER_BYTES=512;\nDIM=2;\n"
+        f"BYTE_ORDER={byte_order};\nTYPE={data_type};\n"
+        f"SIZE1={fpixels};\nSIZE2={spixels};\n"
+        f"PIXEL_SIZE={pixel_size_mm:g};\nDISTANCE={g['distance_mm']:g};\n"
+        f"WAVELENGTH={wavelength_angstrom:g};\n"
+        f"BEAM_CENTER_X={g['xbeam_mm']:g};\nBEAM_CENTER_Y={g['ybeam_mm']:g};\n"
+        f"ADXV_CENTER_X={g['fbeam_mm']:g};\nADXV_CENTER_Y={g['detsize_s_mm'] - g['sbeam_mm']:g};\n"
+        f"MOSFLM_CENTER_X={g['sbeam_mm'] - 0.5 * pixel_size_mm:g};\n"
+        f"MOSFLM_CENTER_Y={g['fbeam_mm'] - 0.5 * pixel_size_mm:g};\n"
+        f"DENZO_X_BEAM={g['sbeam_mm']:g};\nDENZO_Y_BEAM={g['fbeam_mm']:g};\n"
+        f"DIALS_ORIGIN={dials[0]:g},{dials[1]:g},{dials[2]:g}\n"
+        f"XDS_ORGX={g['orgx']:g};\nXDS_ORGY={g['orgy']:g};\n"
+        f"CLOSE_DISTANCE={g['close_distance_mm']:g};\n"
+        f"PHI={phi_deg or 0.0:g};\nOSC_START={(osc_start_deg or 0.0):g};\nOSC_RANGE={(osc_range_deg or 0.0):g};\n"
+        f"TWOTHETA={twotheta_deg:g};\n"
+        f"DETECTOR_SN={detector_sn};\nBEAMLINE={beamline};\n"
+        "}\f"
+    )
     header_bytes = header_str.encode("ascii")
 
-    # Pad to exactly 512 bytes with nulls
     if len(header_bytes) > 512:
         raise ValueError(f"Header too large: {len(header_bytes)} > 512 bytes")
-    header_bytes = header_bytes.ljust(512, b'\x00')
+    header_bytes = header_bytes.ljust(512, b' ')
 
     # Convert image data based on data type
     if data_type == "unsigned_short":
