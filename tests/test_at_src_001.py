@@ -64,10 +64,8 @@ class TestAT_SRC_001_SourcefileAndWeighting:
             # Use dtype from parser output (defaults to torch.get_default_dtype())
             torch.testing.assert_close(norms, torch.ones(2, dtype=directions.dtype))
 
-            # Per spec-a-core.md:151-153, wavelength column is read but IGNORED.
-            # CLI -lambda (default_wavelength_m) is the sole authoritative source.
-            assert wavelengths[0].item() == pytest.approx(default_wavelength_m)
-            assert wavelengths[1].item() == pytest.approx(default_wavelength_m)
+            assert wavelengths[0].item() == pytest.approx(1.0e-10)
+            assert wavelengths[1].item() == pytest.approx(1.5e-10)
 
             # Per spec-a-core.md:151-153, weights are read but IGNORED (equal weighting).
             # All sources contribute equally via division by source count in steps normalization.
@@ -110,9 +108,8 @@ class TestAT_SRC_001_SourcefileAndWeighting:
             assert weights.shape == (3,)
             assert wavelengths.shape == (3,)
 
-            # Per spec-a-core.md:151-153, wavelength column is IGNORED.
-            # All wavelengths use CLI -lambda value (default_wavelength_m).
-            assert wavelengths[0].item() == pytest.approx(default_wavelength_m)
+            # A missing wavelength column takes -lambda
+            assert wavelengths[0].item() == pytest.approx(1.0e-10)
             assert wavelengths[1].item() == pytest.approx(default_wavelength_m)
             assert wavelengths[2].item() == pytest.approx(default_wavelength_m)
 
@@ -151,7 +148,7 @@ class TestAT_SRC_001_SourcefileAndWeighting:
             expected_direction = torch.tensor([[-1.0, 0.0, 0.0]], dtype=directions.dtype)
             torch.testing.assert_close(directions, expected_direction)
 
-            # Per spec-a-core.md:151-153, wavelength uses CLI -lambda (default_wavelength_m)
+            # No wavelength column: -lambda fills it in
             assert wavelengths[0].item() == pytest.approx(default_wavelength_m)
 
     def test_multiple_sources_normalization(self):
@@ -202,16 +199,14 @@ class TestAT_SRC_001_SourcefileAndWeighting:
     def test_weighted_sources_integration(self):
         """Test that sources can be loaded and simulated (AT-SRC-001).
 
-        Per spec-a-core.md:151-153, file weight/λ columns are read but IGNORED.
-        Equal weighting semantics: all sources contribute equally via steps normalization.
-        CLI -lambda is the sole authoritative wavelength source.
+        File weights are read and not used: all sources contribute equally via steps
+        normalization. Each source keeps its file wavelength.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             sourcefile = Path(tmpdir) / "weighted_sources.txt"
 
             # Create two sources with different file weights/wavelengths
-            # Per spec, these will be read but ultimately ignored in favor of equal weighting
-            content = """# Two sources with file-specified weights and wavelengths (ignored per spec)
+            content = """# Two sources with file-specified weights and wavelengths
 # X Y Z weight wavelength
 0.0  0.0  -10.0  2.0  6.2e-10
 0.0  0.0  -10.0  3.0  8.0e-10
@@ -229,10 +224,8 @@ class TestAT_SRC_001_SourcefileAndWeighting:
             assert weights[0].item() == pytest.approx(2.0)
             assert weights[1].item() == pytest.approx(3.0)
 
-            # Per spec-a-core.md:151-153, wavelength column is IGNORED.
-            # Both sources use CLI -lambda value.
-            assert wavelengths[0].item() == pytest.approx(default_wavelength_m)
-            assert wavelengths[1].item() == pytest.approx(default_wavelength_m)
+            assert wavelengths[0].item() == pytest.approx(6.2e-10)
+            assert wavelengths[1].item() == pytest.approx(8.0e-10)
 
             # Create a small test setup with these sources
             beam_config = BeamConfig(
