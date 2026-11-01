@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from nanobrag_torch.__main__ import create_parser, resolve_detector_size
+from nanobrag_torch.__main__ import create_parser, resolve_detector_size, resolve_wavelength_A
 
 
 def _c_binary():
@@ -68,3 +68,19 @@ def test_half_pixel_detsize_of_one_pixel_matches_c(tmp_path):
     c_image, torch_image, size = compare_with_c(["-pixel", "0.172", "-detsize", "0.258"], tmp_path)
     assert size == (1, 1)
     assert torch_image[0] == pytest.approx(c_image[0], rel=1e-4)
+
+
+@pytest.mark.parametrize("flags, wavelength_A", [
+    (["-energy", "0"], math.inf),
+    (["-energy", "-0"], -math.inf),
+    (["-energy", "0", "-lambda", "2"], 2.0),
+    (["-lambda", "2", "-energy", "0"], math.inf),
+])
+def test_energy_zero_divides_as_c_does(flags, wavelength_A):
+    """nanoBragg.c:859 divides doubles and the last flag in argv wins."""
+    args = create_parser().parse_args(flags)
+    args._argv = flags
+    assert resolve_wavelength_A(args) == wavelength_A
+    del args._argv
+    if flags[0] == "-energy":  # without argv, -energy wins
+        assert math.isinf(resolve_wavelength_A(args))

@@ -1657,6 +1657,18 @@ cases:
       - name: wavelength-flag
         extra_args: >-
           -wavelength 2
+      - name: energy-zero
+        extra_args: >-
+          -detpixels 32 -energy 0
+      - name: energy-minus-zero
+        extra_args: >-
+          -detpixels 32 -energy -0
+      - name: energy-zero-then-lambda
+        extra_args: >-
+          -detpixels 32 -energy 0 -lambda 2
+      - name: lambda-then-energy-zero
+        extra_args: >-
+          -detpixels 32 -lambda 2 -energy 0
       - name: xbeam-alone
         extra_args: >-
           -Xbeam 5 -detpixels 128

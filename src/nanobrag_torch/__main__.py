@@ -596,13 +596,17 @@ def resolve_wavelength_A(args: argparse.Namespace) -> Optional[float]:
     Wavelength in Å, None if no flag gave one. nanoBragg.c:853-859 walks argv, so the last of
     -lambda, -wave and -energy wins. Without ``args._argv`` -energy wins.
     """
-    wavelength = 12398.42 / args.energy if args.energy else args.wavelength
+    def from_energy(eV: float) -> float:
+        # C divides doubles, so -energy 0 is an infinite wavelength rather than an error.
+        return 12398.42 / eV if eV != 0.0 else math.copysign(math.inf, eV)
+
+    wavelength = from_energy(args.energy) if args.energy is not None else args.wavelength
     argv = getattr(args, '_argv', None) or []
     for token, value in zip(argv, argv[1:]):
         if token in ('-lambda', '-wave', '-wavelength'):
             wavelength = float(value)
         elif token == '-energy':
-            wavelength = 12398.42 / float(value)
+            wavelength = from_energy(float(value))
     return wavelength
 
 
