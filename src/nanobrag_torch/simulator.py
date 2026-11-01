@@ -623,14 +623,17 @@ class Simulator:
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
-        self.r_e_sqr = torch.tensor(R_E_SQR, device=self.device, dtype=self.dtype)
+        # The scale is computed in double, as in C
+        self._scale_dtype = torch.float64
+        self.r_e_sqr = R_E_SQR
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
         self.fluence = as_tensor_preserving_grad(
             self.beam_config.fluence, device=self.device, dtype=self.dtype
         )
-        self._fluence_double = as_tensor_preserving_grad(
-            self.beam_config.fluence, device=self.device, dtype=torch.float64
+        # The config may hold digits that the run's dtype does not
+        self._fluence_exact = as_tensor_preserving_grad(
+            self.beam_config.fluence, device=self.device, dtype=self._scale_dtype
         )
         # Polarization setup from beam config
         # PERF-PYTORCH-006: Store as tensor with correct dtype
@@ -791,19 +794,48 @@ class Simulator:
         if self._source_directions is not None and source_weights is not None:
             self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
 
+    def _public_and_exact(self, value):
+        """value in the run's dtype for callers, and at full width for the scale."""
+        if isinstance(value, torch.Tensor):
+            return value, value.to(device=self.device, dtype=self._scale_dtype)
+        return (torch.tensor(float(value), device=self.device, dtype=self.dtype),
+                torch.tensor(float(value), device=self.device, dtype=self._scale_dtype))
+
     @property
     def fluence(self) -> torch.Tensor:
-        """Photons per square metre, in the run's dtype. The scale uses it in double."""
+        """Photons per square metre, in the run's dtype. Assign to it, or change it in place."""
         return self._fluence
 
     @fluence.setter
-    def fluence(self, value: torch.Tensor) -> None:
-        self._fluence = value
-        self._fluence_double = value.to(torch.float64)
+    def fluence(self, value) -> None:
+        self._fluence, self._fluence_exact = self._public_and_exact(value)
+
+    @property
+    def r_e_sqr(self) -> torch.Tensor:
+        """Classical electron radius squared, in the run's dtype. Assignable, as fluence is."""
+        return self._r_e_sqr
+
+    @r_e_sqr.setter
+    def r_e_sqr(self, value) -> None:
+        self._r_e_sqr, self._r_e_sqr_exact = self._public_and_exact(value)
+
+    def _at_scale_width(self, public: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
+        """A scale factor at the scale's width, following whatever was done to the public one.
+
+        exact has the digits, but public is what callers hold and may fill_ in place or through
+        .data, or turn into a leaf with requires_grad_. Then exact is stale or cut off from the
+        graph, and public, which is all there is, gives the value.
+        """
+        if not torch.equal(exact.detach().to(public.dtype), public.detach()):
+            return public.to(self._scale_dtype)
+        if public.requires_grad and not exact.requires_grad:
+            return public.to(self._scale_dtype)
+        return exact
 
     def _r_e_sqr_fluence(self) -> torch.Tensor:
-        """r_e^2*fluence as a double tensor, whatever the run's dtype."""
-        return torch.tensor(R_E_SQR, device=self.device, dtype=torch.float64) * self._fluence_double
+        """r_e^2*fluence at the scale's width, whatever the run's dtype."""
+        return (self._at_scale_width(self._r_e_sqr, self._r_e_sqr_exact)
+                * self._at_scale_width(self._fluence, self._fluence_exact))
 
     def _weights_for_kernel(self) -> Optional[torch.Tensor]:
         """Per-source multipliers, or None for C's equal weighting.
@@ -1604,7 +1636,7 @@ class Simulator:
         # In double, as in C: r_e^2*fluence, or either factor with the image, can leave float32
         # at a weak F or a low or high fluence while the pixel itself fits.
         physical_intensity = (
-            normalized_intensity.to(torch.float64)
+            normalized_intensity.to(self._scale_dtype)
             / steps
             * self._r_e_sqr_fluence()
             * getattr(self.beam_config, "spot_scale", 1.0)
