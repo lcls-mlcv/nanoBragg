@@ -200,6 +200,12 @@ def sinc3(x: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: Shape factor values 3*(sin(x)/x - cos(x))/x^2
     """
+    # The bracket is x^2/3 near 0, so in float32 it cancels to nothing at the centre of a peak
+    if x.dtype != torch.float64:
+        if x.device.type == "mps":  # no doubles
+            return _sinc3_series(x)
+        return sinc3(x.to(torch.float64)).to(x.dtype)
+
     # Handle the x=0 case
     eps = 1e-10
     is_zero = torch.abs(x) < eps
@@ -217,6 +223,17 @@ def sinc3(x: torch.Tensor) -> torch.Tensor:
     result = torch.where(is_zero, torch.ones_like(x), result)
 
     return result
+
+
+def _sinc3_series(x: torch.Tensor) -> torch.Tensor:
+    """sinc3 for a device with no doubles: Taylor through x^10 below 1.5, where it is good to 4e-9."""
+    small = torch.abs(x) < 1.5
+    x_safe = torch.where(small, torch.ones_like(x), x)
+    closed = 3.0 * (torch.sin(x_safe) / x_safe - torch.cos(x_safe)) / (x_safe * x_safe)
+    x2 = torch.where(small, x * x, torch.zeros_like(x))
+    series = 1.0 + x2 * (-1.0 / 10.0 + x2 * (1.0 / 280.0 + x2 * (-1.0 / 15120.0 + x2 * (
+        1.0 / 1330560.0 + x2 * (-1.0 / 86486400.0)))))
+    return torch.where(small, series, closed)
 
 
 @_get_compile_decorator()
