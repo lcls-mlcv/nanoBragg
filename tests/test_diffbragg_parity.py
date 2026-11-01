@@ -23,6 +23,7 @@ cctbx build with simtbx; elsewhere the module is skipped. On exxa:
     OMP_NUM_THREADS=1 libtbx.python -m pytest tests/test_diffbragg_parity.py
 """
 import importlib.util
+import math
 import os
 from pathlib import Path
 
@@ -128,3 +129,58 @@ def test_oversampled_default_differs_only_by_pixel_centre_omega_and_polarization
     default = max_rel_diff([])
     assert 1e-6 < default < 1e-4, default
     assert max_rel_diff(["--oversample-omega", "--nopolar"]) < 1e-12
+
+
+# Unit cell (plan C3): ExperimentModel's crystal-system-constrained cell against diffBragg's
+# crystal-system managers (simtbx/diffBragg/refiners/crystal_systems), which hold U fixed and
+# differentiate A = U·B(cell). diffBragg has managers for these four systems.
+UCELL_CASES = {
+    "monoclinic": ["--randomrotate", "5"],
+    "orthorhombic": ["--ucell", "55", "65", "77", "90", "90", "90", "--symbol", "P212121", "--randomrotate", "5"],
+    "tetragonal": ["--ucell", "55", "55", "77", "90", "90", "90", "--symbol", "P43212", "--randomrotate", "5"],
+    "hexagonal": ["--ucell", "55", "55", "77", "90", "90", "120", "--symbol", "P6522", "--randomrotate", "5"],
+}
+# diffBragg variable -> (ExperimentModel parameter, index of the cell value it scales)
+UCELL_PARAMS = {
+    "a_Ang": ("crystal_params.delta_log_a", 0),
+    "b_Ang": ("crystal_params.delta_log_b", 1),
+    "c_Ang": ("crystal_params.delta_log_c", 2),
+    "beta_rad": ("crystal_params.delta_beta_raw", None),
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("system", list(UCELL_CASES))
+def test_unit_cell_gradients_match_diffbragg(system, device):
+    from nanobrag_torch.compat.cctbx import crystal_system_of
+    from nanobrag_torch.utils.unit_cell import FREE_VARIABLES
+
+    args = cmp.build_parser().parse_args(["--detpixels", "128"] + UCELL_CASES[system])
+    args.device = device
+    sim = cmp.build_sim(args)
+    db_img, db_derivs = cmp.diffbragg_ucell_forward_and_derivs(sim)
+    xtal = sim.crystal.dxtbx_crystal
+    model = cmp.torch_experiment_model(sim, args, crystal_system=crystal_system_of(xtal))
+    assert model.crystal_params.crystal_system == system
+    assert [n.split("_")[0] for n in db_derivs] == list(FREE_VARIABLES[system])
+
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-9, atol=1e-12 * db_img.max())
+
+    # ExperimentModel moves log(a) and a tanh-bounded beta offset; at zero offset
+    # d(a)/d(delta_log_a) = a and d(beta_rad)/d(delta_beta_raw) = max_angle in radians.
+    cell = xtal.get_unit_cell().parameters()
+    max_angle_rad = math.radians(model.crystal_params.max_angle_delta_deg)
+    params = dict(model.named_parameters())
+    names = list(db_derivs)
+    leaves = [params[UCELL_PARAMS[n][0]] for n in names]
+    factors = [cell[UCELL_PARAMS[n][1]] if UCELL_PARAMS[n][1] is not None else max_angle_rad for n in names]
+
+    rng = np.random.default_rng(1)
+    for wname, w in {"uniform": np.ones_like(db_img), "random": rng.uniform(0.0, 1.0, db_img.shape)}.items():
+        grads = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(), leaves, retain_graph=True)
+        for name, g, factor in zip(names, grads, factors):
+            ref = float((w * db_derivs[name]).sum())
+            scale = float(np.abs(w * db_derivs[name]).sum())
+            got = float(g) / factor
+            assert abs(got - ref) <= 1e-7 * scale, f"d(w·I)/d{name} ({wname} w): torch {got!r} vs diffBragg {ref!r}"
