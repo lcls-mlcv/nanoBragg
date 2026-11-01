@@ -207,7 +207,7 @@ def fast_noise_image(
     generator = torch.Generator(device=image.device)
     generator.manual_seed(_c_seed(seed))
     in_roi = roi_pixels(tuple(image.shape), roi)
-    photons = _poisson_photons(image.detach(), generator).double().cpu().numpy()[in_roi]
+    photons = _poisson_photons(image.detach(), generator).cpu().double().numpy()[in_roi]
     output, overloads = _noise_image_pixels(photons, adc_offset, in_roi)
     return output, float(photons.sum()), overloads
 

@@ -493,6 +493,11 @@ def compute_physics_for_position(
 R_E_SQR = 7.94079248018965e-30  # classical electron radius squared (meters squared)
 
 
+def _widest_float(device: torch.device) -> torch.dtype:
+    """float64, or float32 on a device that has no doubles (MPS)."""
+    return torch.float32 if torch.device(device).type == "mps" else torch.float64
+
+
 @dataclass
 class PanelPixels:
     """Pixels of several planar panels of one pixel size, for a single kernel call.
@@ -623,8 +628,8 @@ class Simulator:
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
-        # The scale is computed in double, as in C
-        self._scale_dtype = torch.float64
+        # The scale is computed in double, as in C, where the device has doubles
+        self._scale_dtype = _widest_float(self.device)
         self.r_e_sqr = R_E_SQR
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
@@ -2546,7 +2551,7 @@ class Simulator:
             roi_mask[roi_ymax+1:, :] = False
 
         # C's rmsd loop tests the ROI and not the mask (nanoBragg.c:3117-3128)
-        rmsd_pixels = float_image[roi_mask].to(torch.float64)
+        rmsd_pixels = float_image[roi_mask].cpu().to(torch.float64)
 
         # Apply external mask if provided
         if self.detector.config.mask_array is not None:
@@ -2554,7 +2559,7 @@ class Simulator:
                 roi_mask = roi_mask & (self.detector.config.mask_array > 0)
 
         # Get masked pixels, in double as C sums them: a float32 square underflows on a faint image
-        masked_pixels = float_image[roi_mask].to(torch.float64)
+        masked_pixels = float_image[roi_mask].cpu().to(torch.float64)
         N = masked_pixels.numel()
 
         if N == 0:

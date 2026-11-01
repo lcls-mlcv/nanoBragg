@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+import nanobrag_torch.simulator as simulator_module
 from nanobrag_torch.config import BeamConfig, CrystalConfig, DetectorConfig
 from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.models.detector import Detector
@@ -101,3 +102,41 @@ def test_gradient_reaches_an_r_e_sqr_leaf():
     image = sim.run()
     image.sum().backward()
     assert sim.r_e_sqr.grad.item() == pytest.approx(image.sum().item() / R_E_SQR, rel=1e-12)
+
+
+def test_only_mps_lacks_doubles():
+    assert simulator_module._widest_float(torch.device("mps")) is torch.float32
+    assert simulator_module._widest_float(torch.device("cpu")) is torch.float64
+    assert simulator_module._widest_float(torch.device("cuda")) is torch.float64
+
+
+def test_no_double_is_made_on_a_device_without_them(monkeypatch):
+    """No MPS here: cuts the width as MPS does, and refuses a double as MPS refuses it."""
+    real_to, real_tensor = torch.Tensor.to, torch.tensor
+
+    def is_double(args, kwargs):
+        return torch.float64 in args or kwargs.get("dtype") is torch.float64
+
+    def to(self, *args, **kwargs):
+        if is_double(args, kwargs):
+            raise TypeError("Cannot convert a MPS Tensor to float64 dtype")
+        return real_to(self, *args, **kwargs)
+
+    def tensor(*args, **kwargs):
+        if is_double(args, kwargs):
+            raise TypeError("Cannot convert a MPS Tensor to float64 dtype")
+        return real_tensor(*args, **kwargs)
+
+    expected = make(torch.float32).run()
+    sim = None
+    monkeypatch.setattr(simulator_module, "_widest_float", lambda device: torch.float32)
+    sim = make(torch.float32)
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    monkeypatch.setattr(torch, "tensor", tensor)
+    image = sim.run()
+    sim.fluence.fill_(2e24)
+    doubled = sim.run()
+    monkeypatch.undo()
+    assert image.dtype == torch.float32
+    assert torch.allclose(image, expected, rtol=1e-5)
+    assert torch.allclose(doubled, 2 * image, rtol=1e-5)
