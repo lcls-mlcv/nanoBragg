@@ -261,18 +261,18 @@ def generate_sources_from_divergence_dispersion(
     # Generate divergence angle grids using vectorized operations
     # Horizontal divergence angles
     if hdiv_params.count == 1:
-        hdiv_angles = torch.tensor([0.0], dtype=dtype)
+        hdiv_angles = torch.tensor([0.0], dtype=torch.float64)
     else:
         # Use manual arithmetic to avoid torch.linspace gradient issues
         start = -hdiv_params.range / 2
-        hdiv_angles = start + torch.arange(hdiv_params.count, dtype=dtype) * hdiv_params.step
+        hdiv_angles = start + torch.arange(hdiv_params.count, dtype=torch.float64) * hdiv_params.step
 
     # Vertical divergence angles
     if vdiv_params.count == 1:
-        vdiv_angles = torch.tensor([0.0], dtype=dtype)
+        vdiv_angles = torch.tensor([0.0], dtype=torch.float64)
     else:
         start = -vdiv_params.range / 2
-        vdiv_angles = start + torch.arange(vdiv_params.count, dtype=dtype) * vdiv_params.step
+        vdiv_angles = start + torch.arange(vdiv_params.count, dtype=torch.float64) * vdiv_params.step
 
     # Create 2D meshgrid of divergence angles: (H, V)
     h_grid, v_grid = torch.meshgrid(hdiv_angles, vdiv_angles, indexing='ij')
@@ -280,13 +280,14 @@ def generate_sources_from_divergence_dispersion(
     h_flat = h_grid.reshape(-1)
     v_flat = v_grid.reshape(-1)
 
-    # Apply elliptical trimming if requested
-    if round_div and (hdiv_params.count > 1 or vdiv_params.count > 1):
-        # Normalize to unit square
-        h_norm = h_flat / (hdiv_params.range/2) if hdiv_params.range > 0 else torch.zeros_like(h_flat)
-        v_norm = v_flat / (vdiv_params.range/2) if vdiv_params.range > 0 else torch.zeros_like(v_flat)
-        # Create mask for points inside ellipse
-        inside_mask = (h_norm**2 + v_norm**2) <= 1.0
+    # Round off the corners exactly as nanoBragg.c:2359-2361 does: the 1.1 and the half-step
+    # correction for an even count are C's. A zero range divides to NaN, which keeps the point.
+    if round_div:
+        h_range, h_step = hdiv_params.range, hdiv_params.step
+        v_range, v_step = vdiv_params.range, vdiv_params.step
+        test = ((h_flat.double()**2 - h_step*h_step/4.0*(1 - hdiv_params.count % 2)) / h_range / h_range
+                + (v_flat.double()**2 - v_step*v_step/4.0*(1 - vdiv_params.count % 2)) / v_range / v_range)
+        inside_mask = ~(test*4.0 > 1.1)
         h_flat = h_flat[inside_mask]
         v_flat = v_flat[inside_mask]
 
@@ -305,8 +306,8 @@ def generate_sources_from_divergence_dispersion(
 
     # Broadcast divergence and wavelengths: each divergence point gets all wavelengths
     # Shape: (n_div, n_wave)
-    h_angles_expanded = h_flat.unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
-    v_angles_expanded = v_flat.unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
+    h_angles_expanded = h_flat.to(dtype).unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
+    v_angles_expanded = v_flat.to(dtype).unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
     wavelengths_expanded = wavelengths.unsqueeze(0).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
 
     n_sources = h_angles_expanded.shape[0]

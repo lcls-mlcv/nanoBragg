@@ -1753,3 +1753,51 @@ cases:
       - name: half-pixel-per-axis
         extra_args: >-
           -pixel 0.1 -detsize_f 9.55 -detsize_s 1.05
+  - id: PARITY-DIVERGENCE-001
+    description: >-
+      Generated sources. nanoBragg.c:2354-2361 rounds the divergence grid with test*4 > 1.1
+      and a half-step correction for an even count; -divergence alone means 2x2 steps.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -detpixels 48
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: divergence-alone
+        extra_args: >-
+          -divergence 2
+      - name: even-steps-2
+        extra_args: >-
+          -divergence 2 -divsteps 2
+      - name: even-steps-4
+        extra_args: >-
+          -divergence 2 -divsteps 4
+      - name: even-steps-6
+        extra_args: >-
+          -divergence 2 -divsteps 6
+      - name: odd-steps-5
+        extra_args: >-
+          -divergence 2 -divsteps 5
+      - name: mixed-even-odd
+        extra_args: >-
+          -divergence 2 -hdivsteps 4 -vdivsteps 3
+      - name: unequal-ranges
+        extra_args: >-
+          -hdivrange 3 -vdivrange 1 -divsteps 4
+      - name: step-given
+        extra_args: >-
+          -divergence 2 -hdivstep 0.5
+      - name: steps-zero-means-two
+        extra_args: >-
+          -divergence 2 -divsteps 0
+      - name: round-div-after-square-div
+        extra_args: >-
+          -divergence 2 -divsteps 4 -square_div -round_div
