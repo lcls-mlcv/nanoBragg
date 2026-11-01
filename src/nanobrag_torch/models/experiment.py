@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Optional
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -20,6 +21,7 @@ from ..config import (
 from ..models.crystal import Crystal
 from ..models.detector import Detector
 from ..utils.mosaic import diffbragg_umats
+from ..utils.structure_factors import StructureFactors
 from ..utils.tensor_utils import as_tensor_preserving_grad
 from ..utils.unit_cell import (
     B_matrix, FREE_VARIABLES, check_cell, constrained_cell, normalize_crystal_system,
@@ -530,6 +532,75 @@ class BeamStageAParams(nn.Module):
         return cfg
 
 
+class StructureFactorStageAParams(nn.Module):
+    """Stage-A learnable structure factors: one amplitude per unique reflection.
+
+    F_i = F0_i·exp(delta_log_F_i) for the M reflections of a StructureFactors
+    (utils/structure_factors.py); every symmetry mate in the P1 box takes its
+    amplitude through a fixed gather, so the gradient of a mate lands on its
+    unique reflection. diffBragg refines a per-ASU intensity scale s_i (I ∝ s_i·F0_i²),
+    which is exp(2·delta_log_F_i) here. A reflection with F0 = 0 stays at 0.
+
+    Without structure factors the parameter is empty and unrefinable, and the crystal
+    keeps whatever F it was given (default_F, or a fixed grid via
+    ExperimentModel.set_structure_factors).
+    """
+
+    def __init__(
+        self,
+        structure_factors=None,
+        default_F: float = 0.0,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+        param_init: str = "trainable",
+    ) -> None:
+        super().__init__()
+        if device is None:
+            device = torch.device("cpu")
+        self.device = device
+        self.dtype = dtype
+        self.structure_factors = structure_factors
+        self.unrefinable = {}
+        param_cls = _param_factory(param_init)
+
+        if structure_factors is None:
+            M = 0
+            self.hkl_metadata = None
+            self.unrefinable["delta_log_F"] = (
+                "Fhkl is not refinable without structure factors: pass structure_factors= "
+                "(a StructureFactors, see nanobrag_torch.compat.cctbx.asu_structure_factors)"
+            )
+        else:
+            M = len(structure_factors)
+            if structure_factors.default_F is not None:
+                default_F = structure_factors.default_F
+            index, self.hkl_metadata, constants = structure_factors.grid_index(float(default_F))
+            self.register_buffer("grid_index", torch.as_tensor(index, device=self.device))
+            self.register_buffer("constants", torch.as_tensor(constants, device=self.device, dtype=self.dtype))
+        self.register_buffer(
+            "base_F",
+            torch.as_tensor(
+                structure_factors.amplitudes if M else np.zeros(0), device=self.device, dtype=self.dtype
+            ),
+        )
+        self.delta_log_F = param_cls(torch.zeros(M, device=self.device, dtype=self.dtype))
+
+        for pname in self.unrefinable:
+            getattr(self, pname).requires_grad_(False)
+
+    @property
+    def active(self) -> bool:
+        return self.structure_factors is not None
+
+    def amplitudes(self) -> torch.Tensor:
+        """Current amplitudes of the M unique reflections."""
+        return self.base_F * torch.exp(self.delta_log_F)
+
+    def hkl_grid(self) -> torch.Tensor:
+        """The dense P1 box [h-h_min][k-k_min][l-l_min] for Crystal.hkl_data."""
+        return torch.cat([self.amplitudes(), self.constants])[self.grid_index]
+
+
 class ExperimentModel(nn.Module):
     """
     High-level experiment composition model for Stage-A optimization.
@@ -552,6 +623,9 @@ class ExperimentModel(nn.Module):
     the cell refinement; see nanobrag_torch.utils.unit_cell and ``unrefinable``.
     With mosaic spread, ``anisotropic_mosaicity`` refines eta_a, eta_b, eta_c
     instead of one eta (diffBragg's ensemble; see CrystalStageAParams).
+    ``structure_factors`` (a StructureFactors) makes F refinable, one amplitude per
+    unique reflection (see StructureFactorStageAParams); a fixed grid can be given
+    instead with ``hkl_data``/``hkl_metadata`` or set_structure_factors().
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -576,6 +650,7 @@ class ExperimentModel(nn.Module):
         "scale": ("beam_params.delta_log_spot_scale",),
         "Ncells": ("crystal_params.delta_log_N_cells",),
         "eta": ("crystal_params.delta_log_eta",),
+        "Fhkl": ("fhkl_params.delta_log_F",),
     }
 
     def __init__(
@@ -590,8 +665,11 @@ class ExperimentModel(nn.Module):
         hkl_metadata: Optional[dict] = None,
         crystal_system: str = "triclinic",
         anisotropic_mosaicity: bool = False,
+        structure_factors: Optional[StructureFactors] = None,
     ) -> None:
         super().__init__()
+        if structure_factors is not None and hkl_data is not None:
+            raise ValueError("give structure_factors (refinable) or hkl_data (fixed), not both")
         if device is None:
             device = torch.device("cpu")
         self.device = device
@@ -614,6 +692,13 @@ class ExperimentModel(nn.Module):
         )
         self.beam_params = BeamStageAParams(
             base_config=beam_config,
+            device=self.device,
+            dtype=self.dtype,
+            param_init=param_init,
+        )
+        self.fhkl_params = StructureFactorStageAParams(
+            structure_factors,
+            default_F=crystal_config.default_F,
             device=self.device,
             dtype=self.dtype,
             param_init=param_init,
@@ -653,9 +738,11 @@ class ExperimentModel(nn.Module):
 
     @property
     def unrefinable(self) -> dict:
-        """Parameter name -> why it cannot be refined (crystal shape, crystal system, detector kind)."""
-        blocked = {f"crystal_params.{n}": why for n, why in self.crystal_params.unrefinable.items()}
-        blocked.update({f"detector_params.{n}": why for n, why in self.detector_params.unrefinable.items()})
+        """Parameter name -> why it cannot be refined (crystal shape, crystal system, detector kind,
+        no structure factors)."""
+        blocked = {}
+        for block in ("crystal_params", "detector_params", "fhkl_params"):
+            blocked.update({f"{block}.{n}": why for n, why in getattr(self, block).unrefinable.items()})
         return blocked
 
     def refine(self, *names: str) -> "ExperimentModel":
@@ -711,12 +798,19 @@ class ExperimentModel(nn.Module):
         own P1 grids and want ExperimentModel to reuse them, rather than
         loading HKL files internally via Crystal.load_hkl().
         """
+        if self.fhkl_params.active:
+            raise ValueError("this model refines its structure factors (structure_factors=); "
+                             "a fixed grid would replace them")
         self._external_hkl_data = hkl_data
         self._external_hkl_metadata = hkl_metadata
         if self._crystal is not None:
             self._apply_structure_factors(self._crystal)
 
     def _apply_structure_factors(self, crystal: Crystal) -> None:
+        if self.fhkl_params.active:
+            crystal.hkl_data = self.fhkl_params.hkl_grid()
+            crystal.hkl_metadata = dict(self.fhkl_params.hkl_metadata)
+            return
         if self._external_hkl_data is None:
             return
         hkl_tensor = torch.as_tensor(self._external_hkl_data)
@@ -777,6 +871,8 @@ class ExperimentModel(nn.Module):
         # Simulator's auto-oversample choice reads the config copy.
         crystal.config.N_cells = crystal_cfg.N_cells
         self._apply_mosaicity(crystal)
+        if self.fhkl_params.active:
+            self._apply_structure_factors(crystal)
 
         for name in self._DETECTOR_FIELDS:
             setattr(self._detector.config, name, getattr(detector_cfg, name))

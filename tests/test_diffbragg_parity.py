@@ -278,3 +278,50 @@ def test_diffbragg_analytic_detz_derivative_misses_omega_and_polarization(flags,
     (g,) = torch.autograd.grad(model().sum(), [model.detector_params.delta_detz_shift_mm])
     assert 1000.0 * float(g) == pytest.approx(db_fd, rel=1e-7)
     assert abs(1 - float(db_deriv.sum()) / db_fd) > off_by
+
+
+# Structure factors (FHKL). diffBragg refines a per-ASU intensity scale s_i (I ∝ s_i·F_i²) with
+# Friedel mates as separate ASU entries unless centric; torch refines log F_i, so
+# d/d(log F_i) = 2·d/ds_i at s = 1. With Friedel-symmetric data and anomalous=False one torch
+# amplitude drives both mates, and its gradient is the sum of theirs.
+_FHKL_BASE = ["--detpixels", "128", "--distance", "60", "--pixel", "0.2", "--fhkl-dmin", "6"]
+FHKL_CASES = {
+    "monoclinic-anomalous": (["--symbol", "P121"], True),
+    "tetragonal-anomalous": (["--symbol", "P43212", "--ucell", "70", "70", "50", "90", "90", "90",
+                              "--randomrotate", "2"], True),
+    "hexagonal-anomalous": (["--symbol", "P6122", "--ucell", "70", "70", "50", "90", "90", "120",
+                             "--randomrotate", "5"], True),
+    "monoclinic-friedel": (["--symbol", "P121", "--fhkl-friedel", "--randomrotate", "1"], False),
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("case", list(FHKL_CASES))
+def test_fhkl_gradients_match_diffbragg(case, device):
+    from nanobrag_torch.compat.cctbx import asu_structure_factors
+
+    flags, anomalous = FHKL_CASES[case]
+    args = cmp.build_parser().parse_args(_FHKL_BASE + flags)
+    args.device = device
+    sim = cmp.build_sim(args)
+    space_group = sim.fhkl_asu_array.space_group()
+    assert sim.D.hall_symbol == space_group.type().hall_symbol()
+    sf = asu_structure_factors(sim.fhkl_asu_array, anomalous=anomalous)
+    model = cmp.torch_experiment_model(sim, args, structure_factors=sf)
+    img = model()
+
+    rng = np.random.default_rng(5)
+    for wname, w in {"uniform": np.ones((128, 128)), "random": rng.uniform(0.5, 1.5, (128, 128))}.items():
+        db_img, db_grad, asu_map = cmp.diffbragg_fhkl_forward_and_gradients(sim, w)
+        np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-9, atol=1e-12 * db_img.max())
+        ref = np.array([
+            2 * sum(db_grad[i] for i in {asu_map[cmp.diffbragg_asu_key(space_group, s * h)]
+                                         for s in ((1,) if anomalous else (1, -1))})
+            for h in sf.indices])
+        (g,) = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                                   [model.fhkl_params.delta_log_F], retain_graph=True)
+        g = g.cpu().numpy()
+        assert (ref != 0).sum() > 50, "too few reflections on the detector for a meaningful check"
+        np.testing.assert_array_equal(g != 0, ref != 0)
+        np.testing.assert_allclose(g, ref, rtol=1e-7, atol=1e-9 * np.abs(ref).max(),
+                                   err_msg=f"d(w·I)/d(log F) ({wname} w)")

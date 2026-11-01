@@ -215,6 +215,28 @@ def test_structure_factor_box_lookup():
     assert crystal.get_structure_factor(zero, zero, zero).tolist() == [7.0]
 
 
+@pytest.mark.parametrize("symbol", ["P1", "P121", "C121", "P43212", "P6122", "R3:H", "P213", "I41/a"])
+@pytest.mark.parametrize("anomalous", [False, True])
+def test_asu_structure_factors_expand_like_cctbx(symbol, anomalous):
+    """StructureFactors' own expansion reproduces cctbx's expand_to_p1 + Bijvoet mates."""
+    pytest.importorskip("cctbx.miller", reason="cctbx not installed")
+    from cctbx import crystal as cctbx_crystal, sgtbx
+    from scitbx.array_family import flex
+    from nanobrag_torch.compat.cctbx import asu_structure_factors, structure_factors_from_miller_array
+
+    info = sgtbx.space_group_info(symbol)
+    symmetry = cctbx_crystal.symmetry(unit_cell=info.any_compatible_unit_cell(volume=2e5), space_group_info=info)
+    mset = symmetry.build_miller_set(anomalous_flag=anomalous, d_min=6.0)
+    ma = mset.array(data=flex.double(np.random.default_rng(0).uniform(1, 9, mset.size())))
+    sf = asu_structure_factors(ma)
+    assert sf.anomalous == anomalous and len(sf) == mset.size()
+    p1, source = sf.p1()
+    ours = {tuple(int(x) for x in h): sf.amplitudes[i] for h, i in zip(p1, source)}
+    idx, amp = structure_factors_from_miller_array(ma)
+    theirs = {tuple(int(x) for x in h): a for h, a in zip(idx, amp)}
+    assert ours == theirs
+
+
 def test_set_mosaic_blocks_is_used_and_counts_domains():
     cell = (60.0, 60.0, 60.0, 90.0, 90.0, 90.0)
     cfg = crystal_config_from_A(cell, FakeCrystal(cell).get_A(), Ncells_abc=4, default_F=50.0,
