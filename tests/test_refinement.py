@@ -42,6 +42,14 @@ def test_nothing_to_refine_is_an_error():
         refine_lbfgsb(model, lambda: model().sum())
 
 
+def test_float32_parameters_warn():
+    model = _model(background_rois=ROIS).float()
+    model.freeze()
+    model.refine("scale")
+    with pytest.warns(UserWarning, match="float64"):
+        refine_lbfgsb(model, lambda: model.beam_params.delta_log_spot_scale ** 2, maxiter=1)
+
+
 def test_recovers_a_shot_from_a_bad_scale_and_ncells():
     truth = _model(background_rois=ROIS)
     bump_misset = torch.tensor([0.003, -0.004, 0.002], dtype=DTYPE)

@@ -207,7 +207,7 @@ def crystal_config_from_A(
     unit_cell: Sequence[float],
     A,
     *,
-    Ncells_abc: Union[int, Sequence[int]] = (10, 10, 10),
+    Ncells_abc: Union[float, Sequence[float]] = (10, 10, 10),
     shape="square",
     mosaic_spread_deg: float = 0.0,
     mosaic_domains: int = 1,
@@ -237,8 +237,8 @@ def crystal_config_from_A(
         a_star, b_star, c_star = A_np[:, 0].copy(), A_np[:, 1].copy(), A_np[:, 2].copy()
 
     if isinstance(Ncells_abc, (int, float)):
-        Ncells_abc = (int(Ncells_abc),) * 3
-    Ncells_abc = tuple(int(n) for n in Ncells_abc)
+        Ncells_abc = (Ncells_abc,) * 3
+    Ncells_abc = tuple(float(n) for n in Ncells_abc)  # continuous, as diffBragg refines them
     if len(Ncells_abc) == 1:
         Ncells_abc = Ncells_abc * 3
 
@@ -685,6 +685,8 @@ def experiment_model_from_dxtbx(
     spot_metric: SpotMetric = SpotMetric.HKL,
     oversample: int = 1,
     detector_thick_mm: Optional[float] = None,
+    detector_thicksteps: Optional[int] = None,
+    oversample_thick: bool = False,
     fluence: Optional[float] = None,
     spot_scale: float = 1.0,
     spectrum: Optional[Iterable[Tuple[float, float]]] = None,
@@ -693,6 +695,10 @@ def experiment_model_from_dxtbx(
     rois=None,
     tilt_abc=None,
     panels=None,
+    phi_start_deg: float = 0.0,
+    osc_range_deg: float = 0.0,
+    phi_steps: int = 1,
+    spindle_axis: Optional[Sequence[float]] = None,
     device=None,
     dtype=torch.float64,
     **model_kwargs,
@@ -705,18 +711,43 @@ def experiment_model_from_dxtbx(
     ``tilt_abc`` and ``panels`` are diffBragg's rois, tilt_abc and pids. ``spectrum`` is a
     list of (wavelength_Å, flux) as in beam_config_from_dxtbx, and ``fluence`` matches a
     diffBragg image when it is that simulator's D.fluence. ``detector_thick_mm`` overrides
-    the panels' sensor thickness: hopper's simulator ignores it, so pass 0.0 to compare.
+    the panels' sensor thickness. diffBragg applies the sensor too, with its own thicksteps,
+    so to compare with hopper pass 0.0 and set simulator.detector.force_zero_thickness, or
+    pass ``detector_thicksteps`` with ``oversample_thick=True`` (each layer's own capture, as
+    diffBragg) and divide ``fluence`` by the layers, because diffBragg normalises by them.
+    Those layers split the sensor evenly, T/N each as a diffBragg model has them; nanoBragg.c's
+    T/(N-1) would capture beyond the back face, 3.7% too much at 320 um, 110.9 um, N = 4.
+
+    A rotation image sweeps ``phi_steps`` orientations from ``phi_start_deg`` across
+    ``osc_range_deg`` about ``spindle_axis`` (lab frame, as the goniometer's rotation axis);
+    ``crystal`` is the orientation at phi = 0, so pass the frame's lab orientation.
     """
     from ..models.experiment import ExperimentModel
 
     s0 = _s0_of(beam)
     panel_list = list(detector) if hasattr(detector, "__getitem__") else [detector]
-    configs = [detector_config_from_dxtbx_panel(panel, s0, oversample=oversample, detector_thick_mm=detector_thick_mm)
+    if detector_thicksteps is not None and detector_thicksteps < 2:
+        raise ValueError(f"detector_thicksteps must be at least 2, as nanoBragg's, got {detector_thicksteps}")
+
+    def thickness_of(panel):
+        if detector_thicksteps is None:
+            return detector_thick_mm
+        thick_mm = panel.get_thickness() if detector_thick_mm is None else detector_thick_mm
+        return thick_mm * (detector_thicksteps - 1) / detector_thicksteps  # DetectorConfig steps by T/(N-1)
+
+    configs = [detector_config_from_dxtbx_panel(panel, s0, oversample=oversample, detector_thick_mm=thickness_of(panel),
+                                                detector_thicksteps=detector_thicksteps)
                for panel in panel_list]
+    for config in configs:
+        config.oversample_thick = oversample_thick
     crystal_cfg = crystal_config_from_dxtbx(
         crystal, Ncells_abc=Ncells_abc, shape=shape, mosaic_spread_deg=mosaic_spread_deg,
         mosaic_domains=mosaic_domains, default_F=default_F, spot_metric=spot_metric,
     )
+    crystal_cfg.phi_start_deg, crystal_cfg.osc_range_deg = phi_start_deg, osc_range_deg
+    crystal_cfg.phi_steps = phi_steps
+    if spindle_axis is not None:
+        crystal_cfg.spindle_axis = _as_tuple3(_unit(np.asarray(spindle_axis, dtype=np.float64)))
     beam_cfg = beam_config_from_dxtbx(beam, fluence=fluence, spot_scale=spot_scale, spectrum=spectrum)
     model_kwargs.setdefault("crystal_system", crystal_system_of(crystal))
     if miller_array is not None:

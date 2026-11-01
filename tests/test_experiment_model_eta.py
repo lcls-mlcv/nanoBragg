@@ -4,6 +4,7 @@ The ensemble is diffBragg's (utils/mosaic.py); tests/test_diffbragg_parity.py
 checks it and its eta derivatives against simtbx on a cctbx build.
 """
 import math
+from dataclasses import replace
 
 import pytest
 import torch
@@ -120,6 +121,22 @@ def test_eta_unrefinable_without_mosaic_spread():
     assert not model.crystal_params.delta_log_eta.requires_grad
     with pytest.raises(ValueError, match="eta is not refinable without mosaic spread"):
         model.refine("eta")
+
+
+def test_eta_unrefinable_with_two_domains():
+    crystal, detector, beam = _configs(domains=2)
+    model = ExperimentModel(crystal, detector, beam, device=torch.device("cpu"), dtype=DTYPE)
+    assert "delta_log_eta" in model.crystal_params.unrefinable
+
+
+def test_anisotropic_axes_of_a_matrix_crystal_include_its_misset():
+    crystal, detector, beam = _configs()
+    crystal = replace(crystal, misset_deg=(30.0, 40.0, 50.0), cell_alpha=90.0, cell_beta=90.0, cell_gamma=90.0)
+    plain = Crystal(replace(crystal, misset_deg=(0.0, 0.0, 0.0)), device=torch.device("cpu"), dtype=DTYPE)
+    matrix = replace(crystal, **{f"mosflm_{x}_star": tuple(getattr(plain, f"{x}_star").tolist()) for x in "abc"})
+    axes = [ExperimentModel(c, detector, beam, device=torch.device("cpu"), dtype=DTYPE,
+                            anisotropic_mosaicity=True).crystal_params.eta_axes for c in (crystal, matrix)]
+    torch.testing.assert_close(axes[0], axes[1], rtol=1e-9, atol=1e-9)
 
 
 def test_anisotropic_eta_lies_along_the_starting_crystal_axes():

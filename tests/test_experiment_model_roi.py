@@ -174,6 +174,16 @@ def test_poisson_nll_is_the_poisson_likelihood():
     torch.testing.assert_close(model.grad, 1 - data / model.detach(), rtol=1e-12, atol=0.0)
 
 
+@pytest.mark.parametrize("data", [0.0, 5.0])
+def test_poisson_pushes_a_model_under_its_floor_back_up(data):
+    counts = torch.tensor([data], dtype=DTYPE)
+    model = torch.tensor([-1e-3], dtype=DTYPE, requires_grad=True)
+    loss = poisson_nll(model, counts)
+    loss.backward()
+    assert model.grad < 0
+    assert loss > poisson_nll(torch.tensor([max(data, 1e-6)], dtype=DTYPE), counts)
+
+
 def test_poisson_gain_and_trusted():
     model = torch.tensor([4.0, 9.0], dtype=DTYPE)
     data = torch.tensor([5.0, -3.0], dtype=DTYPE)

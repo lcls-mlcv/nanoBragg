@@ -171,3 +171,14 @@ def test_refinable_and_fixed_structure_factors_are_exclusive():
     model = ExperimentModel(*_configs(), dtype=DTYPE, structure_factors=sf)
     with pytest.raises(ValueError, match="refines its structure factors"):
         model.set_structure_factors(grid, meta)
+
+
+def test_one_default_F_inside_and_outside_the_grid():
+    crystal, detector, beam = _configs()
+    crystal.default_F = 0.0
+    sf = StructureFactors([(2, 2, 2)], [10.0], default_F=500.0)
+    model = ExperimentModel(crystal, detector, beam, structure_factors=sf, dtype=DTYPE)
+    model()
+    F = model._crystal.get_structure_factor(*(torch.tensor([v], dtype=DTYPE) for v in ([1.0], [1.0], [1.0])))
+    outside = model._crystal.get_structure_factor(*(torch.tensor([v], dtype=DTYPE) for v in ([3.0], [3.0], [3.0])))
+    assert float(F) == pytest.approx(500.0) and float(outside) == pytest.approx(500.0)

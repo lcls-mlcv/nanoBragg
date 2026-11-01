@@ -153,3 +153,12 @@ def test_gradcheck_spectrum(name, start):
         return functional_call(model, {name: value}, ()).sum()
 
     assert gradcheck(loss, (start.clone().requires_grad_(True),), eps=1e-6, atol=1e-8, rtol=1e-4)
+
+
+def test_built_simulator_config_has_the_current_wavelength():
+    model = _model()
+    with torch.no_grad():
+        model()
+        model.beam_params.lambda_offset.fill_(0.02)
+    simulator, _, _, beam = model._build_simulator()
+    torch.testing.assert_close(beam.source_wavelengths.to(DTYPE), simulator._source_wavelengths.to(DTYPE), rtol=1e-12, atol=0.0)
