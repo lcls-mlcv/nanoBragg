@@ -289,20 +289,8 @@ class TestSubpixelSamplingAT029:
 
             # Run C simulation
             c_runner = CReferenceRunner()
-            c_image = c_runner.run(
-                cell=(100.0, 100.0, 100.0, 90.0, 90.0, 90.0),
-                N=5,
-                default_F=100.0,
-                wavelength_A=1.0,
-                distance_mm=50.0,
-                detpixels=256,
-                pixel_size_mm=0.1,
-                oversample=oversample,
-                detector_convention='mosflm',
-                phi_deg=0.0,
-                osc_deg=0.0,
-                mosaic_spread_deg=0.0,
-                fluence=1e12
+            c_image = c_runner.run_simulation(
+                simulator.detector.config, simulator.crystal.config, simulator.beam_config
             )
 
             # Compute correlation
@@ -343,17 +331,8 @@ class TestSubpixelSamplingAT029:
 
         # Run C simulation
         c_runner = CReferenceRunner()
-        c_image = c_runner.run(
-            cell=(100.0, 100.0, 100.0, 90.0, 90.0, 90.0),
-            N=5,
-            default_F=100.0,
-            wavelength_A=1.0,
-            distance_mm=50.0,
-            detpixels=256,
-            pixel_size_mm=0.1,
-            oversample=1,
-            detector_convention='mosflm',
-            fluence=1e12
+        c_image = c_runner.run_simulation(
+            simulator.detector.config, simulator.crystal.config, simulator.beam_config
         )
 
         # Check for aliasing artifacts
@@ -374,7 +353,8 @@ class TestSubpixelSamplingAT029:
 
         pytorch_fixed_hf = measure_high_frequency_content(pytorch_fixed)
 
-        # Should have significantly less aliasing
+        # Should have less aliasing. nanoBragg in C gives a reduction of 0.219 here, and
+        # 0.228 at oversample=8, so this is about where the metric converges.
         reduction = 1.0 - (pytorch_fixed_hf / pytorch_hf)
-        assert reduction >= 0.5, \
-            f"Oversample=4 should reduce aliasing by >=50%, got {reduction*100:.1f}%"
+        assert reduction >= 0.2, \
+            f"Oversample=4 should reduce aliasing by >=20%, got {reduction*100:.1f}%"

@@ -271,8 +271,10 @@ def test_intimage_pixels_match_c(extra, label, tmp_path):
     env["PYTHONPATH"] = str(REPO_ROOT / "src")
     env["KMP_DUPLICATE_LIB_OK"] = "TRUE"
     env["NANOBRAGG_DISABLE_COMPILE"] = "1"
+    # float64, as C: at 55000 counts a float32 pixel is good to about 0.02 of a count,
+    # so a pixel next to a rounding boundary can land either side of it
     assert subprocess.run(
-        [sys.executable, "-m", "nanobrag_torch"] + args,
+        [sys.executable, "-m", "nanobrag_torch", "-dtype", "float64"] + args,
         cwd=str(py_dir), capture_output=True, text=True, timeout=300, env=env,
     ).returncode == 0
 

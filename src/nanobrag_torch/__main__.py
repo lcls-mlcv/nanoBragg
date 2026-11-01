@@ -1677,14 +1677,15 @@ def build_simulation(
                 dtype=dtype
             )
 
-        # Store generated sources in config
-        config['source_directions'] = source_directions
-        config['source_weights'] = source_weights
-        config['source_wavelengths'] = source_wavelengths
-
-        # Report source generation if multiple sources
+        # Store generated sources in config. One generated source just restates the beam,
+        # and leaves it to Detector, which also knows about -beam_vector.
         n_sources = len(source_directions)
         if n_sources > 1:
+            config['source_directions'] = source_directions
+            config['source_weights'] = source_weights
+            config['source_wavelengths'] = source_wavelengths
+
+            # Report source generation
             print(f"Generated {n_sources} sources from divergence/dispersion:")
             print(f"  H divergence: {hdiv_params.count} steps, range={hdiv_params.range:.4f} rad")
             print(f"  V divergence: {vdiv_params.count} steps, range={vdiv_params.range:.4f} rad")

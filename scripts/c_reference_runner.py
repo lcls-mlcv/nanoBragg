@@ -8,7 +8,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
@@ -30,9 +30,12 @@ class CReferenceRunner:
         crystal_config: CrystalConfig,
         beam_config: BeamConfig,
         label: str = "",
+        extra_args: Optional[List[str]] = None,
     ) -> Optional[np.ndarray]:
         """
         Run C nanoBragg and return a 2D float image, or None if the binary is missing.
+
+        extra_args are appended to the command, for flags the configs do not carry (-hkl).
         """
         try:
             c_bin = find_c_binary()
@@ -51,7 +54,7 @@ class CReferenceRunner:
             wd = Path(tempfile.mkdtemp(prefix="nb_c_run_"))
 
         float_path = wd / "c_floatimage.bin"
-        cmd = list(argv)
+        cmd = list(argv) + list(extra_args or [])
         if "-floatfile" in cmd:
             i = cmd.index("-floatfile")
             cmd[i + 1] = str(float_path)

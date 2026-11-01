@@ -20,7 +20,7 @@ from .models.crystal import Crystal
 from .models.detector import Detector
 from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
-from .utils.physics import sincg, sinc3, polarization_factor
+from .utils.physics import sincg, sincg_miller, sinc3, polarization_factor
 from .utils.tensor_utils import as_tensor_preserving_grad
 
 logger = logging.getLogger(__name__)
@@ -328,9 +328,9 @@ def compute_physics_for_position(
 
     if shape == CrystalShape.SQUARE:
         # Note: sincg internally handles Na/Nb/Nc > 1 guards per C implementation
-        F_latt_a = sincg(torch.pi * h, Na)
-        F_latt_b = sincg(torch.pi * k, Nb)
-        F_latt_c = sincg(torch.pi * l, Nc)
+        F_latt_a = sincg_miller(h, Na)
+        F_latt_b = sincg_miller(k, Nb)
+        F_latt_c = sincg_miller(l, Nc)
         F_latt = F_latt_a * F_latt_b * F_latt_c
     elif shape == CrystalShape.ROUND:
         h_frac = h - h0
@@ -971,7 +971,7 @@ class Simulator:
             coords_reshaped = subpixel_coords_ang_all.reshape(-1, 3).contiguous()
 
             # Compute physics for all subpixels and sources (VECTORIZED)
-            if n_sources > 1:
+            if source_directions is not None:
                 # VECTORIZED Multi-source case: batch all sources together
                 # Note: source_directions point FROM sample TO source
                 # Incident beam direction should be FROM source TO sample (negated)
@@ -997,7 +997,7 @@ class Simulator:
                 else:
                     subpixel_physics_intensity_pre_polar_all = None
             else:
-                # Single source case: use default beam parameters
+                # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
                 physics_intensity_flat, physics_intensity_pre_polar_flat = self._compute_physics_for_position(
                     coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star
@@ -1108,7 +1108,7 @@ class Simulator:
             pixel_coords_angstroms = pixel_coords_meters * 1e10
 
             # Compute physics for pixel centers with multiple sources if available
-            if n_sources > 1:
+            if source_directions is not None:
                 # VECTORIZED Multi-source case: batch all sources together (matching subpixel path)
                 # Note: source_directions point FROM sample TO source
                 # Incident beam direction should be FROM source TO sample (negated)
@@ -1126,7 +1126,7 @@ class Simulator:
                 )
                 # The weighted sum over sources is done inside _compute_physics_for_position
             else:
-                # Single source case: use default beam parameters
+                # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
                 intensity, I_before_normalization_pre_polar = self._compute_physics_for_position(
                     pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star
