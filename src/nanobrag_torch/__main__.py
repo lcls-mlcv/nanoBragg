@@ -1692,6 +1692,15 @@ def build_simulation(
             beam_direction=beam_direction
         )
 
+        if not torch.all(source_weights == source_weights[0]):
+            warnings.warn(
+                "The -sourcefile weights differ, and the CLI ignores them, as nanoBragg.c does: "
+                "every source counts equally. ExperimentModel or BeamConfig.use_source_weights "
+                "honours them.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         # Store loaded sources in config
         config['source_directions'] = source_directions
         config['source_weights'] = source_weights

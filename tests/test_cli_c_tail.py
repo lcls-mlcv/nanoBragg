@@ -117,3 +117,27 @@ def test_nan_in_a_sourcefile_column_is_a_missing_value(tmp_path):
 def test_nan_in_a_sourcefile_matches_c(tmp_path, text, extra):
     (tmp_path / "sources.txt").write_text(text)
     assert_matches_c(DETECTOR + ["-sourcefile", "sources.txt"] + extra, tmp_path)
+
+
+def _torch_run(tmp_path, source_text):
+    (tmp_path / "sources.txt").write_text(source_text)
+    return _render([sys.executable, "-m", "nanobrag_torch"], DETECTOR + ["-sourcefile", "sources.txt"], tmp_path)
+
+
+def test_unequal_sourcefile_weights_warn_and_leave_stdout_and_image_alone(tmp_path):
+    equal_image, _, equal = _torch_run(tmp_path, "-1 0 0 1 1e-10\n-1 0 0 1 1.1e-10\n")
+    assert "use_source_weights" not in equal.stderr
+
+    image, _, unequal = _torch_run(tmp_path, "-1 0 0 9 1e-10\n-1 0 0 1 1.1e-10\n")
+    assert "ignores them, as nanoBragg.c does" in unequal.stderr
+    assert "ExperimentModel or BeamConfig.use_source_weights" in unequal.stderr
+    assert "use_source_weights" not in unequal.stdout
+    assert unequal.stdout == equal.stdout
+    np.testing.assert_array_equal(image, equal_image)
+
+
+def test_a_weight_filled_in_by_default_counts_when_comparing_weights(tmp_path):
+    _, _, done = _torch_run(tmp_path, "-1 0 0 1 1e-10\n-1 0 0\n")
+    assert "use_source_weights" not in done.stderr
+    _, _, done = _torch_run(tmp_path, "-1 0 0 2 1e-10\n-1 0 0\n")
+    assert "use_source_weights" in done.stderr
