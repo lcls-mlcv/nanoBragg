@@ -601,6 +601,79 @@ class StructureFactorStageAParams(nn.Module):
         return torch.cat([self.amplitudes(), self.constants])[self.grid_index]
 
 
+class BackgroundStageAParams(nn.Module):
+    """Stage-A learnable background: a tilted plane per region of the image, in photons.
+
+    Each region of ``rois`` is (x1, x2, y1, y2), half-open, x along fast and y along
+    slow, and carries one (a, b, c):
+
+        background(x, y) = a·(x - x1) + b·(y - y1) + c
+
+    These are diffBragg's rois and tilt_abc, from get_roi_background_and_selection_flags:
+    the origin is the ROI corner, a later ROI paints over an earlier one, and pixels in
+    no ROI get nothing. With pad_for_background_estimation diffBragg's corner is the
+    padded one, so shift c first (c + a·pad_x + b·pad_y). The plane is added to the
+    finished image, so G, fluence, omega and polarization do not touch it. diffBragg
+    fits it once and holds it fixed; here it refines like everything else.
+
+    delta_tilt_abc holds the change across the region in photons, (a·width, b·height, c),
+    so that one optimizer step moves all three about as far at the plane's far corner;
+    a step in a raw slope would move it width times further than a step in c. tilt_abc()
+    gives diffBragg's a, b, c. Everything here is in photons, unlike the log offsets of
+    the other blocks, so it usually wants its own learning rate.
+
+    Without ``rois`` there is one region, the whole image, starting at zero.
+    """
+
+    def __init__(
+        self,
+        spixels: int,
+        fpixels: int,
+        rois=None,
+        tilt_abc=None,
+        device: Optional[torch.device] = None,
+        dtype: torch.dtype = torch.float32,
+        param_init: str = "trainable",
+    ) -> None:
+        super().__init__()
+        if device is None:
+            device = torch.device("cpu")
+        if rois is None:
+            rois = [(0, fpixels, 0, spixels)]
+        rois = np.asarray(rois, dtype=np.int64).reshape(-1, 4)
+        R = len(rois)
+        abc = np.zeros((R, 3)) if tilt_abc is None else np.asarray(tilt_abc, dtype=np.float64)
+        if abc.shape != (R, 3):
+            raise ValueError(f"tilt_abc must have shape ({R}, 3), one (a, b, c) per ROI; got {abc.shape}")
+
+        region = np.full((spixels, fpixels), R, dtype=np.int64)  # slot R: no plane
+        x = np.zeros((spixels, fpixels))
+        y = np.zeros((spixels, fpixels))
+        for i, (x1, x2, y1, y2) in enumerate(rois):
+            if not (0 <= x1 < x2 <= fpixels and 0 <= y1 < y2 <= spixels):
+                raise ValueError(f"ROI {i} (x1, x2, y1, y2) = {tuple(rois[i])} is empty or outside "
+                                 f"the {fpixels}x{spixels} image")
+            region[y1:y2, x1:x2] = i
+            y[y1:y2, x1:x2], x[y1:y2, x1:x2] = np.indices((y2 - y1, x2 - x1))
+        self.register_buffer("region", torch.as_tensor(region, device=device))
+        self.register_buffer(
+            "basis", torch.as_tensor(np.stack([x, y, np.ones_like(x)], axis=-1), device=device, dtype=dtype)
+        )
+        self.register_buffer("base_tilt_abc", torch.as_tensor(abc, device=device, dtype=dtype))
+        extent = np.stack([rois[:, 1] - rois[:, 0], rois[:, 3] - rois[:, 2], np.ones(R, dtype=np.int64)], axis=1)
+        self.register_buffer("extent", torch.as_tensor(extent, device=device, dtype=dtype))
+        self.delta_tilt_abc = _param_factory(param_init)(torch.zeros(R, 3, device=device, dtype=dtype))
+
+    def tilt_abc(self) -> torch.Tensor:
+        """Current (a, b, c) of each region."""
+        return self.base_tilt_abc + self.delta_tilt_abc / self.extent
+
+    def image(self) -> torch.Tensor:
+        """The background of every pixel, shape (spixels, fpixels)."""
+        abc = torch.cat([self.tilt_abc(), torch.zeros_like(self.base_tilt_abc[:1])])
+        return (abc[self.region] * self.basis).sum(dim=-1)
+
+
 class ExperimentModel(nn.Module):
     """
     High-level experiment composition model for Stage-A optimization.
@@ -626,6 +699,9 @@ class ExperimentModel(nn.Module):
     ``structure_factors`` (a StructureFactors) makes F refinable, one amplitude per
     unique reflection (see StructureFactorStageAParams); a fixed grid can be given
     instead with ``hkl_data``/``hkl_metadata`` or set_structure_factors().
+    ``background_rois`` and ``tilt_abc`` give the regions and starting coefficients of
+    the background planes (see BackgroundStageAParams); by default the whole image is
+    one plane starting at zero.
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -651,6 +727,7 @@ class ExperimentModel(nn.Module):
         "Ncells": ("crystal_params.delta_log_N_cells",),
         "eta": ("crystal_params.delta_log_eta",),
         "Fhkl": ("fhkl_params.delta_log_F",),
+        "background": ("background_params.delta_tilt_abc",),
     }
 
     def __init__(
@@ -666,6 +743,8 @@ class ExperimentModel(nn.Module):
         crystal_system: str = "triclinic",
         anisotropic_mosaicity: bool = False,
         structure_factors: Optional[StructureFactors] = None,
+        background_rois=None,
+        tilt_abc=None,
     ) -> None:
         super().__init__()
         if structure_factors is not None and hkl_data is not None:
@@ -699,6 +778,15 @@ class ExperimentModel(nn.Module):
         self.fhkl_params = StructureFactorStageAParams(
             structure_factors,
             default_F=crystal_config.default_F,
+            device=self.device,
+            dtype=self.dtype,
+            param_init=param_init,
+        )
+        self.background_params = BackgroundStageAParams(
+            detector_config.spixels,
+            detector_config.fpixels,
+            background_rois,
+            tilt_abc,
             device=self.device,
             dtype=self.dtype,
             param_init=param_init,
@@ -942,10 +1030,12 @@ class ExperimentModel(nn.Module):
         """
         simulator = self._sync()
 
-        return simulator.run(
+        image = simulator.run(
             pixel_batch_size=pixel_batch_size,
             oversample=oversample,
             oversample_omega=oversample_omega,
             oversample_polar=oversample_polar,
             oversample_thick=oversample_thick,
         )
+        # As diffBragg: Bragg model + background. run() has just refreshed the mask.
+        return image + self.background_params.image() * simulator._cached_roi_mask

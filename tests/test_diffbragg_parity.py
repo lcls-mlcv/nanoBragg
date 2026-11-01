@@ -325,3 +325,32 @@ def test_fhkl_gradients_match_diffbragg(case, device):
         np.testing.assert_array_equal(g != 0, ref != 0)
         np.testing.assert_allclose(g, ref, rtol=1e-7, atol=1e-9 * np.abs(ref).max(),
                                    err_msg=f"d(w·I)/d(log F) ({wname} w)")
+
+
+# Background: diffBragg fits the planes once and holds them fixed, so what is compared is
+# the image of the planes it fitted, not a gradient.
+@pytest.mark.parametrize("robust", [False, True], ids=["fit-tilt", "median"])
+def test_background_planes_reproduce_diffbragg_fit(robust):
+    from dials.array_family import flex
+    from simtbx.diffBragg.utils import get_roi_background_and_selection_flags
+
+    pixels = 128
+    rng = np.random.default_rng(11)
+    Y, X = np.indices((pixels, pixels))
+    data = 40 + 0.3 * X - 0.2 * Y + rng.normal(0, 2, (pixels, pixels))
+    spots = rng.uniform(15, pixels - 15, (20, 2))
+    refls = flex.reflection_table()
+    refls["xyzobs.px.value"] = flex.vec3_double([(x, y, 0.5) for x, y in spots])
+    refls["panel"] = flex.size_t(len(spots), 0)
+    rois, _, tilt_abc, _, background = get_roi_background_and_selection_flags(
+        refls, data[None], shoebox_sz=12, use_robust_estimation=robust, weighted_fit=False,
+        allow_overlaps=True, skip_roi_with_negative_bg=False)
+
+    args = cmp.build_parser().parse_args(["--detpixels", str(pixels)])
+    model = cmp.torch_experiment_model(cmp.build_sim(args), args, background_rois=rois, tilt_abc=tilt_abc)
+    got = model.background_params.image().detach().numpy()
+    covered = background[0] != -1  # diffBragg's marker for a pixel in no ROI
+    assert covered.sum() > 500
+    assert any(a != 0 for a, _, _ in tilt_abc) != robust
+    np.testing.assert_allclose(got[covered], background[0][covered], rtol=1e-12)
+    np.testing.assert_array_equal(got[~covered], 0)

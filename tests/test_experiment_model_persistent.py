@@ -38,7 +38,7 @@ def _fresh_image(model):
     simulator = Simulator(Crystal(crystal_cfg, beam_cfg, dtype=DTYPE),
                           Detector(detector_cfg, dtype=DTYPE),
                           beam_config=beam_cfg, dtype=DTYPE)
-    return simulator.run()
+    return simulator.run() + model.background_params.image()
 
 
 def _set_step(model, k):
@@ -94,7 +94,9 @@ def test_optimizer_steps_reuse_one_simulator(monkeypatch):
     model = ExperimentModel(*_configs(), dtype=DTYPE, param_init="stage_a")
     target = _fresh_image(model).detach() * 1.1
     built.clear()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # This image is ~1e-3 photons a pixel: a step of lr=1e-3 in the plane, in photons, swamps it
+    model.freeze("background")
+    optimizer = torch.optim.Adam(model.trainable_parameters(), lr=1e-3)
     losses = []
     for _ in range(4):
         optimizer.zero_grad()
