@@ -1180,6 +1180,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     if custom and args.spindle_axis:
         config['custom_spindle_axis'] = tuple(args.spindle_axis)
 
+    unitize_custom_vectors(config)
+
     # Convention defaults for both vectors; an explicit flag wins, as in C, where a vector
     # flag switches to CUSTOM and the convention block then leaves them alone.
     convention_axis = _CONVENTION_POLAR_AND_SPINDLE.get(config['convention'])
@@ -1491,6 +1493,30 @@ class SimulationBundle:
     beam_config: BeamConfig
     dtype: torch.dtype
     device: torch.device
+
+
+def unitize_custom_vectors(config: Dict[str, Any]) -> None:
+    """
+    nanoBragg.c:1260-1268 unitizes the vectors the flags gave. An odet whose magnitude isn't
+    exactly 1 is replaced by fdet x sdet, with fdet and sdet at their declared values if unset.
+    """
+    def magnitude(vector):
+        return math.sqrt(sum(component * component for component in vector))
+
+    def unitized(vector):
+        length = magnitude(vector)
+        return tuple(component / length for component in vector) if length != 0.0 else (0.0, 0.0, 0.0)
+
+    for key in ('custom_beam_vector', 'custom_fdet_vector', 'custom_sdet_vector'):
+        if key in config:
+            config[key] = unitized(config[key])
+    if 'custom_odet_vector' in config and magnitude(config['custom_odet_vector']) != 1.0:
+        print("WARNING: auto-generating odet_vector")
+        f = config.get('custom_fdet_vector', (0.0, 0.0, 1.0))
+        s = config.get('custom_sdet_vector', (0.0, -1.0, 0.0))
+        config['custom_odet_vector'] = unitized((f[1] * s[2] - f[2] * s[1],
+                                                 f[2] * s[0] - f[0] * s[2],
+                                                 f[0] * s[1] - f[1] * s[0]))
 
 
 def resolve_beam_and_polar_vectors(config: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:

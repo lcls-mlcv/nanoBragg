@@ -1940,3 +1940,42 @@ cases:
       - name: twotheta-axis-then-mosflm
         extra_args: >-
           -twotheta_axis 0 1 0 -mosflm -twotheta 5
+  - id: PARITY-CUSTOMVEC-001
+    description: >-
+      nanoBragg.c:1260-1268 unitizes the vectors given on the command line, and replaces an
+      odet whose magnitude isn't exactly 1 with fdet x sdet.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -detpixels 48
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: beam-not-unit
+        extra_args: >-
+          -beam_vector 2 0 0
+      - name: beam-tilted-not-unit
+        extra_args: >-
+          -beam_vector 1 0.1 0
+      - name: fdet-not-unit
+        extra_args: >-
+          -fdet_vector 0 0 2
+      - name: sdet-not-unit
+        extra_args: >-
+          -sdet_vector 0 -2 0
+      - name: odet-not-unit
+        extra_args: >-
+          -odet_vector 2 0 0
+      - name: odet-replaced-by-f-cross-s
+        extra_args: >-
+          -beam_vector 0 0 1 -fdet_vector 1 0 0 -sdet_vector 0 1 0 -odet_vector 0 3 0
+      - name: divergence-about-tilted-beam
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -square_div -beam_vector 1 0.1 0 -nopolar
