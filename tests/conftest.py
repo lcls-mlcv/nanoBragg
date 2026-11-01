@@ -5,6 +5,7 @@ This file contains pytest configuration, fixtures, and environment setup
 that is shared across all test modules.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -177,3 +178,16 @@ def session_infrastructure_gate():
             "  - plans/active/test-suite-triage-phase-h.md\n"
             "=" * 80
         )
+
+
+@pytest.fixture
+def library_log_on_stdout():
+    """Send the library's log to stdout at the level the CLI uses."""
+    from nanobrag_torch.__main__ import _send_library_log_to_stdout
+
+    package = logging.getLogger("nanobrag_torch")
+    handlers, level = package.handlers[:], package.level
+    _send_library_log_to_stdout()
+    yield
+    package.handlers[:] = handlers
+    package.setLevel(level)

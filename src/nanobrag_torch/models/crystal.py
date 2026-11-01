@@ -10,12 +10,15 @@ golden test case, which uses a 10 Å unit cell and a 500×500×500 cell crystal 
 
 from typing import Optional, Tuple
 
+import logging
 import math
 import torch
 
 from ..config import CrystalConfig, BeamConfig
 from ..utils.geometry import angles_to_rotation_matrix
 from ..io.hkl import read_hkl_file, try_load_hkl_or_fdump
+
+logger = logging.getLogger(__name__)
 
 
 def _is_compiling() -> bool:
@@ -404,8 +407,8 @@ class Crystal:
         # the .any() reduction never forces a graph break in compiled runs.
         if not self._interpolation_warning_shown and not _is_compiling():
             if bool(torch.any(out_of_bounds)):
-                print("WARNING: out of range for three point interpolation")
-                print("WARNING: further warnings will not be printed!")
+                logger.warning("WARNING: out of range for three point interpolation")
+                logger.warning("WARNING: further warnings will not be printed!")
                 self._interpolation_warning_shown = True
 
         # Phase C1: Batched Neighborhood Gather Implementation

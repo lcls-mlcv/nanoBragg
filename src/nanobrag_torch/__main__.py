@@ -9,6 +9,7 @@ mapping command-line flags to engine parameters per spec requirements.
 import os
 import sys
 import argparse
+import logging
 import math
 import re
 import time
@@ -1770,8 +1771,22 @@ def build_simulation(
     )
 
 
+class _PrintHandler(logging.Handler):
+    def emit(self, record):
+        print(self.format(record))
+
+
+def _send_library_log_to_stdout():
+    """The library logs; the CLI prints those messages bare, like nanoBragg.c."""
+    package = logging.getLogger("nanobrag_torch")
+    package.handlers[:] = [_PrintHandler()]
+    package.setLevel(logging.INFO)
+
+
 def main():
     """Main entry point for CLI."""
+
+    _send_library_log_to_stdout()
 
     # Parse arguments
     parser = create_parser()
