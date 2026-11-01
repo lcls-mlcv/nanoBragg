@@ -636,7 +636,11 @@ def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[in
         size_f = pixel_mm * fpixels
     if spixels:
         size_s = pixel_mm * spixels
-    return (math.ceil(size_f / pixel_mm - 0.5), math.ceil(size_s / pixel_mm - 0.5), size_f, size_s)
+    # Divide metres by metres, as C does: at half a pixel over, mm/mm can land on the other
+    # side of the integer and give a different ceil().
+    pixel_m = pixel_mm / 1000.0
+    return (math.ceil((size_f / 1000.0) / pixel_m - 0.5), math.ceil((size_s / 1000.0) / pixel_m - 0.5),
+            size_f, size_s)
 
 
 def resolve_sample_dimensions(args: argparse.Namespace) -> Tuple[float, float, float]:

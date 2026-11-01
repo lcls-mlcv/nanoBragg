@@ -1,0 +1,70 @@
+"""CLI behaviour nanoBragg.c defines and the parity matrix can't reach: exact arithmetic, and
+runs that need an input file. Oracle tests need NB_C_BIN and skip without it."""
+
+import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+from nanobrag_torch.__main__ import create_parser, resolve_detector_size
+
+
+def _c_binary():
+    path = os.environ.get("NB_C_BIN")
+    if not path or not Path(path).exists():
+        pytest.skip("NB_C_BIN is not set")
+    return path
+
+
+COMMON = ("-default_F 100 -cell 70 80 90 75 85 95 -N 5 -distance 100 -oversample 1 -nonoise -nopgm "
+          "-lambda 1").split()
+
+
+def _render(command, args, cwd, env=None):
+    float_file = Path(cwd) / "out.bin"
+    int_file = Path(cwd) / "out.img"
+    float_file.unlink(missing_ok=True)
+    done = subprocess.run(command + COMMON + args + ["-floatfile", str(float_file), "-intfile", str(int_file)],
+                          cwd=cwd, env=env, capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+    header = int_file.read_bytes()[:512].decode("ascii", "replace")
+    size = tuple(int(header.split(f"{key}=")[1].split(";")[0]) for key in ("SIZE1", "SIZE2"))
+    return np.fromfile(float_file, dtype=np.float32), size, done
+
+
+def compare_with_c(args, cwd):
+    """Render with C and torch and return (c_image, torch_image, size), which must agree in size."""
+    c_image, c_size, _ = _render([_c_binary()], args, cwd)
+    torch_image, torch_size, _ = _render([sys.executable, "-m", "nanobrag_torch"], args, cwd)
+    assert torch_size == c_size
+    return c_image, torch_image, c_size
+
+
+def assert_matches_c(args, cwd, corr_min=0.9999, sum_tol=2e-4):
+    c_image, torch_image, _ = compare_with_c(args, cwd)
+    assert np.isfinite(c_image).all()
+    assert np.isfinite(torch_image).all()
+    assert np.corrcoef(c_image, torch_image)[0, 1] > corr_min
+    assert torch_image.sum() / c_image.sum() == pytest.approx(1.0, abs=sum_tol)
+
+
+@pytest.mark.parametrize("pixel_mm", [0.1, 0.172, 0.05, 0.075])
+def test_half_pixel_detsize_counts_as_c_does(pixel_mm):
+    """nanoBragg.c:1126: ceil(detsize_f/pixel_size-0.5), both already divided by 1000 at parse."""
+    for n in range(1, 3000):
+        detsize_mm = (n + 0.5) * pixel_mm
+        args = create_parser().parse_args(["-detsize", repr(detsize_mm), "-pixel", repr(pixel_mm)])
+        fpixels, spixels, _, _ = resolve_detector_size(args, pixel_mm)
+        expected = math.ceil((detsize_mm / 1000.0) / (pixel_mm / 1000.0) - 0.5)
+        assert (fpixels, spixels) == (expected, expected), n
+
+
+def test_half_pixel_detsize_of_one_pixel_matches_c(tmp_path):
+    """One pixel, so the parity matrix's correlation is undefined: compare size and value."""
+    c_image, torch_image, size = compare_with_c(["-pixel", "0.172", "-detsize", "0.258"], tmp_path)
+    assert size == (1, 1)
+    assert torch_image[0] == pytest.approx(c_image[0], rel=1e-4)

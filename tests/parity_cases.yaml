@@ -1713,3 +1713,28 @@ cases:
       - name: detpixels-f-then-detpixels
         extra_args: >-
           -detpixels_f 30 -detpixels 60
+  - id: PARITY-CLIFLAGS-003
+    description: >-
+      A detsize of exactly n+0.5 pixels. nanoBragg.c:1126 divides metres by metres, so
+      the rounding of those two doubles decides ceil(detsize/pixel - 0.5).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -distance 100
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: half-pixel-rounds-up
+        extra_args: >-
+          -pixel 0.1 -detsize 9.55
+      - name: half-pixel-rounds-up-coarse
+        extra_args: >-
+          -pixel 0.172 -detsize 2.15
+      - name: half-pixel-per-axis
+        extra_args: >-
+          -pixel 0.1 -detsize_f 9.55 -detsize_s 1.05
