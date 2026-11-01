@@ -13,6 +13,8 @@ import pytest
 
 from nanobrag_torch.io.smv import read_smv
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 
 class TestATCLI007NoiseDeterminism:
     """Test CLI noise determinism with seeds."""

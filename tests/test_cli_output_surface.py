@@ -241,8 +241,9 @@ def test_default_pgm_uses_most_of_the_grey_range(tmp_path):
 @pytest.mark.parametrize(
     "extra,label",
     [([], "defaults"), (["-roi", "17", "17", "17", "17"], "roi-single-pixel"),
-     (["-scale", "3"], "explicit-scale")],
-    ids=["defaults", "roi-single-pixel", "explicit-scale"],
+     (["-scale", "3"], "explicit-scale"), (["-fluence", "1e-30"], "faint-image"),
+     (["-fluence", "1e-30", "-scale", "1e38"], "faint-image-explicit-scale"), (["-adc", "0", "-scale", "1"], "no-adc")],
+    ids=["defaults", "roi-single-pixel", "explicit-scale", "faint-image", "faint-image-explicit-scale", "no-adc"],
 )
 def test_intimage_pixels_match_c(extra, label, tmp_path):
     """Integer-image PIXEL data must match C exactly.
@@ -288,6 +289,31 @@ def test_intimage_pixels_match_c(extra, label, tmp_path):
     )
 
 
+def test_reading_fdump_is_announced_with_cs_line(tmp_path):
+    """A leftover cache beats -default_F in both programs, so it has to be visible."""
+    c_bin = c_binary()
+    hkl = tmp_path / "x.hkl"
+    hkl.write_text("0 0 0 3.0\n1 0 0 5.0\n")
+    args = ("-cell 70 80 90 75 85 95 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 16 -oversample 1 -nonoise -nopgm "
+            "-floatfile f.bin -intfile i.img").split()
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), KMP_DUPLICATE_LIB_OK="TRUE", NANOBRAGG_DISABLE_COMPILE="1")
+
+    def lines(cmd, cwd, flags):
+        output = subprocess.run(cmd + args + flags, cwd=cwd, env=env, check=True, capture_output=True, text=True,
+                                timeout=300).stdout.splitlines()
+        return [line for line in output if "Fs from" in line]
+
+    for cmd, name in ([c_bin], "c"), ([sys.executable, "-m", "nanobrag_torch"], "py"):
+        cwd = tmp_path / name
+        cwd.mkdir()
+        assert lines(cmd, cwd, ["-default_F", "100"]) == []
+        lines(cmd, cwd, ["-hkl", str(hkl)])
+        assert lines(cmd, cwd, ["-default_F", "100"]) == ["reading Fs from Fdump.bin"]
+        lines(cmd, cwd, ["-hkl", str(hkl), "-dumpfile", "other.bin"])
+        assert lines(cmd, cwd, ["-dumpfile", "other.bin"]) == ["reading Fs from other.bin"]
+    assert (tmp_path / "py" / "f.bin").stat().st_size == (tmp_path / "c" / "f.bin").stat().st_size
+
+
 @pytest.mark.parametrize("default_F", [[], ["-default_F", "7"]], ids=["no-default-F", "default-F"])
 def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
     c_bin = c_binary()
@@ -300,19 +326,6 @@ def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
     c_dir, py_dir = tmp_path / "c", tmp_path / "py"
     c_dir.mkdir()
     py_dir.mkdir()
-@pytest.mark.parametrize("extra", [
-    [], ["-denzo"], ["-adxv"], ["-xds"], ["-dials"],
-    ["-Xbeam", "2", "-Ybeam", "4.5"], ["-Xbeam", "2", "-Ybeam", "4.5", "-adxv"], ["-Xbeam", "2", "-Ybeam", "4.5", "-xds"],
-    ["-twotheta", "10"], ["-twotheta", "10", "-xds"], ["-detector_rotx", "3", "-detector_roty", "2"],
-    ["-detector_rotz", "5", "-xds"], ["-ORGX", "10", "-ORGY", "12", "-xds"], ["-Xclose", "5", "-Yclose", "3", "-xds"],
-    ["-phi", "5", "-osc", "1", "-phisteps", "2"], ["-distance", "123.456", "-pixel", "0.172"],
-    ["-close_distance", "90", "-detector_rotx", "5"],
-], ids=lambda extra: " ".join(extra) or "defaults")
-def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
-    args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 32 "
-            "-oversample 1 -nopgm -nonoise -intfile i.img -floatfile f.bin").split() + extra
-
-
     first = ["-hkl", str(hkl), "-floatfile", "f.bin"]
     subprocess.run([c_bin] + args + first, cwd=c_dir, env=env, check=True, capture_output=True, timeout=300)
     subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + first, cwd=py_dir, env=env, check=True,
@@ -323,6 +336,28 @@ def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
     subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + ["-floatfile", "g.bin"], cwd=py_dir, env=env,
                    check=True, capture_output=True, timeout=300)
     assert (py_dir / "g.bin").read_bytes() == (py_dir / "f.bin").read_bytes()
+
+
+@pytest.mark.parametrize("extra", [
+    [], ["-denzo"], ["-adxv"], ["-xds"], ["-dials"],
+    ["-Xbeam", "2", "-Ybeam", "4.5"], ["-Xbeam", "2", "-Ybeam", "4.5", "-adxv"], ["-Xbeam", "2", "-Ybeam", "4.5", "-xds"],
+    ["-twotheta", "10"], ["-twotheta", "10", "-xds"], ["-detector_rotx", "3", "-detector_roty", "2"],
+    ["-detector_rotz", "5", "-xds"], ["-ORGX", "10", "-ORGY", "12", "-xds"], ["-Xclose", "5", "-Yclose", "3", "-xds"],
+    ["-phi", "5", "-osc", "1", "-phisteps", "2"], ["-distance", "123.456", "-pixel", "0.172"],
+    ["-close_distance", "90", "-detector_rotx", "5"],
+    # These land next to a %g rounding boundary, where float32 radians move the last digit
+    ["-twotheta", "20", "-detector_rotx", "3", "-detector_roty", "4", "-detector_rotz", "5"],
+    "-xds -distance 194.238 -detector_rotx -0.303 -detector_roty -6.067 -detector_rotz 0.051 -twotheta -15.657".split(),
+    "-distance 286.3 -detector_rotx 6.1 -detector_roty -1.0 -detector_rotz 4.2 -twotheta -9.258".split(),
+    # A zero's sign: C's dot products give +0 in DIALS_ORIGIN, and -phi -0 prints -0
+    "-adxv -Xbeam 0 -Ybeam 0".split(), "-xds -ORGX 0.5 -ORGY 0.5".split(), "-dials -ORGX 0.5 -ORGY 0.5".split(),
+    "-phi -0 -osc 0".split(),
+    "-Xbeam 5 -Ybeam 7 -adxv".split(),
+    "-Xbeam 5 -Ybeam 7 -xds -detpixels_f 40 -detpixels_s 20 -pixel 0.5".split(),
+], ids=lambda extra: " ".join(extra) or "defaults")
+def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
+    args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 32 "
+            "-oversample 1 -nopgm -nonoise -intfile i.img -floatfile f.bin").split() + extra
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), KMP_DUPLICATE_LIB_OK="TRUE", NANOBRAGG_DISABLE_COMPILE="1")
     c_dir, py_dir = tmp_path / "c", tmp_path / "py"
     c_dir.mkdir()

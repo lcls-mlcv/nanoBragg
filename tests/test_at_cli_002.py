@@ -21,6 +21,8 @@ import tempfile
 from pathlib import Path
 import struct
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 
 class TestAT_CLI_002:
     """Test minimal CLI render with outputs."""

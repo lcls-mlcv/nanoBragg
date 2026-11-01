@@ -490,6 +490,9 @@ def compute_physics_for_position(
     return intensity, intensity_pre_polar
 
 
+R_E_SQR = 7.94079248018965e-30  # classical electron radius squared (meters squared)
+
+
 @dataclass
 class PanelPixels:
     """Pixels of several planar panels of one pixel size, for a single kernel call.
@@ -620,13 +623,14 @@ class Simulator:
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
-        self.r_e_sqr = torch.tensor(
-            7.94079248018965e-30, device=self.device, dtype=self.dtype  # classical electron radius squared (meters squared)
-        )
+        self.r_e_sqr = torch.tensor(R_E_SQR, device=self.device, dtype=self.dtype)
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
         self.fluence = as_tensor_preserving_grad(
             self.beam_config.fluence, device=self.device, dtype=self.dtype
+        )
+        self._fluence_double = as_tensor_preserving_grad(
+            self.beam_config.fluence, device=self.device, dtype=torch.float64
         )
         # Polarization setup from beam config
         # PERF-PYTORCH-006: Store as tensor with correct dtype
@@ -786,6 +790,20 @@ class Simulator:
             self._source_wavelengths_A = self._source_wavelengths * 1e10
         if self._source_directions is not None and source_weights is not None:
             self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+
+    @property
+    def fluence(self) -> torch.Tensor:
+        """Photons per square metre, in the run's dtype. The scale uses it in double."""
+        return self._fluence
+
+    @fluence.setter
+    def fluence(self, value: torch.Tensor) -> None:
+        self._fluence = value
+        self._fluence_double = value.to(torch.float64)
+
+    def _r_e_sqr_fluence(self) -> torch.Tensor:
+        """r_e^2*fluence as a double tensor, whatever the run's dtype."""
+        return torch.tensor(R_E_SQR, device=self.device, dtype=torch.float64) * self._fluence_double
 
     def _weights_for_kernel(self) -> Optional[torch.Tensor]:
         """Per-source multipliers, or None for C's equal weighting.
@@ -1583,13 +1601,14 @@ class Simulator:
         # ```
         #
         # Units: [dimensionless] / [dimensionless] × [m²] × [photons/m²] = [photons·m²]
-        # r_e^2*fluence first: normalized_intensity*r_e^2 underflows float32 for weak F.
+        # In double, as in C: r_e^2*fluence, or either factor with the image, can leave float32
+        # at a weak F or a low or high fluence while the pixel itself fits.
         physical_intensity = (
-            normalized_intensity
+            normalized_intensity.to(torch.float64)
             / steps
-            * (self.r_e_sqr * self.fluence)
+            * self._r_e_sqr_fluence()
             * getattr(self.beam_config, "spot_scale", 1.0)
-        )
+        ).to(self.dtype)
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -2268,8 +2287,7 @@ class Simulator:
         # Note: The 1e6 factor creates unit inconsistency but matches C code
         I_bg = (
             F_bg * F_bg
-            * self.r_e_sqr
-            * self.fluence
+            * self._r_e_sqr_fluence()
             * (water_size_m ** 3)
             * 1e6
             * Avogadro
@@ -2495,13 +2513,16 @@ class Simulator:
         if roi_ymax is not None:
             roi_mask[roi_ymax+1:, :] = False
 
+        # C's rmsd loop tests the ROI and not the mask (nanoBragg.c:3117-3128)
+        rmsd_pixels = float_image[roi_mask].to(torch.float64)
+
         # Apply external mask if provided
         if self.detector.config.mask_array is not None:
             if self.detector.config.mask_array.shape == float_image.shape:
                 roi_mask = roi_mask & (self.detector.config.mask_array > 0)
 
-        # Get masked pixels
-        masked_pixels = float_image[roi_mask]
+        # Get masked pixels, in double as C sums them: a float32 square underflows on a faint image
+        masked_pixels = float_image[roi_mask].to(torch.float64)
         N = masked_pixels.numel()
 
         if N == 0:
@@ -2519,7 +2540,9 @@ class Simulator:
             }
 
         # Find maximum value and its location
-        max_I = masked_pixels.max().item()
+        # C's max_I only moves on `>`, so a NaN pixel is passed over
+        comparable_pixels = masked_pixels[~torch.isnan(masked_pixels)]
+        max_I = comparable_pixels.max().item() if comparable_pixels.numel() else 0.0
 
         # Find the last occurrence of the maximum value in the full image
         # This matches C behavior of "last set" location
@@ -2544,25 +2567,14 @@ class Simulator:
         # Compute mean
         mean = masked_pixels.mean().item()
 
-        # Compute RMS = sqrt(sum(pixel^2)/(N - 1))
-        # Note: Using N-1 for unbiased estimate per spec
-        if N > 1:
-            # math.sqrt on the Python float rather than torch.sqrt(torch.tensor(x)):
-            # the latter builds a tensor in the default dtype, which is float32,
-            # so a float64 sum was rounded to ~7 significant digits on its way
-            # back out. RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the
-            # PGM is byte-compared against C, where a boundary pixel could flip on
-            # that rounding.
-            sum_sq = (masked_pixels ** 2).sum().item()
-            RMS = math.sqrt(sum_sq / (N - 1))
-
-            # Compute RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
-            sum_dev_sq = ((masked_pixels - mean) ** 2).sum().item()
-            RMSD = math.sqrt(sum_dev_sq / (N - 1))
-        else:
-            # N=1 case: avoid division by zero
-            RMS = masked_pixels[0].item()
-            RMSD = 0.0
+        # Compute RMS = sqrt(sum(pixel^2)/(N - 1)), and RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
+        # with C's `if(sumn<=1) sumn=2`. math.sqrt on the Python float rather than
+        # torch.sqrt(torch.tensor(x)): the latter builds a tensor in the default dtype, which is
+        # float32, so a float64 sum was rounded to ~7 significant digits on its way back out.
+        # RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the PGM is byte-compared against
+        # C, where a boundary pixel could flip on that rounding.
+        RMS = math.sqrt((masked_pixels ** 2).sum().item() / (max(N, 2) - 1))
+        RMSD = math.sqrt(((rmsd_pixels - mean) ** 2).sum().item() / (max(rmsd_pixels.numel(), 2) - 1))
 
         return {
             "max_I": max_I,

@@ -12,12 +12,34 @@ from typing import Dict, Optional, Tuple
 import torch
 
 
+def read_smv_header_block(handle) -> str:
+    """Read the header from an SMV file open at its start, leaving it at the first pixel.
+
+    Like nanoBragg.c:4153-4187: take 512 bytes, then HEADER_BYTES if that says otherwise.
+    """
+    header_text = handle.read(512).decode("ascii", errors="ignore")
+    header_size = value_of("HEADER_BYTES", header_text)
+    if not math.isnan(header_size) and header_size > 512:
+        header_text += handle.read(int(header_size) - 512).decode("ascii", errors="ignore")
+    return header_text
+
+
+def _parse_smv_keys(header_content: str) -> Dict[str, str]:
+    """Parse key=value pairs. A line ends one as well as a semicolon: DIALS_ORIGIN has none in C."""
+    header_dict = {}
+    for line in re.split("[;\n]", header_content):
+        if "=" in line:
+            key, value = line.split("=", 1)
+            header_dict[key.strip()] = value.strip()
+    return header_dict
+
+
 def parse_smv_header(filename: str) -> Dict[str, str]:
     """Parse SMV header from a file.
 
     Per spec AT-CLI-004 and AT-IO-001:
     - SMV files have ASCII header followed by binary data
-    - Header is exactly 512 bytes
+    - Header is 512 bytes, or the larger size in HEADER_BYTES
     - Contains key=value pairs separated by semicolons
     - Can be used for both -img and -mask files
 
@@ -36,9 +58,7 @@ def parse_smv_header(filename: str) -> Dict[str, str]:
         raise FileNotFoundError(f"SMV file not found: {filename}")
 
     with open(path, "rb") as f:
-        # Read header (exactly 512 bytes per SMV spec)
-        header_bytes = f.read(512)
-        header_str = header_bytes.decode("ascii", errors="ignore")
+        header_str = read_smv_header_block(f)
 
         # Find header content between { and }
         start_idx = header_str.find("{")
@@ -49,15 +69,7 @@ def parse_smv_header(filename: str) -> Dict[str, str]:
 
         header_content = header_str[start_idx+1:end_idx]
 
-        # Parse key=value pairs
-        header_dict = {}
-        for line in header_content.split(";"):
-            line = line.strip()
-            if "=" in line:
-                key, value = line.split("=", 1)
-                header_dict[key.strip()] = value.strip()
-
-    return header_dict
+        return _parse_smv_keys(header_content)
 
 
 def read_smv_header_text(filename: str) -> str:
@@ -70,7 +82,7 @@ def read_smv_header_text(filename: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"SMV file not found: {filename}")
     with open(path, "rb") as f:
-        return f.read(512).decode("ascii", errors="ignore")
+        return read_smv_header_block(f)
 
 
 def _c_atof(text: str) -> float:
@@ -219,12 +231,7 @@ def read_smv_mask(filename: str) -> Tuple[torch.Tensor, dict]:
         raise FileNotFoundError(f"Mask file not found: {filename}")
 
     with open(path, "rb") as f:
-        # Read header (up to 512 bytes per SMV spec)
-        header_bytes = f.read(512)
-        header_str = header_bytes.decode("ascii", errors="ignore")
-
-        # Parse header into dict
-        header_dict = {}
+        header_str = read_smv_header_block(f)
 
         # Find header content between { and }
         start_idx = header_str.find("{")
@@ -235,12 +242,7 @@ def read_smv_mask(filename: str) -> Tuple[torch.Tensor, dict]:
 
         header_content = header_str[start_idx+1:end_idx]
 
-        # Parse key=value pairs
-        for line in header_content.split(";"):
-            line = line.strip()
-            if "=" in line:
-                key, value = line.split("=", 1)
-                header_dict[key.strip()] = value.strip()
+        header_dict = _parse_smv_keys(header_content)
 
         # Extract dimensions
         if "SIZE1" not in header_dict or "SIZE2" not in header_dict:

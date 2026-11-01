@@ -40,6 +40,8 @@ from src.nanobrag_torch.config import DetectorConfig, CrystalConfig, BeamConfig,
 from src.nanobrag_torch.models.detector import Detector
 from src.nanobrag_torch.models.crystal import Crystal
 from src.nanobrag_torch.simulator import Simulator
+
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
 # from src.nanobrag_torch.io.hkl import create_simple_hkl_data  # Not needed for these tests
 
 

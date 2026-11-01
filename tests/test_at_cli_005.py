@@ -13,6 +13,9 @@ import subprocess
 import tempfile
 import numpy as np
 from pathlib import Path
+import pytest
+
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
 
 # Set environment variable for MKL
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'

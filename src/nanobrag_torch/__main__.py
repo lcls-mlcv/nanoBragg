@@ -9,6 +9,7 @@ mapping command-line flags to engine parameters per spec requirements.
 import os
 import sys
 import argparse
+import copy
 import logging
 import math
 import re
@@ -41,7 +42,7 @@ from .utils.units import (
     mm_to_meters, micrometers_to_meters, degrees_to_radians,
     angstroms_to_meters, mrad_to_radians
 )
-from .utils.noise import c_noise_image, generate_poisson_noise
+from .utils.noise import c_noise_image, fast_noise_image, roi_pixels
 from .utils.auto_selection import (
     auto_select_divergence, auto_select_dispersion,
     generate_sources_from_divergence_dispersion
@@ -1086,6 +1087,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         except OSError:
             print(f"WARNING: unable to open dump file: {args.dumpfile}")
     elif Path(args.dumpfile).exists():
+        # A leftover cache overrides -default_F, as in C, so say so with C's line (nanoBragg.c:2109)
+        print(f"reading Fs from {args.dumpfile}")
         config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F,
                                                    dtype=torch.float64)
 
@@ -1230,7 +1233,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['misset_seed'] = args.misset_seed
 
     # Phi rotation: -osc/-phistep/-phisteps are resolved together, as in nanoBragg.c
-    config['phi_deg'] = args.phi if args.phi else 0.0
+    config['phi_deg'] = args.phi if args.phi is not None else 0.0
     config['osc_deg'], config['phi_step_deg'], config['phi_steps'] = resolve_phi_sampling(args)
 
     # Sampling
@@ -1318,7 +1321,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['scale'] = args.scale
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
-    config['seed'] = args.seed if args.seed is not None else int(-time.time())
+    config['seed'] = args.seed if args.seed is not None else int(time.time())  # C: seed = -time, flag negated
     config['fast_noise'] = args.fast_noise
 
     # Sourcefile (store path for later processing)
@@ -1833,7 +1836,8 @@ def build_simulation(
 
 def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig) -> Dict[str, Any]:
     """Header values for write_smv, with Xbeam and Ybeam as nanoBragg.c:1190-1250 leaves them."""
-    size_s = detector_config.spixels * detector_config.pixel_size_mm
+    # C's detsize_s, which stays what was asked for when that isn't a whole number of pixels
+    size_s = config.get('detsize_s_mm', detector_config.spixels * detector_config.pixel_size_mm)
     convention = detector_config.detector_convention
     if convention in (DetectorConvention.MOSFLM, DetectorConvention.DENZO):
         xbeam, ybeam = detector_config.beam_center_s, detector_config.beam_center_f
@@ -1844,7 +1848,14 @@ def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig)
         sclose = config.get('close_center_s_mm', detector_config.beam_center_s)
         xbeam = config.get('beam_center_x_mm', config.get('xclose_mm', fclose))
         ybeam = config.get('beam_center_y_mm', config.get('yclose_mm', sclose))
-    return smv_geometry(Detector(detector_config, dtype=torch.float64), float(xbeam), float(ybeam), size_s)
+    # As doubles, as in C: degrees_to_radians goes through float32 for a Python float, which
+    # moves the 6th digit of a rotated header. A float64 tensor stays double. Rendering keeps
+    # its own Detector.
+    exact = copy.copy(detector_config)
+    for angle in ('detector_rotx_deg', 'detector_roty_deg', 'detector_rotz_deg', 'detector_twotheta_deg'):
+        setattr(exact, angle, torch.tensor(float(getattr(detector_config, angle)), dtype=torch.float64))
+    return smv_geometry(Detector(exact, dtype=torch.float64), float(xbeam), float(ybeam), size_s,
+                        detector_config.pixel_size_mm)
 
 
 class _PrintHandler(logging.Handler):
@@ -1904,8 +1915,12 @@ def main():
 
         intensity = simulator.run(pixel_batch_size=args.pixel_batch_size)
 
+        # Every output comes from C's float image: float32 pixels, then used as doubles
+        with np.errstate(over='ignore'):
+            float_image = intensity.detach().cpu().numpy().astype(np.float32)
+
         # Compute statistics
-        stats = simulator.compute_statistics(intensity)
+        stats = simulator.compute_statistics(torch.from_numpy(float_image).to(intensity.device))
         print(f"\nStatistics:")
         print(f"  Max intensity: {stats['max_I']:.3e} at pixel ({stats['max_I_slow']}, {stats['max_I_fast']})")
         print(f"  Mean: {stats['mean']:.3e}")
@@ -1915,8 +1930,7 @@ def main():
         # Write outputs
         if config.get('floatfile'):
             # Write raw float image
-            data = intensity.cpu().numpy().astype(np.float32)
-            data.tofile(config['floatfile'])
+            float_image.tofile(config['floatfile'])
             print(f"Wrote float image to {config['floatfile']}")
 
         # Resolve the integer-image scale once, before either the int or the PGM
@@ -1931,35 +1945,22 @@ def main():
             # it into the scale made every pixel disagree with C. Measured on a
             # default 32x32 run before this fix: 1024/1024 pixels differed,
             # max |delta| = 41 counts, C peak 55040 against torch 55000.
-            max_val = intensity.max().item()
+            # max_I only ever moves on `>`, so NaN pixels don't reach it.
+            max_val = float(np.nanmax(float_image, initial=0.0))
             intfile_scale = 55000.0 / max_val if max_val > 0 else 1.0
 
         header_geometry = smv_header_geometry(config, detector_config)
 
         if config.get('intfile'):
-            # Scale and write SMV per AT-CLI-006
+            # nanoBragg.c:3152-3168: every pixel of the ROI, in double, to floorf(test + 0.5)
             scale = intfile_scale
-
-            # Apply scaling per spec: integer pixel = floor(min(65535, float*scale + adc))
-            # Only apply to non-zero pixels (AT-CLI-005)
-            # Pixels outside ROI should remain zero
-            threshold = 1e-10
-            roi_mask = intensity > threshold
-
-            # Calculate scaled values
-            scaled = intensity * scale + adc_offset
-            # Only apply scaling where intensity > 0 (inside ROI)
-            scaled = torch.where(roi_mask, scaled, torch.zeros_like(scaled))
-            # C rounds: intimage = (unsigned short)(floorf(test + 0.5))
-            # (nanoBragg.c:3167). This used to truncate, a systematic -0.5 ADU
-            # bias on every pixel. floor(x + 0.5) is round-half-UP, which is not
-            # torch.round's round-half-to-even, so spell it out.
-            scaled = scaled.clip(0, 65535)
-            # int32 then uint16: the old int16 cast relied on two's-complement
-            # wrapping for values above 32767 and happened to round-trip.
-            scaled_int = (
-                torch.floor(scaled + 0.5).to(torch.int32).cpu().numpy().astype(np.uint16)
-            )
+            test = np.clip(float_image.astype(np.float64) * scale + adc_offset, 0.0, 65535.0)
+            # floorf: its double argument is rounded to float first. That is the round-half-up
+            # C wants, which np.round isn't. A NaN pixel comes out as 0.
+            scaled_int = np.nan_to_num(np.floor((test + 0.5).astype(np.float32))).astype(np.uint16)
+            scaled_int = scaled_int * roi_pixels(float_image.shape, (
+                detector_config.roi_xmin, detector_config.roi_xmax,
+                detector_config.roi_ymin, detector_config.roi_ymax))
 
             write_smv(
                 filepath=config['intfile'],
@@ -1967,8 +1968,8 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=header_geometry['xbeam_mm'],
-                beam_center_y_mm=header_geometry['ybeam_mm'],
+                beam_center_x_mm=float(header_geometry['xbeam_m']) * 1000.0,
+                beam_center_y_mm=float(header_geometry['ybeam_m']) * 1000.0,
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
@@ -2015,27 +2016,25 @@ def main():
                     # -roi 17 17 17 17 (one pixel, so rmsd is 0 in both): C wrote
                     # "# pixels scaled by 7570.47" where torch wrote 1.
                     pgmscale = intfile_scale
-            write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
+            write_pgm(config['pgmfile'], float_image, pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 
         # CLI-FLAGS-003: Honor -nonoise flag
         if config.get('noisefile') and not config.get('suppress_noise', False):
             # Generate and write noise image
             adc = config.get('adc', 40.0)
-            xmin, xmax = detector_config.roi_xmin, detector_config.roi_xmax
-            ymin, ymax = detector_config.roi_ymin, detector_config.roi_ymax
+            roi = (detector_config.roi_xmin, detector_config.roi_xmax,
+                   detector_config.roi_ymin, detector_config.roi_ymax)
             if config.get('fast_noise'):
-                noisy, overloads = generate_poisson_noise(
-                    intensity, seed=config.get('seed'), adc_offset=adc, readout_noise=0.0
-                )
-                in_roi = np.zeros(noisy.shape, dtype=np.uint16)
-                in_roi[ymin:ymax + 1, xmin:xmax + 1] = 1
-                noisy_int = noisy.to(torch.int32).cpu().numpy().astype(np.uint16) * in_roi
+                noisy_int, photons, overloads = fast_noise_image(intensity, config['seed'], adc, roi)
             else:
                 noisy_int, photons, overloads = c_noise_image(
-                    intensity.detach().cpu().numpy(), config['seed'], adc, roi=(xmin, xmax, ymin, ymax)
+                    intensity.detach().cpu().numpy(), config['seed'], adc, roi,
+                    mosaic_seed=config.get('mosaic_seed', 12345678),
+                    mosaic_domains=config['mosaic_domains'],
+                    misset_seed=(config.get('misset_seed', config['seed']) if config.get('misset_random') else None),
                 )
-                print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
+            print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
 
             write_smv(
                 filepath=config['noisefile'],
@@ -2043,8 +2042,8 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=header_geometry['xbeam_mm'],
-                beam_center_y_mm=header_geometry['ybeam_mm'],
+                beam_center_x_mm=float(header_geometry['xbeam_m']) * 1000.0,
+                beam_center_y_mm=float(header_geometry['ybeam_m']) * 1000.0,
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),

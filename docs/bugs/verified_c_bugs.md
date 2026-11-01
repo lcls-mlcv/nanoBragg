@@ -43,3 +43,7 @@ for the others. torchBragg computes it per source, which is what C does with
 `-oversample_polar`. The difference grows with the angle between sources: 2.4% in sum for two
 sources 17 degrees apart (`-sourcefile` with the second at -1 0.3 0), none with `-oversample_polar`.
 The oracle keeps this, because it is an approximation and not an error in the arithmetic.
+
+## SMV header longer than 512 bytes
+
+Rotated or long-numbered geometry can take the `%g` header text past 512 bytes. `nanoBragg.c:3179-3198` writes it all under `HEADER_BYTES=512`, so the pixels start late and any reader misplaces them; torchBragg pads to the next multiple of 512 and declares that size, and every other file stays byte-identical to C.

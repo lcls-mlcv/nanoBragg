@@ -12,6 +12,8 @@ from typing import Optional, Dict, Any, Union, Tuple
 import numpy as np
 import torch
 
+from .mask import read_smv_header_block
+
 
 def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Read an SMV format file.
@@ -27,9 +29,7 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     filepath = Path(filepath)
 
     with open(filepath, 'rb') as f:
-        # Read the 512-byte header
-        header_bytes = f.read(512)
-        header_text = header_bytes.decode('ascii', errors='ignore')
+        header_text = read_smv_header_block(f)
 
         # Parse header into dictionary
         header = {}
@@ -45,10 +45,9 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
         header_content = header_text[start+1:end]
         for line in header_content.split('\n'):
             line = line.strip()
-            if '=' in line and line.endswith(';'):
-                # Remove trailing semicolon
-                line = line[:-1]
-                key, value = line.split('=', 1)
+            if '=' in line:
+                # DIALS_ORIGIN has no semicolon in nanoBragg.c
+                key, value = line.rstrip(';').split('=', 1)
                 header[key.strip()] = value.strip()
 
         # Extract dimensions
@@ -102,37 +101,46 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     return image_data, header
 
 
+def _dials_origin_mm(pix0) -> Tuple[float, float, float]:
+    """C's dot products of pix0 with (0,0,1), (0,1,0) and (-1,0,0), whose sum sets the sign of a zero."""
+    x, y, z = pix0
+    return 1000.0 * (0.0 * x + 0.0 * y + z), 1000.0 * (0.0 * x + y + 0.0 * z), 1000.0 * (-x + 0.0 * y + 0.0 * z)
+
+
 def _smv_geometry_defaults(xbeam_mm, ybeam_mm, distance_mm, close_distance_mm, detsize_s_mm, pixel_size_mm) -> dict:
-    """Header geometry of an unrotated MOSFLM detector: Fbeam = Ybeam and Sbeam = Xbeam."""
+    """Header geometry of an unrotated MOSFLM detector, in metres (nanoBragg.c:1200-1201, 1745-1760)."""
+    pixel_m, distance_m = pixel_size_mm / 1000.0, distance_mm / 1000.0
+    fbeam_m, sbeam_m = ybeam_mm / 1000.0 + 0.5 * pixel_m, xbeam_mm / 1000.0 + 0.5 * pixel_m
     return dict(
-        xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm, fbeam_mm=ybeam_mm, sbeam_mm=xbeam_mm,
-        distance_mm=distance_mm,
-        close_distance_mm=distance_mm if close_distance_mm is None else close_distance_mm,
-        detsize_s_mm=detsize_s_mm,
-        orgx=ybeam_mm / pixel_size_mm + 0.5, orgy=xbeam_mm / pixel_size_mm + 0.5,
-        dials_origin_mm=(-ybeam_mm, xbeam_mm, -distance_mm),
+        xbeam_m=xbeam_mm / 1000.0, ybeam_m=ybeam_mm / 1000.0, fbeam_m=fbeam_m, sbeam_m=sbeam_m,
+        distance_m=distance_m,
+        close_distance_m=distance_m if close_distance_mm is None else close_distance_mm / 1000.0,
+        detsize_s_m=detsize_s_mm / 1000.0,
+        orgx=fbeam_m / pixel_m + 0.5, orgy=sbeam_m / pixel_m + 0.5,
+        dials_origin_mm=_dials_origin_mm((distance_m, sbeam_m, -fbeam_m)),
     )
 
 
-def smv_geometry(detector, xbeam_mm: float, ybeam_mm: float, detsize_s_mm: float) -> dict:
+def smv_geometry(detector, xbeam_mm: float, ybeam_mm: float, detsize_s_mm: float, pixel_size_mm: float) -> dict:
     """
     Header values for write_smv, from the detector after its rotations (nanoBragg.c:1745-1770).
 
     Fbeam, Sbeam and ORGX are read back off the final geometry, so they differ from the
     beam centre that was asked for once the detector is rotated. Xbeam and Ybeam are as given.
+    Lengths are in metres, as C holds them, because write_smv's sums must round as C's do.
     """
     pix0, fdet, sdet, odet = detector.pix0_vector, detector.fdet_vec, detector.sdet_vec, detector.odet_vec
     close = torch.dot(pix0, odet)
     distance = close / detector.r_factor
     spot = distance * detector.beam_vector - pix0
-    pixel_m = detector.pixel_size
+    pixel_m = pixel_size_mm / 1000.0
     return dict(
-        xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm,
-        fbeam_mm=torch.dot(fdet, spot).item() * 1000, sbeam_mm=torch.dot(sdet, spot).item() * 1000,
-        distance_mm=distance.item() * 1000, close_distance_mm=close.item() * 1000,
-        detsize_s_mm=detsize_s_mm,
+        xbeam_m=xbeam_mm / 1000.0, ybeam_m=ybeam_mm / 1000.0,
+        fbeam_m=torch.dot(fdet, spot).item(), sbeam_m=torch.dot(sdet, spot).item(),
+        distance_m=distance.item(), close_distance_m=close.item(),
+        detsize_s_m=detsize_s_mm / 1000.0,
         orgx=(-torch.dot(pix0, fdet) / pixel_m + 0.5).item(), orgy=(-torch.dot(pix0, sdet) / pixel_m + 0.5).item(),
-        dials_origin_mm=(pix0[2].item() * 1000, pix0[1].item() * 1000, -pix0[0].item() * 1000),
+        dials_origin_mm=_dials_origin_mm(pix0.tolist()),
     )
 
 
@@ -161,7 +169,7 @@ def write_smv(
     """Write image data in SMV format, with the header nanoBragg.c writes.
 
     The SMV format consists of:
-    1. A 512-byte text header with metadata
+    1. A text header with metadata, 512 bytes unless the text needs more (see below)
     2. Binary image data in fast-major (row-wise) order
 
     Args:
@@ -188,7 +196,8 @@ def write_smv(
             they are worked out for an unrotated MOSFLM detector from the beam centre.
 
     Per spec AT-IO-001:
-    - Header closed with "}\\f" and padded with spaces to 512 bytes
+    - Header closed with "}\\f" and padded with spaces to 512 bytes, or to the next multiple
+      of 512 given in HEADER_BYTES when the text is longer
     - Data is fast-major (row-wise) with pixel index = slow*fpixels + fast
     """
     filepath = Path(filepath)
@@ -204,35 +213,42 @@ def write_smv(
     # Image dimensions (slow, fast)
     spixels, fpixels = image_data.shape
 
+    pixel_m = pixel_size_mm / 1000.0
     g = _smv_geometry_defaults(beam_center_x_mm, beam_center_y_mm, distance_mm, close_distance_mm,
                                spixels * pixel_size_mm, pixel_size_mm)
     g.update(geometry or {})
     dials = g['dials_origin_mm']
     # The layout of nanoBragg.c:3178-3197. DIALS_ORIGIN has no semicolon there.
-    header_str = (
-        "{\nHEADER_BYTES=512;\nDIM=2;\n"
+    header_body = (
+        "DIM=2;\n"
         f"BYTE_ORDER={byte_order};\nTYPE={data_type};\n"
         f"SIZE1={fpixels};\nSIZE2={spixels};\n"
-        f"PIXEL_SIZE={pixel_size_mm:g};\nDISTANCE={g['distance_mm']:g};\n"
+        f"PIXEL_SIZE={pixel_m * 1000.0:g};\nDISTANCE={g['distance_m'] * 1000.0:g};\n"
         f"WAVELENGTH={wavelength_angstrom:g};\n"
-        f"BEAM_CENTER_X={g['xbeam_mm']:g};\nBEAM_CENTER_Y={g['ybeam_mm']:g};\n"
-        f"ADXV_CENTER_X={g['fbeam_mm']:g};\nADXV_CENTER_Y={g['detsize_s_mm'] - g['sbeam_mm']:g};\n"
-        f"MOSFLM_CENTER_X={g['sbeam_mm'] - 0.5 * pixel_size_mm:g};\n"
-        f"MOSFLM_CENTER_Y={g['fbeam_mm'] - 0.5 * pixel_size_mm:g};\n"
-        f"DENZO_X_BEAM={g['sbeam_mm']:g};\nDENZO_Y_BEAM={g['fbeam_mm']:g};\n"
+        f"BEAM_CENTER_X={g['xbeam_m'] * 1000.0:g};\nBEAM_CENTER_Y={g['ybeam_m'] * 1000:g};\n"
+        f"ADXV_CENTER_X={g['fbeam_m'] * 1000.0:g};\nADXV_CENTER_Y={(g['detsize_s_m'] - g['sbeam_m']) * 1000:g};\n"
+        f"MOSFLM_CENTER_X={(g['sbeam_m'] - 0.5 * pixel_m) * 1000.0:g};\n"
+        f"MOSFLM_CENTER_Y={(g['fbeam_m'] - 0.5 * pixel_m) * 1000:g};\n"
+        f"DENZO_X_BEAM={(g['sbeam_m'] - 0.0 * pixel_m) * 1000.0:g};\nDENZO_Y_BEAM={(g['fbeam_m'] - 0.0 * pixel_m) * 1000:g};\n"
         f"DIALS_ORIGIN={dials[0]:g},{dials[1]:g},{dials[2]:g}\n"
         f"XDS_ORGX={g['orgx']:g};\nXDS_ORGY={g['orgy']:g};\n"
-        f"CLOSE_DISTANCE={g['close_distance_mm']:g};\n"
-        f"PHI={phi_deg or 0.0:g};\nOSC_START={(osc_start_deg or 0.0):g};\nOSC_RANGE={(osc_range_deg or 0.0):g};\n"
+        f"CLOSE_DISTANCE={g['close_distance_m'] * 1000.0:g};\n"
+        f"PHI={0.0 if phi_deg is None else phi_deg:g};\nOSC_START={0.0 if osc_start_deg is None else osc_start_deg:g};\n"
+        f"OSC_RANGE={0.0 if osc_range_deg is None else osc_range_deg:g};\n"
         f"TWOTHETA={twotheta_deg:g};\n"
         f"DETECTOR_SN={detector_sn};\nBEAMLINE={beamline};\n"
         "}\f"
     )
-    header_bytes = header_str.encode("ascii")
-
-    if len(header_bytes) > 512:
-        raise ValueError(f"Header too large: {len(header_bytes)} > 512 bytes")
-    header_bytes = header_bytes.ljust(512, b' ')
+    # %g can take the text past 512 bytes. C then writes it all and still declares 512, which
+    # puts the pixels where no reader looks (docs/bugs/verified_c_bugs.md), so grow the block
+    # to the next multiple of 512 and declare that. Up to 512 this is C's header, byte for byte.
+    header_size = 512
+    while True:
+        header_bytes = f"{{\nHEADER_BYTES={header_size};\n{header_body}".encode("ascii")
+        if len(header_bytes) <= header_size:
+            break
+        header_size = (len(header_bytes) + 511) // 512 * 512
+    header_bytes = header_bytes.ljust(header_size, b' ')
 
     # Convert image data based on data type
     if data_type == "unsigned_short":
