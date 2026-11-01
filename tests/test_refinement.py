@@ -137,3 +137,38 @@ def test_a_model_of_rois_holds_no_full_image_for_its_mask():
     model = _model(background_rois=ROIS)
     model(roi_only=True)
     assert model._simulator._cached_roi_mask.untyped_storage().nbytes() <= 8
+
+
+def _two_terms():
+    model = _model(background_rois=ROIS)
+    model.freeze().refine("scale")
+    return model, lambda: model(roi_only=True).sum()
+
+
+def test_each_term_frees_its_graph_before_the_next_starts():
+    model, term = _two_terms()
+    earlier = []
+
+    def second():
+        with pytest.raises(RuntimeError, match="second time"):
+            earlier[-1].backward()
+        return term()
+
+    def first():
+        earlier.append(term())
+        return earlier[-1]
+
+    refine_lbfgsb(model, [first, second], maxiter=1)
+
+
+def test_a_term_of_nothing_trainable_counts_in_the_loss():
+    model, term = _two_terms()
+    together = refine_lbfgsb(model, [term, lambda: torch.tensor(5.0, dtype=DTYPE)], maxiter=1)
+    model, term = _two_terms()
+    assert together.fun == pytest.approx(refine_lbfgsb(model, lambda: term() + 5.0, maxiter=1).fun)
+
+
+def test_an_empty_list_of_terms_is_an_error():
+    model, _ = _two_terms()
+    with pytest.raises(ValueError, match="empty"):
+        refine_lbfgsb(model, [])

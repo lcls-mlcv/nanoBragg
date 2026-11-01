@@ -176,8 +176,9 @@ def stage_real(args):
     os.chdir(args.outdir)
     with DeviceWrapper(0):
         frame = args.frame - expt.scan.get_image_range()[0]  # scan point at the start of the frame
+        index = args.frame - 1  # angles and reflection z use the array index, counted from image 1
         # A rotating frame starts at that scan point and turns through the oscillation.
-        angle = expt.scan.get_angle_from_array_index(frame + (0 if args.phi_steps else 0.5), deg=True)
+        angle = expt.scan.get_angle_from_array_index(index + (0 if args.phi_steps else 0.5), deg=True)
         gonio = expt.goniometer
         S, F = sqr(gonio.get_setting_rotation()), sqr(gonio.get_fixed_rotation())
         R = col(gonio.get_rotation_axis_datum()).axis_and_angle_as_r3_rotation_matrix(angle, deg=True)
@@ -185,7 +186,7 @@ def stage_real(args):
         real = A.inverse()
         start = Crystal(real[:3], real[3:6], real[6:9], expt.crystal.get_space_group())
 
-        image_file = expt.imageset.paths()[0].replace("00001", "%05d" % args.frame)
+        image_file = expt.imageset.get_path(frame)
         raw = dxtbx.load(image_file).get_raw_data().as_numpy_array().astype(np.float64)
         E = Experiment()
         E.crystal = start
@@ -197,7 +198,7 @@ def stage_real(args):
                 pickle.dump((flex.bool((raw >= 0) & (raw < 1e5) & ~np.load(args.hot)["hot"]),), out)
 
         z = refls["xyzobs.px.value"].parts()[2]
-        chosen = refls.select((z >= frame) & (z < frame + 1) & (refls["intensity.sum.value"] > 0))
+        chosen = refls.select((z >= index) & (z < index + 1) & (refls["intensity.sum.value"] > 0))
         chosen = chosen.select(flex.sort_permutation(chosen["intensity.sum.value"], reverse=True))[:args.spots]
         chosen = chosen.select(chosen["xyzobs.px.value"].parts()[2] >= 0)
         utils.refls_to_q(chosen, E.detector, E.beam, update_table=True)

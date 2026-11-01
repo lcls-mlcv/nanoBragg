@@ -65,9 +65,11 @@ def refine_lbfgsb(
     is scipy's solution. Returns scipy's OptimizeResult, in the scaled variables.
 
     ``objective`` can be a list of closures whose sum is minimised. Each backward runs and
-    frees its graph before the next closure starts, so memory stays at one term's, not the
-    sum's. Each closure must build everything it differentiates through itself, as
-    ``serial([i], roi_only=True)`` does.
+    frees its graph before the next closure starts, so graphs don't pile up across terms.
+    Each closure must build everything it differentiates through itself, as
+    ``serial([i], roi_only=True)`` does, which costs memory of its own: trainable Fhkl or a
+    trainable shared detector are rebuilt per term and kept alive by each model until its
+    next run, about 435 MB a shot for pixel coordinates on a 16M detector.
 
         model.freeze().refine("scale", "misset", "Ncells", "cell")
         data = model.roi_values(image)
@@ -80,6 +82,8 @@ def refine_lbfgsb(
         raise ValueError("nothing to refine: every parameter is frozen")
     starts = [parameter.detach().clone() for parameter, _ in chosen]
     terms = [objective] if callable(objective) else list(objective)
+    if not terms:
+        raise ValueError("nothing to minimise: the list of objective terms is empty")
 
     def load(x):
         at = 0
@@ -96,7 +100,8 @@ def refine_lbfgsb(
         loss = 0.0
         for term in terms:
             value = term()
-            value.backward()
+            if value.requires_grad:  # a term can miss every trainable parameter, as in a sum
+                value.backward()
             loss += value.item()
         gradient = [
             (torch.zeros_like(p) if p.grad is None else p.grad * scale).reshape(-1).detach().cpu().numpy()
