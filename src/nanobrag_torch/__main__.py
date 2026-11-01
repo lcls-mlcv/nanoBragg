@@ -9,7 +9,6 @@ mapping command-line flags to engine parameters per spec requirements.
 import os
 import sys
 import argparse
-import copy
 import logging
 import math
 import re
@@ -1832,8 +1831,8 @@ def build_simulation(
         config_hook(crystal_config, detector_config, beam_config)
 
     # Create models
-    detector = Detector(detector_config)
-    crystal = Crystal(crystal_config, beam_config=beam_config)
+    detector = Detector(detector_config, device=device, dtype=dtype)
+    crystal = Crystal(crystal_config, beam_config=beam_config, device=device, dtype=dtype)
 
     # Set HKL data if available
     hkl_entry = config.get('hkl_data')
@@ -1894,13 +1893,8 @@ def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig)
         sclose = config.get('close_center_s_mm', detector_config.beam_center_s)
         xbeam = config.get('beam_center_x_mm', config.get('xclose_mm', fclose))
         ybeam = config.get('beam_center_y_mm', config.get('yclose_mm', sclose))
-    # As doubles, as in C: degrees_to_radians goes through float32 for a Python float, which
-    # moves the 6th digit of a rotated header. A float64 tensor stays double. Rendering keeps
-    # its own Detector.
-    exact = copy.copy(detector_config)
-    for angle in ('detector_rotx_deg', 'detector_roty_deg', 'detector_rotz_deg', 'detector_twotheta_deg'):
-        setattr(exact, angle, torch.tensor(float(getattr(detector_config, angle)), dtype=torch.float64))
-    return smv_geometry(Detector(exact, dtype=torch.float64), float(xbeam), float(ybeam), size_s,
+    # In double, as in C, whatever the run's dtype. Rendering keeps its own Detector.
+    return smv_geometry(Detector(detector_config, dtype=torch.float64), float(xbeam), float(ybeam), size_s,
                         detector_config.pixel_size_mm)
 
 
