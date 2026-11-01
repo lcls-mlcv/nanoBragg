@@ -2,7 +2,7 @@
 
 Orientation, cell and detector stay at DIALS' scan-varying solution, F is the PDB's F_calc.
 Frames listed under --test never inform Ncells or eta: they only get their own G, and their
-own orientation with --misset, then are scored.
+own orientation with --misset, fitted to the same likelihood as the other frames, then are scored.
 
     OMP_NUM_THREADS=2 NANOBRAGG_DISABLE_COMPILE=1 PYTHONPATH=src:$PYTHONPATH libtbx.python \
         scripts/rotation_refinement.py --expt sv.expt --refl sv.refl --pdb model.pdb \
@@ -37,7 +37,6 @@ P.add_argument("--domains", type=int, default=26)
 P.add_argument("--phi-steps", dest="phi_steps", type=int, default=4)
 P.add_argument("--sign", type=float, default=1.0)
 P.add_argument("--sensor-layers", dest="layers", type=int, default=0)
-P.add_argument("--aniso", action="store_true")
 P.add_argument("--misset", action="store_true", help="refine each frame and lattice's orientation too")
 P.add_argument("--rmin", type=float, default=400.0, help="pixels from the beam; F_calc has no bulk solvent inside about 8.5 A")
 P.add_argument("--maxiter", type=int, default=100)
@@ -49,7 +48,8 @@ fit, test = [[int(x) for x in s.split(",") if x] for s in (A.fit, A.test)]
 
 E = ExperimentList.from_file(A.expt, check_format=False)
 scan, gonio, beam, det = E[0].scan, E[0].goniometer, E[0].beam, E[0].detector
-axis = np.array(gonio.get_rotation_axis())
+axis = np.array(gonio.get_rotation_axis())  # in the lab, after the setting rotation
+datum = np.array(gonio.get_rotation_axis_datum())
 fc = iotbx.pdb.input(A.pdb).xray_structure_simple().structure_factors(
     d_min=1.7, algorithm="fft").f_calc().amplitudes()
 sf = asu_structure_factors(fc, anomalous=False)
@@ -57,14 +57,14 @@ refl = flex.reflection_table.from_file(A.refl)
 xo, yo, zo = (np.array(v) for v in refl["xyzobs.px.value"].parts())
 intensity = np.array(refl["intensity.sum.value"])
 lattice = np.array(refl["id"])
-hot = np.load(A.hot)["hot"] if A.hot else False
+hot = np.load(A.hot)["hot"] if A.hot else np.False_
 bx, by = det[0].get_beam_centre_px(beam.get_s0())
 osc = scan.get_oscillation()[1]
 
 
 def lab_crystal(exp, i):
     A_i = sqr(exp.crystal.get_A_at_scan_point(i))
-    R = sqr(_axis_angle_matrix(axis, math.radians(scan.get_angle_from_array_index(i))).flatten().tolist())
+    R = sqr(_axis_angle_matrix(datum, math.radians(scan.get_angle_from_array_index(i))).flatten().tolist())
     c = copy.deepcopy(exp.crystal)
     c.reset_scan_points()
     c.set_A(sqr(gonio.get_setting_rotation()) * R * sqr(gonio.get_fixed_rotation()) * A_i)
@@ -114,7 +114,7 @@ for i in fit + test:
     for l, exp in enumerate(E):
         models.append(experiment_model_from_dxtbx(
             det, beam, lab_crystal(exp, i), Ncells_abc=tuple(A.N), shape="gauss", mosaic_spread_deg=A.eta,
-            mosaic_domains=A.domains, oversample=1, rois=rois, anisotropic_mosaicity=A.aniso, **sensor,
+            mosaic_domains=A.domains, oversample=1, rois=rois, **sensor,
             tilt_abc=tilts if l == 0 else np.zeros((len(rois), 3)),
             phi_start_deg=A.sign * osc / A.phi_steps / 2, osc_range_deg=A.sign * osc, phi_steps=A.phi_steps,
             spindle_axis=axis, structure_factors=sf, device=device))
@@ -138,8 +138,7 @@ for f in frames.values():
 
 
 def predict(f):
-    parts = [m(roi_only=True) for m in f["models"]]
-    return parts[0] + parts[1] + parts[2]
+    return sum(m(roi_only=True) for m in f["models"])
 
 
 def set_G(f):
@@ -157,7 +156,10 @@ def set_G(f):
         floor = 1e-4 * w.max()
         for m, g in zip(f["models"], w):
             m.beam_params.delta_log_spot_scale.data.fill_(math.log(max(g, floor)))
-    return w
+
+
+def G_of(f):
+    return [torch.exp(m.beam_params.delta_log_spot_scale).item() for m in f["models"]]
 
 
 def score(f):
@@ -169,10 +171,10 @@ def score(f):
 
 
 for f in frames.values():
-    f["G"] = set_G(f)
+    set_G(f)
 start = {i: score(f) for i, f in frames.items()}
 print("start (cc, nll/px):", start, flush=True)
-print("start G:", {i: [float(f"{g:.3g}") for g in f["G"]] for i, f in frames.items()}, flush=True)
+print("start G:", {i: [float(f"{g:.3g}") for g in G_of(f)] for i, f in frames.items()}, flush=True)
 print("peak GiB", round(torch.cuda.max_memory_allocated() / 2**30, 2), flush=True)
 result = dict(args=vars(A), start=start)
 if not A.start_only:
@@ -186,26 +188,24 @@ if not A.start_only:
     t0 = time.time()
     r = refine_lbfgsb(serial, objective, maxiter=A.maxiter, scales=dict(scale=0.1))
     seconds = time.time() - t0
-    for i in test:
-        frames[i]["G"] = set_G(frames[i])
-    if A.misset:
-        for i in test:  # Ncells and eta stay as the fitted frames left them
-            f = frames[i]
-            serial.freeze()
-            for m in f["models"]:
-                m.refine("scale", "misset")
+    for i in test:  # Ncells and eta stay as the fitted frames left them
+        f = frames[i]
+        set_G(f)
+        serial.freeze()
+        for m in f["models"]:
+            m.refine("scale", *(["misset"] if A.misset else []))
 
-            def held_out():
-                return gaussian_nll(predict(f), f["data"], 1.0, trusted=f["trusted"])
+        def held_out():
+            return gaussian_nll(predict(f), f["data"], 1.0, trusted=f["trusted"])
 
-            refine_lbfgsb(serial, held_out, maxiter=A.maxiter, scales=dict(scale=0.1))
+        refine_lbfgsb(serial, held_out, maxiter=A.maxiter, scales=dict(scale=0.1))
     end = {i: score(f) for i, f in frames.items()}
     lat = []
     for l in range(len(E)):
         cp = frames[fit[0]]["models"][l].crystal_params
         lat.append(dict(N=(cp.base_N_cells * torch.exp(cp.delta_log_N_cells)).tolist(), eta=cp.eta().tolist()))
     result.update(end=end, lattices=lat, seconds=seconds, nfev=int(r.nfev), nit=int(r.nit), message=str(r.message),
-                  G={i: [float(g) for g in f["G"]] for i, f in frames.items()},
+                  G={i: G_of(f) for i, f in frames.items()},
                   peak_GiB=torch.cuda.max_memory_allocated() / 2**30)
     print(json.dumps({k: result[k] for k in ("end", "lattices", "seconds", "nfev", "nit", "message", "peak_GiB")}), flush=True)
 json.dump(result, open(A.out, "w"), indent=1, default=str)

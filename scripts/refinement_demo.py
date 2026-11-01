@@ -488,7 +488,7 @@ def stage_torch(args):
             sensor.update(mosaic_spread_deg=eta, mosaic_domains=int(saved["mosaic_domains"]))
         model = experiment_model_from_dxtbx(
             detector, beam, crystal, Ncells_abc=Ncells, shape="gauss", default_F=float(saved["default_F"]),
-            fluence=float(saved["fluence"]) * fluence_scale / max(layers, 1), spot_scale=G, oversample=max(int(saved["oversample"]), 1),
+            fluence=float(saved["fluence"]) / max(layers, 1), spot_scale=G, oversample=max(int(saved["oversample"]), 1),
             **sensor,
             miller_array=miller, anomalous=True, rois=saved["rois"], tilt_abc=saved["tilt_abc"], spectrum=spectrum,
             panels=saved["panels"] if len(detector) > 1 else None, device=device,
@@ -498,10 +498,8 @@ def stage_torch(args):
     spectrum = None
     if "wavelengths" in saved.files:
         spectrum = [(float(w), float(f)) for w, f in zip(saved["wavelengths"], saved["weights"])]
-    fluence_scale = 1.0
-    if args.spectrum_npz:  # D.fluence is per channel
+    if args.spectrum_npz:  # the image doesn't depend on the channel count
         other = np.load(args.spectrum_npz)
-        fluence_scale = len(spectrum) / len(other["wavelengths"])
         spectrum = [(float(w), float(f)) for w, f in zip(other["wavelengths"], other["weights"])]
 
     def image_of(values, fast, slow, shape):
