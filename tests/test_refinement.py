@@ -131,3 +131,9 @@ def test_a_list_of_terms_matches_their_sum():
     assert apart[0] == pytest.approx(together[0], rel=1e-10)
     np.testing.assert_allclose(apart[1], together[1], rtol=1e-6, atol=1e-9)
     np.testing.assert_allclose(apart[2], together[2], rtol=1e-6, atol=1e-6)
+
+
+def test_a_model_of_rois_holds_no_full_image_for_its_mask():
+    model = _model(background_rois=ROIS)
+    model(roi_only=True)
+    assert model._simulator._cached_roi_mask.untyped_storage().nbytes() <= 8

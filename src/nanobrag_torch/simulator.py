@@ -715,13 +715,10 @@ class Simulator:
 
     def _refresh_roi_mask(self) -> None:
         # Build ROI mask once and cache it (AT-ROI-001)
-        # Start with all pixels enabled
-        self._cached_roi_mask = torch.ones(
-            self.detector.config.spixels,
-            self.detector.config.fpixels,
-            device=self.device,
-            dtype=self.dtype
-        )
+        # Start with all pixels enabled. Expanded, so this costs no memory: many Simulators
+        # of a large detector otherwise hold one full image each.
+        spixels, fpixels = self.detector.config.spixels, self.detector.config.fpixels
+        self._cached_roi_mask = torch.ones((), device=self.device, dtype=self.dtype).expand(spixels, fpixels)
 
         # Apply ROI bounds if specified
         # Note: ROI is in pixel indices (xmin/xmax for fast axis, ymin/ymax for slow axis)
@@ -738,10 +735,12 @@ class Simulator:
             )
 
         # Set everything outside ROI to zero
-        self._cached_roi_mask[:roi_ymin, :] = 0  # Below ymin
-        self._cached_roi_mask[roi_ymax+1:, :] = 0  # Above ymax
-        self._cached_roi_mask[:, :roi_xmin] = 0  # Left of xmin
-        self._cached_roi_mask[:, roi_xmax+1:] = 0  # Right of xmax
+        if (roi_ymin, roi_ymax, roi_xmin, roi_xmax) != (0, spixels - 1, 0, fpixels - 1):
+            self._cached_roi_mask = self._cached_roi_mask.clone()
+            self._cached_roi_mask[:roi_ymin, :] = 0  # Below ymin
+            self._cached_roi_mask[roi_ymax+1:, :] = 0  # Above ymax
+            self._cached_roi_mask[:, :roi_xmin] = 0  # Left of xmin
+            self._cached_roi_mask[:, roi_xmax+1:] = 0  # Right of xmax
 
         # Apply external mask if provided and cache it
         if self.detector.config.mask_array is not None:
