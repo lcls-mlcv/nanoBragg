@@ -61,8 +61,10 @@ def build_sim(args):
         C.set_U(axis.axis_and_angle_as_r3_rotation_matrix(float(rng.uniform(0, 2 * math.pi))))
     nb = NBcrystal(init_defaults=True)
     nb.dxtbx_crystal = C
-    nb.n_mos_domains = 1
-    nb.mos_spread_deg = 0
+    nb.n_mos_domains = args.mosaic_domains if args.eta else 1
+    nb.mos_spread_deg = args.eta[0] if args.eta else 0
+    if args.eta and len(args.eta) == 3:
+        nb.anisotropic_mos_spread_deg = tuple(args.eta)
     nb.thick_mm = 0.01
     nb.Ncells_abc = (args.ncells,) * 3
     nb.miller_array = None  # constant default_F on both sides
@@ -125,8 +127,26 @@ def diffbragg_ucell_forward_and_derivs(SIM):
     return img, derivs
 
 
+def diffbragg_eta_forward_and_derivs(SIM):
+    """diffBragg image and d(image)/d(eta) (ETA_ID 19): one derivative, or three if anisotropic."""
+    from simtbx.diffBragg.hopper_utils import ETA_ID
+
+    D = SIM.D
+    D.refine(ETA_ID)
+    D.initialize_managers()
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[0].get_image_size()
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+    pixels = D.get_aniso_eta_deriv_pixels() if D.has_anisotropic_mosaic_spread else [D.get_derivative_pixels(ETA_ID)]
+    return img, [p.as_numpy_array().reshape(slow, fast).copy() for p in pixels]
+
+
 def torch_experiment_model(SIM, args, **kwargs):
-    """ExperimentModel for SIM's experiment, oriented by its A matrix (float64)."""
+    """ExperimentModel for SIM's experiment, oriented by its A matrix (float64).
+
+    With --eta the model starts at diffBragg's eta (anisotropic for three values).
+    """
     import torch
     from nanobrag_torch.compat.cctbx import (
         crystal_config_from_A, detector_config_from_dxtbx_panel, beam_config_from_dxtbx,
@@ -140,11 +160,16 @@ def torch_experiment_model(SIM, args, **kwargs):
     det_cfg.oversample_omega = args.oversample_omega
     beam_cfg = beam_config_from_dxtbx(beam, fluence=float(SIM.D.fluence), spot_scale=float(SIM.D.spot_scale))
     beam_cfg.nopolar = beam_cfg.nopolar or args.nopolar
+    eta = list(args.eta or [0.0])
     cfg = crystal_config_from_A(xtal.get_unit_cell().parameters(), xtal.get_A(), Ncells_abc=args.ncells,
                                 shape=args.shape, default_F=args.default_F,
-                                spot_metric=SpotMetric(args.spot_metric))
+                                spot_metric=SpotMetric(args.spot_metric),
+                                mosaic_spread_deg=eta[0], mosaic_domains=args.mosaic_domains if args.eta else 1)
     model = ExperimentModel(cfg, det_cfg, beam_cfg, device=torch.device(args.device), dtype=torch.float64,
-                            **kwargs)
+                            anisotropic_mosaicity=len(eta) == 3, **kwargs)
+    if len(eta) == 3:
+        with torch.no_grad():
+            model.crystal_params.delta_log_eta.copy_(torch.log(torch.tensor(eta, dtype=torch.float64) / eta[0]))
     # cctbx: F(0,0,0) = F000 (0), every other reflection default_F
     model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
                                 dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
@@ -250,6 +275,10 @@ def build_parser():
     p.add_argument("--oversample-omega", dest="oversample_omega", action="store_true",
                    help="solid angle per subpixel on both sides (diffBragg otherwise takes it at the pixel centre)")
     p.add_argument("--nopolar", action="store_true", help="polarization factor 1 on both sides")
+    p.add_argument("--eta", type=float, nargs="+", default=None,
+                   help="mosaic spread in degrees: one value, or three for anisotropic (crystal a, b, c)")
+    p.add_argument("--mosaic-domains", dest="mosaic_domains", type=int, default=20,
+                   help="number of mosaic domains with --eta (even)")
     p.add_argument("--device", default="cpu")
     p.add_argument("--plot", action="store_true")
     return p

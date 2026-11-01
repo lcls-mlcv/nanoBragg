@@ -17,6 +17,7 @@ from torch import nn
 from ..config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig
 from ..models.crystal import Crystal
 from ..models.detector import Detector
+from ..utils.mosaic import diffbragg_umats
 from ..utils.tensor_utils import as_tensor_preserving_grad
 from ..utils.unit_cell import (
     B_matrix, FREE_VARIABLES, check_cell, constrained_cell, normalize_crystal_system,
@@ -49,6 +50,12 @@ class CrystalStageAParams(nn.Module):
     dxtbx/cctbx path and ``-mat`` produce) Crystal ignores the cell parameters, so the
     orientation is held as U = A0·B(cell0)⁻¹ and every step rebuilds A = U·B(cell),
     B being cctbx's. That is diffBragg's unit-cell derivative.
+
+    Mosaic spread η (``mosaic_spread_deg`` with ``mosaic_domains`` > 1) is modelled
+    with diffBragg's deterministic domain ensemble (utils/mosaic.py), which is
+    smooth in η, not nanoBragg.c's random blocks. ``anisotropic_mosaicity`` gives
+    η_a, η_b, η_c along the crystal's a, b, c axes as they are at construction
+    (diffBragg's eta_abc refinement, transform_eta=True); otherwise one η.
     """
 
     # cell variable -> its delta parameter
@@ -66,6 +73,7 @@ class CrystalStageAParams(nn.Module):
         max_angle_delta_deg: float = 10.0,
         max_misset_delta_deg: float = 10.0,
         crystal_system: str = "triclinic",
+        anisotropic_mosaicity: bool = False,
     ) -> None:
         super().__init__()
         if device is None:
@@ -192,9 +200,6 @@ class CrystalStageAParams(nn.Module):
                     f"{var} is not a free variable of a {self.crystal_system} cell "
                     f"(free: {', '.join(free)})"
                 )
-        for pname in self.unrefinable:
-            getattr(self, pname).requires_grad_(False)
-
         # Orientation held as U when the config gives an orientation matrix.
         self.oriented_by_matrix = all(
             getattr(base_config, f"mosflm_{x}_star", None) is not None for x in "abc"
@@ -214,6 +219,51 @@ class CrystalStageAParams(nn.Module):
                     f"(U = A·B⁻¹ is off orthogonal by {float(err):.2g})"
                 )
             self.register_buffer("U", U.to(self.dtype))
+
+        # Mosaic spread: log offsets from the config's eta (one, or three if anisotropic).
+        base_eta = float(base_config.mosaic_spread_deg)
+        self.mosaic_domains = int(base_config.mosaic_domains)
+        self.models_mosaicity = base_eta > 0 and self.mosaic_domains > 1
+        if self.models_mosaicity and self.mosaic_domains % 2:
+            raise ValueError(
+                f"mosaic_domains must be even for diffBragg's mosaic ensemble (± rotation pairs), "
+                f"got {self.mosaic_domains}"
+            )
+        self.anisotropic_mosaicity = bool(anisotropic_mosaicity)
+        self.register_buffer(
+            "base_eta", torch.as_tensor(base_eta, device=self.device, dtype=self.dtype)
+        )
+        self.delta_log_eta = param_cls(
+            torch.zeros((3 if self.anisotropic_mosaicity else 1,), device=self.device, dtype=self.dtype)
+        )
+        if self.models_mosaicity and self.anisotropic_mosaicity:
+            # unit real-space a, b, c (columns) of the starting crystal
+            if self.oriented_by_matrix:
+                real = torch.linalg.inv(A0)  # rows are a, b, c
+            else:
+                start = Crystal(replace(base_config), device=self.device, dtype=torch.float64)
+                real = torch.stack([start.a, start.b, start.c]).detach()
+            self.register_buffer("eta_axes", (real / real.norm(dim=1, keepdim=True)).T.to(self.dtype))
+        else:
+            self.eta_axes = None
+        if not self.models_mosaicity:
+            self.unrefinable["delta_log_eta"] = (
+                "eta is not refinable without mosaic spread: set mosaic_spread_deg > 0 and "
+                "an even mosaic_domains > 1"
+            )
+
+        for pname in self.unrefinable:
+            getattr(self, pname).requires_grad_(False)
+
+    def eta(self) -> torch.Tensor:
+        """Mosaic spread in degrees: shape (1,), or (3,) for anisotropic mosaicity."""
+        return self.base_eta * torch.exp(self.delta_log_eta)
+
+    def mosaic_umats(self) -> Optional[torch.Tensor]:
+        """(mosaic_domains, 3, 3) mosaic rotations for the current eta, or None without mosaicity."""
+        if not self.models_mosaicity:
+            return None
+        return diffbragg_umats(self.eta(), self.mosaic_domains, crystal_axes=self.eta_axes).to(self.dtype)
 
     def build_config(self) -> CrystalConfig:
         """Return a CrystalConfig with physical values derived from raw parameters."""
@@ -445,6 +495,8 @@ class ExperimentModel(nn.Module):
 
     ``crystal_system`` (default "triclinic", six free cell parameters) constrains
     the cell refinement; see nanobrag_torch.utils.unit_cell and ``unrefinable``.
+    With mosaic spread, ``anisotropic_mosaicity`` refines eta_a, eta_b, eta_c
+    instead of one eta (diffBragg's ensemble; see CrystalStageAParams).
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -467,6 +519,7 @@ class ExperimentModel(nn.Module):
         "fluence": ("beam_params.delta_log_fluence",),
         "scale": ("beam_params.delta_log_spot_scale",),
         "Ncells": ("crystal_params.delta_log_N_cells",),
+        "eta": ("crystal_params.delta_log_eta",),
     }
 
     def __init__(
@@ -480,6 +533,7 @@ class ExperimentModel(nn.Module):
         hkl_data: Optional[torch.Tensor] = None,
         hkl_metadata: Optional[dict] = None,
         crystal_system: str = "triclinic",
+        anisotropic_mosaicity: bool = False,
     ) -> None:
         super().__init__()
         if device is None:
@@ -494,6 +548,7 @@ class ExperimentModel(nn.Module):
             dtype=self.dtype,
             param_init=param_init,
             crystal_system=crystal_system,
+            anisotropic_mosaicity=anisotropic_mosaicity,
         )
         self.detector_params = DetectorStageAParams(
             base_config=detector_config,
@@ -614,6 +669,12 @@ class ExperimentModel(nn.Module):
             else None
         )
 
+    def _apply_mosaicity(self, crystal: Crystal) -> None:
+        umats = self.crystal_params.mosaic_umats()
+        if umats is not None:
+            crystal.mosaic_umats_override = umats
+            crystal.config.mosaic_domains = int(umats.shape[0])
+
     # Fields the Stage-A blocks produce. Everything else in the configs is fixed at
     # construction.
     _CRYSTAL_CELL_FIELDS = (
@@ -657,6 +718,7 @@ class ExperimentModel(nn.Module):
         )
         # Simulator's auto-oversample choice reads the config copy.
         crystal.config.N_cells = crystal_cfg.N_cells
+        self._apply_mosaicity(crystal)
 
         for name in self._DETECTOR_FIELDS:
             setattr(self._detector.config, name, getattr(detector_cfg, name))
@@ -677,6 +739,7 @@ class ExperimentModel(nn.Module):
             dtype=self.dtype,
         )
         self._apply_structure_factors(crystal)
+        self._apply_mosaicity(crystal)
 
         detector = Detector(
             config=detector_cfg,

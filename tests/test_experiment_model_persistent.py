@@ -51,7 +51,7 @@ def _set_step(model, k):
 @pytest.mark.parametrize("steps", [3])
 def test_persistent_forward_and_gradients_match_fresh_build(steps):
     model = ExperimentModel(*_configs(), dtype=DTYPE, param_init="stage_a")
-    params = dict(model.named_parameters())
+    params = {n: p for n, p in model.named_parameters() if p.requires_grad}
     assert len(params) >= 10  # cell, misset, detector and fluence blocks are all live
 
     first_simulator = None

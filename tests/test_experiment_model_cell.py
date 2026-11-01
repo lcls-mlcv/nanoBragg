@@ -74,7 +74,8 @@ def test_only_the_free_cell_variables_train_and_ties_hold(system):
     free = FREE_VARIABLES[system]
     trainable = {n for n in CELL_PARAMS if getattr(params, n).requires_grad}
     assert len(trainable) == len(free)
-    assert set(model.unrefinable) == {f"crystal_params.{n}" for n in CELL_PARAMS if n not in trainable}
+    blocked_cell = {n for n in model.unrefinable if n.split(".")[-1] in CELL_PARAMS}
+    assert blocked_cell == {f"crystal_params.{n}" for n in CELL_PARAMS if n not in trainable}
 
     model.freeze().refine("cell")  # a group refines its refinable members only
     assert {n for n in CELL_PARAMS if getattr(params, n).requires_grad} == trainable
