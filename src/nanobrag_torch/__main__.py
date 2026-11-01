@@ -24,7 +24,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 from .config import (
-    DetectorConfig, CrystalConfig, BeamConfig, NoiseConfig,
+    DetectorConfig, CrystalConfig, BeamConfig,
     DetectorConvention, DetectorPivot, CrystalShape
 )
 from .models.detector import Detector
@@ -41,7 +41,7 @@ from .utils.units import (
     mm_to_meters, micrometers_to_meters, degrees_to_radians,
     angstroms_to_meters, mrad_to_radians
 )
-from .utils.noise import generate_poisson_noise
+from .utils.noise import c_noise_image, generate_poisson_noise
 from .utils.auto_selection import (
     auto_select_divergence, auto_select_dispersion,
     generate_sources_from_divergence_dispersion
@@ -380,6 +380,8 @@ Examples:
                         help='Enable progress meter')
     parser.add_argument('-seed', type=int,
                         help='Noise RNG seed')
+    parser.add_argument('-fast_noise', action='store_true',
+                        help="torch.poisson instead of C's generator: GPU speed, not reproducible against C")
     parser.add_argument('-show_config', '-echo_config', action='store_true',
                         help='Print configuration parameters for debugging')
 
@@ -1266,6 +1268,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
     config['seed'] = args.seed if args.seed else int(-time.time())
+    config['fast_noise'] = args.fast_noise
 
     # Sourcefile (store path for later processing)
     if args.sourcefile:
@@ -1944,49 +1947,21 @@ def main():
         # CLI-FLAGS-003: Honor -nonoise flag
         if config.get('noisefile') and not config.get('suppress_noise', False):
             # Generate and write noise image
-            noise_config = NoiseConfig(
-                seed=config.get('seed'),
-                adc_offset=config.get('adc', 40.0)
-            )
-            # For noise generation, we need to handle ROI properly (AT-CLI-005)
-            # Only apply noise and ADC to pixels inside ROI
-            # First, create a mask for where intensity > 0 (inside ROI)
-            roi_mask = intensity > 0
-
-            # Generate noise for the entire image (but without readout noise)
-            noisy, overloads = generate_poisson_noise(
-                intensity,
-                seed=noise_config.seed,
-                adc_offset=0.0,  # Don't apply ADC globally
-                readout_noise=0.0,  # Don't apply readout noise globally
-                overload_value=noise_config.overload_value
-            )
-
-            # noisy is now an integer tensor, convert back to float for additional operations
-            noisy = noisy.float()
-
-            # Add ADC offset and readout noise only to pixels inside ROI
-            if roi_mask.any():
-                # Apply readout noise only inside ROI
-                if noise_config.readout_noise > 0:
-                    generator = torch.Generator(device=intensity.device)
-                    if noise_config.seed is not None:
-                        generator.manual_seed(noise_config.seed + 1)  # Different seed for readout
-                    readout = torch.normal(
-                        mean=torch.zeros_like(noisy),
-                        std=noise_config.readout_noise,
-                        generator=generator
-                    )
-                    noisy = torch.where(roi_mask, noisy + readout, noisy)
-
-                # Add ADC offset only inside ROI
-                if noise_config.adc_offset > 0:
-                    noisy = torch.where(roi_mask, noisy + noise_config.adc_offset, noisy)
-
-            # Ensure pixels outside ROI remain exactly zero
-            noisy = torch.where(roi_mask, noisy, torch.zeros_like(noisy))
-
-            noisy_int = noisy.to(torch.int16).cpu().numpy().astype(np.uint16)
+            adc = config.get('adc', 40.0)
+            xmin, xmax = detector_config.roi_xmin, detector_config.roi_xmax
+            ymin, ymax = detector_config.roi_ymin, detector_config.roi_ymax
+            if config.get('fast_noise'):
+                noisy, overloads = generate_poisson_noise(
+                    intensity, seed=config.get('seed'), adc_offset=adc, readout_noise=0.0
+                )
+                in_roi = np.zeros(noisy.shape, dtype=np.uint16)
+                in_roi[ymin:ymax + 1, xmin:xmax + 1] = 1
+                noisy_int = noisy.to(torch.int32).cpu().numpy().astype(np.uint16) * in_roi
+            else:
+                noisy_int, photons, overloads = c_noise_image(
+                    intensity.detach().cpu().numpy(), config['seed'], adc, roi=(xmin, xmax, ymin, ymax)
+                )
+                print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
 
             write_smv(
                 filepath=config['noisefile'],
