@@ -1004,7 +1004,7 @@ cases:
           -fluence 1e45
       - name: high-fluence-water
         extra_args: >-
-          -fluence 1e45
+          -fluence 1e40
           -water 100
       - name: flux-only
         extra_args: >-
