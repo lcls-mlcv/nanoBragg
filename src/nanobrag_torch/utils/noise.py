@@ -7,8 +7,12 @@ This module implements Poisson noise generation following the spec requirements:
 - Gaussian approximation for means > 1e6
 """
 
+import math
+import struct
+
+import numpy as np
 import torch
-from typing import Optional, Union
+from typing import Optional, Tuple, Union
 
 
 def generate_poisson_noise(
@@ -173,3 +177,138 @@ def lcg_random(
         values[i] = float(current) / float(RAND_MAX)
 
     return values
+
+def c_noise_image(
+    image,
+    seed: int,
+    adc_offset: float = 40.0,
+    roi: Optional[Tuple[int, int, int, int]] = None,
+) -> Tuple[np.ndarray, float, int]:
+    """
+    Noise image as nanoBragg.c:3245-3265 makes it, bit for bit given its float image.
+
+    Walks the pixels in file order drawing poidev from ran1, in the single precision the C
+    code uses: the number of draws a pixel takes depends on the rounding, so anything looser
+    loses the sequence for every pixel after it. This is a Python loop, about a second per
+    million pixels. generate_poisson_noise is the fast alternative.
+
+    Args:
+        image: Photons per pixel, (slow, fast). Read as float32, like C's floatimage.
+        seed: The value given to -seed. C negates it, and ran1 starts from its magnitude,
+            or from 1 for seed 0.
+        adc_offset: Added to each pixel after the draw.
+        roi: Inclusive (xmin, xmax, ymin, ymax). Pixels outside stay 0 and draw nothing.
+
+    Returns:
+        uint16 image, photons drawn, overloaded pixels.
+    """
+    pixels = np.asarray(image, dtype=np.float32)
+    spixels, fpixels = pixels.shape
+    xmin, xmax, ymin, ymax = roi if roi is not None else (0, fpixels - 1, 0, spixels - 1)
+    values = pixels.ravel().tolist()
+    output = np.zeros(pixels.size, dtype=np.uint16)
+
+    packer = struct.Struct("f")
+    pack, unpack = packer.pack, packer.unpack
+
+    def f32(x):
+        return unpack(pack(x))[0]
+
+    IA, IM, IQ, IR, NTAB = 16807, 2147483647, 127773, 2836, 32
+    NDIV = 1 + (IM - 1) // NTAB
+    AM = 1.0 / IM
+    RNMX = 1.0 - 1.2e-7
+
+    idum = abs(seed) or 1
+    iv = [0] * NTAB
+    for j in range(NTAB + 7, -1, -1):
+        k = idum // IQ
+        idum = IA * (idum - k * IQ) - IR * k
+        if idum < 0:
+            idum += IM
+        if j < NTAB:
+            iv[j] = idum
+    iy = iv[0]
+
+    def ran1():
+        nonlocal idum, iy
+        k = idum // IQ
+        idum = IA * (idum - k * IQ) - IR * k
+        if idum < 0:
+            idum += IM
+        j = iy // NDIV
+        iy = iv[j]
+        iv[j] = idum
+        temp = f32(AM * iy)
+        return f32(RNMX) if temp > RNMX else temp
+
+    def gammln(xx):
+        x = y = xx
+        tmp = x + 5.5
+        tmp -= (x + 0.5) * math.log(tmp)
+        ser = 1.000000000190015
+        for c in (76.18009172947146, -86.50532032941677, 24.01409824083091,
+                  -1.231739572450155, 0.1208650973866179e-2, -0.5395239384953e-5):
+            y += 1.0
+            ser += c / y
+        return f32(-tmp + math.log(2.5066282746310005 * ser / x))
+
+    spare = None
+
+    def gaussdev():
+        nonlocal spare
+        if spare is not None:
+            value, spare = spare, None
+            return value
+        while True:
+            v1 = f32(2.0 * ran1() - 1.0)
+            v2 = f32(2.0 * ran1() - 1.0)
+            rsq = f32(f32(v1 * v1) + f32(v2 * v2))
+            if rsq < 1.0 and rsq != 0:
+                break
+        fac = f32(math.sqrt(-2.0 * math.log(rsq) / rsq))
+        spare = f32(v1 * fac)
+        return f32(v2 * fac)
+
+    def poidev(xm):
+        if xm > 1.0e6:
+            return f32(xm + math.sqrt(xm) * gaussdev())
+        if xm < 12.0:
+            g = f32(math.exp(-xm))
+            em = -1.0
+            t = 1.0
+            while True:
+                em += 1.0
+                t = f32(t * ran1())
+                if not t > g:
+                    return em
+        sq = f32(math.sqrt(2.0 * xm))
+        alxm = f32(math.log(xm))
+        g = f32(f32(xm * alxm) - gammln(f32(xm + 1.0)))
+        while True:
+            while True:
+                y = f32(math.tan(math.pi * ran1()))
+                em = f32(f32(sq * y) + xm)
+                if not em < 0.0:
+                    break
+            em = float(math.floor(em))
+            t = f32(0.9 * (1.0 + f32(y * y))
+                    * math.exp(f32(f32(f32(em * alxm) - gammln(f32(em + 1.0))) - g)))
+            if not ran1() > t:
+                return em
+
+    photons = 0.0
+    overloads = 0
+    index = 0
+    for spixel in range(spixels):
+        for fpixel in range(fpixels):
+            if ymin <= spixel <= ymax and xmin <= fpixel <= xmax:
+                test = poidev(values[index])
+                photons += test
+                test += adc_offset
+                if test > 65535.0:
+                    test = 65535.0
+                    overloads += 1
+                output[index] = int(test)
+            index += 1
+    return output.reshape(pixels.shape), photons, overloads
