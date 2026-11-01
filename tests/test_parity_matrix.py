@@ -104,7 +104,7 @@ def read_float_image(path, shape_hint=None):
     """
     data = np.fromfile(path, dtype=np.float32)
 
-    if shape_hint:
+    if shape_hint and shape_hint[0] * shape_hint[1] == len(data):
         return data.reshape(shape_hint)
 
     # Try to infer square shape
@@ -113,7 +113,8 @@ def read_float_image(path, shape_hint=None):
     if side * side == size:
         return data.reshape(side, side)
 
-    raise ValueError(f"Cannot infer shape for {len(data)} pixels (provide shape_hint)")
+    # Not square: the two images are still compared pixel by pixel.
+    return data.reshape(1, -1)
 
 
 # --- Metrics ---

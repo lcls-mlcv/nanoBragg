@@ -88,7 +88,7 @@ Examples:
     # C writes its binary Fhkl cache here after reading -hkl, and re-reads it when
     # -hkl is absent. We only ever read it; the flag exists so a run can redirect
     # C's cache away from the working directory.
-    parser.add_argument('-dumpfile', type=str, metavar='FILE', default='Fdump.bin',
+    parser.add_argument('-dumpfile', '-dump', type=str, metavar='FILE', default='Fdump.bin', dest='dumpfile',
                         help='Binary Fhkl cache read when -hkl is not given (default: Fdump.bin)')
     parser.add_argument('-cell', nargs=6, type=float,
                         metavar=('a', 'b', 'c', 'α', 'β', 'γ'),
@@ -152,7 +152,7 @@ Examples:
                         help='Pixels on sphere equidistant from sample')
 
     # Detector absorption
-    parser.add_argument('-detector_abs', type=str, metavar='µm',
+    parser.add_argument('-detector_abs', '-detector_absorb', type=str, metavar='µm', dest='detector_abs',
                         help='Attenuation depth in µm (inf or 0 to disable)')
     parser.add_argument('-detector_thick', type=float, metavar='µm',
                         help='Sensor thickness in µm')
@@ -216,7 +216,7 @@ Examples:
                         help='XDS-style beam center Y')
 
     # Beam spectrum/divergence
-    parser.add_argument('-lambda', '-wave', type=float, metavar='Å',
+    parser.add_argument('-lambda', '-wave', '-wavelength', type=float, metavar='Å',
                         dest='wavelength', help='Central wavelength in Å')
     parser.add_argument('-energy', type=float, metavar='eV',
                         help='Central energy in eV')
@@ -257,7 +257,7 @@ Examples:
     parser.add_argument('-Nc', type=int, help='Unit cells along c')
     parser.add_argument('-N', type=int, help='Unit cells (all axes)')
 
-    parser.add_argument('-samplesize', '-xtalsize', type=float, metavar='MM',
+    parser.add_argument('-samplesize', '-sample_size', '-xtalsize', '-xtal_size', type=float, metavar='MM',
                         dest='samplesize', help='Crystal size in mm')
     parser.add_argument('-sample_thick', '-sample_x', '-xtal_thick', '-xtal_x',
                         type=float, metavar='MM', dest='sample_x',
@@ -285,7 +285,7 @@ Examples:
     parser.add_argument('-mosaic', '-mosaici', '-mosaic_spr', type=float,
                         metavar='DEG', dest='mosaic',
                         help='Isotropic mosaic spread (degrees)')
-    parser.add_argument('-mosaic_dom', type=int,
+    parser.add_argument('-mosaic_dom', '-mosaic_domains', type=int, dest='mosaic_dom',
                         help='Number of mosaic domains')
     parser.add_argument('-mosaic_seed', type=int,
                         help='Seed for mosaic rotations')
@@ -571,6 +571,54 @@ _C_SAMPLE_PARSER = (
 )
 
 
+def resolve_wavelength_A(args: argparse.Namespace) -> Optional[float]:
+    """
+    Wavelength in Å, None if no flag gave one. nanoBragg.c:853-859 walks argv, so the last of
+    -lambda, -wave and -energy wins. Without ``args._argv`` -energy wins.
+    """
+    wavelength = 12398.42 / args.energy if args.energy else args.wavelength
+    argv = getattr(args, '_argv', None) or []
+    for token, value in zip(argv, argv[1:]):
+        if token in ('-lambda', '-wave', '-wavelength'):
+            wavelength = float(value)
+        elif token == '-energy':
+            wavelength = 12398.42 / float(value)
+    return wavelength
+
+
+def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[int, int, float, float]:
+    """
+    fpixels, spixels, detsize_f and detsize_s (mm) as nanoBragg.c:781-804 and 1120-1127 find them.
+
+    C walks argv, so the last flag wins for its axis. A pixel count then sets detsize for that
+    axis, otherwise the count is ceil(detsize/pixel - 0.5) from a default detsize of 102.4 mm.
+    detsize need not be a whole number of pixels, and the default beam centre uses detsize.
+    """
+    fpixels = args.detpixels or args.detpixels_f
+    spixels = args.detpixels or args.detpixels_s
+    size_f = args.detsize_f or args.detsize or 102.4
+    size_s = args.detsize_s or args.detsize or 102.4
+    argv = getattr(args, '_argv', None) or []
+    for token, value in zip(argv, argv[1:]):
+        if token == '-detsize':
+            size_f = size_s = float(value)
+        elif token == '-detsize_f':
+            size_f = float(value)
+        elif token == '-detsize_s':
+            size_s = float(value)
+        elif token == '-detpixels':
+            fpixels = spixels = int(value)
+        elif token in ('-detpixels_f', '-detpixels_x'):
+            fpixels = int(value)
+        elif token in ('-detpixels_s', '-detpixels_y'):
+            spixels = int(value)
+    if fpixels:
+        size_f = pixel_mm * fpixels
+    if spixels:
+        size_s = pixel_mm * spixels
+    return (math.ceil(size_f / pixel_mm - 0.5), math.ceil(size_s / pixel_mm - 0.5), size_f, size_s)
+
+
 def resolve_sample_dimensions(args: argparse.Namespace) -> Tuple[float, float, float]:
     """
     Crystal dimensions (x, y, z) in mm exactly as nanoBragg.c reads them.
@@ -749,9 +797,9 @@ def resolve_close_centers_mm(
 
     pixel_mm = config['pixel_size_mm']
     fclose = ((args.ORGX - 0.5) * pixel_mm if args.ORGX is not None
-              else config['fpixels'] * pixel_mm / 2.0)
+              else config['detsize_f_mm'] / 2.0)
     sclose = ((args.ORGY - 0.5) * pixel_mm if args.ORGY is not None
-              else config['spixels'] * pixel_mm / 2.0)
+              else config['detsize_s_mm'] / 2.0)
 
     if config['convention'] == 'CUSTOM':
         # CUSTOM: Xbeam defaults to Xclose (which defaults to Fclose), then Fclose = Xbeam.
@@ -986,11 +1034,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # Need wavelength for proper scaling
         wavelength_A = config.get('wavelength_A')
         if not wavelength_A:
-            if args.energy:
-                wavelength_A = 12398.42 / args.energy
-            elif args.wavelength:
-                wavelength_A = args.wavelength
-            else:
+            wavelength_A = resolve_wavelength_A(args)
+            if wavelength_A is None:
                 raise ValueError("Wavelength must be specified (via -lambda or -energy) when using -mat")
 
         # Read the MOSFLM matrix and convert to cell parameters
@@ -1018,13 +1063,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F)
 
     # Wavelength/energy
-    if args.energy:
-        # λ = (12398.42 / E_eV) * 1e-10 meters
-        config['wavelength_A'] = 12398.42 / args.energy
-    elif args.wavelength:
-        config['wavelength_A'] = args.wavelength
-    else:
-        config['wavelength_A'] = 1.0  # Default
+    config['wavelength_A'] = resolve_wavelength_A(args) or 1.0  # Default
 
     # Convention and pivot
     # nanoBragg.c:665-728 switches to CUSTOM for every explicit basis vector, and
@@ -1043,24 +1082,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     # Detector parameters
     config['pixel_size_mm'] = args.pixel if args.pixel else 0.1
 
-    # Pixel counts - detpixels takes precedence over detsize
-    if args.detpixels:
-        config['fpixels'] = args.detpixels
-        config['spixels'] = args.detpixels
-    elif args.detpixels_f or args.detpixels_s:
-        config['fpixels'] = args.detpixels_f if args.detpixels_f else 1024
-        config['spixels'] = args.detpixels_s if args.detpixels_s else 1024
-    elif args.detsize:
-        # Only use detsize if detpixels not specified
-        config['fpixels'] = int(args.detsize / config['pixel_size_mm'])
-        config['spixels'] = int(args.detsize / config['pixel_size_mm'])
-    elif args.detsize_f and args.detsize_s:
-        config['fpixels'] = int(args.detsize_f / config['pixel_size_mm'])
-        config['spixels'] = int(args.detsize_s / config['pixel_size_mm'])
-    else:
-        # Default values
-        config['fpixels'] = 1024
-        config['spixels'] = 1024
+    config['fpixels'], config['spixels'], config['detsize_f_mm'], config['detsize_s_mm'] = \
+        resolve_detector_size(args, config['pixel_size_mm'])
 
     config['distance_mm'] = args.distance if args.distance else 100.0
     config['close_distance_mm'] = args.close_distance
@@ -1502,6 +1525,8 @@ def build_simulation(
                        if 'twotheta_axis' in config else None),
         close_center_f_mm=config.get('close_center_f_mm'),
         close_center_s_mm=config.get('close_center_s_mm'),
+        detsize_f_mm=config.get('detsize_f_mm'),
+        detsize_s_mm=config.get('detsize_s_mm'),
         detector_convention=DetectorConvention[config.get('convention', 'MOSFLM')],
         detector_pivot=DetectorPivot[config.get('pivot', 'BEAM')] if config.get('pivot') else None,
         oversample=config.get('oversample', -1),  # -1 means auto-select
@@ -1538,9 +1563,10 @@ def build_simulation(
     convention = detector_config.detector_convention
     pixel_size_mm = detector_config.pixel_size_mm
 
-    if 'beam_center_x_mm' in config and 'beam_center_y_mm' in config:
-        Xbeam_mm = config['beam_center_x_mm']
-        Ybeam_mm = config['beam_center_y_mm']
+    if 'beam_center_x_mm' in config or 'beam_center_y_mm' in config:
+        # An axis left out keeps its DetectorConfig default, like C's isnan(Xbeam) defaults.
+        Xbeam_mm = config.get('beam_center_x_mm')
+        Ybeam_mm = config.get('beam_center_y_mm')
 
         # Check if convention forces SAMPLE pivot (XDS/DIALS)
         # For these conventions, Xbeam/Ybeam are ignored; use detector center instead
@@ -1553,20 +1579,22 @@ def build_simulation(
         elif convention in [DetectorConvention.MOSFLM, DetectorConvention.DENZO]:
             # MOSFLM/DENZO: BEAM pivot with axis swap (Fbeam ← Ybeam, Sbeam ← Xbeam)
             # +0.5 pixel offset is added later in Detector.__init__
-            detector_config.beam_center_f = Ybeam_mm
-            detector_config.beam_center_s = Xbeam_mm
+            if Ybeam_mm is not None:
+                detector_config.beam_center_f = Ybeam_mm
+            if Xbeam_mm is not None:
+                detector_config.beam_center_s = Xbeam_mm
         elif convention == DetectorConvention.ADXV:
             # ADXV: BEAM pivot with Y-axis flip
-            detsize_s_mm = detector_config.spixels * pixel_size_mm
-            detector_config.beam_center_f = Xbeam_mm
-            detector_config.beam_center_s = detsize_s_mm - Ybeam_mm
+            if Xbeam_mm is not None:
+                detector_config.beam_center_f = Xbeam_mm
+            if Ybeam_mm is not None:
+                detector_config.beam_center_s = config['detsize_s_mm'] - Ybeam_mm
         elif convention == DetectorConvention.CUSTOM:
             # CUSTOM: No axis swap (Fbeam ← Xbeam, Sbeam ← Ybeam)
-            detector_config.beam_center_f = Xbeam_mm
-            detector_config.beam_center_s = Ybeam_mm
-    elif 'beam_center_x_mm' in config or 'beam_center_y_mm' in config:
-        # Partial beam center - this shouldn't happen in well-formed input
-        raise ValueError("Both -Xbeam and -Ybeam must be provided together")
+            if Xbeam_mm is not None:
+                detector_config.beam_center_f = Xbeam_mm
+            if Ybeam_mm is not None:
+                detector_config.beam_center_s = Ybeam_mm
 
     # ROI
     if 'roi' in config:
