@@ -31,7 +31,7 @@ from .models.detector import Detector
 from .models.crystal import Crystal
 from .simulator import Simulator
 from .io.hkl import read_hkl_file, try_load_hkl_or_fdump, write_fdump
-from .io.smv import write_smv
+from .io.smv import smv_geometry, write_smv
 from .io.mosflm import read_mosflm_matrix, reciprocal_to_real_cell
 from .io.pgm import write_pgm
 from .io.mask import (read_smv_mask, parse_smv_header,
@@ -1095,6 +1095,10 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['beam_center_x_mm'] = args.Xbeam
     if args.Ybeam is not None:
         config['beam_center_y_mm'] = args.Ybeam
+    if args.Xclose is not None:
+        config['xclose_mm'] = args.Xclose
+    if args.Yclose is not None:
+        config['yclose_mm'] = args.Yclose
 
     # Point of closest approach (-ORGX/-ORGY/-Xclose/-Yclose); only the SAMPLE pivot reads it
     close_centers = resolve_close_centers_mm(args, config)
@@ -1796,6 +1800,22 @@ def build_simulation(
     )
 
 
+def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig) -> Dict[str, Any]:
+    """Header values for write_smv, with Xbeam and Ybeam as nanoBragg.c:1190-1250 leaves them."""
+    size_s = detector_config.spixels * detector_config.pixel_size_mm
+    convention = detector_config.detector_convention
+    if convention in (DetectorConvention.MOSFLM, DetectorConvention.DENZO):
+        xbeam, ybeam = detector_config.beam_center_s, detector_config.beam_center_f
+    elif convention == DetectorConvention.ADXV:
+        xbeam, ybeam = detector_config.beam_center_f, size_s - detector_config.beam_center_s
+    else:  # Xbeam = Xclose and Ybeam = Yclose unless the flags gave them
+        fclose = config.get('close_center_f_mm', detector_config.beam_center_f)
+        sclose = config.get('close_center_s_mm', detector_config.beam_center_s)
+        xbeam = config.get('beam_center_x_mm', config.get('xclose_mm', fclose))
+        ybeam = config.get('beam_center_y_mm', config.get('yclose_mm', sclose))
+    return smv_geometry(Detector(detector_config, dtype=torch.float64), float(xbeam), float(ybeam), size_s)
+
+
 class _PrintHandler(logging.Handler):
     def emit(self, record):
         print(self.format(record))
@@ -1883,6 +1903,8 @@ def main():
             max_val = intensity.max().item()
             intfile_scale = 55000.0 / max_val if max_val > 0 else 1.0
 
+        header_geometry = smv_header_geometry(config, detector_config)
+
         if config.get('intfile'):
             # Scale and write SMV per AT-CLI-006
             scale = intfile_scale
@@ -1914,16 +1936,16 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=detector_config.beam_center_s,
-                beam_center_y_mm=detector_config.beam_center_f,
-                close_distance_mm=detector_config.close_distance_mm,
+                beam_center_x_mm=header_geometry['xbeam_mm'],
+                beam_center_y_mm=header_geometry['ybeam_mm'],
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
                 twotheta_deg=config.get('twotheta_deg', 0.0),
                 convention=detector_config.detector_convention.name,
                 scale=1.0,  # Already scaled
-                adc_offset=0.0  # Already applied ADC
+                adc_offset=0.0,  # Already applied ADC
+                geometry=header_geometry,
             )
             print(f"Wrote SMV image to {config['intfile']}")
 
@@ -2018,16 +2040,16 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=detector_config.beam_center_s,
-                beam_center_y_mm=detector_config.beam_center_f,
-                close_distance_mm=detector_config.close_distance_mm,
+                beam_center_x_mm=header_geometry['xbeam_mm'],
+                beam_center_y_mm=header_geometry['ybeam_mm'],
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
                 twotheta_deg=config.get('twotheta_deg', 0.0),
                 convention=detector_config.detector_convention.name,
                 scale=1.0,  # Already scaled
-                adc_offset=0.0  # Already applied ADC
+                adc_offset=0.0,  # Already applied ADC
+                geometry=header_geometry,
             )
             print(f"Wrote noise image to {config['noisefile']} ({overloads} overloads)")
 
