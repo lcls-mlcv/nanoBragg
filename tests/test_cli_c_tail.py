@@ -141,3 +141,37 @@ def test_a_weight_filled_in_by_default_counts_when_comparing_weights(tmp_path):
     assert "use_source_weights" not in done.stderr
     _, _, done = _torch_run(tmp_path, "-1 0 0 2 1e-10\n-1 0 0\n")
     assert "use_source_weights" in done.stderr
+
+
+@pytest.fixture
+def header_40x24(tmp_path):
+    """An image C wrote, 40x24 pixels of 0.5 mm."""
+    _render([_c_binary()], "-pixel 0.5 -detpixels_f 40 -detpixels_s 24".split(), tmp_path)
+    (tmp_path / "out.img").rename(tmp_path / "header.img")
+    return "header.img"
+
+
+@pytest.mark.parametrize("flags, size", [
+    ("-img {h}", (40, 24)),
+    ("-img {h} -detpixels 16", (16, 16)),
+    ("-img {h} -detpixels_f 16", (16, 24)),
+    ("-img {h} -detpixels_s 16", (40, 16)),
+    ("-img {h} -detpixels_y 16", (40, 16)),
+    ("-detsize 20 -img {h}", (40, 24)),
+    ("-img {h} -detsize_f 20", (40, 24)),
+    ("-img {h} -detsize_s 20", (40, 24)),
+    ("-img {h} -detpixels 0", (40, 24)),
+    ("-img {h} -detpixels_f 0", (40, 24)),
+    ("-img {h} -detpixels 0 -detsize 20", (40, 40)),
+    ("-img {h} -detpixels_f 0 -detsize_f 33", (66, 24)),
+    ("-img {h} -pixel 0.25", (40, 24)),
+    ("-img {h} -pixel 0.25 -detpixels 0", (80, 48)),
+    ("-mask {h} -detsize 20", (40, 24)),
+])
+def test_header_size_is_where_the_flags_start_from(tmp_path, header_40x24, flags, size):
+    """nanoBragg.c:424-430 and 467-473 run before the flags, and 1119-1127 prefer a count to detsize."""
+    args = flags.format(h=header_40x24).split()
+    c_image, torch_image, c_size = compare_with_c(args, tmp_path)
+    assert c_size == size
+    assert np.corrcoef(c_image, torch_image)[0, 1] > 0.9999
+    assert torch_image.sum() / c_image.sum() == pytest.approx(1.0, abs=1e-3)

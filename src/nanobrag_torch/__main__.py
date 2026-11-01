@@ -637,11 +637,15 @@ def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[in
     C walks argv, so the last flag wins for its axis. A pixel count then sets detsize for that
     axis, otherwise the count is ceil(detsize/pixel - 0.5) from a default detsize of 102.4 mm.
     detsize need not be a whole number of pixels, and the default beam centre uses detsize.
+
+    An -img or -mask header starts all four off, so its count stands on any axis no flag
+    counted (a count beats detsize), and -detpixels 0 falls back on the header's detsize.
     """
-    fpixels = args.detpixels or args.detpixels_f
-    spixels = args.detpixels or args.detpixels_s
-    size_f = args.detsize_f or args.detsize or 102.4
-    size_s = args.detsize_s or args.detsize or 102.4
+    header_f, header_s, header_size_f, header_size_s = getattr(args, '_header_size', (0, 0, 0.0, 0.0))
+    fpixels = args.detpixels or args.detpixels_f or header_f
+    spixels = args.detpixels or args.detpixels_s or header_s
+    size_f = args.detsize_f or args.detsize or header_size_f or 102.4
+    size_s = args.detsize_s or args.detsize or header_size_s or 102.4
     argv = getattr(args, '_argv', None) or []
     for token, value in zip(argv, argv[1:]):
         if token == '-detsize':
@@ -939,12 +943,6 @@ _HEADER_ARG_SEEDS = {
     # pixel-loop scratch variable, so a header TWOTHETA changes nothing.
 }
 
-# Any of these means the user sized the detector themselves, so SIZE1/SIZE2
-# from the header must not be injected.
-_HEADER_SIZE_FLAGS = ('-detpixels', '-detpixels_f', '-detpixels_s',
-                      '-detpixels_x', '-detpixels_y',
-                      '-detsize', '-detsize_f', '-detsize_s')
-
 
 def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
     """Apply -img/-mask header geometry as *defaults*, the way C's pre-pass does.
@@ -979,11 +977,11 @@ def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
     if not defaults:
         return
 
-    if not named.intersection(_HEADER_SIZE_FLAGS):
-        if 'fpixels' in defaults:
-            args.detpixels_f = defaults['fpixels']
-        if 'spixels' in defaults:
-            args.detpixels_s = defaults['spixels']
+    # C's pre-pass leaves the header size in fpixels, spixels, detsize_f and detsize_s
+    # (nanoBragg.c:424-430), and the flags then work from there: see resolve_detector_size.
+    pixel_mm = defaults.get('pixel_size_mm', 0.1)
+    fpixels, spixels = defaults.get('fpixels', 0), defaults.get('spixels', 0)
+    args._header_size = (fpixels, spixels, pixel_mm * fpixels, pixel_mm * spixels)
 
     for key, (dest, tokens) in _HEADER_ARG_SEEDS.items():
         if key not in defaults:
