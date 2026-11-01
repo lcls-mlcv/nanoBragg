@@ -300,6 +300,18 @@ def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
     c_dir, py_dir = tmp_path / "c", tmp_path / "py"
     c_dir.mkdir()
     py_dir.mkdir()
+    first = ["-hkl", str(hkl), "-floatfile", "f.bin"]
+    subprocess.run([c_bin] + args + first, cwd=c_dir, env=env, check=True, capture_output=True, timeout=300)
+    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + first, cwd=py_dir, env=env, check=True,
+                   capture_output=True, timeout=300)
+    assert (py_dir / "Fdump.bin").read_bytes() == (c_dir / "Fdump.bin").read_bytes()
+
+    # A run without -hkl renders the same image from the cache
+    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + ["-floatfile", "g.bin"], cwd=py_dir, env=env,
+                   check=True, capture_output=True, timeout=300)
+    assert (py_dir / "g.bin").read_bytes() == (py_dir / "f.bin").read_bytes()
+
+
 @pytest.mark.parametrize("extra", [
     [], ["-denzo"], ["-adxv"], ["-xds"], ["-dials"],
     ["-Xbeam", "2", "-Ybeam", "4.5"], ["-Xbeam", "2", "-Ybeam", "4.5", "-adxv"], ["-Xbeam", "2", "-Ybeam", "4.5", "-xds"],
@@ -311,18 +323,6 @@ def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
 def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
     args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 32 "
             "-oversample 1 -nopgm -nonoise -intfile i.img -floatfile f.bin").split() + extra
-
-
-    first = ["-hkl", str(hkl), "-floatfile", "f.bin"]
-    subprocess.run([c_bin] + args + first, cwd=c_dir, env=env, check=True, capture_output=True, timeout=300)
-    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + first, cwd=py_dir, env=env, check=True,
-                   capture_output=True, timeout=300)
-    assert (py_dir / "Fdump.bin").read_bytes() == (c_dir / "Fdump.bin").read_bytes()
-
-    # A run without -hkl renders the same image from the cache
-    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + ["-floatfile", "g.bin"], cwd=py_dir, env=env,
-                   check=True, capture_output=True, timeout=300)
-    assert (py_dir / "g.bin").read_bytes() == (py_dir / "f.bin").read_bytes()
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), KMP_DUPLICATE_LIB_OK="TRUE", NANOBRAGG_DISABLE_COMPILE="1")
     c_dir, py_dir = tmp_path / "c", tmp_path / "py"
     c_dir.mkdir()
