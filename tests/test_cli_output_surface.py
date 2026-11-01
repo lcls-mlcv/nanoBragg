@@ -323,6 +323,9 @@ def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
     ["-twotheta", "20", "-detector_rotx", "3", "-detector_roty", "4", "-detector_rotz", "5"],
     "-xds -distance 194.238 -detector_rotx -0.303 -detector_roty -6.067 -detector_rotz 0.051 -twotheta -15.657".split(),
     "-distance 286.3 -detector_rotx 6.1 -detector_roty -1.0 -detector_rotz 4.2 -twotheta -9.258".split(),
+    # A zero's sign: C's dot products give +0 in DIALS_ORIGIN, and -phi -0 prints -0
+    "-adxv -Xbeam 0 -Ybeam 0".split(), "-xds -ORGX 0.5 -ORGY 0.5".split(), "-dials -ORGX 0.5 -ORGY 0.5".split(),
+    "-phi -0 -osc 0".split(),
 ], ids=lambda extra: " ".join(extra) or "defaults")
 def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
     args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 32 "

@@ -126,13 +126,16 @@ def smv_geometry(detector, xbeam_mm: float, ybeam_mm: float, detsize_s_mm: float
     distance = close / detector.r_factor
     spot = distance * detector.beam_vector - pix0
     pixel_m = detector.pixel_size
+    # C's dot products with (0,0,1), (0,1,0) and (-1,0,0), whose sum sets the sign of a zero
+    x, y, z = pix0.tolist()
+    dials_origin_mm = (1000 * (0.0 * x + 0.0 * y + z), 1000 * (0.0 * x + y + 0.0 * z), 1000 * (-x + 0.0 * y + 0.0 * z))
     return dict(
         xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm,
         fbeam_mm=torch.dot(fdet, spot).item() * 1000, sbeam_mm=torch.dot(sdet, spot).item() * 1000,
         distance_mm=distance.item() * 1000, close_distance_mm=close.item() * 1000,
         detsize_s_mm=detsize_s_mm,
         orgx=(-torch.dot(pix0, fdet) / pixel_m + 0.5).item(), orgy=(-torch.dot(pix0, sdet) / pixel_m + 0.5).item(),
-        dials_origin_mm=(pix0[2].item() * 1000, pix0[1].item() * 1000, -pix0[0].item() * 1000),
+        dials_origin_mm=dials_origin_mm,
     )
 
 
@@ -224,7 +227,8 @@ def write_smv(
         f"DIALS_ORIGIN={dials[0]:g},{dials[1]:g},{dials[2]:g}\n"
         f"XDS_ORGX={g['orgx']:g};\nXDS_ORGY={g['orgy']:g};\n"
         f"CLOSE_DISTANCE={g['close_distance_mm']:g};\n"
-        f"PHI={phi_deg or 0.0:g};\nOSC_START={(osc_start_deg or 0.0):g};\nOSC_RANGE={(osc_range_deg or 0.0):g};\n"
+        f"PHI={0.0 if phi_deg is None else phi_deg:g};\nOSC_START={0.0 if osc_start_deg is None else osc_start_deg:g};\n"
+        f"OSC_RANGE={0.0 if osc_range_deg is None else osc_range_deg:g};\n"
         f"TWOTHETA={twotheta_deg:g};\n"
         f"DETECTOR_SN={detector_sn};\nBEAMLINE={beamline};\n"
         "}\f"

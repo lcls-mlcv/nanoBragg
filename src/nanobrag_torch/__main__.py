@@ -1231,7 +1231,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['misset_seed'] = args.misset_seed
 
     # Phi rotation: -osc/-phistep/-phisteps are resolved together, as in nanoBragg.c
-    config['phi_deg'] = args.phi if args.phi else 0.0
+    config['phi_deg'] = args.phi if args.phi is not None else 0.0
     config['osc_deg'], config['phi_step_deg'], config['phi_steps'] = resolve_phi_sampling(args)
 
     # Sampling
