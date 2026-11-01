@@ -94,7 +94,18 @@ def build_sim(args):
         # corner and also the lowest-resolution one (its d_max bound is exclusive); load all
         SIM.D.Fhkl_tuple = SIM.crystal.miller_array.indices(), SIM.crystal.miller_array.data(), None
         SIM.fhkl_asu_array = random_asu_amplitudes(ucell, args.symbol, args.fhkl_dmin, args.fhkl_seed, args.fhkl_friedel)
+    if args.spectrum_channels:
+        wavelength, flux = SIM.beam.spectrum[0]
+        rng = np.random.RandomState(args.spectrum_seed)
+        offsets = np.linspace(-args.spectrum_width, args.spectrum_width, args.spectrum_channels)
+        set_spectrum(SIM, wavelength * (1 + offsets), flux * rng.uniform(0.5, 1.5, offsets.size))
     return SIM
+
+
+def set_spectrum(SIM, wavelengths, fluxes):
+    """Load a spectrum the way hopper does; D.fluence becomes total flux / channels."""
+    SIM.beam.spectrum = [(float(w), float(f)) for w, f in zip(wavelengths, fluxes)]
+    SIM.D.xray_beams = SIM.beam.xray_beams
 
 
 def diffbragg_asu_key(space_group, hkl):
@@ -196,6 +207,27 @@ def diffbragg_detz_forward_and_derivs(SIM):
     return img, D.get_derivative_pixels(DETZ_ID).as_numpy_array().reshape(slow, fast).copy()
 
 
+def diffbragg_image(SIM):
+    """diffBragg's image for the current settings."""
+    D = SIM.D
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[0].get_image_size()
+    return D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+
+
+def diffbragg_lambda_forward_and_derivs(SIM):
+    """diffBragg image and d(image)/d(lambda_offset), d(image)/d(lambda_scale) (ids 12, 13)."""
+    D = SIM.D
+    D.refine(12)
+    D.refine(13)
+    D.initialize_managers()
+    D.lambda_coefficients = 0.0, 1.0
+    img = diffbragg_image(SIM)
+    fast, slow = SIM.detector[0].get_image_size()
+    return img, [d.as_numpy_array().reshape(slow, fast).copy() for d in D.get_lambda_derivative_pixels()]
+
+
 def diffbragg_fhkl_forward_and_gradients(SIM, weights):
     """diffBragg image, and Σ_pix w·dI/ds_i for its per-ASU intensity scales s_i (at s = 1).
 
@@ -238,7 +270,9 @@ def torch_experiment_model(SIM, args, **kwargs):
     beam = SIM.beam.nanoBragg_constructor_beam
     det_cfg = detector_config_from_dxtbx_panel(SIM.detector[0], beam.get_s0(), oversample=max(args.oversample, 1))
     det_cfg.oversample_omega = args.oversample_omega
-    beam_cfg = beam_config_from_dxtbx(beam, fluence=float(SIM.D.fluence), spot_scale=float(SIM.D.spot_scale))
+    spectrum = SIM.beam.spectrum if len(SIM.beam.spectrum) > 1 else None
+    beam_cfg = beam_config_from_dxtbx(beam, fluence=float(SIM.D.fluence), spot_scale=float(SIM.D.spot_scale),
+                                      spectrum=spectrum)
     beam_cfg.nopolar = beam_cfg.nopolar or args.nopolar
     eta = list(args.eta or [0.0])
     cfg = crystal_config_from_A(xtal.get_unit_cell().parameters(), xtal.get_A(), Ncells_abc=args.ncells,
@@ -367,6 +401,11 @@ def build_parser():
     p.add_argument("--fhkl-seed", dest="fhkl_seed", type=int, default=0)
     p.add_argument("--fhkl-friedel", dest="fhkl_friedel", action="store_true",
                    help="with --fhkl-dmin, equal amplitudes for each Friedel pair")
+    p.add_argument("--spectrum-channels", dest="spectrum_channels", type=int, default=0,
+                   help="replace the beam with this many sources, of random flux")
+    p.add_argument("--spectrum-width", dest="spectrum_width", type=float, default=0.002,
+                   help="half width of the spectrum, as a fraction of the wavelength")
+    p.add_argument("--spectrum-seed", dest="spectrum_seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     p.add_argument("--plot", action="store_true")
     return p

@@ -486,7 +486,18 @@ class DetectorStageAParams(nn.Module):
 
 
 class BeamStageAParams(nn.Module):
-    """Stage-A learnable parameterization for beam fluence."""
+    """Stage-A learnable parameterization for fluence, scale and spectrum.
+
+    The wavelength model is diffBragg's lambda_offset and lambda_scale,
+
+        lambda = lambda_offset + exp(delta_log_lambda_scale)·lambda_0 (Angstrom),
+
+    applied to the beam wavelength and to every source. With more than one source the
+    sources are weighted as diffBragg weights them, whatever BeamConfig.use_source_weights
+    says: fractions f_s of the fluence, f_s ∝ w_s·exp(delta_log_source_weights_s). Only
+    the shape of the spectrum is refined, so moving all the weights together does nothing
+    and the total stays with fluence and spot_scale. diffBragg has no gradient for weights.
+    """
 
     def __init__(
         self,
@@ -522,6 +533,43 @@ class BeamStageAParams(nn.Module):
             torch.zeros((), device=self.device, dtype=self.dtype)
         )
 
+        self.register_buffer(
+            "base_wavelength_A",
+            torch.as_tensor(base_config.wavelength_A, device=self.device, dtype=self.dtype),
+        )
+        self.lambda_offset = param_cls(torch.zeros((), device=self.device, dtype=self.dtype))
+        self.delta_log_lambda_scale = param_cls(torch.zeros((), device=self.device, dtype=self.dtype))
+
+        directions = base_config.source_directions
+        n_sources = 0 if directions is None else len(directions)
+        self.has_sources = n_sources > 0
+        M = n_sources if n_sources > 1 else 0
+        self.register_buffer(
+            "base_source_wavelengths_A",
+            torch.full((n_sources,), float(base_config.wavelength_A), device=self.device, dtype=self.dtype)
+            if base_config.source_wavelengths is None
+            else base_config.source_wavelengths.to(device=self.device, dtype=self.dtype) * 1e10,
+        )
+        self.register_buffer(
+            "base_source_weights",
+            torch.ones(n_sources, device=self.device, dtype=self.dtype)
+            if base_config.source_weights is None
+            else base_config.source_weights.to(device=self.device, dtype=self.dtype),
+        )
+        self.delta_log_source_weights = param_cls(torch.zeros(M, device=self.device, dtype=self.dtype))
+
+        self.unrefinable = {}
+        if M == 0:
+            self.unrefinable["delta_log_source_weights"] = (
+                "source weights are not refinable with fewer than two sources: give the beam a "
+                "spectrum (source_directions, source_wavelengths, source_weights)"
+            )
+        for pname in self.unrefinable:
+            getattr(self, pname).requires_grad_(False)
+
+    def _wavelength_A(self, wavelength_A: torch.Tensor) -> torch.Tensor:
+        return self.lambda_offset + torch.exp(self.delta_log_lambda_scale) * wavelength_A
+
     def build_config(self) -> BeamConfig:
         """Return a BeamConfig with physical values derived from raw parameters."""
         fluence = self.base_fluence * torch.exp(self.delta_log_fluence)
@@ -529,6 +577,12 @@ class BeamStageAParams(nn.Module):
         cfg = replace(self._base_config)
         cfg.fluence = fluence
         cfg.spot_scale = self.base_spot_scale * torch.exp(self.delta_log_spot_scale)
+        cfg.wavelength_A = self._wavelength_A(self.base_wavelength_A)
+        if self.has_sources:
+            cfg.source_wavelengths = self._wavelength_A(self.base_source_wavelengths_A) * 1e-10
+            if self.delta_log_source_weights.numel():
+                cfg.source_weights = self.base_source_weights * torch.exp(self.delta_log_source_weights)
+                cfg.use_source_weights = True
         return cfg
 
 
@@ -701,7 +755,9 @@ class ExperimentModel(nn.Module):
     instead with ``hkl_data``/``hkl_metadata`` or set_structure_factors().
     ``background_rois`` and ``tilt_abc`` give the regions and starting coefficients of
     the background planes (see BackgroundStageAParams); by default the whole image is
-    one plane starting at zero.
+    one plane starting at zero. A beam with several sources is a spectrum, weighted as
+    diffBragg weights it even though a plain Simulator ignores the weights as C does
+    (see BeamStageAParams).
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -728,6 +784,8 @@ class ExperimentModel(nn.Module):
         "eta": ("crystal_params.delta_log_eta",),
         "Fhkl": ("fhkl_params.delta_log_F",),
         "background": ("background_params.delta_tilt_abc",),
+        "wavelength": ("beam_params.lambda_offset", "beam_params.delta_log_lambda_scale"),
+        "source_weights": ("beam_params.delta_log_source_weights",),
     }
 
     def __init__(
@@ -827,9 +885,9 @@ class ExperimentModel(nn.Module):
     @property
     def unrefinable(self) -> dict:
         """Parameter name -> why it cannot be refined (crystal shape, crystal system, detector kind,
-        no structure factors)."""
+        no structure factors, a single source)."""
         blocked = {}
-        for block in ("crystal_params", "detector_params", "fhkl_params"):
+        for block in ("crystal_params", "detector_params", "beam_params", "fhkl_params"):
             blocked.update({f"{block}.{n}": why for n, why in getattr(self, block).unrefinable.items()})
         return blocked
 
@@ -971,6 +1029,7 @@ class ExperimentModel(nn.Module):
         self._simulator.fluence = as_tensor_preserving_grad(
             beam_cfg.fluence, device=self.device, dtype=self.dtype
         )
+        self._simulator.set_spectrum(beam_cfg.wavelength_A, beam_cfg.source_wavelengths, beam_cfg.source_weights)
         return self._simulator
 
     def _construct(self, crystal_cfg, detector_cfg, beam_cfg) -> None:

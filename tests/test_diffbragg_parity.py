@@ -354,3 +354,104 @@ def test_background_planes_reproduce_diffbragg_fit(robust):
     assert any(a != 0 for a, _, _ in tilt_abc) != robust
     np.testing.assert_allclose(got[covered], background[0][covered], rtol=1e-12)
     np.testing.assert_array_equal(got[~covered], 0)
+
+
+# Spectrum: diffBragg's lambda_offset and lambda_scale (ids 12, 13), and source weights.
+_LAMBDA_BASE = ["--detpixels", "128", "--distance", "100", "--pixel", "0.2"]
+LAMBDA_CASES = {
+    "monochromatic": [],
+    "five-channels": ["--spectrum-channels", "5"],
+    "five-channels-tilted": ["--spectrum-channels", "5", "--tilt-deg", "5"],
+    "five-channels-Fhkl": ["--spectrum-channels", "5", "--distance", "60", "--fhkl-dmin", "6", "--randomrotate", "1"],
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("point", [(0.0, 1.0), (0.002, 1.001)], ids=["start", "moved"])
+@pytest.mark.parametrize("case", list(LAMBDA_CASES))
+def test_lambda_gradients_match_diffbragg(case, point, device):
+    from nanobrag_torch.compat.cctbx import asu_structure_factors
+
+    args = cmp.build_parser().parse_args(_LAMBDA_BASE + LAMBDA_CASES[case])
+    args.device = device
+    sim = cmp.build_sim(args)
+    sf = {}
+    if args.fhkl_dmin:
+        sf = dict(structure_factors=asu_structure_factors(sim.fhkl_asu_array, anomalous=True))
+    db_img, _ = cmp.diffbragg_lambda_forward_and_derivs(sim)
+    sim.D.lambda_coefficients = point
+    db_img = cmp.diffbragg_image(sim)
+    db_derivs = [d.as_numpy_array().reshape(db_img.shape).copy() for d in sim.D.get_lambda_derivative_pixels()]
+
+    model = cmp.torch_experiment_model(sim, args, **sf)
+    offset, scale = point
+    with torch.no_grad():
+        model.beam_params.lambda_offset.fill_(offset)
+        model.beam_params.delta_log_lambda_scale.fill_(math.log(scale))
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-8, atol=1e-11 * db_img.max())
+
+    # diffBragg's analytic d/d(lambda_scale) is only right at the start (see the test
+    # below), so difference its image instead
+    eps = 1e-6
+    sim.D.lambda_coefficients = offset, scale + eps
+    above = cmp.diffbragg_image(sim)
+    sim.D.lambda_coefficients = offset, scale - eps
+    dI_dscale = (above - cmp.diffbragg_image(sim)) / (2 * eps)
+
+    rng = np.random.default_rng(5)
+    for wname, w in {"uniform": np.ones_like(db_img), "random": rng.uniform(0.5, 1.5, db_img.shape)}.items():
+        grads = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                                    [model.beam_params.lambda_offset, model.beam_params.delta_log_lambda_scale],
+                                    retain_graph=True)
+        references = (w * db_derivs[0]).sum(), scale * (w * dI_dscale).sum()  # d/d(log s) = s·d/ds
+        for name, got, ref in zip(("offset", "log scale"), grads, references):
+            assert ref != 0
+            np.testing.assert_allclose(float(got), ref, rtol=1e-7, err_msg=f"d(w·I)/d({name}) ({wname} w)")
+
+
+@pytest.mark.parametrize("offset, scale", [(0.0, 1.0), (0.002, 1.001), (0.0, 1.02)])
+def test_diffbragg_analytic_lambda_scale_derivative_uses_the_moved_wavelength(offset, scale):
+    # diffBragg_cpu_kernel.cpp:990 sets dg_dlambda = lambda_ang, which by then is
+    # offset + scale·lambda; dlambda/dscale is the source's own lambda. Right at (0, 1)
+    # and off by the ratio of the two after that. Pinned so a fix upstream shows up here.
+    args = cmp.build_parser().parse_args(_LAMBDA_BASE)
+    sim = cmp.build_sim(args)
+    wavelength = sim.beam.spectrum[0][0]
+    cmp.diffbragg_lambda_forward_and_derivs(sim)
+    sim.D.lambda_coefficients = offset, scale
+    db_img = cmp.diffbragg_image(sim)
+    analytic = sim.D.get_lambda_derivative_pixels()[1].as_numpy_array().sum()
+    eps = 1e-6
+    sim.D.lambda_coefficients = offset, scale + eps
+    above = cmp.diffbragg_image(sim)
+    sim.D.lambda_coefficients = offset, scale - eps
+    difference = ((above - cmp.diffbragg_image(sim)) / (2 * eps)).sum()
+    assert db_img.sum() > 0
+    np.testing.assert_allclose(analytic / difference, (offset + scale * wavelength) / wavelength, rtol=1e-6)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_source_weight_gradients_match_diffbragg_differences(device):
+    # diffBragg has no gradient for source_I, so difference its image at fixed total flux
+    args = cmp.build_parser().parse_args(_LAMBDA_BASE + ["--spectrum-channels", "5"])
+    args.device = device
+    sim = cmp.build_sim(args)
+    wavelengths, fluxes = (np.array(x) for x in zip(*sim.beam.spectrum))
+    model = cmp.torch_experiment_model(sim, args)
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), cmp.diffbragg_image(sim), rtol=1e-9)
+
+    w = np.random.default_rng(5).uniform(0.5, 1.5, img.shape)
+    (g,) = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                               [model.beam_params.delta_log_source_weights])
+
+    def weighted(delta):
+        moved = fluxes * np.exp(delta)
+        cmp.set_spectrum(sim, wavelengths, moved * fluxes.sum() / moved.sum())
+        return (w * cmp.diffbragg_image(sim)).sum()
+
+    eps = 1e-4
+    reference = np.array([(weighted(eps * np.eye(5)[i]) - weighted(-eps * np.eye(5)[i])) / (2 * eps) for i in range(5)])
+    assert (reference > 0).any() and (reference < 0).any()
+    np.testing.assert_allclose(g.cpu().numpy(), reference, rtol=1e-5)
