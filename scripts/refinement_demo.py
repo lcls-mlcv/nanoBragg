@@ -352,7 +352,26 @@ def stage_still(args):
         P.simulator.init_scale = 1
         P.simulator.beam.size_mm = 1
         P.simulator.total_flux = 1e12
-        P.simulator.detector.force_zero_thickness = True  # as the torch stage; the kernel otherwise applies the sensor
+        # From a panel, nanoBragg takes 2 layers of the full thickness in units 1000 times too long.
+        P.simulator.detector.force_zero_thickness = not args.sensor_layers
+        if args.sensor_layers:
+            thick_mm = expt.detector[0].get_thickness()
+            build_simulator = utils.simulator_for_refinement
+
+            def layered_simulator(*build_args):
+                SIM = build_simulator(*build_args)
+                SIM.D.detector_thicksteps = args.sensor_layers
+                SIM.D.detector_thick_mm = thick_mm
+                SIM.D.detector_thickstep_mm = thick_mm / args.sensor_layers
+                SIM.D.detector_attenuation_length_mm = 1 / expt.detector[0].get_mu()
+                return SIM
+
+            utils.simulator_for_refinement = layered_simulator
+        if args.eta:
+            P.init.eta_abc = [args.eta] * 3
+            P.fix.eta_abc = False
+            P.simulator.crystal.has_isotropic_mosaicity = True
+            P.simulator.crystal.num_mosaicity_samples = args.mosaic_domains
         wavelengths = weights = None
         if args.channels:
             wavelengths, weights = _binned_spectrum(
@@ -367,6 +386,8 @@ def stage_still(args):
         P.niter_per_J = 1
         P.method = "L-BFGS-B"
         P.ftol = 1e-10
+        if args.hopper_maxiter:
+            P.lbfgs_maxiter = args.hopper_maxiter
 
         clock = time.perf_counter()
         # refine() replaces simulator.spectrum.filename with this argument
@@ -377,6 +398,9 @@ def stage_still(args):
         miss_opt, _ = utils.compare_with_ground_truth(
             *start.get_real_space_vectors(), dxcryst_models=[Eopt.crystal, start],
             symbol=start.get_space_group().info().type().lookup_symbol())
+        eta = 0.0
+        if args.eta:
+            eta = float(Mod.P["eta_abc0"].get_val(x[Mod.P["eta_abc0"].xpos]))
         rois = np.array(Mod.rois)
         pids = np.array(Mod.pids)
         area = (rois[:, 1] - rois[:, 0]) * (rois[:, 3] - rois[:, 2])
@@ -388,7 +412,7 @@ def stage_still(args):
         trusted = Mod.all_trusted
         cc = np.corrcoef(Mod.best_model[trusted] + Mod.all_background[trusted], Mod.all_data[trusted])[0, 1]
         result = dict(seconds=seconds, misset_deg=float(miss_opt), G=float(G), Ncells=[float(Na), float(Nb), float(Nc)],
-                      ucell=[float(v) for v in (a, b, c, al, be, ga)], cc=float(cc),
+                      ucell=[float(v) for v in (a, b, c, al, be, ga)], cc=float(cc), eta=eta,
                       rois=len(rois), pixels=len(Mod.all_data), trusted=int(trusted.sum()))
         print(json.dumps(result, indent=1))
         D = SIM_hopper.D
@@ -422,7 +446,8 @@ def stage_still(args):
             rois=rois, tilt_abc=tilt_abc, panels=pids,
             G_true=float(G), G_start=float(args.init_g), fluence=float(D.fluence), oversample=1,
             default_F=float(D.default_F), ncells_true=[float(Na), float(Nb), float(Nc)],
-            ncells_start=list(args.ncells_start), **extra,
+            ncells_start=list(args.ncells_start), sensor_layers=args.sensor_layers,
+            eta_true=eta, eta_start=args.eta, mosaic_domains=args.mosaic_domains, **extra,
         )
         with open(os.path.join(args.outdir, "models.json"), "w") as out:
             json.dump(dict(truth=Eopt.crystal.to_dict(), start=start.to_dict(), detector=expt.detector.to_dict(),
@@ -452,11 +477,19 @@ def stage_torch(args):
     G_true = float(saved["G_true"])
     device = torch.device(args.device)
 
-    def build(crystal, Ncells, G):
+    layers = int(saved["sensor_layers"]) if "sensor_layers" in saved.files else 0
+    eta_true = float(saved["eta_true"]) if "eta_true" in saved.files else 0.0
+    sensor = dict(detector_thick_mm=0.0)  # the other stages force zero thickness in hopper too
+    if layers:
+        sensor = dict(detector_thicksteps=layers, oversample_thick=True)
+
+    def build(crystal, Ncells, G, eta=0.0):
+        if eta:
+            sensor.update(mosaic_spread_deg=eta, mosaic_domains=int(saved["mosaic_domains"]))
         model = experiment_model_from_dxtbx(
             detector, beam, crystal, Ncells_abc=Ncells, shape="gauss", default_F=float(saved["default_F"]),
-            detector_thick_mm=0.0,  # the real and still stages force zero thickness in hopper too
-            fluence=float(saved["fluence"]), spot_scale=G, oversample=max(int(saved["oversample"]), 1),
+            fluence=float(saved["fluence"]) * fluence_scale / max(layers, 1), spot_scale=G, oversample=max(int(saved["oversample"]), 1),
+            **sensor,
             miller_array=miller, anomalous=True, rois=saved["rois"], tilt_abc=saved["tilt_abc"], spectrum=spectrum,
             panels=saved["panels"] if len(detector) > 1 else None, device=device,
         )
@@ -465,6 +498,11 @@ def stage_torch(args):
     spectrum = None
     if "wavelengths" in saved.files:
         spectrum = [(float(w), float(f)) for w, f in zip(saved["wavelengths"], saved["weights"])]
+    fluence_scale = 1.0
+    if args.spectrum_npz:  # D.fluence is per channel
+        other = np.load(args.spectrum_npz)
+        fluence_scale = len(spectrum) / len(other["wavelengths"])
+        spectrum = [(float(w), float(f)) for w, f in zip(other["wavelengths"], other["weights"])]
 
     def image_of(values, fast, slow, shape):
         image = np.zeros(shape, dtype=values.dtype)
@@ -479,7 +517,8 @@ def stage_torch(args):
         shape = (len(detector), *shape)
     fast, slow = saved["all_fast"], saved["all_slow"]
     symbol = truth.get_space_group().info().type().lookup_symbol()
-    model = build(start, tuple(float(n) for n in saved["ncells_start"]), float(saved["G_start"]))
+    model = build(start, tuple(float(n) for n in saved["ncells_start"]), float(saved["G_start"]),
+                  float(saved["eta_start"]) if eta_true else 0.0)
     data = model.roi_values(image_of(saved["all_data"].astype(np.float64), fast, slow, shape))
     trusted = model.roi_values(image_of(saved["all_trusted"], fast, slow, shape))
     sigma = model.roi_values(image_of(saved["all_sigma_rdout"].astype(np.float64), fast, slow, shape))
@@ -489,7 +528,7 @@ def stage_torch(args):
         expected = model.roi_values(image_of(saved["all_background"].astype(np.float64), fast, slow, shape))
     print("background vs hopper, max difference", float((planes - expected).abs().max()))
 
-    reference = build(truth, tuple(float(n) for n in saved["ncells_true"]), G_true)
+    reference = build(truth, tuple(float(n) for n in saved["ncells_true"]), G_true, eta_true)
     with torch.no_grad():
         pred = reference(roi_only=True)
         spots = reference.roi_values(saved["spots"])
@@ -500,9 +539,11 @@ def stage_torch(args):
     ratio = (bragg[bright] / spots[bright]).cpu().numpy()
     print("torch/diffBragg on %d bright pixels: percentiles 1, 50, 99" % bright.sum(), np.percentile(ratio, [1, 50, 99]))
 
-    model.freeze().refine("scale", "misset", "Ncells", *([] if args.fix_cell else ["cell"]))
+    model.freeze().refine("scale", "misset", "Ncells", *([] if args.fix_cell else ["cell"]), *(["eta"] if eta_true else []))
     if args.free_background:
         model.refine("background")
+    if args.refine_wavelength:
+        model.refine("wavelength")
 
     def objective():
         return gaussian_nll(model(roi_only=True), data, sigma, trusted=trusted)
@@ -520,7 +561,9 @@ def stage_torch(args):
         with torch.no_grad():
             cc = torch.corrcoef(torch.stack((model(roi_only=True)[trusted], data[trusted].to(torch.float64))))[0, 1]
         out = dict(stage=tag, seconds=seconds, nll=objective().item(), misset_deg=float(misset),
-                   G_over_truth=G / G_true, Ncells=Ncells, ucell=cell, cc=cc.item())
+                   G_over_truth=G / G_true, Ncells=Ncells, ucell=cell, cc=cc.item(),
+                   eta=model.crystal_params.eta().item() if eta_true else 0.0,
+                   lambda_offset=model.beam_params.lambda_offset.item())
         print(json.dumps(out))
         return out
 
@@ -549,6 +592,13 @@ def main():
     parser.add_argument("--shot", help="still: directory with shot.npz, shot.expt and indexed.refl")
     parser.add_argument("--mask", help="still: .npz with mask, True on good pixels (panel, slow, fast)")
     parser.add_argument("--channels", type=int, default=0, help="still: spectrum channels, 0 for one wavelength")
+    parser.add_argument("--sensor-layers", dest="sensor_layers", type=int, default=0,
+                        help="still: layers across the panels' sensor, 0 for no sensor")
+    parser.add_argument("--eta", type=float, default=0.0, help="still: starting mosaic spread in degrees, 0 for none")
+    parser.add_argument("--mosaic-domains", dest="mosaic_domains", type=int, default=26, help="still: even")
+    parser.add_argument("--hopper-maxiter", dest="hopper_maxiter", type=int, default=None, help="still: L-BFGS-B cap")
+    parser.add_argument("--spectrum-npz", dest="spectrum_npz", help="torch: wavelengths and weights to use instead")
+    parser.add_argument("--refine-wavelength", dest="refine_wavelength", action="store_true", help="torch")
     parser.add_argument("--shoebox", type=int, default=15, help="still: shoebox size")
     parser.add_argument("--sigma-r", dest="sigma_r", type=float, default=0.0,
                         help="still: readout noise in image units, by default from the pedestal")
