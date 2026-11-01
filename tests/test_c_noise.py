@@ -185,11 +185,62 @@ def test_a_draw_past_float32_range_is_inf_not_a_crash():
     assert overloads == 32 and noise.min() == 65535 and photons > 1e39
 
 
+@pytest.mark.parametrize("mean", [0.1, 1.0, 5.0, 11.9, 12.0, 12.1, 100.0, 1000.0, 3e5, 5e5, 1000001.0, 2e6, 1e7],
+                         ids=lambda mean: f"{mean:g}")
+def test_c_noise_image_is_poisson(mean):
+    """
+    Mean and variance within 5 standard errors, so the port is right and not just like C.
+
+    A negative adc keeps the draws of a bright pixel on the image: the 16-bit clip is what
+    would otherwise hide them, and the pixel is the draw plus adc.
+    """
+    n = 100000
+    adc = 30000.0 - mean if mean > 30000 else 0.0
+    noise, photons, _ = c_noise_image(np.full((1, n), mean, dtype=np.float32), 12345, adc)
+    draws = noise.astype(np.float64).ravel() - adc
+    if adc:
+        assert noise.min() > 0 and noise.max() < 65535  # nothing wrapped or clipped
+    assert abs(draws.mean() - mean) < 5 * (mean / n) ** 0.5
+    assert abs(draws.var() / mean - 1) < 5 * ((2 + 1 / mean) / n) ** 0.5
+    assert abs(photons / n - draws.mean()) <= 1  # the pixel truncates what the Gaussian branch draws
+
+
+@pytest.mark.parametrize("mean", [7e5, 999999.0], ids=lambda mean: f"{mean:g}")
+def test_c_noise_image_keeps_cs_excess_variance_below_1e6(mean):
+    """The one regime that isn't Poisson. Pinned, since the docstring states it and C needs it."""
+    n = 100000
+    noise, _, _ = c_noise_image(np.full((1, n), mean, dtype=np.float32), 12345, 30000.0 - mean)
+    draws = noise.astype(np.float64).ravel() - (30000.0 - mean)
+    assert abs(draws.mean() - mean) < 5 * (1.2 * mean / n) ** 0.5
+    assert 1.05 < draws.var() / mean < 1.25
+
+
 def fast_noise(tmp_path, flags, name="a"):
     folder = tmp_path / name
     folder.mkdir()
     stdout = run_torch(folder, flags + " -fast_noise")
     return noise_pixels(folder / "n.img"), np.fromfile(folder / "f.bin", dtype=np.float32).reshape(96, 96), stdout
+
+
+def test_cli_fast_noise_is_seeded_and_not_cs_stream(tmp_path):
+    first, _, _ = fast_noise(tmp_path, "-seed 7 -fluence 1e30", "a")
+    again, _, _ = fast_noise(tmp_path, "-seed 7 -fluence 1e30", "b")
+    other, _, _ = fast_noise(tmp_path, "-seed 8 -fluence 1e30", "c")
+    (tmp_path / "d").mkdir()
+    run_torch(tmp_path / "d", "-seed 7 -fluence 1e30")
+    assert np.array_equal(first, again)
+    assert not np.array_equal(first, other)
+    assert not np.array_equal(first, noise_pixels(tmp_path / "d" / "n.img"))
+
+
+def test_cli_fast_noise_is_poisson_about_the_float_image(tmp_path):
+    noise, pixels, stdout = fast_noise(tmp_path, "-seed 7 -fluence 1e30 -adc 0")
+    assert pixels.max() < 60000 and (pixels > 10).sum() > 500
+    bright = pixels > 10
+    z = (noise[bright] - pixels[bright]) / np.sqrt(pixels[bright])
+    assert abs(z.mean()) < 5 / z.size ** 0.5
+    assert abs(z.var() - 1) < 5 * (2 / z.size) ** 0.5
+    assert photon_line(stdout) == f"{noise.sum():.0f} photons on noise image (0 overloads)"
 
 
 def test_cli_fast_noise_honours_roi_and_adc_as_the_c_path_does(tmp_path):
