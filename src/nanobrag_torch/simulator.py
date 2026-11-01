@@ -1584,11 +1584,11 @@ class Simulator:
         # ```
         #
         # Units: [dimensionless] / [dimensionless] × [m²] × [photons/m²] = [photons·m²]
+        # r_e^2*fluence first: normalized_intensity*r_e^2 underflows float32 for weak F.
         physical_intensity = (
             normalized_intensity
             / steps
-            * self.r_e_sqr
-            * self.fluence
+            * (self.r_e_sqr * self.fluence)
             * getattr(self.beam_config, "spot_scale", 1.0)
         )
 

@@ -979,6 +979,12 @@ cases:
     runs:
       - name: default-fluence
         extra_args: >-
+      - name: weak-structure-factor
+        extra_args: >-
+          -default_F 1e-6
+      - name: weak-structure-factor-below-float32-underflow
+        extra_args: >-
+          -default_F 1e-8
       - name: flux-only
         extra_args: >-
           -flux 1e12
