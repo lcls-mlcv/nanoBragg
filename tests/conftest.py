@@ -55,6 +55,24 @@ def _restore_process_globals():
     torch.use_deterministic_algorithms(deterministic, warn_only=deterministic_warn_only)
 
 
+@pytest.fixture(autouse=True)
+def _no_fdump_left_in_repo_root():
+    """A -hkl run writes Fdump.bin to its cwd, and every later -default_F run there reads it."""
+    fdump = Path(__file__).resolve().parent.parent / "Fdump.bin"
+    was_there = fdump.exists()
+    yield
+    if fdump.exists() and not was_there:
+        fdump.unlink()
+        pytest.fail("this test left Fdump.bin in the repo root: run the CLI in a tmp cwd")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _suite_leaves_no_fdump():
+    yield
+    fdump = Path(__file__).resolve().parent.parent / "Fdump.bin"
+    assert not fdump.exists(), f"{fdump} changes what -default_F runs from that directory render; remove it"
+
+
 # ============================================================================
 # Phase K Task K1: Session Infrastructure Gate
 # ============================================================================

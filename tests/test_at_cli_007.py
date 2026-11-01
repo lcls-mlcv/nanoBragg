@@ -57,7 +57,7 @@ class TestATCLI007NoiseDeterminism:
 
         # Run the command
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False
+            cmd, capture_output=True, text=True, check=False, cwd=hkl_file.parent  # -hkl writes Fdump.bin here
         )
 
         if result.returncode != 0:

@@ -1087,6 +1087,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         except OSError:
             print(f"WARNING: unable to open dump file: {args.dumpfile}")
     elif Path(args.dumpfile).exists():
+        # A leftover cache overrides -default_F, as in C, so say so with C's line (nanoBragg.c:2109)
+        print(f"reading Fs from {args.dumpfile}")
         config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F,
                                                    dtype=torch.float64)
 
