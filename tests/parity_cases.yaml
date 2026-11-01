@@ -1628,3 +1628,88 @@ cases:
         extra_args: >-
           -misset_seed 0
           -misset random
+  - id: PARITY-CLIFLAGS-002
+    description: >-
+      Flags nanoBragg.c reads with strstr or advertises under a longer name, flags it
+      resolves by argv order (-lambda/-energy, -detsize/-detpixels per axis), a lone
+      -Xbeam or -Ybeam, and detector sizes from a default detsize of 102.4 mm with
+      fpixels = ceil(detsize/pixel - 0.5). The default beam centre follows detsize even
+      when that is not a whole number of pixels.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: energy-then-lambda
+        extra_args: >-
+          -energy 12398.42 -lambda 2
+      - name: lambda-then-energy
+        extra_args: >-
+          -lambda 2 -energy 12398.42
+      - name: wavelength-flag
+        extra_args: >-
+          -wavelength 2
+      - name: xbeam-alone
+        extra_args: >-
+          -Xbeam 5 -detpixels 128
+      - name: ybeam-alone
+        extra_args: >-
+          -Ybeam 5 -detpixels 128
+      - name: xbeam-alone-denzo
+        extra_args: >-
+          -Xbeam 5 -detpixels 128 -denzo
+      - name: ybeam-alone-adxv
+        extra_args: >-
+          -Ybeam 5 -detpixels 128 -adxv
+      - name: mosaic-domains-flag
+        extra_args: >-
+          -mosaic 1 -mosaic_domains 3
+      - name: detector-absorb-flag
+        extra_args: >-
+          -detector_absorb 100 -detector_thick 100 -detector_thicksteps 3
+      - name: sample-size-flag
+        extra_args: >-
+          -sample_size 0.0005
+      - name: xtal-size-flag
+        extra_args: >-
+          -xtal_size 0.0005
+      - name: default-size-coarse-pixels
+        extra_args: >-
+      - name: detsize-f-alone
+        extra_args: >-
+          -detsize_f 32
+      - name: detsize-s-alone
+        extra_args: >-
+          -detsize_s 32
+      - name: detsize-not-whole-pixels
+        extra_args: >-
+          -detsize 64.5
+      - name: detsize-not-whole-pixels-xds
+        extra_args: >-
+          -detsize 64.5 -xds
+      - name: detsize-not-whole-pixels-adxv
+        extra_args: >-
+          -detsize 64.5 -adxv
+      - name: detpixels-f-alone
+        extra_args: >-
+          -detpixels_f 80
+      - name: detsize-then-detsize-f
+        extra_args: >-
+          -detsize 40 -detsize_f 20
+      - name: detsize-f-then-detsize
+        extra_args: >-
+          -detsize_f 20 -detsize 40
+      - name: detpixels-then-detpixels-f
+        extra_args: >-
+          -detpixels 60 -detpixels_f 30
+      - name: detpixels-f-then-detpixels
+        extra_args: >-
+          -detpixels_f 30 -detpixels 60

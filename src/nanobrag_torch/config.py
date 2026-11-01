@@ -220,6 +220,8 @@ class DetectorConfig:
     # whose Fclose and Fbeam coincide does.
     close_center_f_mm: Optional[float] = None  # Fclose (fast axis)
     close_center_s_mm: Optional[float] = None  # Sclose (slow axis)
+    detsize_f_mm: Optional[float] = None  # Size behind the default beam centre, fpixels*pixel if None
+    detsize_s_mm: Optional[float] = None  # Same, slow axis
 
     # Beam center source tracking (DETECTOR-CONFIG-001 Phase C1)
     # Distinguishes auto-calculated defaults from explicit user-provided values
@@ -324,8 +326,8 @@ class DetectorConfig:
         # The offset is part of the MOSFLM beam-center MAPPING formula and should
         # be applied when converting beam centers to Fbeam/Sbeam in the Detector class.
         if self.beam_center_s is None or self.beam_center_f is None:
-            detsize_s = self.spixels * self.pixel_size_mm  # Total detector size in slow axis (mm)
-            detsize_f = self.fpixels * self.pixel_size_mm  # Total detector size in fast axis (mm)
+            detsize_s = self.detsize_s_mm or self.spixels * self.pixel_size_mm  # Total detector size in slow axis (mm)
+            detsize_f = self.detsize_f_mm or self.fpixels * self.pixel_size_mm  # Total detector size in fast axis (mm)
 
             # Per spec-a-core.md §71-72:
             # MOSFLM/DENZO: Default Xbeam = Ybeam = (detsize + pixel)/2
