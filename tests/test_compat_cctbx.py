@@ -483,7 +483,7 @@ def test_model_layers_split_the_sensor_evenly(thick_mm, expected_um):
 
 
 def test_model_passes_oversample_thick_on():
-    with_layers, averaged = (_layered_model(oversample_thick=flag)().detach().sum() for flag in (True, False))
+    with_layers, averaged = (_layered_model(oversample_thick=flag)().detach().sum().item() for flag in (True, False))
     assert with_layers != pytest.approx(averaged, rel=1e-3)
 
 
