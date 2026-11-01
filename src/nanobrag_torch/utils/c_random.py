@@ -42,7 +42,7 @@ Determinism validated by AT-PARALLEL-013 (same-seed runs, correlation ≥0.99999
 
 References:
 -----------
-- C Source: nanoBragg.c lines 4143-4185 (ran1), 3820-3868 (mosaic_rotation_umat)
+- C Source: nanoBragg.c lines 3785-3816 (ran1), 3451-3499 (mosaic_rotation_umat)
 - Spec: specs/spec-a-core.md §5.3 (RNG determinism)
 - Architecture: arch.md ADR-05 (Deterministic Sampling & Seeds)
 - Phase B3 Analysis: reports/determinism-callchain/phase_b3/20251011T051737Z/c_seed_flow.md
@@ -60,7 +60,7 @@ class CLCG:
     This class implements the ran1() function from nanoBragg.c, which is based on
     the Park and Miller "Minimal Standard" generator with Bays-Durham shuffle.
 
-    C-Code Implementation Reference (from nanoBragg.c, lines ~49100-49150):
+    C-Code Implementation Reference (from nanoBragg.c, lines 3785-3816):
     ```c
     #define IA 16807
     #define IM 2147483647
@@ -178,7 +178,7 @@ def mosaic_rotation_umat(
     which generates a random rotation matrix with maximum rotation angle
     limited by the mosaicity parameter.
 
-    C-Code Implementation Reference (from nanoBragg.c, lines ~48855-48905):
+    C-Code Implementation Reference (from nanoBragg.c, lines 3451-3499):
     ```c
     double *mosaic_rotation_umat(float mosaicity, double umat[9], long *seed)
     {
@@ -245,7 +245,7 @@ def mosaic_rotation_umat(
 
     C Equivalent:
     -------------
-    Replicates nanoBragg.c lines 3820-3868 (mosaic_rotation_umat).
+    Replicates nanoBragg.c lines 3451-3499 (mosaic_rotation_umat).
     C version uses pointer side effects: `ran1(&seed)` mutates seed in-place.
     PyTorch version uses stateful CLCG class for memory safety.
 
@@ -395,7 +395,7 @@ def umat2misset(umat: torch.Tensor) -> Tuple[float, float, float]:
     This function ports the umat2misset() function from nanoBragg.c,
     which decomposes a rotation matrix into XYZ Euler angles.
 
-    C-Code Implementation Reference (from nanoBragg.c, lines ~48910-48995):
+    C-Code Implementation Reference (from nanoBragg.c, lines 3503-3624):
     ```c
     double *umat2misset(double umat[9],double *missets)
     {
