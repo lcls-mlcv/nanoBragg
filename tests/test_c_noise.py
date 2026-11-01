@@ -129,7 +129,8 @@ def test_cli_noise_image_is_cs_byte_for_byte(flags, tmp_path):
                            timeout=300).stdout
     py_out = run_torch(py_dir, flags, "-dtype", "float64")
     assert (py_dir / "n.img").read_bytes()[512:] == (c_dir / "n.img").read_bytes()[512:]
-    assert photon_line(py_out) == photon_line(c_out)
+    # glibc prints the sign of a NaN and Darwin's libc doesn't
+    assert photon_line(py_out) == photon_line(c_out).replace("-nan", "nan")
 
 
 def test_cli_noise_image_at_a_fluence_float32_cannot_hold(tmp_path):
