@@ -684,6 +684,7 @@ def experiment_model_from_dxtbx(
     default_F: float = 0.0,
     spot_metric: SpotMetric = SpotMetric.HKL,
     oversample: int = 1,
+    detector_thick_mm: Optional[float] = None,
     fluence: Optional[float] = None,
     spot_scale: float = 1.0,
     spectrum: Optional[Iterable[Tuple[float, float]]] = None,
@@ -703,13 +704,15 @@ def experiment_model_from_dxtbx(
     refinable, one amplitude per reflection of its ASU (see asu_structure_factors); ``rois``,
     ``tilt_abc`` and ``panels`` are diffBragg's rois, tilt_abc and pids. ``spectrum`` is a
     list of (wavelength_Å, flux) as in beam_config_from_dxtbx, and ``fluence`` matches a
-    diffBragg image when it is that simulator's D.fluence.
+    diffBragg image when it is that simulator's D.fluence. ``detector_thick_mm`` overrides
+    the panels' sensor thickness: hopper's simulator ignores it, so pass 0.0 to compare.
     """
     from ..models.experiment import ExperimentModel
 
     s0 = _s0_of(beam)
     panel_list = list(detector) if hasattr(detector, "__getitem__") else [detector]
-    configs = [detector_config_from_dxtbx_panel(panel, s0, oversample=oversample) for panel in panel_list]
+    configs = [detector_config_from_dxtbx_panel(panel, s0, oversample=oversample, detector_thick_mm=detector_thick_mm)
+               for panel in panel_list]
     crystal_cfg = crystal_config_from_dxtbx(
         crystal, Ncells_abc=Ncells_abc, shape=shape, mosaic_spread_deg=mosaic_spread_deg,
         mosaic_domains=mosaic_domains, default_F=default_F, spot_metric=spot_metric,

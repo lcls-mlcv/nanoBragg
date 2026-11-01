@@ -137,6 +137,16 @@ def test_rois_across_panels_on_every_kernel_path(case):
                                    rtol=1e-12, atol=1e-16)
 
 
+def test_each_pixel_uses_its_own_panels_distance():
+    panels = [_panel(*p) for p in PANELS]
+    panels[1].distance_mm = 90.0
+    model = ExperimentModel(_crystal(), panels, _beam(), dtype=DTYPE, background_rois=ROIS, tilt_abc=ABC,
+                            background_panels=ROI_PANELS)
+    with torch.no_grad():
+        full = model()
+        torch.testing.assert_close(model(roi_only=True), model.roi_values(full), rtol=1e-12, atol=1e-16)
+
+
 def test_rois_across_panels_gradient_matches_whole_images():
     rois_model = _multi(background_rois=ROIS, tilt_abc=ABC, background_panels=ROI_PANELS)
     selected = torch.zeros(3, P, P, dtype=DTYPE)
@@ -251,6 +261,13 @@ def test_a_fhkl_step_reaches_every_shot_and_a_minibatch_runs_only_those():
     assert len(after) == 2
     assert not torch.allclose(after[0], before[2])
     torch.testing.assert_close(after[0], expected, rtol=1e-12, atol=0.0)
+
+
+def test_shots_read_one_fhkl_grid():
+    sf = _sf()
+    serial = SerialExperiment([_shot(sf, m) for m in MISSETS])
+    serial()
+    assert len({id(shot._crystal.hkl_data) for shot in serial.shots}) == 1
 
 
 def test_group_control_reaches_all_shots():
