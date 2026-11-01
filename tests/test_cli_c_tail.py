@@ -9,8 +9,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 from nanobrag_torch.__main__ import create_parser, resolve_detector_size, resolve_wavelength_A
+from nanobrag_torch.io.source import read_sourcefile
 
 
 def _c_binary():
@@ -84,3 +86,34 @@ def test_energy_zero_divides_as_c_does(flags, wavelength_A):
     del args._argv
     if flags[0] == "-energy":  # without argv, -energy wins
         assert math.isinf(resolve_wavelength_A(args))
+
+
+DETECTOR = "-pixel 0.5 -detpixels 48".split()
+
+
+def _sources(tmp_path, text, beam=(1.0, 0.0, 0.0)):
+    path = tmp_path / "sources.txt"
+    path.write_bytes(text.encode())
+    return read_sourcefile(path, default_wavelength_m=1e-10, beam_direction=torch.tensor(beam, dtype=torch.float64),
+                           dtype=torch.float64)
+
+
+def test_nan_in_a_sourcefile_column_is_a_missing_value(tmp_path):
+    """nanoBragg.c:2329-2343: NaN marks a value as missing, whichever column it is in."""
+    directions, weights, wavelengths = _sources(
+        tmp_path, "nan 0 -1 2 1.1e-10\n-1 nan 0 nan 1.1e-10\n-1 0 nan 1 nan\n", beam=(0.0, 0.0, 1.0))
+    expected = torch.tensor([[0.0, 0.0, -1.0], [-1.0, 0.0, 0.0], [-1.0, 0.0, -10.0]], dtype=torch.float64)
+    torch.testing.assert_close(directions, expected / expected.norm(dim=1, keepdim=True))
+    assert weights.tolist() == [2.0, 1.0, 1.0]
+    assert wavelengths.tolist() == [1.1e-10, 1.1e-10, 1e-10]
+
+
+@pytest.mark.parametrize("text, extra", [
+    ("-1 0 0 1 nan\n-1 0 0 1 1.1e-10\n", []),
+    ("nan 0 0 1 1.1e-10\n-1 0 0 1 1e-10\n", []),
+    ("nan nan nan 1 1.1e-10\n0 0 -1 1 1e-10\n", ["-adxv"]),
+    ("-1 0 0 nan 1.1e-10\n-1 0 0 1 1e-10\n", []),
+])
+def test_nan_in_a_sourcefile_matches_c(tmp_path, text, extra):
+    (tmp_path / "sources.txt").write_text(text)
+    assert_matches_c(DETECTOR + ["-sourcefile", "sources.txt"] + extra, tmp_path)

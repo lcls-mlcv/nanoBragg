@@ -7,6 +7,7 @@ Each source keeps its wavelength from the file, and -lambda fills in a missing c
 as in nanoBragg.c:2341-2343 and 2748.
 """
 
+import math
 from pathlib import Path
 from typing import List, Tuple, Optional
 import torch
@@ -63,7 +64,7 @@ def read_sourcefile(
     wavelengths = []
 
     # Default position is along -source_distance·b
-    default_position = -default_source_distance_m * beam_direction
+    default_position = -default_source_distance_m * beam_direction.to(dtype=dtype, device=device)
 
     with open(filepath, 'r') as f:
         for line_num, line in enumerate(f, 1):
@@ -100,6 +101,14 @@ def read_sourcefile(
                 weight = 1.0
 
             wavelength = float(parts[4]) if len(parts) >= 5 else default_wavelength_m
+
+            # A literal nan is C's mark for a missing value (nanoBragg.c:2329-2343).
+            if torch.isnan(position).any():
+                position = torch.where(torch.isnan(position), default_position, position)
+            if math.isnan(weight):
+                weight = 1.0
+            if math.isnan(wavelength):
+                wavelength = default_wavelength_m
 
             # Normalize position to unit direction vector
             direction = position / torch.linalg.norm(position)
