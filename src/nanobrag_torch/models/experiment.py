@@ -700,7 +700,8 @@ class BackgroundStageAParams(nn.Module):
         if abc.shape != (R, 3):
             raise ValueError(f"tilt_abc must have shape ({R}, 3), one (a, b, c) per ROI; got {abc.shape}")
 
-        region = np.full((spixels, fpixels), R, dtype=np.int64)  # slot R: no plane
+        self.spixels, self.fpixels = spixels, fpixels
+        region = np.full((spixels, fpixels), R, dtype=np.int64)  # R: no plane
         x = np.zeros((spixels, fpixels))
         y = np.zeros((spixels, fpixels))
         for i, (x1, x2, y1, y2) in enumerate(rois):
@@ -709,10 +710,12 @@ class BackgroundStageAParams(nn.Module):
                                  f"the {fpixels}x{spixels} image")
             region[y1:y2, x1:x2] = i
             y[y1:y2, x1:x2], x[y1:y2, x1:x2] = np.indices((y2 - y1, x2 - x1))
-        self.register_buffer("region", torch.as_tensor(region, device=device))
-        self.register_buffer(
-            "basis", torch.as_tensor(np.stack([x, y, np.ones_like(x)], axis=-1), device=device, dtype=dtype)
-        )
+        # Only the covered pixels are kept, so a detector of shoeboxes stays small.
+        slow, fast = np.nonzero(region < R)
+        self.register_buffer("pixels", torch.as_tensor(np.stack([slow, fast], axis=1), device=device))
+        self.register_buffer("region", torch.as_tensor(region[slow, fast], device=device))
+        basis = np.stack([x[slow, fast], y[slow, fast], np.ones_like(slow, dtype=np.float64)], axis=1)
+        self.register_buffer("basis", torch.as_tensor(basis, device=device, dtype=dtype))
         self.register_buffer("base_tilt_abc", torch.as_tensor(abc, device=device, dtype=dtype))
         extent = np.stack([rois[:, 1] - rois[:, 0], rois[:, 3] - rois[:, 2], np.ones(R, dtype=np.int64)], axis=1)
         self.register_buffer("extent", torch.as_tensor(extent, device=device, dtype=dtype))
@@ -722,10 +725,15 @@ class BackgroundStageAParams(nn.Module):
         """Current (a, b, c) of each region."""
         return self.base_tilt_abc + self.delta_tilt_abc / self.extent
 
+    def values(self) -> torch.Tensor:
+        """The background of each covered pixel, in the order of ``pixels``."""
+        return (self.tilt_abc()[self.region] * self.basis).sum(dim=-1)
+
     def image(self) -> torch.Tensor:
         """The background of every pixel, shape (spixels, fpixels)."""
-        abc = torch.cat([self.tilt_abc(), torch.zeros_like(self.base_tilt_abc[:1])])
-        return (abc[self.region] * self.basis).sum(dim=-1)
+        values = self.values()
+        image = torch.zeros((self.spixels, self.fpixels), device=values.device, dtype=values.dtype)
+        return image.index_put(tuple(self.pixels.T), values)
 
 
 class ExperimentModel(nn.Module):
@@ -755,7 +763,8 @@ class ExperimentModel(nn.Module):
     instead with ``hkl_data``/``hkl_metadata`` or set_structure_factors().
     ``background_rois`` and ``tilt_abc`` give the regions and starting coefficients of
     the background planes (see BackgroundStageAParams); by default the whole image is
-    one plane starting at zero. A beam with several sources is a spectrum, weighted as
+    one plane starting at zero. ``model(roi_only=True)`` evaluates just the pixels of
+    those regions (see roi_values). A beam with several sources is a spectrum, weighted as
     diffBragg weights it even though a plain Simulator ignores the weights as C does
     (see BeamStageAParams).
     """
@@ -1032,6 +1041,11 @@ class ExperimentModel(nn.Module):
         self._simulator.set_spectrum(beam_cfg.wavelength_A, beam_cfg.source_wavelengths, beam_cfg.source_weights)
         return self._simulator
 
+    def roi_values(self, image) -> torch.Tensor:
+        """The pixels of an image (data, a trusted mask), in the order of model(roi_only=True)."""
+        image = torch.as_tensor(image, device=self.device)
+        return image[tuple(self.background_params.pixels.T)]
+
     def _construct(self, crystal_cfg, detector_cfg, beam_cfg) -> None:
         crystal = Crystal(
             config=crystal_cfg,
@@ -1080,14 +1094,19 @@ class ExperimentModel(nn.Module):
         oversample_omega: Optional[bool] = None,
         oversample_polar: Optional[bool] = None,
         oversample_thick: Optional[bool] = None,
+        roi_only: bool = False,
     ) -> torch.Tensor:
         """
         Run the diffraction simulation for the current parameter values.
 
+        With ``roi_only`` only the pixels of the background regions are evaluated.
+
         Returns:
-            Float image tensor with shape (spixels, fpixels).
+            Float image tensor with shape (spixels, fpixels), or with ``roi_only`` the
+            (N,) values of those pixels, in the order of roi_values().
         """
         simulator = self._sync()
+        background = self.background_params
 
         image = simulator.run(
             pixel_batch_size=pixel_batch_size,
@@ -1095,6 +1114,10 @@ class ExperimentModel(nn.Module):
             oversample_omega=oversample_omega,
             oversample_polar=oversample_polar,
             oversample_thick=oversample_thick,
+            pixels=background.pixels if roi_only else None,
         )
         # As diffBragg: Bragg model + background. run() has just refreshed the mask.
-        return image + self.background_params.image() * simulator._cached_roi_mask
+        mask = simulator._cached_roi_mask
+        if roi_only:
+            return image + background.values() * mask[tuple(background.pixels.T)]
+        return image + background.image() * mask

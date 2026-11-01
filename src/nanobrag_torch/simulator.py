@@ -1318,6 +1318,7 @@ class Simulator:
         oversample_omega: Optional[bool] = None,
         oversample_polar: Optional[bool] = None,
         oversample_thick: Optional[bool] = None,
+        pixels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Run the diffraction simulation with crystal rotation and mosaicity.
@@ -1383,10 +1384,16 @@ class Simulator:
             oversample_omega: Apply solid angle per subpixel. Defaults to detector config.
             oversample_polar: Apply polarization per subpixel. Defaults to detector config.
             oversample_thick: Apply absorption per subpixel. Defaults to detector config.
+            pixels: Optional (N, 2) integer (slow, fast) indices: evaluate only these pixels.
+                They run as an N x 1 image, so every path gives the values the full image
+                has there, and pixel_batch_size chunks them.
 
         Returns:
-            torch.Tensor: Final diffraction image with shape (spixels, fpixels).
+            torch.Tensor: Final diffraction image with shape (spixels, fpixels), or the
+            (N,) values of ``pixels``.
         """
+        if pixels is not None and (self.printout or self.trace_pixel):
+            raise ValueError("printout and trace_pixel need the whole image; run without pixels=")
         self._warn_if_tophat_severs_cell_gradients()
         self._ensure_pixel_coords_current()
 
@@ -1414,6 +1421,10 @@ class Simulator:
 
         # PERF-PYTORCH-004 P3.4: Use cached pixel coordinates instead of fetching/converting every run
         pixel_coords_meters = self._cached_pixel_coords_meters
+        if pixels is not None:
+            slow, fast = pixels.to(self.device).unbind(dim=-1)
+            pixel_coords_meters = pixel_coords_meters[slow, fast].unsqueeze(1)
+            roi_mask = roi_mask[slow, fast].unsqueeze(1)
 
         # Get rotated lattice vectors for all phi steps and mosaic domains
         # Shape: (N_phi, N_mos, 3)
@@ -1644,6 +1655,8 @@ class Simulator:
 
         # PERF-PYTORCH-006: Ensure output matches requested dtype
         # Some intermediate operations may upcast for precision, but final output should match dtype
+        if pixels is not None:
+            physical_intensity = physical_intensity.squeeze(1)
         return physical_intensity.to(dtype=self.dtype)
 
     def _apply_debug_output(self,
