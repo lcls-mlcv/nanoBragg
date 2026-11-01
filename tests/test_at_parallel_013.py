@@ -263,6 +263,7 @@ class TestATParallel013CrossPlatformConsistency:
             "-detpixels", "512",
             "-distance", "100",
             "-pixel", "0.1",
+            "-fluence", "1e15",
             "-floatfile", "test_c_output.bin"
         ]
 

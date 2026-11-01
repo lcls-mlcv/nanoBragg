@@ -98,7 +98,14 @@ def find_local_maxima(image: np.ndarray, percentile: float = 99.0,
     # Sort by intensity (highest first)
     peaks.sort(key=lambda p: p.intensity, reverse=True)
 
-    return peaks
+    # The filter passes equal neighbours and maxima just outside its window, so keep each
+    # peak only if it is min_distance from every stronger one
+    kept = []
+    for peak in peaks:
+        if all(peak.distance_to(other) >= min_distance for other in kept):
+            kept.append(peak)
+
+    return kept
 
 
 def hungarian_match_peaks(peaks1: List[Peak], peaks2: List[Peak],

@@ -118,6 +118,39 @@ def sincg(u: torch.Tensor, N: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def sincg_miller(h: torch.Tensor, N: torch.Tensor) -> torch.Tensor:
+    """
+    sin(N*pi*h)/sin(pi*h), taking the Miller index rather than pi*h.
+
+    Same function as sincg(pi*h, N), which is what nanoBragg.c evaluates, but the integer
+    part of h is removed before any trigonometry. In single precision pi*h rounds to about
+    1e-5 at h = 100, the same size as the distance to a Bragg peak in the pixels nearest
+    it, and the ratio there comes out above N.
+
+    Args:
+        h: Fractional Miller index
+        N: Number of cells along this axis (scalar or tensor)
+
+    Returns:
+        torch.Tensor: Grating factor, same shape as h
+    """
+    if N.device != h.device:
+        N = N.to(device=h.device)
+    h0 = torch.round(h)
+    delta = h - h0
+    # sin(pi*h) = (-1)^h0 sin(pi*delta), and likewise for N*h0 = n0 + rest, where rest is
+    # zero for integer N and is what carries the gradient for N
+    n0 = torch.round(N * h0)
+    rest = N * h0 - n0
+    sign = (1 - 2 * (torch.abs(h0) % 2)) * (1 - 2 * (torch.abs(n0) % 2))
+    sin_u = torch.sin(torch.pi * delta)
+    at_peak = torch.abs(sin_u) < 1e-10
+    safe_sin_u = torch.where(at_peak, torch.ones_like(sin_u), sin_u)
+    return sign * torch.where(at_peak,
+                              N * torch.cos(torch.pi * rest),
+                              torch.sin(torch.pi * (rest + N * delta)) / safe_sin_u)
+
+
 @_get_compile_decorator()
 def sinc3(x: torch.Tensor) -> torch.Tensor:
     """

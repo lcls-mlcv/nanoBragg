@@ -171,24 +171,14 @@ class TestAT_PARALLEL_027:
         simulator = Simulator(crystal, detector, crystal_config=crystal_config, beam_config=beam_config)
         pytorch_image = simulator.run()
 
-        # Setup C runner parameters
-        params = {
-            'hkl': str(test_pattern_hkl),  # Use the HKL file, not default_F
-            'lambda': beam_config.wavelength_A,
-            'N': crystal_config.N_cells[0],
-            'cell': f"{crystal_config.cell_a} {crystal_config.cell_b} {crystal_config.cell_c} "
-                   f"{crystal_config.cell_alpha} {crystal_config.cell_beta} {crystal_config.cell_gamma}",
-            'distance': detector_config.distance_mm,
-            'detpixels': detector_config.spixels,
-            'pixel': detector_config.pixel_size_mm,
-            'fluence': beam_config.fluence,
-            'mosflm': True,  # Use MOSFLM convention
-            'floatfile': str(tmp_path / "c_output.bin")
-        }
-
-        # Run C simulation
-        runner = CReferenceRunner()
-        c_image = runner.run(params)
+        # Run C simulation. nanoBragg.c does not read comment lines in an HKL file.
+        c_hkl = tmp_path / "pattern.hkl"
+        c_hkl.write_text("".join(line for line in test_pattern_hkl.read_text().splitlines(True)
+                                 if not line.startswith("#")))
+        c_image = CReferenceRunner(str(tmp_path)).run_simulation(
+            detector_config, crystal_config, beam_config, extra_args=["-hkl", str(c_hkl)]
+        )
+        assert c_image is not None, "C simulation failed"
 
         # Compare images
         correlation = np.corrcoef(

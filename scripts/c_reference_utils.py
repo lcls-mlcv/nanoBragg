@@ -145,11 +145,20 @@ def build_nanobragg_command(
         ]
 
     if dc.beam_center_f is not None and dc.beam_center_s is not None:
+        # nanoBragg.c:1184-1216: MOSFLM and DENZO have Fbeam = Ybeam and Sbeam = Xbeam,
+        # ADXV has Sbeam = detsize_s - Ybeam
+        xbeam, ybeam = dc.beam_center_f, dc.beam_center_s
+        # By name: tests import this enum through both nanobrag_torch and src.nanobrag_torch
+        convention = dc.detector_convention.name
+        if convention in ("MOSFLM", "DENZO"):
+            xbeam, ybeam = dc.beam_center_s, dc.beam_center_f
+        elif convention == "ADXV":
+            ybeam = dc.spixels * dc.pixel_size_mm - dc.beam_center_s
         cmd += [
             "-Xbeam",
-            _fmm(dc.beam_center_f),
+            _fmm(xbeam),
             "-Ybeam",
-            _fmm(dc.beam_center_s),
+            _fmm(ybeam),
         ]
 
     if float(dc.detector_rotx_deg) != 0.0:

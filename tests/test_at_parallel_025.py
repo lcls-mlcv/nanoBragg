@@ -147,8 +147,8 @@ def test_maximum_intensity_with_offset():
             pixel_size_mm=0.1,
             spixels=128,
             fpixels=128,
-            beam_center_f=8.0,  # MOSFLM: Xbeam -> fast (offset beam center in mm)
-            beam_center_s=10.0   # MOSFLM: Ybeam -> slow
+            beam_center_f=8.0,  # MOSFLM: Ybeam -> fast (offset beam center in mm)
+            beam_center_s=10.0   # MOSFLM: Xbeam -> slow
         )
 
         beam_config = BeamConfig(
