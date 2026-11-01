@@ -47,7 +47,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 def build_sim(args):
     from simtbx.nanoBragg.sim_data import SimData
     from simtbx.nanoBragg.nanoBragg_crystal import NBcrystal
-    from scitbx.matrix import sqr
+    from scitbx.matrix import col, sqr
     from cctbx import uctbx
     from dxtbx.model import Crystal
 
@@ -55,7 +55,6 @@ def build_sim(args):
     a_real, b_real, c_real = sqr(uctbx.unit_cell(ucell).orthogonalization_matrix()).transpose().as_list_of_lists()
     C = Crystal(a_real, b_real, c_real, args.symbol)
     if args.randomrotate is not None:
-        from scitbx.matrix import col
         rng = np.random.RandomState(args.randomrotate)
         axis = col(tuple(rng.normal(size=3))).normalize()
         C.set_U(axis.axis_and_angle_as_r3_rotation_matrix(float(rng.uniform(0, 2 * math.pi))))
@@ -72,6 +71,15 @@ def build_sim(args):
     nb.xtal_shape = args.shape
     SIM = SimData(use_default_crystal=True)
     SIM.detector = SimData.simple_detector(args.distance, args.pixel, (args.detpixels, args.detpixels))
+    if args.tilt_deg:
+        # tilt the panel about (1, 1, 0) through its centre, so both axes get z components
+        panel = SIM.detector[0]
+        R = col((1, 1, 0)).normalize().axis_and_angle_as_r3_rotation_matrix(args.tilt_deg, deg=True)
+        fast, slow, origin = col(panel.get_fast_axis()), col(panel.get_slow_axis()), col(panel.get_origin())
+        centre = origin + fast * (args.pixel * args.detpixels / 2) + slow * (args.pixel * args.detpixels / 2)
+        fast, slow = R * fast, R * slow
+        panel.set_frame(fast, slow, centre - fast * (args.pixel * args.detpixels / 2)
+                        - slow * (args.pixel * args.detpixels / 2))
     SIM.crystal = nb
     SIM.instantiate_diffBragg(oversample=args.oversample, verbose=0, interpolate=0, default_F=args.default_F,
                               auto_set_spotscale=False)
@@ -140,6 +148,20 @@ def diffbragg_eta_forward_and_derivs(SIM):
     img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
     pixels = D.get_aniso_eta_deriv_pixels() if D.has_anisotropic_mosaic_spread else [D.get_derivative_pixels(ETA_ID)]
     return img, [p.as_numpy_array().reshape(slow, fast).copy() for p in pixels]
+
+
+def diffbragg_detz_forward_and_derivs(SIM):
+    """diffBragg image and d(image)/d(detz_shift) (DETZ_ID 10; the shift is in metres)."""
+    from simtbx.diffBragg.hopper_utils import DETZ_ID
+
+    D = SIM.D
+    D.refine(DETZ_ID)
+    D.initialize_managers()
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[0].get_image_size()
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+    return img, D.get_derivative_pixels(DETZ_ID).as_numpy_array().reshape(slow, fast).copy()
 
 
 def torch_experiment_model(SIM, args, **kwargs):
@@ -275,6 +297,8 @@ def build_parser():
     p.add_argument("--oversample-omega", dest="oversample_omega", action="store_true",
                    help="solid angle per subpixel on both sides (diffBragg otherwise takes it at the pixel centre)")
     p.add_argument("--nopolar", action="store_true", help="polarization factor 1 on both sides")
+    p.add_argument("--tilt-deg", dest="tilt_deg", type=float, default=0.0,
+                   help="tilt the panel about (1, 1, 0) through its centre")
     p.add_argument("--eta", type=float, nargs="+", default=None,
                    help="mosaic spread in degrees: one value, or three for anisotropic (crystal a, b, c)")
     p.add_argument("--mosaic-domains", dest="mosaic_domains", type=int, default=20,

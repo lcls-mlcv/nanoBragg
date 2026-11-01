@@ -14,7 +14,9 @@ from typing import Optional
 import torch
 from torch import nn
 
-from ..config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig
+from ..config import (
+    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
+)
 from ..models.crystal import Crystal
 from ..models.detector import Detector
 from ..utils.mosaic import diffbragg_umats
@@ -309,7 +311,17 @@ class CrystalStageAParams(nn.Module):
 
 
 class DetectorStageAParams(nn.Module):
-    """Stage-A learnable parameterization for detector geometry."""
+    """Stage-A learnable parameterization for detector geometry.
+
+    Distance refines whichever field drives the geometry: ``close_distance_mm``
+    when it is set (SAMPLE pivot, ``-close_distance``), else ``distance_mm``.
+
+    A detector given by its origin (dxtbx panels through compat.cctbx: CUSTOM
+    convention, SAMPLE pivot, close distance) instead refines ``detz_shift``,
+    diffBragg's parameter: a shift of the origin along lab z in mm. For such a
+    detector both would move the same thing, so ``distance`` is listed in
+    ``unrefinable`` there, and ``detz_shift`` is unrefinable everywhere else.
+    """
 
     def __init__(
         self,
@@ -374,6 +386,41 @@ class DetectorStageAParams(nn.Module):
         self.delta_log_distance_mm = param_cls(
             torch.zeros((), device=self.device, dtype=self.dtype)
         )
+        # Origin shift along lab z (mm), additive.
+        self.delta_detz_shift_mm = param_cls(
+            torch.zeros((), device=self.device, dtype=self.dtype)
+        )
+
+        self.unrefinable = {}
+        self.close_distance_drives = base_config.close_distance_mm is not None
+        if self.close_distance_drives:
+            self.register_buffer(
+                "base_close_distance_mm",
+                torch.as_tensor(base_config.close_distance_mm, device=self.device, dtype=self.dtype),
+            )
+        self.origin_defined = (
+            self.close_distance_drives
+            and base_config.detector_convention == DetectorConvention.CUSTOM
+            and base_config.detector_pivot == DetectorPivot.SAMPLE
+        )
+        if self.origin_defined:
+            # pix0 = -beam_center_f·f - beam_center_s·s + close_distance·o, so a lab-z shift
+            # of the origin moves those three by -dz·f_z, -dz·s_z and +dz·o_z.
+            for name in ("fdet", "sdet", "odet"):
+                vec = torch.as_tensor(getattr(base_config, f"custom_{name}_vector"),
+                                      device=self.device, dtype=self.dtype)
+                self.register_buffer(f"{name}_z", vec[2].clone())
+            self.unrefinable["delta_log_distance_mm"] = (
+                "this detector is given by its origin (dxtbx panel): refine 'detz_shift', "
+                "diffBragg's origin shift along z, instead of 'distance'"
+            )
+        else:
+            self.unrefinable["delta_detz_shift_mm"] = (
+                "detz_shift moves a detector given by its origin (dxtbx panels: CUSTOM "
+                "convention, SAMPLE pivot); refine 'distance' for this detector"
+            )
+        for pname in self.unrefinable:
+            getattr(self, pname).requires_grad_(False)
 
         # Bounded tilt and twotheta deltas.
         self.delta_rotx_raw = param_cls(
@@ -418,7 +465,15 @@ class DetectorStageAParams(nn.Module):
         beam_center_f = self.base_beam_center_f_mm + beam_delta_f_mm
 
         cfg = replace(self._base_config)
-        cfg.distance_mm = distance_mm
+        if self.origin_defined:
+            dz = self.delta_detz_shift_mm
+            cfg.close_distance_mm = self.base_close_distance_mm + dz * self.odet_z
+            beam_center_f = beam_center_f - dz * self.fdet_z
+            beam_center_s = beam_center_s - dz * self.sdet_z
+        elif self.close_distance_drives:
+            cfg.close_distance_mm = self.base_close_distance_mm * torch.exp(self.delta_log_distance_mm)
+        else:
+            cfg.distance_mm = distance_mm
         cfg.detector_rotx_deg = rotx
         cfg.detector_roty_deg = roty
         cfg.detector_rotz_deg = rotz
@@ -508,6 +563,7 @@ class ExperimentModel(nn.Module):
         ),
         "misset": ("crystal_params.delta_misset_raw",),
         "distance": ("detector_params.delta_log_distance_mm",),
+        "detz_shift": ("detector_params.delta_detz_shift_mm",),
         "detector_rotation": (
             "detector_params.delta_rotx_raw", "detector_params.delta_roty_raw",
             "detector_params.delta_rotz_raw",
@@ -597,8 +653,10 @@ class ExperimentModel(nn.Module):
 
     @property
     def unrefinable(self) -> dict:
-        """Parameter name -> why it cannot be refined (crystal shape, crystal system)."""
-        return {f"crystal_params.{n}": why for n, why in self.crystal_params.unrefinable.items()}
+        """Parameter name -> why it cannot be refined (crystal shape, crystal system, detector kind)."""
+        blocked = {f"crystal_params.{n}": why for n, why in self.crystal_params.unrefinable.items()}
+        blocked.update({f"detector_params.{n}": why for n, why in self.detector_params.unrefinable.items()})
+        return blocked
 
     def refine(self, *names: str) -> "ExperimentModel":
         """Turn gradients on for these groups/parameters (all of them if none given).
@@ -681,7 +739,7 @@ class ExperimentModel(nn.Module):
         "cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",
     )
     _DETECTOR_FIELDS = (
-        "distance_mm", "detector_rotx_deg", "detector_roty_deg", "detector_rotz_deg",
+        "distance_mm", "close_distance_mm", "detector_rotx_deg", "detector_roty_deg", "detector_rotz_deg",
         "detector_twotheta_deg", "beam_center_s", "beam_center_f",
     )
 

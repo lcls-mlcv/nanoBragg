@@ -221,3 +221,60 @@ def test_eta_gradients_match_diffbragg(case, device):
             scale = float(np.abs(w * ref_pixels).sum())
             got = float(g[i]) / eta[i]
             assert abs(got - ref) <= 1e-7 * scale, f"d(w·I)/d(eta{i}) ({wname} w): torch {got!r} vs diffBragg {ref!r}"
+
+
+# detz_shift (plan C3): ExperimentModel's origin shift along lab z against diffBragg's DETZ_ID (10).
+# diffBragg's shift is in metres, ExperimentModel's in mm. diffBragg applies the solid angle and the
+# polarization once per pixel and leaves both out of its analytic detz derivative (pinned by the
+# next test), so the exact comparison turns on per-subpixel omega and turns polarization off.
+DETZ_CASES = {
+    "flat": ["--oversample-omega", "--nopolar"],
+    "tilted": ["--oversample-omega", "--nopolar", "--tilt-deg", "12", "--randomrotate", "4"],
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("case", list(DETZ_CASES))
+def test_detz_shift_gradient_matches_diffbragg(case, device):
+    args = cmp.build_parser().parse_args(["--detpixels", "128"] + DETZ_CASES[case])
+    args.device = device
+    sim = cmp.build_sim(args)
+    db_img, db_deriv = cmp.diffbragg_detz_forward_and_derivs(sim)
+    model = cmp.torch_experiment_model(sim, args)
+    assert model.detector_params.origin_defined
+
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-9, atol=1e-12 * db_img.max())
+
+    rng = np.random.default_rng(3)
+    for wname, w in {"uniform": np.ones_like(db_img), "random": rng.uniform(0.0, 1.0, db_img.shape)}.items():
+        (g,) = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                                   [model.detector_params.delta_detz_shift_mm], retain_graph=True)
+        ref = float((w * db_deriv).sum())
+        scale = float(np.abs(w * db_deriv).sum())
+        got = 1000.0 * float(g)  # d/d(metres)
+        assert abs(got - ref) <= 1e-7 * scale, f"d(w·I)/d(detz_shift) ({wname} w): torch {got!r} vs diffBragg {ref!r}"
+
+
+@pytest.mark.parametrize("flags, off_by", [
+    ([], 0.05),                                                         # omega term: 11% low here
+    (["--oversample-omega", "--tilt-deg", "12", "--randomrotate", "4"], 1e-7),  # polarization: 2e-6 high
+])
+def test_diffbragg_analytic_detz_derivative_misses_omega_and_polarization(flags, off_by):
+    """diffBragg's analytic d/d(detz_shift) differs from its own finite difference; torch matches the FD."""
+    args = cmp.build_parser().parse_args(["--detpixels", "128"] + flags)
+    sim = cmp.build_sim(args)
+    _, db_deriv = cmp.diffbragg_detz_forward_and_derivs(sim)
+    h, sums = 2e-6, []
+    for shift in (h, -h):
+        sim.D.shift_origin_z(sim.detector, shift)
+        sim.D.raw_pixels_roi *= 0
+        sim.D.add_diffBragg_spots()
+        sums.append(sim.D.raw_pixels_roi.as_numpy_array().sum())
+    sim.D.shift_origin_z(sim.detector, 0.0)
+    db_fd = float((sums[0] - sums[1]) / (2 * h))
+
+    model = cmp.torch_experiment_model(sim, args)
+    (g,) = torch.autograd.grad(model().sum(), [model.detector_params.delta_detz_shift_mm])
+    assert 1000.0 * float(g) == pytest.approx(db_fd, rel=1e-7)
+    assert abs(1 - float(db_deriv.sum()) / db_fd) > off_by
