@@ -42,7 +42,7 @@ from .utils.units import (
     mm_to_meters, micrometers_to_meters, degrees_to_radians,
     angstroms_to_meters, mrad_to_radians
 )
-from .utils.noise import c_noise_image, generate_poisson_noise
+from .utils.noise import c_noise_image, fast_noise_image
 from .utils.auto_selection import (
     auto_select_divergence, auto_select_dispersion,
     generate_sources_from_divergence_dispersion
@@ -1521,8 +1521,6 @@ def build_simulation(
             phi_steps=config.get('phi_steps', 1),
             phi_step_deg=config.get('phi_step_deg'),
             mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
-            mosaic_domains=config.get('mosaic_domains', 1),
-            mosaic_seed=config.get('mosaic_seed'),
             shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
             fudge=config.get('fudge', 1.0),
             default_F=config.get('default_F', 0.0),
@@ -2033,20 +2031,15 @@ def main():
         if config.get('noisefile') and not config.get('suppress_noise', False):
             # Generate and write noise image
             adc = config.get('adc', 40.0)
-            xmin, xmax = detector_config.roi_xmin, detector_config.roi_xmax
-            ymin, ymax = detector_config.roi_ymin, detector_config.roi_ymax
+            roi = (detector_config.roi_xmin, detector_config.roi_xmax,
+                   detector_config.roi_ymin, detector_config.roi_ymax)
             if config.get('fast_noise'):
-                noisy, overloads = generate_poisson_noise(
-                    intensity, seed=config.get('seed'), adc_offset=adc, readout_noise=0.0
-                )
-                in_roi = np.zeros(noisy.shape, dtype=np.uint16)
-                in_roi[ymin:ymax + 1, xmin:xmax + 1] = 1
-                noisy_int = noisy.to(torch.int32).cpu().numpy().astype(np.uint16) * in_roi
+                noisy_int, photons, overloads = fast_noise_image(intensity, config['seed'], adc, roi)
             else:
                 noisy_int, photons, overloads = c_noise_image(
-                    intensity.detach().cpu().numpy(), config['seed'], adc, roi=(xmin, xmax, ymin, ymax)
+                    intensity.detach().cpu().numpy(), config['seed'], adc, roi
                 )
-                print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
+            print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
 
             write_smv(
                 filepath=config['noisefile'],
