@@ -101,40 +101,46 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     return image_data, header
 
 
+def _dials_origin_mm(pix0) -> Tuple[float, float, float]:
+    """C's dot products of pix0 with (0,0,1), (0,1,0) and (-1,0,0), whose sum sets the sign of a zero."""
+    x, y, z = pix0
+    return 1000.0 * (0.0 * x + 0.0 * y + z), 1000.0 * (0.0 * x + y + 0.0 * z), 1000.0 * (-x + 0.0 * y + 0.0 * z)
+
+
 def _smv_geometry_defaults(xbeam_mm, ybeam_mm, distance_mm, close_distance_mm, detsize_s_mm, pixel_size_mm) -> dict:
-    """Header geometry of an unrotated MOSFLM detector: Fbeam = Ybeam and Sbeam = Xbeam."""
+    """Header geometry of an unrotated MOSFLM detector, in metres (nanoBragg.c:1200-1201, 1745-1760)."""
+    pixel_m, distance_m = pixel_size_mm / 1000.0, distance_mm / 1000.0
+    fbeam_m, sbeam_m = ybeam_mm / 1000.0, xbeam_mm / 1000.0
     return dict(
-        xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm, fbeam_mm=ybeam_mm, sbeam_mm=xbeam_mm,
-        distance_mm=distance_mm,
-        close_distance_mm=distance_mm if close_distance_mm is None else close_distance_mm,
-        detsize_s_mm=detsize_s_mm,
+        xbeam_m=xbeam_mm / 1000.0, ybeam_m=ybeam_mm / 1000.0, fbeam_m=fbeam_m, sbeam_m=sbeam_m,
+        distance_m=distance_m,
+        close_distance_m=distance_m if close_distance_mm is None else close_distance_mm / 1000.0,
+        detsize_s_m=detsize_s_mm / 1000.0,
         orgx=ybeam_mm / pixel_size_mm + 0.5, orgy=xbeam_mm / pixel_size_mm + 0.5,
-        dials_origin_mm=(-ybeam_mm, xbeam_mm, -distance_mm),
+        dials_origin_mm=_dials_origin_mm((distance_m, sbeam_m, -fbeam_m)),
     )
 
 
-def smv_geometry(detector, xbeam_mm: float, ybeam_mm: float, detsize_s_mm: float) -> dict:
+def smv_geometry(detector, xbeam_mm: float, ybeam_mm: float, detsize_s_mm: float, pixel_size_mm: float) -> dict:
     """
     Header values for write_smv, from the detector after its rotations (nanoBragg.c:1745-1770).
 
     Fbeam, Sbeam and ORGX are read back off the final geometry, so they differ from the
     beam centre that was asked for once the detector is rotated. Xbeam and Ybeam are as given.
+    Lengths are in metres, as C holds them, because write_smv's sums must round as C's do.
     """
     pix0, fdet, sdet, odet = detector.pix0_vector, detector.fdet_vec, detector.sdet_vec, detector.odet_vec
     close = torch.dot(pix0, odet)
     distance = close / detector.r_factor
     spot = distance * detector.beam_vector - pix0
-    pixel_m = detector.pixel_size
-    # C's dot products with (0,0,1), (0,1,0) and (-1,0,0), whose sum sets the sign of a zero
-    x, y, z = pix0.tolist()
-    dials_origin_mm = (1000 * (0.0 * x + 0.0 * y + z), 1000 * (0.0 * x + y + 0.0 * z), 1000 * (-x + 0.0 * y + 0.0 * z))
+    pixel_m = pixel_size_mm / 1000.0
     return dict(
-        xbeam_mm=xbeam_mm, ybeam_mm=ybeam_mm,
-        fbeam_mm=torch.dot(fdet, spot).item() * 1000, sbeam_mm=torch.dot(sdet, spot).item() * 1000,
-        distance_mm=distance.item() * 1000, close_distance_mm=close.item() * 1000,
-        detsize_s_mm=detsize_s_mm,
+        xbeam_m=xbeam_mm / 1000.0, ybeam_m=ybeam_mm / 1000.0,
+        fbeam_m=torch.dot(fdet, spot).item(), sbeam_m=torch.dot(sdet, spot).item(),
+        distance_m=distance.item(), close_distance_m=close.item(),
+        detsize_s_m=detsize_s_mm / 1000.0,
         orgx=(-torch.dot(pix0, fdet) / pixel_m + 0.5).item(), orgy=(-torch.dot(pix0, sdet) / pixel_m + 0.5).item(),
-        dials_origin_mm=dials_origin_mm,
+        dials_origin_mm=_dials_origin_mm(pix0.tolist()),
     )
 
 
@@ -207,6 +213,7 @@ def write_smv(
     # Image dimensions (slow, fast)
     spixels, fpixels = image_data.shape
 
+    pixel_m = pixel_size_mm / 1000.0
     g = _smv_geometry_defaults(beam_center_x_mm, beam_center_y_mm, distance_mm, close_distance_mm,
                                spixels * pixel_size_mm, pixel_size_mm)
     g.update(geometry or {})
@@ -216,16 +223,16 @@ def write_smv(
         "DIM=2;\n"
         f"BYTE_ORDER={byte_order};\nTYPE={data_type};\n"
         f"SIZE1={fpixels};\nSIZE2={spixels};\n"
-        f"PIXEL_SIZE={pixel_size_mm:g};\nDISTANCE={g['distance_mm']:g};\n"
+        f"PIXEL_SIZE={pixel_m * 1000.0:g};\nDISTANCE={g['distance_m'] * 1000.0:g};\n"
         f"WAVELENGTH={wavelength_angstrom:g};\n"
-        f"BEAM_CENTER_X={g['xbeam_mm']:g};\nBEAM_CENTER_Y={g['ybeam_mm']:g};\n"
-        f"ADXV_CENTER_X={g['fbeam_mm']:g};\nADXV_CENTER_Y={g['detsize_s_mm'] - g['sbeam_mm']:g};\n"
-        f"MOSFLM_CENTER_X={g['sbeam_mm'] - 0.5 * pixel_size_mm:g};\n"
-        f"MOSFLM_CENTER_Y={g['fbeam_mm'] - 0.5 * pixel_size_mm:g};\n"
-        f"DENZO_X_BEAM={g['sbeam_mm']:g};\nDENZO_Y_BEAM={g['fbeam_mm']:g};\n"
+        f"BEAM_CENTER_X={g['xbeam_m'] * 1000.0:g};\nBEAM_CENTER_Y={g['ybeam_m'] * 1000:g};\n"
+        f"ADXV_CENTER_X={g['fbeam_m'] * 1000.0:g};\nADXV_CENTER_Y={(g['detsize_s_m'] - g['sbeam_m']) * 1000:g};\n"
+        f"MOSFLM_CENTER_X={(g['sbeam_m'] - 0.5 * pixel_m) * 1000.0:g};\n"
+        f"MOSFLM_CENTER_Y={(g['fbeam_m'] - 0.5 * pixel_m) * 1000:g};\n"
+        f"DENZO_X_BEAM={(g['sbeam_m'] - 0.0 * pixel_m) * 1000.0:g};\nDENZO_Y_BEAM={(g['fbeam_m'] - 0.0 * pixel_m) * 1000:g};\n"
         f"DIALS_ORIGIN={dials[0]:g},{dials[1]:g},{dials[2]:g}\n"
         f"XDS_ORGX={g['orgx']:g};\nXDS_ORGY={g['orgy']:g};\n"
-        f"CLOSE_DISTANCE={g['close_distance_mm']:g};\n"
+        f"CLOSE_DISTANCE={g['close_distance_m'] * 1000.0:g};\n"
         f"PHI={0.0 if phi_deg is None else phi_deg:g};\nOSC_START={0.0 if osc_start_deg is None else osc_start_deg:g};\n"
         f"OSC_RANGE={0.0 if osc_range_deg is None else osc_range_deg:g};\n"
         f"TWOTHETA={twotheta_deg:g};\n"

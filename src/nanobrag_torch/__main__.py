@@ -1834,7 +1834,8 @@ def build_simulation(
 
 def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig) -> Dict[str, Any]:
     """Header values for write_smv, with Xbeam and Ybeam as nanoBragg.c:1190-1250 leaves them."""
-    size_s = detector_config.spixels * detector_config.pixel_size_mm
+    # C's detsize_s, which stays what was asked for when that isn't a whole number of pixels
+    size_s = config.get('detsize_s_mm', detector_config.spixels * detector_config.pixel_size_mm)
     convention = detector_config.detector_convention
     if convention in (DetectorConvention.MOSFLM, DetectorConvention.DENZO):
         xbeam, ybeam = detector_config.beam_center_s, detector_config.beam_center_f
@@ -1851,7 +1852,8 @@ def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig)
     exact = copy.copy(detector_config)
     for angle in ('detector_rotx_deg', 'detector_roty_deg', 'detector_rotz_deg', 'detector_twotheta_deg'):
         setattr(exact, angle, torch.tensor(float(getattr(detector_config, angle)), dtype=torch.float64))
-    return smv_geometry(Detector(exact, dtype=torch.float64), float(xbeam), float(ybeam), size_s)
+    return smv_geometry(Detector(exact, dtype=torch.float64), float(xbeam), float(ybeam), size_s,
+                        detector_config.pixel_size_mm)
 
 
 class _PrintHandler(logging.Handler):
@@ -1974,8 +1976,8 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=header_geometry['xbeam_mm'],
-                beam_center_y_mm=header_geometry['ybeam_mm'],
+                beam_center_x_mm=float(header_geometry['xbeam_m']) * 1000.0,
+                beam_center_y_mm=float(header_geometry['ybeam_m']) * 1000.0,
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
@@ -2050,8 +2052,8 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=header_geometry['xbeam_mm'],
-                beam_center_y_mm=header_geometry['ybeam_mm'],
+                beam_center_x_mm=float(header_geometry['xbeam_m']) * 1000.0,
+                beam_center_y_mm=float(header_geometry['ybeam_m']) * 1000.0,
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
