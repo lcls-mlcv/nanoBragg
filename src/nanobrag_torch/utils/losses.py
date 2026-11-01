@@ -58,9 +58,13 @@ def poisson_nll(
             negative where trusted: use gaussian_nll for pedestal-subtracted data.
         trusted: Boolean mask; only these pixels count.
         adu_per_photon: Detector gain; data is divided by it.
-        model_floor: Lower bound on the model inside the logarithm.
+        model_floor: Below this the logarithm continues as its second-order expansion, so
+            the loss stays smooth and turns a model at or under zero back upward.
     """
     model, data = _select(model, data.to(model.dtype) / adu_per_photon, trusted)
     if (data < 0).any():
         raise ValueError("poisson_nll needs counts >= 0: mask negative pixels with trusted, or use gaussian_nll")
-    return (model - data * torch.log(model.clamp_min(model_floor)) + torch.lgamma(data + 1)).sum()
+    floored = model.clamp_min(model_floor)
+    under = (model - floored) / model_floor
+    log_term = data * (torch.log(floored) + under) - data.clamp_min(1.0) * under * under / 2
+    return (model - log_term + torch.lgamma(data + 1)).sum()

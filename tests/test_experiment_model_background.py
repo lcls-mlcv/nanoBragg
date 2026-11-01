@@ -135,3 +135,8 @@ def test_bad_rois_are_rejected(roi):
 def test_tilt_abc_must_match_the_rois():
     with pytest.raises(ValueError, match=r"shape \(2, 3\)"):
         BackgroundStageAParams(16, 16, ROIS, [(1.0, 2.0, 3.0)], dtype=DTYPE)
+
+
+def test_a_tilt_that_is_not_finite_is_refused():
+    with pytest.raises(ValueError, match="finite"):
+        ExperimentModel(*_configs(), dtype=DTYPE, background_rois=[(0, 4, 0, 4)], tilt_abc=[(0.0, 0.0, float("nan"))])

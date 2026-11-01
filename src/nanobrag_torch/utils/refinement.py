@@ -7,6 +7,7 @@ loop stalls: on a shot hopper refines to 0.0013 degrees in 112 iterations, Adam 
 torch.optim.LBFGS on the raw parameters stopped with G 34% off. Rescaling to comparable
 sensitivity, as hopper does, and using SciPy's L-BFGS-B gives hopper's answer.
 """
+import warnings
 from typing import Callable, Optional
 
 import numpy as np
@@ -94,6 +95,8 @@ def refine_lbfgsb(
         ]
         return loss.item(), np.concatenate(gradient).astype(np.float64)
 
+    if any(p.dtype != torch.float64 for p, _ in chosen):
+        warnings.warn("refine_lbfgsb needs float64: float32 losses can tie under ftol and stop it early")
     result = minimize(value_and_gradient, np.zeros(sum(p.numel() for p, _ in chosen)), jac=True, method="L-BFGS-B",
                       options=dict(ftol=ftol, gtol=gtol, maxiter=maxiter, maxfun=3 * maxiter))
     load(result.x)

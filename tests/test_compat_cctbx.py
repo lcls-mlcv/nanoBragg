@@ -466,11 +466,11 @@ def test_rotation_image_is_the_mean_of_rotated_stills(axis):
     assert np.abs(backwards - swept).max() > 0.01 * swept.max()
 
 
-def _layered_model(thick_mm=None, steps=4):
+def _layered_model(thick_mm=None, steps=4, oversample_thick=True):
     det = FakeDetector([FakePanel((-32.0, 24.0, 150.0), (1, 0, 0), (0, -1, 0), 1.0, thickness_mm=0.32, mu=9.0)])
     kwargs = dict(detector_thick_mm=thick_mm) if thick_mm is not None else {}
     return experiment_model_from_dxtbx(det, FakeBeam(wavelength=1.2), _end_to_end_models()[2], default_F=100.0,
-                                       oversample=1, detector_thicksteps=steps, oversample_thick=True, **kwargs)
+                                       oversample=1, detector_thicksteps=steps, oversample_thick=oversample_thick, **kwargs)
 
 
 @pytest.mark.parametrize("thick_mm, expected_um", [(None, 80.0), (0.4, 100.0)])
@@ -480,6 +480,11 @@ def test_model_layers_split_the_sensor_evenly(thick_mm, expected_um):
     n_layers, step_m, _ = model._detector.thickness_layers()
     assert n_layers == 4
     assert float(step_m) * 1e6 == pytest.approx(expected_um)
+
+
+def test_model_passes_oversample_thick_on():
+    with_layers, averaged = (_layered_model(oversample_thick=flag)().detach().sum() for flag in (True, False))
+    assert with_layers != pytest.approx(averaged, rel=1e-3)
 
 
 def test_panel_simulator_keeps_nanoBragg_layer_step():

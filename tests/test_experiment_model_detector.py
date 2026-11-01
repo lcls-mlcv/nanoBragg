@@ -102,6 +102,15 @@ def test_distance_refines_close_distance_when_it_drives():
     torch.testing.assert_close(stepped, fresh, rtol=1e-9, atol=0.0)
 
 
+def test_detector_with_only_some_custom_vectors_refines_distance():
+    config = DetectorConfig(distance_mm=80.0, close_distance_mm=80.0, pixel_size_mm=0.2, spixels=32, fpixels=32,
+                            detector_convention=DetectorConvention.CUSTOM, detector_pivot=DetectorPivot.SAMPLE,
+                            custom_fdet_vector=(1.0, 0.0, 0.0), oversample=1)
+    model = ExperimentModel(_crystal(), config, _beam(), device=torch.device("cpu"), dtype=DTYPE)
+    assert not model.detector_params.origin_defined
+    assert "delta_detz_shift_mm" in model.detector_params.unrefinable
+
+
 def test_c_convention_detector_refines_distance():
     det = DetectorConfig(distance_mm=80.0, pixel_size_mm=0.1, spixels=64, fpixels=64,
                          detector_convention=DetectorConvention.MOSFLM,

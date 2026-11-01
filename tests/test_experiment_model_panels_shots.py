@@ -6,6 +6,7 @@ diffBragg's pan_fast_slow simulation.
 import numpy as np
 import pytest
 import torch
+from torch.func import functional_call
 
 from nanobrag_torch.config import (
     BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
@@ -41,6 +42,69 @@ ABC = [(0.5, -0.25, 3.0), (-1.0, 2.0, 7.0), (0.0, 0.0, 1.0), (0.1, 0.1, 0.0)]
 
 def _multi(**kwargs):
     return ExperimentModel(_crystal(), [_panel(*p) for p in PANELS], _beam(), dtype=DTYPE, **kwargs)
+
+
+DISTANCE = "detector_params.delta_log_distance_mm"
+
+
+def _frozen_rois():
+    model = _multi(background_rois=ROIS, background_panels=ROI_PANELS)
+    model.freeze()
+    with torch.no_grad():
+        return model, model(roi_only=True).clone()
+
+
+def _moved(model, step=0.2):
+    moved = ExperimentModel(_crystal(), [_panel(*p) for p in PANELS], _beam(), dtype=DTYPE,
+                            background_rois=ROIS, background_panels=ROI_PANELS)
+    with torch.no_grad():
+        getattr(moved.detector_params, DISTANCE.split(".")[1]).fill_(step)
+        return moved(roi_only=True)
+
+
+@pytest.mark.parametrize("requires_grad", [True, False])
+def test_functional_call_on_frozen_detector_lasts_one_call(requires_grad):
+    model, plain = _frozen_rois()
+    override = torch.tensor(0.2, dtype=DTYPE, requires_grad=requires_grad)
+    inside = functional_call(model, {DISTANCE: override}, kwargs=dict(roi_only=True))
+    torch.testing.assert_close(inside.detach(), _moved(model), rtol=1e-12, atol=0.0)
+    with torch.no_grad():
+        torch.testing.assert_close(model(roi_only=True), plain, rtol=1e-12, atol=0.0)
+
+
+def test_data_edit_of_a_frozen_detector_is_seen():
+    model, _ = _frozen_rois()
+    model.detector_params.delta_log_distance_mm.data.fill_(0.2)
+    with torch.no_grad():
+        torch.testing.assert_close(model(roi_only=True), _moved(model), rtol=1e-12, atol=0.0)
+
+
+def test_freezing_detector_between_backwards():
+    model = _multi(background_rois=ROIS, background_panels=ROI_PANELS)
+    model.freeze()
+    model.refine("distance", "scale")
+    model(roi_only=True).sum().backward()
+    model.freeze("distance")
+    model(roi_only=True).sum().backward()
+
+
+@pytest.mark.parametrize("field, value", [("pixel_size_mm", 0.2), ("oversample", 2), ("point_pixel", True),
+                                          ("curved_detector", True), ("detector_thick_um", 100.0)])
+def test_roi_refuses_panels_one_kernel_call_cannot_hold(field, value):
+    panels = [_panel(*p) for p in PANELS]
+    setattr(panels[1], field, value)
+    model = ExperimentModel(_crystal(), panels, _beam(), dtype=DTYPE, background_rois=ROIS, background_panels=ROI_PANELS)
+    with pytest.raises(ValueError, match=field):
+        model(roi_only=True)
+    model()  # whole images keep each panel's own Simulator
+
+
+def test_empty_roi_list_builds():
+    model = ExperimentModel(_crystal(), _panel(), _beam(), dtype=DTYPE, background_rois=[])
+    assert model.background_params.pixels.shape[0] == 0
+    assert model(roi_only=True).numel() == 0
+    with torch.no_grad():
+        torch.testing.assert_close(model(), ExperimentModel(_crystal(), _panel(), _beam(), dtype=DTYPE)())
 
 
 def test_panels_are_the_single_panel_images():

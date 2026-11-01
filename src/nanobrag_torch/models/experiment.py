@@ -242,18 +242,15 @@ class CrystalStageAParams(nn.Module):
         )
         if self.models_mosaicity and self.anisotropic_mosaicity:
             # unit real-space a, b, c (columns) of the starting crystal
-            if self.oriented_by_matrix:
-                real = torch.linalg.inv(A0)  # rows are a, b, c
-            else:
-                start = Crystal(replace(base_config), device=self.device, dtype=torch.float64)
-                real = torch.stack([start.a, start.b, start.c]).detach()
+            start = Crystal(replace(base_config), device=self.device, dtype=torch.float64)
+            real = torch.stack([start.a, start.b, start.c]).detach()
             self.register_buffer("eta_axes", (real / real.norm(dim=1, keepdim=True)).T.to(self.dtype))
         else:
             self.eta_axes = None
-        if not self.models_mosaicity:
+        if not self.models_mosaicity or self.mosaic_domains == 2:  # 2 domains are both the identity
             self.unrefinable["delta_log_eta"] = (
                 "eta is not refinable without mosaic spread: set mosaic_spread_deg > 0 and "
-                "an even mosaic_domains > 1"
+                "an even mosaic_domains > 2"
             )
 
         for pname in self.unrefinable:
@@ -404,6 +401,8 @@ class DetectorStageAParams(nn.Module):
             self.close_distance_drives
             and base_config.detector_convention == DetectorConvention.CUSTOM
             and base_config.detector_pivot == DetectorPivot.SAMPLE
+            and all(getattr(base_config, f"custom_{name}_vector") is not None
+                    for name in ("fdet", "sdet", "odet"))
         )
         if self.origin_defined:
             # pix0 = -beam_center_f·f - beam_center_s·s + close_distance·o, so a lab-z shift
@@ -628,7 +627,8 @@ class StructureFactorStageAParams(nn.Module):
             M = len(structure_factors)
             if structure_factors.default_F is not None:
                 default_F = structure_factors.default_F
-            index, self.hkl_metadata, constants = structure_factors.grid_index(float(default_F))
+            self.default_F = float(default_F)
+            index, self.hkl_metadata, constants = structure_factors.grid_index(self.default_F)
             self.register_buffer("grid_index", torch.as_tensor(index, device=self.device))
             self.register_buffer("constants", torch.as_tensor(constants, device=self.device, dtype=self.dtype))
         self.register_buffer(
@@ -707,11 +707,13 @@ class BackgroundStageAParams(nn.Module):
         abc = np.zeros((R, 3)) if tilt_abc is None else np.asarray(tilt_abc, dtype=np.float64)
         if abc.shape != (R, 3):
             raise ValueError(f"tilt_abc must have shape ({R}, 3), one (a, b, c) per ROI; got {abc.shape}")
+        if not np.isfinite(abc).all():
+            raise ValueError(f"tilt_abc must be finite: ROIs {sorted(set(np.flatnonzero(~np.isfinite(abc)) // 3))}")
 
         self.spixels, self.fpixels, self.n_panels = spixels, fpixels, n_panels
         # Only the covered pixels are kept, so a detector of shoeboxes stays small.
         kept = {key: [] for key in ("panel", "slow", "fast", "region", "x", "y")}
-        for panel in np.unique(panels):
+        for panel in np.unique(panels) if R else [0]:
             region = np.full((spixels, fpixels), R, dtype=np.int64)  # R: no plane
             x = np.zeros((spixels, fpixels))
             y = np.zeros((spixels, fpixels))
@@ -1008,6 +1010,7 @@ class ExperimentModel(nn.Module):
         if self.fhkl_params.active:
             crystal.hkl_data = self.fhkl_params.hkl_grid() if self._hkl_grid is None else self._hkl_grid
             crystal.hkl_metadata = dict(self.fhkl_params.hkl_metadata)
+            crystal.config.default_F = self.fhkl_params.default_F  # for reflections outside the grid
             return
         if self._external_hkl_data is None:
             return
@@ -1076,6 +1079,9 @@ class ExperimentModel(nn.Module):
             self._sync_detectors()
 
         self._beam_config.fluence = beam_cfg.fluence
+        self._beam_config.wavelength_A = beam_cfg.wavelength_A
+        self._beam_config.source_wavelengths = beam_cfg.source_wavelengths
+        self._beam_config.source_weights = beam_cfg.source_weights
         # Simulator.run() reads spot_scale from this config on every run.
         self._beam_config.spot_scale = beam_cfg.spot_scale
         for simulator in self._simulators:
@@ -1098,17 +1104,27 @@ class ExperimentModel(nn.Module):
         simulator.fluence = as_tensor_preserving_grad(beam_cfg.fluence, device=self.device, dtype=self.dtype)
         simulator.set_spectrum(beam_cfg.wavelength_A, beam_cfg.source_wavelengths, beam_cfg.source_weights)
 
+    _UNIFORM_PANEL_FIELDS = (
+        "pixel_size_mm", "detector_convention", "oversample", "oversample_omega", "oversample_polar",
+        "oversample_thick", "curved_detector", "point_pixel", "detector_thick_um", "detector_thicksteps",
+        "detector_abs_um",
+    )
+
     def _detector_parameter_state(self) -> tuple:
-        return tuple(p._version for p in self.detector_params.parameters())
+        params = list(self.detector_params.parameters())
+        return tuple(p.requires_grad for p in params), torch.cat([p.detach().reshape(-1) for p in params])
 
     def _sync_detectors(self) -> None:
         """Write the detector offsets into the configs, if they can have changed.
 
         A new tensor in a config rebuilds the whole panel's pixel coordinates, which is
-        most of the cost of a small ROI, so frozen offsets are written only after an edit.
+        most of the cost of a small ROI, so frozen offsets are written only when their values
+        or their requires_grad differ from the last write: .data edits don't move _version,
+        and functional_call swaps the tensors for the length of one call.
         """
         state = self._detector_parameter_state()
-        if state == self._detector_state and not any(p.requires_grad for p in self.detector_params.parameters()):
+        last = self._detector_state
+        if last is not None and not any(state[0]) and state[0] == last[0] and torch.equal(state[1], last[1]):
             return
         self._detector_state = state
         for detector, block in zip(self._detectors, self._panel_blocks):
@@ -1167,6 +1183,7 @@ class ExperimentModel(nn.Module):
         key = tuple(detector._geometry_version for detector in self._detectors)
         if key == self._panel_pixels_key:
             return self._panel_pixels
+        self._require_uniform_panels()
 
         def per_panel(values):
             return torch.stack([torch.as_tensor(v, device=self.device, dtype=self.dtype) for v in values])
@@ -1188,6 +1205,17 @@ class ExperimentModel(nn.Module):
         )
         self._panel_pixels_key = key
         return self._panel_pixels
+
+    def _require_uniform_panels(self) -> None:
+        """One kernel call has one value of each of these: refuse panels that differ."""
+        def value_of(cfg, name):
+            value = getattr(cfg, name)
+            return float(value) if isinstance(value, torch.Tensor) else value
+
+        for name in self._UNIFORM_PANEL_FIELDS:
+            values = {value_of(detector.config, name) for detector in self._detectors}
+            if len(values) > 1:
+                raise ValueError(f"roi_only needs every panel to share {name}, got {sorted(map(str, values))}")
 
     def _roi_mask_values(self) -> torch.Tensor:
         """Each ROI pixel's ROI limits and mask_array, as Simulator's mask has them."""
