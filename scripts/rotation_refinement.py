@@ -200,11 +200,11 @@ if not A.start_only:
         for m in f["models"]:
             m.refine("Ncells", "eta", "scale", *(["misset"] if A.misset else []))
 
-    def objective():
-        return sum(gaussian_nll(predict(frames[i]), frames[i]["data"], 1.0, trusted=frames[i]["trusted"]) for i in fit)
+    def term(f):
+        return lambda: gaussian_nll(predict(f), f["data"], 1.0, trusted=f["trusted"])
 
     t0 = time.time()
-    r = refine_lbfgsb(serial, objective, maxiter=A.maxiter, scales=dict(scale=0.1))
+    r = refine_lbfgsb(serial, [term(frames[i]) for i in fit], maxiter=A.maxiter, scales=dict(scale=0.1))
     seconds = time.time() - t0
     for i in test:  # Ncells and eta stay as the fitted frames left them
         f = frames[i]

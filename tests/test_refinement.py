@@ -105,3 +105,29 @@ def test_serial_refinement_shares_fhkl_and_keeps_per_shot_scales():
     assert float(objective()) < 0.05 * start
     fitted = [float(shot.beam_params.delta_log_spot_scale) for shot in model.shots]
     np.testing.assert_allclose(fitted, scales, atol=0.02)
+
+
+def test_a_list_of_terms_matches_their_sum():
+    hkl = np.array([(h, k, l) for h in range(-3, 4) for k in range(-3, 4) for l in range(-3, 4)  # noqa: E741
+                    if (h, k, l) > (0, 0, 0)])
+    sf = StructureFactors(hkl, np.random.default_rng(0).uniform(50, 500, len(hkl)))
+    missets = [(5.0, -3.0, 2.0), (20.0, 10.0, -5.0), (-30.0, 7.0, 15.0)]
+
+    def run(as_list):
+        model = SerialExperiment(
+            [_model(m, structure_factors=sf, background_rois=ROIS) for m in missets], share_detector=True)
+        with torch.no_grad():
+            data = [d * 1.3 + 1.0 for d in model(roi_only=True)]
+        model.freeze().refine("Fhkl", "scale", "misset", "distance")
+
+        def term(i):
+            return gaussian_nll(model([i], roi_only=True)[0], data[i], 1.0)
+
+        terms = [lambda i=i: term(i) for i in range(len(missets))]
+        result = refine_lbfgsb(model, terms if as_list else lambda: sum(t() for t in terms), maxiter=3)
+        return result.fun, result.x, result.jac
+
+    together, apart = run(False), run(True)
+    assert apart[0] == pytest.approx(together[0], rel=1e-10)
+    np.testing.assert_allclose(apart[1], together[1], rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(apart[2], together[2], rtol=1e-6, atol=1e-6)
