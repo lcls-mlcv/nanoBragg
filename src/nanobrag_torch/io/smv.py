@@ -110,13 +110,13 @@ def _dials_origin_mm(pix0) -> Tuple[float, float, float]:
 def _smv_geometry_defaults(xbeam_mm, ybeam_mm, distance_mm, close_distance_mm, detsize_s_mm, pixel_size_mm) -> dict:
     """Header geometry of an unrotated MOSFLM detector, in metres (nanoBragg.c:1200-1201, 1745-1760)."""
     pixel_m, distance_m = pixel_size_mm / 1000.0, distance_mm / 1000.0
-    fbeam_m, sbeam_m = ybeam_mm / 1000.0, xbeam_mm / 1000.0
+    fbeam_m, sbeam_m = ybeam_mm / 1000.0 + 0.5 * pixel_m, xbeam_mm / 1000.0 + 0.5 * pixel_m
     return dict(
         xbeam_m=xbeam_mm / 1000.0, ybeam_m=ybeam_mm / 1000.0, fbeam_m=fbeam_m, sbeam_m=sbeam_m,
         distance_m=distance_m,
         close_distance_m=distance_m if close_distance_mm is None else close_distance_mm / 1000.0,
         detsize_s_m=detsize_s_mm / 1000.0,
-        orgx=ybeam_mm / pixel_size_mm + 0.5, orgy=xbeam_mm / pixel_size_mm + 0.5,
+        orgx=fbeam_m / pixel_m + 0.5, orgy=sbeam_m / pixel_m + 0.5,
         dials_origin_mm=_dials_origin_mm((distance_m, sbeam_m, -fbeam_m)),
     )
 

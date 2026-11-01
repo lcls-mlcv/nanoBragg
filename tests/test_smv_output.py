@@ -131,6 +131,19 @@ def test_only_a_longer_text_grows_the_block(tmp_path):
     assert len(header(1024 - shortest)) == 1536 and b"HEADER_BYTES=1536;" in header(1024 - shortest)
 
 
+@pytest.mark.parametrize("extra", [[], ["-Xbeam", "1.65", "-Ybeam", "2.4"], ["-distance", "123.4", "-pixel", "0.172"]],
+                         ids=["defaults", "beam", "distance-pixel"])
+def test_write_smv_without_geometry_is_cs_unrotated_mosflm_header(extra, tmp_path):
+    render([c_binary()], tmp_path, BASE + "-detpixels 32 -distance 100 -pixel 0.1 -nonoise -intfile i.img -floatfile f.bin".split() + extra)
+    c_file = (tmp_path / "i.img").read_bytes()
+    _, c_header = read_smv(tmp_path / "i.img")
+
+    pixel = float(c_header["PIXEL_SIZE"])
+    write_smv(tmp_path / "lib.img", np.zeros((32, 32)), pixel, float(c_header["DISTANCE"]), 1.0,
+              float(c_header["BEAM_CENTER_X"]), float(c_header["BEAM_CENTER_Y"]))
+    assert (tmp_path / "lib.img").read_bytes()[:512] == c_file[:512]
+
+
 def test_readers_keep_the_key_after_dials_origin(tmp_path):
     """DIALS_ORIGIN has no semicolon in nanoBragg.c:3186, and must not swallow XDS_ORGX."""
     render([c_binary()], tmp_path, BASE + "-detpixels 16 -nonoise -intfile i.img -floatfile f.bin".split())
