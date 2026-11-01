@@ -1861,3 +1861,82 @@ cases:
       - name: step-count-rounds-as-in-c
         extra_args: >-
           -divergence 0.9 -hdivstep 0.3
+  - id: PARITY-PIX0-001
+    description: >-
+      nanoBragg.c:1719 and 1740 overwrite pix0_vector under either pivot, so -pix0_vector
+      only switches to CUSTOM, and like every vector flag it loses to a later convention
+      flag, whose block then overwrites all the vectors (nanoBragg.c:647-728, 1172-1248).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -detpixels 48
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: pix0-default
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01
+      - name: pix0-mm
+        extra_args: >-
+          -pix0_vector_mm 100 10 10
+      - name: pix0-and-pix0-mm
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -pix0_vector_mm 100 10 10
+      - name: pix0-after-mosflm
+        extra_args: >-
+          -mosflm -pix0_vector -0.1 0.01 0.01
+      - name: pix0-after-adxv
+        extra_args: >-
+          -adxv -pix0_vector 0.1 0.01 0.01
+      - name: pix0-after-xds
+        extra_args: >-
+          -xds -pix0_vector 0.1 0.01 0.01
+      - name: pix0-with-xbeam
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -Xbeam 5 -Ybeam 7
+      - name: pix0-pivot-sample
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -pivot sample
+      - name: pix0-twotheta
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -twotheta 10
+      - name: pix0-then-mosflm
+        extra_args: >-
+          -pix0_vector -0.1 0.01 0.01 -mosflm
+      - name: pix0-then-adxv
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -adxv
+      - name: pix0-then-xds
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -xds
+      - name: pix0-then-denzo
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -denzo
+      - name: pix0-then-dials
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -dials
+      - name: fdet-then-mosflm
+        extra_args: >-
+          -fdet_vector 0 0.1 1 -mosflm
+      - name: beam-then-adxv
+        extra_args: >-
+          -beam_vector 0 0 1 -adxv
+      - name: polar-then-mosflm
+        extra_args: >-
+          -polar_vector 0 1 0 -mosflm
+      - name: fdet-then-xds
+        extra_args: >-
+          -fdet_vector 0 0 1 -xds
+      - name: spindle-then-mosflm
+        extra_args: >-
+          -spindle_axis 0 1 0 -mosflm -osc 1 -phisteps 2
+      - name: twotheta-axis-then-mosflm
+        extra_args: >-
+          -twotheta_axis 0 1 0 -mosflm -twotheta 5

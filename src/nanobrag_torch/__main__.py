@@ -866,9 +866,13 @@ def resolve_close_centers_mm(
     return fclose, sclose
 
 
-def resolve_detector_pivot(args: argparse.Namespace) -> str:
+def resolve_convention_and_pivot(args: argparse.Namespace) -> Tuple[str, str]:
     """
-    Detector pivot exactly as nanoBragg.c chooses it.
+    Beam convention and detector pivot exactly as nanoBragg.c chooses them.
+
+    The convention is the last of -mosflm, -xds, -adxv, -denzo, -dials and the explicit
+    vector flags, which mean CUSTOM (nanoBragg.c:647-728). A convention flag after a vector
+    flag therefore wins, and its block then overwrites every vector.
 
     C walks argv once and every pivot-affecting flag overwrites detector_pivot
     (last one wins). After parsing, the convention block forces BEAM for MOSFLM,
@@ -912,10 +916,15 @@ def resolve_detector_pivot(args: argparse.Namespace) -> str:
                 pivot = action[1]
 
     if convention in ('MOSFLM', 'DENZO', 'ADXV'):
-        return 'BEAM'
+        return convention, 'BEAM'
     if convention in ('XDS', 'DIALS'):
-        return 'SAMPLE'
-    return pivot
+        return convention, 'SAMPLE'
+    return convention, pivot
+
+
+def resolve_detector_pivot(args: argparse.Namespace) -> str:
+    """The detector pivot: see resolve_convention_and_pivot."""
+    return resolve_convention_and_pivot(args)[1]
 
 
 # nanoBragg.c reads the -img/-mask headers in a pre-pass (nanoBragg.c:419-502)
@@ -1119,18 +1128,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['wavelength_A'] = resolve_wavelength_A(args) or 1.0  # Default
 
     # Convention and pivot
-    # nanoBragg.c:665-728 switches to CUSTOM for every explicit basis vector, and
-    # -twotheta_axis (nanoBragg.c:714-720) is one of them.
-    if any([args.fdet_vector, args.sdet_vector, args.odet_vector,
-            args.beam_vector, args.polar_vector, args.spindle_axis,
-            args.twotheta_axis, args.pix0_vector, args.pix0_vector_mm]):
-        config['convention'] = 'CUSTOM'
-    elif args.convention:
-        config['convention'] = args.convention
-    else:
-        config['convention'] = 'MOSFLM'  # Default
-
-    config['pivot'] = resolve_detector_pivot(args)
+    config['convention'], config['pivot'] = resolve_convention_and_pivot(args)
 
     # Detector parameters
     config['pixel_size_mm'] = args.pixel if args.pixel else 0.1
@@ -1161,24 +1159,25 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['detector_roty_deg'] = args.detector_roty
     config['detector_rotz_deg'] = args.detector_rotz
     config['twotheta_deg'] = resolve_twotheta_deg(args)
-    if args.twotheta_axis:
+    custom = config['convention'] == 'CUSTOM'  # any other convention overwrites these vectors
+    if custom and args.twotheta_axis:
         config['twotheta_axis'] = tuple(args.twotheta_axis)
 
     config['point_pixel'] = args.point_pixel
     config['curved_detector'] = args.curved_det
 
     # Custom vectors for CUSTOM convention
-    if args.fdet_vector:
+    if custom and args.fdet_vector:
         config['custom_fdet_vector'] = tuple(args.fdet_vector)
-    if args.sdet_vector:
+    if custom and args.sdet_vector:
         config['custom_sdet_vector'] = tuple(args.sdet_vector)
-    if args.odet_vector:
+    if custom and args.odet_vector:
         config['custom_odet_vector'] = tuple(args.odet_vector)
-    if args.beam_vector:
+    if custom and args.beam_vector:
         config['custom_beam_vector'] = tuple(args.beam_vector)
-    if args.polar_vector:
+    if custom and args.polar_vector:
         config['custom_polar_vector'] = tuple(args.polar_vector)
-    if args.spindle_axis:
+    if custom and args.spindle_axis:
         config['custom_spindle_axis'] = tuple(args.spindle_axis)
 
     # Convention defaults for both vectors; an explicit flag wins, as in C, where a vector
@@ -1192,10 +1191,6 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # declared with in nanoBragg.c: beam [1,0,0] (line 191), fdet [0,0,1],
         # sdet [0,-1,0], odet [1,0,0] (lines 246-248), polar and spindle [0,0,1].
         config.setdefault('custom_beam_vector', (1.0, 0.0, 0.0))
-    # Handle pix0 override (validate mutual exclusivity)
-    if args.pix0_vector and args.pix0_vector_mm:
-        raise ValueError("Cannot specify both -pix0_vector and -pix0_vector_mm simultaneously")
-
     if args.pix0_vector:
         config['custom_pix0_vector'] = tuple(args.pix0_vector)
         # pix0_vector is in meters, convert to config
@@ -1605,8 +1600,8 @@ def build_simulation(
         custom_sdet_vector=config.get('custom_sdet_vector'),
         custom_odet_vector=config.get('custom_odet_vector'),
         custom_beam_vector=config.get('custom_beam_vector'),
-        # Detector origin override (CLI-FLAGS-003)
-        pix0_override_m=config.get('pix0_override_m')
+        # Not pix0_override_m: nanoBragg.c:1719 or 1740 overwrites -pix0_vector under either
+        # pivot, so the flag's only effect is the switch to CUSTOM.
     )
 
     # Set beam center if provided (values are in mm)

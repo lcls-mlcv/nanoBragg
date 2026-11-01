@@ -91,16 +91,16 @@ class TestPix0VectorAlias:
 
         assert config_m['pix0_override_m'] == pytest.approx(config_mm['pix0_override_m'], rel=0, abs=1e-12)
 
-    def test_dual_pix0_flag_rejection(self):
-        """Using both -pix0_vector and -pix0_vector_mm should raise ValueError."""
-        with pytest.raises(ValueError, match="Cannot specify both -pix0_vector and -pix0_vector_mm"):
-            run_parse([
-                '-cell', '100', '100', '100', '90', '90', '90',
-                '-pixel', '0.1',
-                '-default_F', '100',
-                '-pix0_vector', '0', '0', '0',
-                '-pix0_vector_mm', '0', '0', '0'
-            ])
+    def test_both_pix0_flags_are_accepted(self):
+        """C reads both, and the image is the same as with either: PARITY-PIX0-001."""
+        config = run_parse([
+            '-cell', '100', '100', '100', '90', '90', '90',
+            '-pixel', '0.1',
+            '-default_F', '100',
+            '-pix0_vector', '0', '0', '0',
+            '-pix0_vector_mm', '0', '0', '0'
+        ])
+        assert config['convention'] == 'CUSTOM'
 
     @pytest.mark.parametrize("pix0_m,pix0_mm", [
         ((0.1, -0.2, 0.3), (100, -200, 300)),
