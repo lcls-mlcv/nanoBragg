@@ -1014,3 +1014,10 @@ class TestInterpolateParity:
 
         assert not np.allclose(on, off), \
             "-interpolate and -nointerpolate produced identical images"
+
+
+def test_seed_zero_is_a_seed():
+    args = create_parser().parse_args("-default_F 100 -cell 70 80 90 90 90 90 -seed 0 -misset_seed 0".split())
+    config = parse_and_validate_args(args)
+    assert config['seed'] == 0
+    assert config['misset_seed'] == 0
