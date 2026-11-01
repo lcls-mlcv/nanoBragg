@@ -30,7 +30,7 @@ from .config import (
 from .models.detector import Detector
 from .models.crystal import Crystal
 from .simulator import Simulator
-from .io.hkl import read_hkl_file, try_load_hkl_or_fdump
+from .io.hkl import read_hkl_file, try_load_hkl_or_fdump, write_fdump
 from .io.smv import write_smv
 from .io.mosflm import read_mosflm_matrix, reciprocal_to_real_cell
 from .io.pgm import write_pgm
@@ -85,11 +85,9 @@ Examples:
                         help='Text file of "h k l F" (P1 reflections)')
     parser.add_argument('-mat', type=str, metavar='FILE',
                         help='3×3 MOSFLM-style A matrix (reciprocal vectors)')
-    # C writes its binary Fhkl cache here after reading -hkl, and re-reads it when
-    # -hkl is absent. We only ever read it; the flag exists so a run can redirect
-    # C's cache away from the working directory.
+    # Binary Fhkl cache, written after reading -hkl and re-read when -hkl is absent.
     parser.add_argument('-dumpfile', type=str, metavar='FILE', default='Fdump.bin',
-                        help='Binary Fhkl cache read when -hkl is not given (default: Fdump.bin)')
+                        help='Binary Fhkl cache: written after -hkl, read without it (default: Fdump.bin)')
     parser.add_argument('-cell', nargs=6, type=float,
                         metavar=('a', 'b', 'c', 'α', 'β', 'γ'),
                         help='Direct cell in Å and degrees')
@@ -1032,10 +1030,17 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Load HKL data
     config['default_F'] = args.default_F
+    # Doubles as in C, so the cache is byte-identical; the run's dtype is applied later
     if args.hkl:
-        config['hkl_data'] = read_hkl_file(args.hkl, default_F=args.default_F)
+        config['hkl_data'] = read_hkl_file(args.hkl, default_F=args.default_F, dtype=torch.float64)
+        try:
+            write_fdump(*config['hkl_data'], args.dumpfile)
+            print(f"writing dump file for next time: {args.dumpfile}")
+        except OSError:
+            print(f"WARNING: unable to open dump file: {args.dumpfile}")
     elif Path(args.dumpfile).exists():
-        config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F)
+        config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F,
+                                                   dtype=torch.float64)
 
     # Wavelength/energy
     if args.energy:

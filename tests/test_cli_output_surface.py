@@ -291,3 +291,27 @@ def test_intimage_pixels_match_c(extra, label, tmp_path):
         f"{label}: {differing}/{len(c_px)} integer pixels differ from C, "
         f"max |delta| = {worst} counts (C peak {c_px.max()}, torch peak {py_px.max()})"
     )
+
+
+@pytest.mark.parametrize("default_F", [[], ["-default_F", "7"]], ids=["no-default-F", "default-F"])
+def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
+    c_bin = c_binary()
+    hkl = tmp_path / "x.hkl"
+    r = range(-3, 4)
+    hkl.write_text("".join(f"{h} {k} {l} {50.1 + h + k + l}\n" for h in r for k in r for l in r if h != 2))
+    args = ["-cell", "70", "80", "90", "75", "85", "95", "-N", "5", "-lambda", "1", "-distance", "100",
+            "-pixel", "0.1", "-detpixels", "32", "-oversample", "1", "-nonoise", "-nopgm"] + default_F
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), KMP_DUPLICATE_LIB_OK="TRUE", NANOBRAGG_DISABLE_COMPILE="1")
+    c_dir, py_dir = tmp_path / "c", tmp_path / "py"
+    c_dir.mkdir()
+    py_dir.mkdir()
+    first = ["-hkl", str(hkl), "-floatfile", "f.bin"]
+    subprocess.run([c_bin] + args + first, cwd=c_dir, env=env, check=True, capture_output=True, timeout=300)
+    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + first, cwd=py_dir, env=env, check=True,
+                   capture_output=True, timeout=300)
+    assert (py_dir / "Fdump.bin").read_bytes() == (c_dir / "Fdump.bin").read_bytes()
+
+    # A run without -hkl renders the same image from the cache
+    subprocess.run([sys.executable, "-m", "nanobrag_torch"] + args + ["-floatfile", "g.bin"], cwd=py_dir, env=env,
+                   check=True, capture_output=True, timeout=300)
+    assert (py_dir / "g.bin").read_bytes() == (py_dir / "f.bin").read_bytes()

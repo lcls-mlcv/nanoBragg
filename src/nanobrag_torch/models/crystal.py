@@ -16,7 +16,7 @@ import torch
 
 from ..config import CrystalConfig, BeamConfig
 from ..utils.geometry import angles_to_rotation_matrix
-from ..io.hkl import read_hkl_file, try_load_hkl_or_fdump
+from ..io.hkl import read_hkl_file, try_load_hkl_or_fdump, write_fdump
 
 logger = logging.getLogger(__name__)
 
@@ -218,12 +218,12 @@ class Crystal:
                 warnings.warn(f"Unit cell angle {angle_name} is very close to 0° or 180°, which may cause numerical instability")
 
 
-    def load_hkl(self, hkl_path: str, write_cache: bool = True):
+    def load_hkl(self, hkl_path: str, write_cache: bool = False):
         """Load HKL structure factor data from file.
 
         Args:
             hkl_path: Path to HKL text file
-            write_cache: Whether to write Fdump.bin cache after loading
+            write_cache: Whether to write Fdump.bin to the working directory after loading
         """
         self.hkl_data, self.hkl_metadata = read_hkl_file(
             hkl_path,
@@ -231,6 +231,8 @@ class Crystal:
             device=self.device,
             dtype=self.dtype
         )
+        if write_cache:
+            write_fdump(self.hkl_data, self.hkl_metadata, "Fdump.bin")
 
         # Note: Auto-enable interpolation is already handled in __init__
         # This should be overridden by explicit CLI flags when they're implemented
