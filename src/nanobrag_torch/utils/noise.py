@@ -256,10 +256,7 @@ def c_noise_image(
     pack, unpack = packer.pack, packer.unpack
 
     def f32(x):
-        try:
-            return unpack(pack(x))[0]
-        except OverflowError:  # a C cast gives inf, struct raises
-            return math.copysign(math.inf, x)
+        return unpack(pack(x))[0]
 
     IA, IM, IQ, IR, NTAB = 16807, 2147483647, 127773, 2836, 32
     NDIV = 1 + (IM - 1) // NTAB
@@ -326,7 +323,7 @@ def c_noise_image(
         if xm < 12.0:
             try:
                 g = f32(math.exp(-xm))
-            except OverflowError:  # a large negative pixel
+            except OverflowError:  # a pixel below about -88: C's float g is inf, struct and exp raise
                 g = math.inf
             em = -1.0
             t = 1.0
