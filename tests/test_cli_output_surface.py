@@ -241,8 +241,9 @@ def test_default_pgm_uses_most_of_the_grey_range(tmp_path):
 @pytest.mark.parametrize(
     "extra,label",
     [([], "defaults"), (["-roi", "17", "17", "17", "17"], "roi-single-pixel"),
-     (["-scale", "3"], "explicit-scale")],
-    ids=["defaults", "roi-single-pixel", "explicit-scale"],
+     (["-scale", "3"], "explicit-scale"), (["-fluence", "1e-30"], "faint-image"),
+     (["-fluence", "1e-30", "-scale", "1e38"], "faint-image-explicit-scale"), (["-adc", "0", "-scale", "1"], "no-adc")],
+    ids=["defaults", "roi-single-pixel", "explicit-scale", "faint-image", "faint-image-explicit-scale", "no-adc"],
 )
 def test_intimage_pixels_match_c(extra, label, tmp_path):
     """Integer-image PIXEL data must match C exactly.

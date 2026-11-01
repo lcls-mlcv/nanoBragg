@@ -2513,13 +2513,16 @@ class Simulator:
         if roi_ymax is not None:
             roi_mask[roi_ymax+1:, :] = False
 
+        # C's rmsd loop tests the ROI and not the mask (nanoBragg.c:3117-3128)
+        rmsd_pixels = float_image[roi_mask].to(torch.float64)
+
         # Apply external mask if provided
         if self.detector.config.mask_array is not None:
             if self.detector.config.mask_array.shape == float_image.shape:
                 roi_mask = roi_mask & (self.detector.config.mask_array > 0)
 
-        # Get masked pixels
-        masked_pixels = float_image[roi_mask]
+        # Get masked pixels, in double as C sums them: a float32 square underflows on a faint image
+        masked_pixels = float_image[roi_mask].to(torch.float64)
         N = masked_pixels.numel()
 
         if N == 0:
@@ -2537,7 +2540,9 @@ class Simulator:
             }
 
         # Find maximum value and its location
-        max_I = masked_pixels.max().item()
+        # C's max_I only moves on `>`, so a NaN pixel is passed over
+        comparable_pixels = masked_pixels[~torch.isnan(masked_pixels)]
+        max_I = comparable_pixels.max().item() if comparable_pixels.numel() else 0.0
 
         # Find the last occurrence of the maximum value in the full image
         # This matches C behavior of "last set" location
@@ -2562,25 +2567,14 @@ class Simulator:
         # Compute mean
         mean = masked_pixels.mean().item()
 
-        # Compute RMS = sqrt(sum(pixel^2)/(N - 1))
-        # Note: Using N-1 for unbiased estimate per spec
-        if N > 1:
-            # math.sqrt on the Python float rather than torch.sqrt(torch.tensor(x)):
-            # the latter builds a tensor in the default dtype, which is float32,
-            # so a float64 sum was rounded to ~7 significant digits on its way
-            # back out. RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the
-            # PGM is byte-compared against C, where a boundary pixel could flip on
-            # that rounding.
-            sum_sq = (masked_pixels ** 2).sum().item()
-            RMS = math.sqrt(sum_sq / (N - 1))
-
-            # Compute RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
-            sum_dev_sq = ((masked_pixels - mean) ** 2).sum().item()
-            RMSD = math.sqrt(sum_dev_sq / (N - 1))
-        else:
-            # N=1 case: avoid division by zero
-            RMS = masked_pixels[0].item()
-            RMSD = 0.0
+        # Compute RMS = sqrt(sum(pixel^2)/(N - 1)), and RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
+        # with C's `if(sumn<=1) sumn=2`. math.sqrt on the Python float rather than
+        # torch.sqrt(torch.tensor(x)): the latter builds a tensor in the default dtype, which is
+        # float32, so a float64 sum was rounded to ~7 significant digits on its way back out.
+        # RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the PGM is byte-compared against
+        # C, where a boundary pixel could flip on that rounding.
+        RMS = math.sqrt((masked_pixels ** 2).sum().item() / (max(N, 2) - 1))
+        RMSD = math.sqrt(((rmsd_pixels - mean) ** 2).sum().item() / (max(rmsd_pixels.numel(), 2) - 1))
 
         return {
             "max_I": max_I,

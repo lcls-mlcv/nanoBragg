@@ -155,3 +155,23 @@ def test_readers_keep_the_key_after_dials_origin(tmp_path):
     assert read_smv(path)[1] == expected
     assert parse_smv_header(str(path)) == expected
     assert read_smv_mask(str(path))[1] == expected
+
+
+@pytest.mark.parametrize("extra", [[], ["-roi", "3", "12", "2", "14"]], ids=["whole-detector", "roi"])
+def test_every_file_of_a_masked_run_matches_c(extra, tmp_path):
+    """C keeps masked pixels in the int image, at adc, and counts them as zeros in rmsd."""
+    args = "-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -detpixels 16 -pixel 0.1 -distance 100 -oversample 1".split()
+    mask = np.ones((16, 16))
+    mask[4:8, 2:9] = 0
+    write_smv(tmp_path / "mask.img", mask, 0.1, 100.0, 1.0, 0.85, 0.85, adc_offset=0.0)
+    args += ["-mask", str(tmp_path / "mask.img"), "-nonoise", "-intfile", "i.img", "-floatfile", "f.bin", "-pgmfile", "p.pgm"]
+    render([c_binary()], tmp_path / "c", args + extra)
+    render(torch_cmd("-dtype", "float64"), tmp_path / "py", args + extra)
+
+    assert (tmp_path / "py" / "p.pgm").read_bytes() == (tmp_path / "c" / "p.pgm").read_bytes()
+    c_image = np.frombuffer((tmp_path / "c" / "i.img").read_bytes()[512:], dtype=np.uint16).reshape(16, 16)
+    py_image = np.frombuffer((tmp_path / "py" / "i.img").read_bytes()[512:], dtype=np.uint16).reshape(16, 16)
+    assert c_image[mask == 0].max() == 40
+    # The int image has 55000 counts across a float32 pixel, so the odd one can round apart
+    assert np.abs(c_image.astype(int) - py_image.astype(int)).max() <= 1
+    assert np.array_equal(c_image[mask == 0], py_image[mask == 0])

@@ -42,7 +42,7 @@ from .utils.units import (
     mm_to_meters, micrometers_to_meters, degrees_to_radians,
     angstroms_to_meters, mrad_to_radians
 )
-from .utils.noise import c_noise_image, fast_noise_image
+from .utils.noise import c_noise_image, fast_noise_image, roi_pixels
 from .utils.auto_selection import (
     auto_select_divergence, auto_select_dispersion,
     generate_sources_from_divergence_dispersion
@@ -1915,8 +1915,12 @@ def main():
 
         intensity = simulator.run(pixel_batch_size=args.pixel_batch_size)
 
+        # Every output comes from C's float image: float32 pixels, then used as doubles
+        with np.errstate(over='ignore'):
+            float_image = intensity.detach().cpu().numpy().astype(np.float32)
+
         # Compute statistics
-        stats = simulator.compute_statistics(intensity)
+        stats = simulator.compute_statistics(torch.from_numpy(float_image).to(intensity.device))
         print(f"\nStatistics:")
         print(f"  Max intensity: {stats['max_I']:.3e} at pixel ({stats['max_I_slow']}, {stats['max_I_fast']})")
         print(f"  Mean: {stats['mean']:.3e}")
@@ -1926,8 +1930,7 @@ def main():
         # Write outputs
         if config.get('floatfile'):
             # Write raw float image
-            data = intensity.cpu().numpy().astype(np.float32)
-            data.tofile(config['floatfile'])
+            float_image.tofile(config['floatfile'])
             print(f"Wrote float image to {config['floatfile']}")
 
         # Resolve the integer-image scale once, before either the int or the PGM
@@ -1942,35 +1945,22 @@ def main():
             # it into the scale made every pixel disagree with C. Measured on a
             # default 32x32 run before this fix: 1024/1024 pixels differed,
             # max |delta| = 41 counts, C peak 55040 against torch 55000.
-            max_val = intensity.max().item()
+            # max_I only ever moves on `>`, so NaN pixels don't reach it.
+            max_val = float(np.nanmax(float_image, initial=0.0))
             intfile_scale = 55000.0 / max_val if max_val > 0 else 1.0
 
         header_geometry = smv_header_geometry(config, detector_config)
 
         if config.get('intfile'):
-            # Scale and write SMV per AT-CLI-006
+            # nanoBragg.c:3152-3168: every pixel of the ROI, in double, to floorf(test + 0.5)
             scale = intfile_scale
-
-            # Apply scaling per spec: integer pixel = floor(min(65535, float*scale + adc))
-            # Only apply to non-zero pixels (AT-CLI-005)
-            # Pixels outside ROI should remain zero
-            threshold = 1e-10
-            roi_mask = intensity > threshold
-
-            # Calculate scaled values
-            scaled = intensity * scale + adc_offset
-            # Only apply scaling where intensity > 0 (inside ROI)
-            scaled = torch.where(roi_mask, scaled, torch.zeros_like(scaled))
-            # C rounds: intimage = (unsigned short)(floorf(test + 0.5))
-            # (nanoBragg.c:3167). This used to truncate, a systematic -0.5 ADU
-            # bias on every pixel. floor(x + 0.5) is round-half-UP, which is not
-            # torch.round's round-half-to-even, so spell it out.
-            scaled = scaled.clip(0, 65535)
-            # int32 then uint16: the old int16 cast relied on two's-complement
-            # wrapping for values above 32767 and happened to round-trip.
-            scaled_int = (
-                torch.floor(scaled + 0.5).to(torch.int32).cpu().numpy().astype(np.uint16)
-            )
+            test = np.clip(float_image.astype(np.float64) * scale + adc_offset, 0.0, 65535.0)
+            # floorf: its double argument is rounded to float first. That is the round-half-up
+            # C wants, which np.round isn't. A NaN pixel comes out as 0.
+            scaled_int = np.nan_to_num(np.floor((test + 0.5).astype(np.float32))).astype(np.uint16)
+            scaled_int = scaled_int * roi_pixels(float_image.shape, (
+                detector_config.roi_xmin, detector_config.roi_xmax,
+                detector_config.roi_ymin, detector_config.roi_ymax))
 
             write_smv(
                 filepath=config['intfile'],
@@ -2026,7 +2016,7 @@ def main():
                     # -roi 17 17 17 17 (one pixel, so rmsd is 0 in both): C wrote
                     # "# pixels scaled by 7570.47" where torch wrote 1.
                     pgmscale = intfile_scale
-            write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
+            write_pgm(config['pgmfile'], float_image, pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 
         # CLI-FLAGS-003: Honor -nonoise flag

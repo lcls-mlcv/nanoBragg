@@ -50,11 +50,11 @@ def write_pgm(
     # Image dimensions (height, width)
     height, width = image_data.shape
 
-    # Scale and convert to bytes per spec
-    # values = floor(min(255, float_pixel * pgm_scale))
-    scaled_data = image_data * pgm_scale
-    clipped_data = np.minimum(scaled_data, 255)
-    byte_data = np.floor(clipped_data).astype(np.uint8)
+    # nanoBragg.c:3216-3218, in double: test = pixel*pgm_scale, clipped above at 255, then
+    # (unsigned char) test. A NaN comes out as 0.
+    scaled_data = image_data.astype(np.float64) * pgm_scale
+    clipped_data = np.nan_to_num(np.minimum(scaled_data, 255), nan=0.0, neginf=-2**31)
+    byte_data = (np.trunc(clipped_data.clip(min=-2**31)).astype(np.int64) & 0xFF).astype(np.uint8)
 
     # Write PGM file
     with open(filepath, "wb") as f:
