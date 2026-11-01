@@ -12,6 +12,8 @@ from typing import Optional, Dict, Any, Union, Tuple
 import numpy as np
 import torch
 
+from .mask import read_smv_header_block
+
 
 def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     """Read an SMV format file.
@@ -27,9 +29,7 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
     filepath = Path(filepath)
 
     with open(filepath, 'rb') as f:
-        # Read the 512-byte header
-        header_bytes = f.read(512)
-        header_text = header_bytes.decode('ascii', errors='ignore')
+        header_text = read_smv_header_block(f)
 
         # Parse header into dictionary
         header = {}
@@ -161,7 +161,7 @@ def write_smv(
     """Write image data in SMV format, with the header nanoBragg.c writes.
 
     The SMV format consists of:
-    1. A 512-byte text header with metadata
+    1. A text header with metadata, 512 bytes unless the text needs more (see below)
     2. Binary image data in fast-major (row-wise) order
 
     Args:
@@ -188,7 +188,8 @@ def write_smv(
             they are worked out for an unrotated MOSFLM detector from the beam centre.
 
     Per spec AT-IO-001:
-    - Header closed with "}\\f" and padded with spaces to 512 bytes
+    - Header closed with "}\\f" and padded with spaces to 512 bytes, or to the next multiple
+      of 512 given in HEADER_BYTES when the text is longer
     - Data is fast-major (row-wise) with pixel index = slow*fpixels + fast
     """
     filepath = Path(filepath)
@@ -209,8 +210,8 @@ def write_smv(
     g.update(geometry or {})
     dials = g['dials_origin_mm']
     # The layout of nanoBragg.c:3178-3197. DIALS_ORIGIN has no semicolon there.
-    header_str = (
-        "{\nHEADER_BYTES=512;\nDIM=2;\n"
+    header_body = (
+        "DIM=2;\n"
         f"BYTE_ORDER={byte_order};\nTYPE={data_type};\n"
         f"SIZE1={fpixels};\nSIZE2={spixels};\n"
         f"PIXEL_SIZE={pixel_size_mm:g};\nDISTANCE={g['distance_mm']:g};\n"
@@ -228,11 +229,16 @@ def write_smv(
         f"DETECTOR_SN={detector_sn};\nBEAMLINE={beamline};\n"
         "}\f"
     )
-    header_bytes = header_str.encode("ascii")
-
-    if len(header_bytes) > 512:
-        raise ValueError(f"Header too large: {len(header_bytes)} > 512 bytes")
-    header_bytes = header_bytes.ljust(512, b' ')
+    # %g can take the text past 512 bytes. C then writes it all and still declares 512, which
+    # puts the pixels where no reader looks (docs/bugs/verified_c_bugs.md), so grow the block
+    # to the next multiple of 512 and declare that. Up to 512 this is C's header, byte for byte.
+    header_size = 512
+    while True:
+        header_bytes = f"{{\nHEADER_BYTES={header_size};\n{header_body}".encode("ascii")
+        if len(header_bytes) <= header_size:
+            break
+        header_size = (len(header_bytes) + 511) // 512 * 512
+    header_bytes = header_bytes.ljust(header_size, b' ')
 
     # Convert image data based on data type
     if data_type == "unsigned_short":
