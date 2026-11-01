@@ -39,6 +39,8 @@ P.add_argument("--sign", type=float, default=1.0)
 P.add_argument("--sensor-layers", dest="layers", type=int, default=0)
 P.add_argument("--misset", action="store_true", help="refine each frame and lattice's orientation too")
 P.add_argument("--rmin", type=float, default=400.0, help="pixels from the beam; F_calc has no bulk solvent inside about 8.5 A")
+P.add_argument("--flash", type=float, default=20.0,
+               help="drop a box whose peak is this many times the same box on both neighbouring frames; 0 keeps all")
 P.add_argument("--maxiter", type=int, default=100)
 P.add_argument("--start-only", dest="start_only", action="store_true")
 P.add_argument("--out", default="rotation_refinement.json")
@@ -71,19 +73,33 @@ def lab_crystal(exp, i):
     return c
 
 
+def read(i):
+    return load(A.images % (i + 1)).get_raw_data().as_numpy_array().astype(np.float64)
+
+
 def rois_of(i, img, good):
-    """Strongest indexed spots of frame i, one tilted plane each; returns rois, tilt_abc."""
+    """Strongest indexed spots of frame i, one tilted plane each; returns rois, tilt_abc.
+
+    Real spots here rock over three to five frames, so a box bright on one frame alone is a
+    cosmic ray that DIALS happened to index, and the model can never fit it.
+    """
     sel = np.where((zo >= i - 0.5) & (zo < i + 1.5) & (lattice >= 0) & (np.hypot(xo - bx, yo - by) > A.rmin))[0]
     sel = sel[np.argsort(-intensity[sel])]
     H, W = img.shape
     h, rois, tilts = A.half, [], []
     used = np.zeros(img.shape, bool)
+    side = np.maximum(read(i - 1), read(i + 1)) if A.flash else None
+    flashes = []
     for j in sel:
         x, y = int(xo[j]), int(yo[j])
         x1, x2, y1, y2 = x - h, x + h + 1, y - h, y + h + 1
         if x1 < 0 or y1 < 0 or x2 > W or y2 > H or used[y1:y2, x1:x2].any() or good[y1:y2, x1:x2].mean() < 0.9:
             continue
         used[y1:y2, x1:x2] = True
+        box = good[y1:y2, x1:x2]
+        if A.flash and img[y1:y2, x1:x2][box].max() > A.flash * max(1.0, side[y1:y2, x1:x2][box].max()):
+            flashes.append((x, y, img[y1:y2, x1:x2][box].max()))
+            continue
         yy, xx = np.mgrid[0:y2 - y1, 0:x2 - x1]
         keep = good[y1:y2, x1:x2].ravel().copy()
         M = np.stack((xx.ravel(), yy.ravel(), np.ones(xx.size)), 1).astype(float)
@@ -97,6 +113,8 @@ def rois_of(i, img, good):
         tilts.append(abc)
         if len(rois) == A.spots:
             break
+    if flashes:
+        print("frame", i, "dropped flashes (x, y, peak):", flashes, flush=True)
     return rois, tilts
 
 
@@ -107,7 +125,7 @@ if A.layers:
     sensor = dict(detector_thicksteps=A.layers, oversample_thick=True)
 t0 = time.time()
 for i in fit + test:
-    img = load(A.images % (i + 1)).get_raw_data().as_numpy_array().astype(np.float64)
+    img = read(i)
     good = (img >= 0) & (img < 1e5) & ~hot
     rois, tilts = rois_of(i, img, good)
     start = len(models)
