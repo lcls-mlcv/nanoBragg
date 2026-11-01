@@ -509,6 +509,60 @@ def test_gaussian_nll_matches_hopper_target_and_gradient(device):
         np.testing.assert_allclose(got, ref, rtol=1e-8, err_msg=name)
 
 
+def _diffbragg_swept(sim, spindle, osc, steps):
+    D = sim.D
+    D.spindle_axis, D.phi_deg, D.osc_deg, D.phisteps, D.phistep_deg = tuple(spindle), 0.0, osc, steps, osc / steps
+    D.refine(0)
+    D.initialize_managers()
+    D.set_value(0, 0.0)
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    size = sim.detector[0].get_image_size()
+    return D.raw_pixels_roi.as_numpy_array().reshape(size[1], size[0]).copy()
+
+
+def test_diffbragg_phi_turns_about_U_times_its_spindle():
+    """Its kernel rotates B inside U·B, so the lab axis is U·spindle: pass Uᵀ·axis to rotate about axis."""
+    import copy
+    from scitbx.matrix import sqr
+
+    from nanobrag_torch.compat.cctbx import _axis_angle_matrix, experiment_model_from_dxtbx
+
+    args = cmp.build_parser().parse_args(["--detpixels", "128", "--randomrotate", "3", "--ncells", "12"])
+    osc, steps, axis = 2.0, 4, np.array([1.0, 0.0, 0.0])
+    sim = cmp.build_sim(args)
+    start = sim.crystal.dxtbx_crystal
+    U = np.array(sim.D.Umatrix).reshape(3, 3)
+
+    def image(crystal, **options):
+        model = experiment_model_from_dxtbx(
+            sim.detector, sim.beam.nanoBragg_constructor_beam, crystal, Ncells_abc=args.ncells,
+            default_F=args.default_F, fluence=float(sim.D.fluence), spot_scale=float(sim.D.spot_scale), **options)
+        model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
+                                    dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
+        with torch.no_grad():
+            return model().numpy()
+
+    def stills(about):
+        images = []
+        for k in range(steps):
+            rotated = copy.deepcopy(start)
+            R = _axis_angle_matrix(about, math.radians(k * osc / steps))
+            rotated.set_A(sqr(R.flatten().tolist()) * sqr(start.get_A()))
+            images.append(image(rotated))
+        return np.mean(images, axis=0)
+
+    lab = stills(axis)
+    as_given = _diffbragg_swept(sim, axis, osc, steps)
+    np.testing.assert_allclose(as_given, stills(U @ axis), rtol=1e-7, atol=1e-8 * lab.max())
+    assert np.abs(as_given - lab).max() > 0.1 * lab.max()
+
+    corrected = _diffbragg_swept(cmp.build_sim(args), U.T @ axis, osc, steps)
+    np.testing.assert_allclose(corrected, lab, rtol=1e-7, atol=1e-8 * lab.max())
+    swept = image(start, osc_range_deg=osc, phi_steps=steps, spindle_axis=axis)
+    np.testing.assert_allclose(swept, corrected, rtol=1e-7, atol=1e-8 * lab.max())
+
+
 # Panels: hopper simulates (panel, fast, slow) pixels of a multi-panel detector in one call.
 def _panelled(distance=150.0, device="cpu"):
     from nanobrag_torch.compat.cctbx import experiment_model_from_dxtbx

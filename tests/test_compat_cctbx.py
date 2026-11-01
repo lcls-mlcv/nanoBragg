@@ -24,6 +24,7 @@ from nanobrag_torch.compat.cctbx import (  # noqa: E402
     isotropic_umats,
     rotate_A,
     set_mosaic_blocks,
+    experiment_model_from_dxtbx,
     set_structure_factors,
     simulator_from_dxtbx,
     to_raw_pixels,
@@ -87,6 +88,10 @@ class FakeUnitCell:
     def parameters(self): return self._p
 
 
+class FakeSpaceGroup:
+    def crystal_system(self): return "Triclinic"
+
+
 class FakeCrystal:
     """dxtbx.model.Crystal look-alike: A = U·B, columns are a*, b*, c* (Å⁻¹)."""
 
@@ -107,6 +112,7 @@ class FakeCrystal:
         self._A = self._U @ B
 
     def get_unit_cell(self): return FakeUnitCell(self._cell)
+    def get_space_group(self): return FakeSpaceGroup()
     def get_A(self): return tuple(self._A.reshape(-1))
     def get_U(self): return tuple(self._U.reshape(-1))
     def get_real_space_vectors(self):
@@ -437,3 +443,52 @@ def test_fractional_ncells_survive_the_config():
     assert crystal_config_from_A(cell, A, Ncells_abc=(4.87, 10.65, 4.52)).N_cells == (4.87, 10.65, 4.52)
     assert crystal_config_from_A(cell, A, Ncells_abc=4.87).N_cells == (4.87,) * 3
     assert crystal_config_from_A(cell, A, Ncells_abc=(5,)).N_cells == (5,) * 3
+
+
+def _rotation_model(xtal, **options):
+    det, beam, _ = _end_to_end_models()
+    model = experiment_model_from_dxtbx(det, beam, xtal, Ncells_abc=(12.0, 8.0, 6.0), shape="gauss", default_F=100.0,
+                                        oversample=1, **options)
+    with torch.no_grad():
+        return model().numpy()
+
+
+@pytest.mark.parametrize("axis", [(1, 0, 0), (0, 1, 0), (1, 2, 2)])
+def test_rotation_image_is_the_mean_of_rotated_stills(axis):
+    cell = (78.0, 78.0, 37.0, 90.0, 90.0, 90.0)
+    U = rotation_matrix((1, 2, 3), 20.0)
+    start, osc, steps = 0.5, 2.0, 4
+    swept = _rotation_model(FakeCrystal(cell, U), phi_start_deg=start, osc_range_deg=osc, phi_steps=steps, spindle_axis=axis)
+    stills = [_rotation_model(FakeCrystal(cell, rotation_matrix(axis, start + k * osc / steps) @ U)) for k in range(steps)]
+    np.testing.assert_allclose(swept, np.mean(stills, axis=0), rtol=1e-10, atol=1e-10 * swept.max())
+    backwards = _rotation_model(FakeCrystal(cell, U), phi_start_deg=-start, osc_range_deg=-osc, phi_steps=steps,
+                                spindle_axis=axis)
+    assert np.abs(backwards - swept).max() > 0.01 * swept.max()
+
+
+def _layered_model(thick_mm=None, steps=4):
+    det = FakeDetector([FakePanel((-32.0, 24.0, 150.0), (1, 0, 0), (0, -1, 0), 1.0, thickness_mm=0.32, mu=9.0)])
+    kwargs = dict(detector_thick_mm=thick_mm) if thick_mm is not None else {}
+    return experiment_model_from_dxtbx(det, FakeBeam(wavelength=1.2), _end_to_end_models()[2], default_F=100.0,
+                                       oversample=1, detector_thicksteps=steps, oversample_thick=True, **kwargs)
+
+
+@pytest.mark.parametrize("thick_mm, expected_um", [(None, 80.0), (0.4, 100.0)])
+def test_model_layers_split_the_sensor_evenly(thick_mm, expected_um):
+    model = _layered_model(thick_mm)
+    model()
+    n_layers, step_m, _ = model._detector.thickness_layers()
+    assert n_layers == 4
+    assert float(step_m) * 1e6 == pytest.approx(expected_um)
+
+
+def test_panel_simulator_keeps_nanoBragg_layer_step():
+    panel = FakePanel((-32.0, 24.0, 150.0), (1, 0, 0), (0, -1, 0), 1.0, thickness_mm=0.32, mu=9.0)
+    config = detector_config_from_dxtbx_panel(panel, FakeBeam(wavelength=1.2).get_s0(), detector_thicksteps=4)
+    _, step_m, _ = Detector(config).thickness_layers()
+    assert float(step_m) * 1e6 == pytest.approx(320.0 / 3)
+
+
+def test_model_rejects_a_single_sensor_layer():
+    with pytest.raises(ValueError, match="at least 2"):
+        _layered_model(steps=1)
