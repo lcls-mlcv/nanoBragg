@@ -1703,13 +1703,16 @@ cases:
           -detsize_s 32
       - name: detsize-not-whole-pixels
         extra_args: >-
-          -detsize 64.5
+          -detsize 64.3
       - name: detsize-not-whole-pixels-xds
         extra_args: >-
-          -detsize 64.5 -xds
+          -detsize 64.3 -xds
       - name: detsize-not-whole-pixels-adxv
         extra_args: >-
-          -detsize 64.5 -adxv
+          -detsize 64.3 -adxv
+      - name: ybeam-adxv-not-whole-pixels
+        extra_args: >-
+          -detsize_f 20.3 -detsize_s 30.7 -Ybeam 5 -adxv
       - name: detpixels-f-alone
         extra_args: >-
           -detpixels_f 80
