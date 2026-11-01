@@ -156,7 +156,9 @@ def stage_hopper(args):
 
 
 def stage_real(args):
-    """One frame of a rotation dataset as a still; hopper's solution stands in for the truth."""
+    """One frame of a rotation dataset, a still unless --phi-steps; hopper's solution stands in for the truth."""
+    import pickle
+
     import dxtbx
     from dials.array_family import flex
     from dxtbx.model import Experiment, ExperimentList
@@ -168,12 +170,14 @@ def stage_real(args):
     from simtbx.diffBragg.phil import hopper_phil, philz
     from simtbx.nanoBragg import make_imageset
 
-    expt = ExperimentList.from_file(args.expt, check_format=False)[0]
+    expt = ExperimentList.from_file(args.expt, check_format=False)[args.lattice]
     refls = flex.reflection_table.from_file(args.refl)
+    refls = refls.select(refls["id"] == args.lattice)
     os.chdir(args.outdir)
     with DeviceWrapper(0):
         frame = args.frame - expt.scan.get_image_range()[0]  # scan point at the start of the frame
-        angle = expt.scan.get_angle_from_array_index(frame + 0.5, deg=True)
+        # A rotating frame starts at that scan point and turns through the oscillation.
+        angle = expt.scan.get_angle_from_array_index(frame + (0 if args.phi_steps else 0.5), deg=True)
         gonio = expt.goniometer
         S, F = sqr(gonio.get_setting_rotation()), sqr(gonio.get_fixed_rotation())
         R = col(gonio.get_rotation_axis_datum()).axis_and_angle_as_r3_rotation_matrix(angle, deg=True)
@@ -188,6 +192,9 @@ def stage_real(args):
         E.detector = expt.detector
         E.beam = expt.beam
         E.imageset = make_imageset([raw], E.beam, E.detector)
+        if args.hot:
+            with open("mask.pickle", "wb") as out:
+                pickle.dump((flex.bool((raw >= 0) & (raw < 1e5) & ~np.load(args.hot)["hot"]),), out)
 
         z = refls["xyzobs.px.value"].parts()[2]
         chosen = refls.select((z >= frame) & (z < frame + 1) & (refls["intensity.sum.value"] > 0))
@@ -201,7 +208,7 @@ def stage_real(args):
 
         P = parse(hopper_phil + philz).extract()
         P.init.G = args.init_g
-        P.init.Nabc = NCELLS_START
+        P.init.Nabc = tuple(args.ncells_start)
         P.init.detz_shift = 0
         P.types.G = "positive"
         P.types.Nabc = "ranged"
@@ -210,6 +217,9 @@ def stage_real(args):
         P.roi.fit_tilt = False
         P.roi.pad_shoebox_for_background_estimation = 10
         P.roi.reject_edge_reflections = False
+        if args.hot:
+            P.roi.reject_roi_with_hotpix = False
+            P.roi.hotpixel_mask = os.path.abspath("mask.pickle")
         P.refiner.sigma_r = 1
         P.refiner.adu_per_photon = 1
         P.simulator.oversample = 1
@@ -226,6 +236,25 @@ def stage_real(args):
         P.niter_per_J = 1
         P.method = "L-BFGS-B"
         P.ftol = 1e-10
+        if args.hopper_maxiter:
+            P.lbfgs_maxiter = args.hopper_maxiter
+        osc = expt.scan.get_oscillation()[1]
+        axis = gonio.get_rotation_axis()
+        if args.phi_steps:
+            # diffBragg turns about U * spindle_axis, so the lab axis needs this frame's U undone.
+            spindle = sqr(start.get_U()).transpose() * col(axis)
+            build_simulator = utils.simulator_for_refinement
+
+            def rotating_simulator(*build_args):
+                SIM = build_simulator(*build_args)
+                SIM.D.spindle_axis = spindle.elems
+                SIM.D.phi_deg = osc / args.phi_steps / 2
+                SIM.D.osc_deg = osc
+                SIM.D.phisteps = args.phi_steps
+                SIM.D.phistep_deg = osc / args.phi_steps
+                return SIM
+
+            utils.simulator_for_refinement = rotating_simulator
 
         clock = time.perf_counter()
         Eopt, _, Mod, SIM_hopper, x = hopper_utils.refine(E, chosen, P, return_modeler=True)
@@ -248,7 +277,8 @@ def stage_real(args):
             all_sigma_rdout=np.broadcast_to(Mod.all_sigma_rdout, Mod.all_data.shape),
             rois=np.array(Mod.rois), tilt_abc=np.array(Mod.tilt_abc),
             G_true=float(G), G_start=float(args.init_g), fluence=float(D.fluence), oversample=1,
-            default_F=float(D.default_F), ncells_true=[float(Na), float(Nb), float(Nc)], ncells_start=NCELLS_START,
+            default_F=float(D.default_F), ncells_true=[float(Na), float(Nb), float(Nc)], ncells_start=args.ncells_start,
+            phi_steps=args.phi_steps, osc_deg=osc, spindle_axis=axis,
         )
         with open(os.path.join(args.outdir, "models.json"), "w") as out:
             json.dump(dict(truth=Eopt.crystal.to_dict(), start=start.to_dict(), detector=expt.detector.to_dict(),
@@ -482,6 +512,10 @@ def stage_torch(args):
     sensor = dict(detector_thick_mm=0.0)  # the other stages force zero thickness in hopper too
     if layers:
         sensor = dict(detector_thicksteps=layers, oversample_thick=True)
+    if "phi_steps" in saved.files and int(saved["phi_steps"]):
+        steps, osc = int(saved["phi_steps"]), float(saved["osc_deg"])
+        sensor.update(phi_start_deg=osc / steps / 2, osc_range_deg=osc, phi_steps=steps,
+                      spindle_axis=tuple(float(v) for v in saved["spindle_axis"]))
 
     def build(crystal, Ncells, G, eta=0.0):
         if eta:
@@ -533,6 +567,7 @@ def stage_torch(args):
         bragg = pred - planes
     print("Bragg model at the truth vs diffBragg's spots: max relative difference",
           float((bragg - spots).abs().max() / spots.max()))
+    print("NLL at hopper's solution", gaussian_nll(pred, data, sigma, trusted=trusted).item())
     bright = spots > 0.01 * spots.max()
     ratio = (bragg[bright] / spots[bright]).cpu().numpy()
     print("torch/diffBragg on %d bright pixels: percentiles 1, 50, 99" % bright.sum(), np.percentile(ratio, [1, 50, 99]))
@@ -602,6 +637,10 @@ def main():
                         help="still: readout noise in image units, by default from the pedestal")
     parser.add_argument("--ncells-start", dest="ncells_start", type=float, nargs=3, default=NCELLS_START)
     parser.add_argument("--frame", type=int, default=900, help="real: image number")
+    parser.add_argument("--hot", help="real: .npz with hot, True on pixels to drop")
+    parser.add_argument("--lattice", type=int, default=0, help="real: experiment to fit")
+    parser.add_argument("--phi-steps", dest="phi_steps", type=int, default=0,
+                        help="real: steps across the frame's oscillation, 0 for a still")
     parser.add_argument("--spots", type=int, default=150, help="real: strongest reflections kept")
     parser.add_argument("--init-g", dest="init_g", type=float, default=1e4, help="real: starting scale")
     parser.add_argument("--outdir", required=True)
