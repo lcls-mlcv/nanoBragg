@@ -672,6 +672,56 @@ class MultiPanelSimulator:
         return torch.stack([sim.run(**kwargs) for sim in self.panels], dim=0)
 
 
+def experiment_model_from_dxtbx(
+    detector,
+    beam,
+    crystal,
+    *,
+    Ncells_abc=(10, 10, 10),
+    shape="gauss",
+    mosaic_spread_deg: float = 0.0,
+    mosaic_domains: int = 1,
+    default_F: float = 0.0,
+    spot_metric: SpotMetric = SpotMetric.HKL,
+    oversample: int = 1,
+    fluence: Optional[float] = None,
+    spot_scale: float = 1.0,
+    spectrum: Optional[Iterable[Tuple[float, float]]] = None,
+    miller_array=None,
+    anomalous: Optional[bool] = None,
+    rois=None,
+    tilt_abc=None,
+    panels=None,
+    device=None,
+    dtype=torch.float64,
+    **model_kwargs,
+):
+    """
+    ExperimentModel for a dxtbx experiment, all panels, ready to refine.
+
+    ``crystal_system`` comes from the crystal's space group. ``miller_array`` makes F
+    refinable, one amplitude per reflection of its ASU (see asu_structure_factors); ``rois``,
+    ``tilt_abc`` and ``panels`` are diffBragg's rois, tilt_abc and pids. ``spectrum`` is a
+    list of (wavelength_Å, flux) as in beam_config_from_dxtbx, and ``fluence`` matches a
+    diffBragg image when it is that simulator's D.fluence.
+    """
+    from ..models.experiment import ExperimentModel
+
+    s0 = _s0_of(beam)
+    panel_list = list(detector) if hasattr(detector, "__getitem__") else [detector]
+    configs = [detector_config_from_dxtbx_panel(panel, s0, oversample=oversample) for panel in panel_list]
+    crystal_cfg = crystal_config_from_dxtbx(
+        crystal, Ncells_abc=Ncells_abc, shape=shape, mosaic_spread_deg=mosaic_spread_deg,
+        mosaic_domains=mosaic_domains, default_F=default_F, spot_metric=spot_metric,
+    )
+    beam_cfg = beam_config_from_dxtbx(beam, fluence=fluence, spot_scale=spot_scale, spectrum=spectrum)
+    model_kwargs.setdefault("crystal_system", crystal_system_of(crystal))
+    if miller_array is not None:
+        model_kwargs["structure_factors"] = asu_structure_factors(miller_array, anomalous=anomalous)
+    return ExperimentModel(crystal_cfg, configs, beam_cfg, device=device, dtype=dtype, background_rois=rois,
+                           tilt_abc=tilt_abc, background_panels=panels, **model_kwargs)
+
+
 def to_raw_pixels(image: torch.Tensor):
     """
     Return the image as nanoBragg's ``raw_pixels`` would present it: a slow-major

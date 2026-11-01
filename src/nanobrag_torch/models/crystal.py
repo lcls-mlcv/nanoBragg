@@ -1096,6 +1096,9 @@ class Crystal:
         """
         from ..utils.geometry import rotate_axis, rotate_umat
 
+        # Every property below recomputes the whole cell, seven times a run; read it once.
+        cell = self.compute_cell_tensors()
+
         # Generate phi angles
         # Assume config parameters are tensors (enforced at call site)
         # torch.linspace doesn't preserve gradients, so we handle different cases manually
@@ -1154,17 +1157,17 @@ class Crystal:
         # Apply rotation to base vectors for all φ angles
         # When phi=0, rotate_axis applies identity rotation, yielding base vectors
         a_phi = rotate_axis(
-            self.a.unsqueeze(0).expand(config.phi_steps, -1),
+            cell["a"].unsqueeze(0).expand(config.phi_steps, -1),
             spindle_axis.unsqueeze(0).expand(config.phi_steps, -1),
             phi_rad
         )
         b_phi = rotate_axis(
-            self.b.unsqueeze(0).expand(config.phi_steps, -1),
+            cell["b"].unsqueeze(0).expand(config.phi_steps, -1),
             spindle_axis.unsqueeze(0).expand(config.phi_steps, -1),
             phi_rad
         )
         c_phi = rotate_axis(
-            self.c.unsqueeze(0).expand(config.phi_steps, -1),
+            cell["c"].unsqueeze(0).expand(config.phi_steps, -1),
             spindle_axis.unsqueeze(0).expand(config.phi_steps, -1),
             phi_rad
         )
@@ -1239,9 +1242,9 @@ class Crystal:
 
         # Initialize reciprocal vectors with base values (broadcast to (N_phi, N_mos, 3))
         # These will be overwritten for non-identity (phi, mosaic) combinations
-        a_star_base = self.a_star.unsqueeze(0).unsqueeze(0).expand(config.phi_steps, config.mosaic_domains, -1)
-        b_star_base = self.b_star.unsqueeze(0).unsqueeze(0).expand(config.phi_steps, config.mosaic_domains, -1)
-        c_star_base = self.c_star.unsqueeze(0).unsqueeze(0).expand(config.phi_steps, config.mosaic_domains, -1)
+        a_star_base = cell["a_star"].unsqueeze(0).unsqueeze(0).expand(config.phi_steps, config.mosaic_domains, -1)
+        b_star_base = cell["b_star"].unsqueeze(0).unsqueeze(0).expand(config.phi_steps, config.mosaic_domains, -1)
+        c_star_base = cell["c_star"].unsqueeze(0).unsqueeze(0).expand(config.phi_steps, config.mosaic_domains, -1)
 
         # Create a mask for cases where we need reciprocal recalculation
         # Condition: phi != 0.0 OR mos_tic > 0 (matching C code logic)
@@ -1261,7 +1264,7 @@ class Crystal:
             # It does NOT recompute volume per-φ step! (see summary.md line 22)
             # The volume V is already computed from the base misset-rotated vectors
             # and stored in self.V
-            V_cell_static = self.V
+            V_cell_static = cell["V"]
             V_star_static = 1.0 / V_cell_static
 
             # Recompute reciprocal vectors using the STATIC volume

@@ -318,6 +318,7 @@ class Detector:
 
     def to(self, device=None, dtype=None):
         """Move detector to specified device and/or dtype."""
+        moved = (device is not None and device != self.device) or (dtype is not None and dtype != self.dtype)
         if device is not None:
             self.device = device
         if dtype is not None:
@@ -347,8 +348,9 @@ class Detector:
                 dtype=self.dtype,
             )
 
-        # Invalidate cache since device/dtype changed
-        self.invalidate_cache()
+        # Every Simulator calls this; a Detector shared by several must keep its coordinates.
+        if moved:
+            self.invalidate_cache()
         return self
 
     # Config fields the detector geometry is derived from. Anything listed here
