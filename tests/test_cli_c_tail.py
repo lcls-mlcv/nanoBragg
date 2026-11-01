@@ -243,3 +243,12 @@ def test_a_wavelength_of_zero_in_the_file_is_nan_in_both(tmp_path):
 def test_a_sourcefile_with_only_comments_has_no_sources(tmp_path):
     with pytest.raises(ValueError, match="No valid source lines"):
         _sources(tmp_path, "# nothing\n# here at all\n")
+
+
+@pytest.mark.parametrize("header_flag", ["-img", "-mask"])
+@pytest.mark.parametrize("flags", ["-phisteps 2", "-phistep 0.5", "-phi 0"])
+def test_header_phi_stands_unless_phi_itself_is_given(tmp_path, header_flag, flags):
+    """nanoBragg.c:939 needs strlen(argv[i])==4, so -phistep and -phisteps leave phi0 alone."""
+    _render([_c_binary()], "-pixel 0.5 -detpixels_f 40 -detpixels_s 24 -phi 10 -osc 2 -phisteps 2".split(), tmp_path)
+    (tmp_path / "out.img").rename(tmp_path / "header.img")
+    assert_matches_c([header_flag, "header.img"] + flags.split(), tmp_path)

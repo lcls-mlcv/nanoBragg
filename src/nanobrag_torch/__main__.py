@@ -946,7 +946,7 @@ _HEADER_ARG_SEEDS = {
     'beam_center_y_mm':  ('Ybeam',          ('-Ybeam',)),
     'orgx':              ('ORGX',           ('-ORGX',)),
     'orgy':              ('ORGY',           ('-ORGY',)),
-    'phi_start_deg':     ('phi',            ('-phi', '-phistep', '-phisteps')),
+    'phi_start_deg':     ('phi',            ('-phi',)),  # C checks strlen==4, so not -phistep
     'osc_range_deg':     ('osc',            ('-osc',)),
     # No TWOTHETA entry: see smv_header_defaults() -- C parses it into a
     # pixel-loop scratch variable, so a header TWOTHETA changes nothing.
