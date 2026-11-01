@@ -597,14 +597,38 @@ def resolve_wavelength_A(args: argparse.Namespace) -> Optional[float]:
     Wavelength in Å, None if no flag gave one. nanoBragg.c:853-859 walks argv, so the last of
     -lambda, -wave and -energy wins. Without ``args._argv`` -energy wins.
     """
-    wavelength = 12398.42 / args.energy if args.energy else args.wavelength
+    def from_energy(eV: float) -> float:
+        # C divides doubles, so -energy 0 is an infinite wavelength rather than an error.
+        return 12398.42 / eV if eV != 0.0 else math.copysign(math.inf, eV)
+
+    wavelength = from_energy(args.energy) if args.energy is not None else args.wavelength
     argv = getattr(args, '_argv', None) or []
     for token, value in zip(argv, argv[1:]):
         if token in ('-lambda', '-wave', '-wavelength'):
             wavelength = float(value)
         elif token == '-energy':
-            wavelength = 12398.42 / float(value)
+            wavelength = from_energy(float(value))
     return wavelength
+
+
+def resolve_divergence_ranges_mrad(args: argparse.Namespace) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Divergence range per axis. nanoBragg.c:893-904 walks argv and -divergence sets both axes,
+    so the last flag wins. Without ``args._argv`` -divergence fills the axes left unset.
+    """
+    hrange, vrange = args.hdivrange, args.vdivrange
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        return (hrange if hrange is not None else args.divergence,
+                vrange if vrange is not None else args.divergence)
+    for token, value in zip(argv, argv[1:]):
+        if token == '-hdivrange':
+            hrange = float(value)
+        elif token == '-vdivrange':
+            vrange = float(value)
+        elif token == '-divergence':
+            hrange = vrange = float(value)
+    return hrange, vrange
 
 
 def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[int, int, float, float]:
@@ -614,11 +638,15 @@ def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[in
     C walks argv, so the last flag wins for its axis. A pixel count then sets detsize for that
     axis, otherwise the count is ceil(detsize/pixel - 0.5) from a default detsize of 102.4 mm.
     detsize need not be a whole number of pixels, and the default beam centre uses detsize.
+
+    An -img or -mask header starts all four off, so its count stands on any axis no flag
+    counted (a count beats detsize), and -detpixels 0 falls back on the header's detsize.
     """
-    fpixels = args.detpixels or args.detpixels_f
-    spixels = args.detpixels or args.detpixels_s
-    size_f = args.detsize_f or args.detsize or 102.4
-    size_s = args.detsize_s or args.detsize or 102.4
+    header_f, header_s, header_size_f, header_size_s = getattr(args, '_header_size', (0, 0, 0.0, 0.0))
+    fpixels = args.detpixels or args.detpixels_f or header_f
+    spixels = args.detpixels or args.detpixels_s or header_s
+    size_f = args.detsize_f or args.detsize or header_size_f or 102.4
+    size_s = args.detsize_s or args.detsize or header_size_s or 102.4
     argv = getattr(args, '_argv', None) or []
     for token, value in zip(argv, argv[1:]):
         if token == '-detsize':
@@ -637,7 +665,11 @@ def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[in
         size_f = pixel_mm * fpixels
     if spixels:
         size_s = pixel_mm * spixels
-    return (math.ceil(size_f / pixel_mm - 0.5), math.ceil(size_s / pixel_mm - 0.5), size_f, size_s)
+    # Divide metres by metres, as C does: at half a pixel over, mm/mm can land on the other
+    # side of the integer and give a different ceil().
+    pixel_m = pixel_mm / 1000.0
+    return (math.ceil((size_f / 1000.0) / pixel_m - 0.5), math.ceil((size_s / 1000.0) / pixel_m - 0.5),
+            size_f, size_s)
 
 
 def resolve_sample_dimensions(args: argparse.Namespace) -> Tuple[float, float, float]:
@@ -835,9 +867,13 @@ def resolve_close_centers_mm(
     return fclose, sclose
 
 
-def resolve_detector_pivot(args: argparse.Namespace) -> str:
+def resolve_convention_and_pivot(args: argparse.Namespace) -> Tuple[str, str]:
     """
-    Detector pivot exactly as nanoBragg.c chooses it.
+    Beam convention and detector pivot exactly as nanoBragg.c chooses them.
+
+    The convention is the last of -mosflm, -xds, -adxv, -denzo, -dials and the explicit
+    vector flags, which mean CUSTOM (nanoBragg.c:647-728). A convention flag after a vector
+    flag therefore wins, and its block then overwrites every vector.
 
     C walks argv once and every pivot-affecting flag overwrites detector_pivot
     (last one wins). After parsing, the convention block forces BEAM for MOSFLM,
@@ -881,10 +917,15 @@ def resolve_detector_pivot(args: argparse.Namespace) -> str:
                 pivot = action[1]
 
     if convention in ('MOSFLM', 'DENZO', 'ADXV'):
-        return 'BEAM'
+        return convention, 'BEAM'
     if convention in ('XDS', 'DIALS'):
-        return 'SAMPLE'
-    return pivot
+        return convention, 'SAMPLE'
+    return convention, pivot
+
+
+def resolve_detector_pivot(args: argparse.Namespace) -> str:
+    """The detector pivot: see resolve_convention_and_pivot."""
+    return resolve_convention_and_pivot(args)[1]
 
 
 # nanoBragg.c reads the -img/-mask headers in a pre-pass (nanoBragg.c:419-502)
@@ -906,17 +947,11 @@ _HEADER_ARG_SEEDS = {
     'beam_center_y_mm':  ('Ybeam',          ('-Ybeam',)),
     'orgx':              ('ORGX',           ('-ORGX',)),
     'orgy':              ('ORGY',           ('-ORGY',)),
-    'phi_start_deg':     ('phi',            ('-phi', '-phistep', '-phisteps')),
+    'phi_start_deg':     ('phi',            ('-phi',)),  # C checks strlen==4, so not -phistep
     'osc_range_deg':     ('osc',            ('-osc',)),
     # No TWOTHETA entry: see smv_header_defaults() -- C parses it into a
     # pixel-loop scratch variable, so a header TWOTHETA changes nothing.
 }
-
-# Any of these means the user sized the detector themselves, so SIZE1/SIZE2
-# from the header must not be injected.
-_HEADER_SIZE_FLAGS = ('-detpixels', '-detpixels_f', '-detpixels_s',
-                      '-detpixels_x', '-detpixels_y',
-                      '-detsize', '-detsize_f', '-detsize_s')
 
 
 def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
@@ -952,11 +987,11 @@ def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
     if not defaults:
         return
 
-    if not named.intersection(_HEADER_SIZE_FLAGS):
-        if 'fpixels' in defaults:
-            args.detpixels_f = defaults['fpixels']
-        if 'spixels' in defaults:
-            args.detpixels_s = defaults['spixels']
+    # C's pre-pass leaves the header size in fpixels, spixels, detsize_f and detsize_s
+    # (nanoBragg.c:424-430), and the flags then work from there: see resolve_detector_size.
+    pixel_mm = defaults.get('pixel_size_mm', 0.1)
+    fpixels, spixels = defaults.get('fpixels', 0), defaults.get('spixels', 0)
+    args._header_size = (fpixels, spixels, pixel_mm * fpixels, pixel_mm * spixels)
 
     for key, (dest, tokens) in _HEADER_ARG_SEEDS.items():
         if key not in defaults:
@@ -1096,18 +1131,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['wavelength_A'] = resolve_wavelength_A(args) or 1.0  # Default
 
     # Convention and pivot
-    # nanoBragg.c:665-728 switches to CUSTOM for every explicit basis vector, and
-    # -twotheta_axis (nanoBragg.c:714-720) is one of them.
-    if any([args.fdet_vector, args.sdet_vector, args.odet_vector,
-            args.beam_vector, args.polar_vector, args.spindle_axis,
-            args.twotheta_axis, args.pix0_vector, args.pix0_vector_mm]):
-        config['convention'] = 'CUSTOM'
-    elif args.convention:
-        config['convention'] = args.convention
-    else:
-        config['convention'] = 'MOSFLM'  # Default
-
-    config['pivot'] = resolve_detector_pivot(args)
+    config['convention'], config['pivot'] = resolve_convention_and_pivot(args)
 
     # Detector parameters
     config['pixel_size_mm'] = args.pixel if args.pixel else 0.1
@@ -1138,25 +1162,28 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['detector_roty_deg'] = args.detector_roty
     config['detector_rotz_deg'] = args.detector_rotz
     config['twotheta_deg'] = resolve_twotheta_deg(args)
-    if args.twotheta_axis:
+    custom = config['convention'] == 'CUSTOM'  # any other convention overwrites these vectors
+    if custom and args.twotheta_axis:
         config['twotheta_axis'] = tuple(args.twotheta_axis)
 
     config['point_pixel'] = args.point_pixel
     config['curved_detector'] = args.curved_det
 
     # Custom vectors for CUSTOM convention
-    if args.fdet_vector:
+    if custom and args.fdet_vector:
         config['custom_fdet_vector'] = tuple(args.fdet_vector)
-    if args.sdet_vector:
+    if custom and args.sdet_vector:
         config['custom_sdet_vector'] = tuple(args.sdet_vector)
-    if args.odet_vector:
+    if custom and args.odet_vector:
         config['custom_odet_vector'] = tuple(args.odet_vector)
-    if args.beam_vector:
+    if custom and args.beam_vector:
         config['custom_beam_vector'] = tuple(args.beam_vector)
-    if args.polar_vector:
+    if custom and args.polar_vector:
         config['custom_polar_vector'] = tuple(args.polar_vector)
-    if args.spindle_axis:
+    if custom and args.spindle_axis:
         config['custom_spindle_axis'] = tuple(args.spindle_axis)
+
+    unitize_custom_vectors(config)
 
     # Convention defaults for both vectors; an explicit flag wins, as in C, where a vector
     # flag switches to CUSTOM and the convention block then leaves them alone.
@@ -1169,10 +1196,6 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # declared with in nanoBragg.c: beam [1,0,0] (line 191), fdet [0,0,1],
         # sdet [0,-1,0], odet [1,0,0] (lines 246-248), polar and spindle [0,0,1].
         config.setdefault('custom_beam_vector', (1.0, 0.0, 0.0))
-    # Handle pix0 override (validate mutual exclusivity)
-    if args.pix0_vector and args.pix0_vector_mm:
-        raise ValueError("Cannot specify both -pix0_vector and -pix0_vector_mm simultaneously")
-
     if args.pix0_vector:
         config['custom_pix0_vector'] = tuple(args.pix0_vector)
         # pix0_vector is in meters, convert to config
@@ -1278,13 +1301,11 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Divergence and dispersion parameters for source generation
     # Convert from mrad to radians for divergence parameters
-    if args.divergence is not None:
-        config['hdivrange'] = mrad_to_radians(args.divergence)
-        config['vdivrange'] = mrad_to_radians(args.divergence)
-    if args.hdivrange is not None:
-        config['hdivrange'] = mrad_to_radians(args.hdivrange)
-    if args.vdivrange is not None:
-        config['vdivrange'] = mrad_to_radians(args.vdivrange)
+    hdivrange_mrad, vdivrange_mrad = resolve_divergence_ranges_mrad(args)
+    if hdivrange_mrad is not None:
+        config['hdivrange'] = mrad_to_radians(hdivrange_mrad)
+    if vdivrange_mrad is not None:
+        config['vdivrange'] = mrad_to_radians(vdivrange_mrad)
     if args.hdivstep is not None:
         config['hdivstep'] = mrad_to_radians(args.hdivstep)
     if args.vdivstep is not None:
@@ -1477,6 +1498,38 @@ class SimulationBundle:
     device: torch.device
 
 
+def unitize_custom_vectors(config: Dict[str, Any]) -> None:
+    """
+    nanoBragg.c:1260-1268 unitizes the vectors the flags gave. An odet whose magnitude isn't
+    exactly 1 is replaced by fdet x sdet, with fdet and sdet at their declared values if unset.
+    """
+    def magnitude(vector):
+        return math.sqrt(sum(component * component for component in vector))
+
+    def unitized(vector):
+        length = magnitude(vector)
+        return tuple(component / length for component in vector) if length != 0.0 else (0.0, 0.0, 0.0)
+
+    for key in ('custom_beam_vector', 'custom_fdet_vector', 'custom_sdet_vector'):
+        if key in config:
+            config[key] = unitized(config[key])
+    if 'custom_odet_vector' in config and magnitude(config['custom_odet_vector']) != 1.0:
+        print("WARNING: auto-generating odet_vector")
+        f = config.get('custom_fdet_vector', (0.0, 0.0, 1.0))
+        s = config.get('custom_sdet_vector', (0.0, -1.0, 0.0))
+        config['custom_odet_vector'] = unitized((f[1] * s[2] - f[2] * s[1],
+                                                 f[2] * s[0] - f[0] * s[2],
+                                                 f[0] * s[1] - f[1] * s[0]))
+
+
+def resolve_beam_and_polar_vectors(config: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unit beam_vector and polar_vector as nanoBragg.c:1172-1270 leaves them, in double."""
+    default_beam = (1.0, 0.0, 0.0) if config['convention'] in ('MOSFLM', 'DENZO', 'CUSTOM') else (0.0, 0.0, 1.0)
+    beam = torch.tensor(config.get('custom_beam_vector', default_beam), dtype=torch.float64)
+    polar = torch.tensor(config.get('custom_polar_vector', (0.0, 0.0, 1.0)), dtype=torch.float64)
+    return beam / beam.norm(), polar / polar.norm()
+
+
 def build_simulation(
     args: argparse.Namespace,
     config_hook: Optional[Callable[[Any, DetectorConfig, BeamConfig], None]] = None,
@@ -1576,8 +1629,8 @@ def build_simulation(
         custom_sdet_vector=config.get('custom_sdet_vector'),
         custom_odet_vector=config.get('custom_odet_vector'),
         custom_beam_vector=config.get('custom_beam_vector'),
-        # Detector origin override (CLI-FLAGS-003)
-        pix0_override_m=config.get('pix0_override_m')
+        # Not pix0_override_m: nanoBragg.c:1719 or 1740 overwrites -pix0_vector under either
+        # pivot, so the flag's only effect is the switch to CUSTOM.
     )
 
     # Set beam center if provided (values are in mm)
@@ -1670,22 +1723,24 @@ def build_simulation(
         # Load sources from file
         wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
 
-        # Get beam direction based on detector convention.
-        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0];
-        # ADXV/XDS/DIALS use [0,0,1].
-        if detector_config.detector_convention in (
-            DetectorConvention.MOSFLM, DetectorConvention.DENZO
-        ):
-            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-        else:
-            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
+        beam_direction, _ = resolve_beam_and_polar_vectors(config)
 
         source_directions, source_weights, source_wavelengths = read_sourcefile(
             config['sourcefile'],
             default_wavelength_m=wavelength_m,
             default_source_distance_m=10.0,  # C code default
-            beam_direction=beam_direction
+            beam_direction=beam_direction,
+            dtype=dtype,
         )
+
+        if not torch.all(source_weights == source_weights[0]):
+            warnings.warn(
+                "The -sourcefile weights differ, and the CLI ignores them, as nanoBragg.c does: "
+                "every source counts equally. ExperimentModel or BeamConfig.use_source_weights "
+                "honours them.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # Store loaded sources in config
         config['source_directions'] = source_directions
@@ -1713,18 +1768,7 @@ def build_simulation(
 
         # Generate source arrays
         wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
-
-        # Get beam direction based on detector convention.
-        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0] with
-        # polar_vector = [0,0,1]; ADXV/XDS/DIALS use beam_vector = [0,0,1].
-        if detector_config.detector_convention in (
-            DetectorConvention.MOSFLM, DetectorConvention.DENZO
-        ):
-            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-            polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-        else:
-            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-            polarization_axis = torch.tensor([0.0, 1.0, 0.0], dtype=dtype)
+        beam_direction, polarization_axis = resolve_beam_and_polar_vectors(config)
 
         source_directions, source_weights, source_wavelengths = \
             generate_sources_from_divergence_dispersion(
@@ -1739,10 +1783,10 @@ def build_simulation(
                 dtype=dtype
             )
 
-        # Store generated sources in config. One generated source just restates the beam,
-        # and leaves it to Detector, which also knows about -beam_vector.
+        # Store generated sources in config. One source with no divergence just restates the
+        # beam, and leaves it to Detector, which also knows about -beam_vector.
         n_sources = len(source_directions)
-        if n_sources > 1:
+        if n_sources > 1 or hdiv_params.range > 0.0 or vdiv_params.range > 0.0:
             config['source_directions'] = source_directions
             config['source_weights'] = source_weights
             config['source_wavelengths'] = source_wavelengths

@@ -265,10 +265,10 @@ class TestSourceWeights:
         - Run B: Sourcefile with equal weights [1.0, 1.0]
         - Assert: Outputs are identical (within 0.3% tolerance for float32 precision)
 
-        Per spec: "Both the weight column and the wavelength column are read but ignored:
-        the CLI -lambda parameter is the sole authoritative wavelength source for all sources,
-        and equal weighting results (all sources contribute equally via division by total
-        source count in the steps normalization)." (spec-a-core.md:151-153)
+        nanoBragg.c reads the weight column and only prints it (nanoBragg.c:2424), so all sources
+        contribute equally via division by the total source count in the steps normalization.
+        The wavelength column is used per source (nanoBragg.c:2748); both files here give
+        the same wavelength as -lambda.
         """
         py_cli = f"{sys.executable} -m nanobrag_torch"
 
@@ -297,7 +297,7 @@ class TestSourceWeights:
                 '-distance', '100',
                 '-detpixels', '128',
                 '-pixel', '0.1',
-                '-lambda', '1.0',  # CLI lambda overrides sourcefile values
+                '-lambda', '1.0',  # same as the file's wavelengths, which win over it
                 '-oversample', '1',
                 '-phisteps', '1',
                 '-mosaic_dom', '1'
@@ -481,14 +481,13 @@ class TestSourceWeightsDivergence:
         Validate C vs PyTorch parity on weighted sources (SOURCE-WEIGHT-001 Phase H).
 
         After Phase G validation (5 consecutive XPASS results), we confirmed that both
-        C and PyTorch correctly ignore source weights per spec-a-core.md:151-153.
+        C and PyTorch both ignore source weights.
 
         Expected parity (from Phase G evidence):
         - Correlation ≥ 0.999 (observed: 0.9999886)
         - |sum_ratio - 1| ≤ 5e-3 / 0.5% (observed: 0.0038 / 0.38%)
 
-        Per spec: "Both the weight column and the wavelength column are read but ignored"
-        (spec-a-core.md:151-152). Both implementations comply with this requirement.
+        Both implementations ignore the weight column. Each source keeps its wavelength.
 
         See parity reassessment memo:
         reports/2025-11-source-weights/phase_h/20251010T002324Z/parity_reassessment.md
