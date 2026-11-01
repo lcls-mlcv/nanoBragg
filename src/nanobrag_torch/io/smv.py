@@ -45,10 +45,9 @@ def read_smv(filepath: Union[str, Path]) -> Tuple[np.ndarray, Dict[str, Any]]:
         header_content = header_text[start+1:end]
         for line in header_content.split('\n'):
             line = line.strip()
-            if '=' in line and line.endswith(';'):
-                # Remove trailing semicolon
-                line = line[:-1]
-                key, value = line.split('=', 1)
+            if '=' in line:
+                # DIALS_ORIGIN has no semicolon in nanoBragg.c
+                key, value = line.rstrip(';').split('=', 1)
                 header[key.strip()] = value.strip()
 
         # Extract dimensions

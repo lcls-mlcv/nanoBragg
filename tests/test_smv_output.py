@@ -129,3 +129,16 @@ def test_only_a_longer_text_grows_the_block(tmp_path):
     assert len(header(513 - shortest)) == 1024 and b"HEADER_BYTES=1024;" in header(513 - shortest)
     assert len(header(1023 - shortest)) == 1024
     assert len(header(1024 - shortest)) == 1536 and b"HEADER_BYTES=1536;" in header(1024 - shortest)
+
+
+def test_readers_keep_the_key_after_dials_origin(tmp_path):
+    """DIALS_ORIGIN has no semicolon in nanoBragg.c:3186, and must not swallow XDS_ORGX."""
+    render([c_binary()], tmp_path, BASE + "-detpixels 16 -nonoise -intfile i.img -floatfile f.bin".split())
+    path = tmp_path / "i.img"
+    lines = [line for line in path.read_bytes()[:512].decode("ascii").split("\n") if "=" in line]
+    expected = dict(line.rstrip(";").split("=", 1) for line in lines)
+    assert expected["XDS_ORGX"] and "," in expected["DIALS_ORIGIN"]
+
+    assert read_smv(path)[1] == expected
+    assert parse_smv_header(str(path)) == expected
+    assert read_smv_mask(str(path))[1] == expected

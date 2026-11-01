@@ -24,6 +24,16 @@ def read_smv_header_block(handle) -> str:
     return header_text
 
 
+def _parse_smv_keys(header_content: str) -> Dict[str, str]:
+    """Parse key=value pairs. A line ends one as well as a semicolon: DIALS_ORIGIN has none in C."""
+    header_dict = {}
+    for line in re.split("[;\n]", header_content):
+        if "=" in line:
+            key, value = line.split("=", 1)
+            header_dict[key.strip()] = value.strip()
+    return header_dict
+
+
 def parse_smv_header(filename: str) -> Dict[str, str]:
     """Parse SMV header from a file.
 
@@ -59,15 +69,7 @@ def parse_smv_header(filename: str) -> Dict[str, str]:
 
         header_content = header_str[start_idx+1:end_idx]
 
-        # Parse key=value pairs
-        header_dict = {}
-        for line in header_content.split(";"):
-            line = line.strip()
-            if "=" in line:
-                key, value = line.split("=", 1)
-                header_dict[key.strip()] = value.strip()
-
-    return header_dict
+        return _parse_smv_keys(header_content)
 
 
 def read_smv_header_text(filename: str) -> str:
@@ -231,9 +233,6 @@ def read_smv_mask(filename: str) -> Tuple[torch.Tensor, dict]:
     with open(path, "rb") as f:
         header_str = read_smv_header_block(f)
 
-        # Parse header into dict
-        header_dict = {}
-
         # Find header content between { and }
         start_idx = header_str.find("{")
         end_idx = header_str.find("}")
@@ -243,12 +242,7 @@ def read_smv_mask(filename: str) -> Tuple[torch.Tensor, dict]:
 
         header_content = header_str[start_idx+1:end_idx]
 
-        # Parse key=value pairs
-        for line in header_content.split(";"):
-            line = line.strip()
-            if "=" in line:
-                key, value = line.split("=", 1)
-                header_dict[key.strip()] = value.strip()
+        header_dict = _parse_smv_keys(header_content)
 
         # Extract dimensions
         if "SIZE1" not in header_dict or "SIZE2" not in header_dict:
