@@ -610,6 +610,26 @@ def resolve_wavelength_A(args: argparse.Namespace) -> Optional[float]:
     return wavelength
 
 
+def resolve_divergence_ranges_mrad(args: argparse.Namespace) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Divergence range per axis. nanoBragg.c:893-904 walks argv and -divergence sets both axes,
+    so the last flag wins. Without ``args._argv`` -divergence fills the axes left unset.
+    """
+    hrange, vrange = args.hdivrange, args.vdivrange
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        return (hrange if hrange is not None else args.divergence,
+                vrange if vrange is not None else args.divergence)
+    for token, value in zip(argv, argv[1:]):
+        if token == '-hdivrange':
+            hrange = float(value)
+        elif token == '-vdivrange':
+            vrange = float(value)
+        elif token == '-divergence':
+            hrange = vrange = float(value)
+    return hrange, vrange
+
+
 def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[int, int, float, float]:
     """
     fpixels, spixels, detsize_f and detsize_s (mm) as nanoBragg.c:781-804 and 1120-1127 find them.
@@ -1283,13 +1303,11 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
 
     # Divergence and dispersion parameters for source generation
     # Convert from mrad to radians for divergence parameters
-    if args.divergence is not None:
-        config['hdivrange'] = mrad_to_radians(args.divergence)
-        config['vdivrange'] = mrad_to_radians(args.divergence)
-    if args.hdivrange is not None:
-        config['hdivrange'] = mrad_to_radians(args.hdivrange)
-    if args.vdivrange is not None:
-        config['vdivrange'] = mrad_to_radians(args.vdivrange)
+    hdivrange_mrad, vdivrange_mrad = resolve_divergence_ranges_mrad(args)
+    if hdivrange_mrad is not None:
+        config['hdivrange'] = mrad_to_radians(hdivrange_mrad)
+    if vdivrange_mrad is not None:
+        config['vdivrange'] = mrad_to_radians(vdivrange_mrad)
     if args.hdivstep is not None:
         config['hdivstep'] = mrad_to_radians(args.hdivstep)
     if args.vdivstep is not None:
@@ -1480,6 +1498,14 @@ class SimulationBundle:
     beam_config: BeamConfig
     dtype: torch.dtype
     device: torch.device
+
+
+def resolve_beam_and_polar_vectors(config: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unit beam_vector and polar_vector as nanoBragg.c:1172-1270 leaves them, in double."""
+    default_beam = (1.0, 0.0, 0.0) if config['convention'] in ('MOSFLM', 'DENZO', 'CUSTOM') else (0.0, 0.0, 1.0)
+    beam = torch.tensor(config.get('custom_beam_vector', default_beam), dtype=torch.float64)
+    polar = torch.tensor(config.get('custom_polar_vector', (0.0, 0.0, 1.0)), dtype=torch.float64)
+    return beam / beam.norm(), polar / polar.norm()
 
 
 def build_simulation(
@@ -1727,18 +1753,7 @@ def build_simulation(
 
         # Generate source arrays
         wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
-
-        # Get beam direction based on detector convention.
-        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0] with
-        # polar_vector = [0,0,1]; ADXV/XDS/DIALS use beam_vector = [0,0,1].
-        if detector_config.detector_convention in (
-            DetectorConvention.MOSFLM, DetectorConvention.DENZO
-        ):
-            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-            polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-        else:
-            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-            polarization_axis = torch.tensor([0.0, 1.0, 0.0], dtype=dtype)
+        beam_direction, polarization_axis = resolve_beam_and_polar_vectors(config)
 
         source_directions, source_weights, source_wavelengths = \
             generate_sources_from_divergence_dispersion(
@@ -1753,10 +1768,10 @@ def build_simulation(
                 dtype=dtype
             )
 
-        # Store generated sources in config. One generated source just restates the beam,
-        # and leaves it to Detector, which also knows about -beam_vector.
+        # Store generated sources in config. One source with no divergence just restates the
+        # beam, and leaves it to Detector, which also knows about -beam_vector.
         n_sources = len(source_directions)
-        if n_sources > 1:
+        if n_sources > 1 or hdiv_params.range > 0.0 or vdiv_params.range > 0.0:
             config['source_directions'] = source_directions
             config['source_weights'] = source_weights
             config['source_wavelengths'] = source_wavelengths

@@ -1801,3 +1801,60 @@ cases:
       - name: round-div-after-square-div
         extra_args: >-
           -divergence 2 -divsteps 4 -square_div -round_div
+      - name: count-without-range
+        extra_args: >-
+          -hdivsteps 3 -vdivsteps 3 -nopolar
+      - name: hdivrange-and-divsteps
+        extra_args: >-
+          -hdivrange 2 -divsteps 3 -nopolar
+      - name: vdivrange-and-divsteps-square
+        extra_args: >-
+          -vdivrange 2 -divsteps 3 -square_div -nopolar
+      - name: one-hdivstep-is-off-axis
+        extra_args: >-
+          -hdivsteps 1
+      - name: one-vdivstep-is-off-axis
+        extra_args: >-
+          -vdivsteps 1
+      - name: one-divstep-square
+        extra_args: >-
+          -divsteps 1 -square_div
+      - name: range-and-one-step-means-two
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 1
+      - name: all-three-given-one-step
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 1 -hdivstep 0.5
+      - name: all-three-given-step-beyond-range
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -hdivstep 1.5
+      - name: steps-given-on-both-axes
+        extra_args: >-
+          -hdivstep 0.5 -vdivstep 0.3
+      - name: divergence-then-hdivrange
+        extra_args: >-
+          -divergence 2 -hdivrange 1 -divsteps 3
+      - name: hdivrange-then-divergence
+        extra_args: >-
+          -hdivrange 1 -divergence 2 -divsteps 3
+      - name: polar-axis-adxv
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -adxv -square_div
+      - name: polar-axis-xds
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -xds -square_div
+      - name: polar-axis-flag
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -polar_vector 0 1 0
+      - name: dispsteps-alone
+        extra_args: >-
+          -dispsteps 3
+      - name: dispersion-and-one-step-means-two
+        extra_args: >-
+          -dispersion 10 -dispsteps 1
+      - name: negative-dispersion-and-steps
+        extra_args: >-
+          -dispersion -5 -dispsteps 3
+      - name: dispersion-at-energy-zero
+        extra_args: >-
+          -dispersion 10 -energy 0

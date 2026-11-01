@@ -1,8 +1,8 @@
 """
-Auto-selection logic for count/range/step parameters per spec AT-SRC-002.
+Auto-selection logic for count/range/step parameters.
 
-This module implements the auto-selection rules from specs/spec-a.md for resolving
-missing combinations of count/range/step for divergence, dispersion, and thickness sampling.
+This module resolves missing combinations of count/range/step for divergence, dispersion,
+and thickness sampling the way nanoBragg.c does, and generates the sources from them.
 """
 
 from typing import Tuple, Optional
@@ -24,103 +24,68 @@ def auto_select_sampling(
     range_val: Optional[float] = None,
     step: Optional[float] = None,
     default_range: float = 1.0,
-    parameter_type: str = "angle"
+    parameter_type: str = "angle",
+    unset_range: float = -1.0,
 ) -> SamplingParams:
     """
-    Apply auto-selection rules for sampling parameters per spec AT-SRC-002.
+    Resolve count, range and step exactly as nanoBragg.c does.
 
-    Rules from spec section "Auto-selection rules":
-    - If step count ≤ 0:
-        - If range < 0 and step size ≤ 0: use 1 step, zero range (i.e., no spread)
-        - If range < 0 and step size > 0: set range = step size, steps = 2
-        - If range ≥ 0 and step size ≤ 0: step size = range, steps = 2
-        - If range ≥ 0 and step size > 0: steps = ceil(range / step size)
-    - If step count > 0:
-        - If range < 0 and step size ≤ 0: set a nominal range and step size = range / max(steps-1, 1)
-        - If range < 0 and step size > 0: range = step size, steps = 2
-        - If range ≥ 0 and step size ≤ 0: step size = range / max(steps - 1, 1)
+    Divergence is nanoBragg.c:1431-1529, dispersion 1532-1580, thickness 1583-1631, each with
+    the sanity check at 1676-1695:
 
-    Additional rules from AT-SRC-002:
-    - No parameters → count=1, range=0, step=0
-    - Only step → range=step, count=2
-    - Only range → step=range, count=2
-    - Only count → range set to finite default and step derived as range/(count-1)
-      with count coerced to ≥2 for nonzero range
+    - count <= 0:
+        - range < 0, step <= 0: nothing to do: count 1, range 0, step 0
+        - range < 0, step > 0: range = step, count = 2
+        - range >= 0, step <= 0: step = range, count = 2 (for thickness, step = range/2)
+        - range >= 0, step > 0: count = ceil(range/step)
+    - count > 0:
+        - range < 0, step <= 0: range = default_range, step = range/count
+        - range < 0, step > 0: range = step, count = 2
+        - range >= 0, step <= 0: count is at least 2, step = range/(count-1)
+        - range >= 0, step > 0: all three stand as given
+    - then a range, step or count that is not positive means no spread: 1, 0, 0
 
     Args:
         count: Number of steps (None or int)
         range_val: Total range to cover (None or float)
         step: Step size (None or float)
-        default_range: Default range when only count is provided
-                      (1.0 rad for angles, 0.5e-6 m for thickness)
-        parameter_type: "angle" or "thickness" for appropriate defaults
+        default_range: Range when only a count is provided (1.0 rad for angles,
+                      0.5e-6 m for thickness)
+        parameter_type: "angle" or "thickness"
+        unset_range: The range C starts from: -1 for divergence, 0 for dispersion and thickness
 
     Returns:
         SamplingParams with resolved count, range, and step values
     """
-    import math
-
-    # Convert None to appropriate sentinel values
     count = count if count is not None else -1
-    range_val = range_val if range_val is not None else -1.0
+    range_val = range_val if range_val is not None else unset_range
     step = step if step is not None else -1.0
 
-    # Special case: No parameters provided
-    if count <= 0 and range_val < 0 and step <= 0:
-        return SamplingParams(count=1, range=0.0, step=0.0)
-
-    # Special case: Only step provided
-    if count <= 0 and range_val < 0 and step > 0:
-        return SamplingParams(count=2, range=step, step=step)
-
-    # Special case: Only range provided
-    if count <= 0 and range_val >= 0 and step <= 0:
-        return SamplingParams(count=2, range=range_val, step=range_val)
-
-    # Special case: Only count provided
-    if count > 0 and range_val < 0 and step <= 0:
-        # Set nominal range based on parameter type
-        nominal_range = default_range
-        # Coerce count to ≥2 for nonzero range
-        if nominal_range > 0:
-            count = max(count, 2)
-        # Calculate step size
-        step_size = nominal_range / max(count - 1, 1)
-        return SamplingParams(count=count, range=nominal_range, step=step_size)
-
-    # Apply general rules when step count ≤ 0
     if count <= 0:
-        if range_val < 0 and step <= 0:
-            # Use 1 step, zero range
-            return SamplingParams(count=1, range=0.0, step=0.0)
-        elif range_val < 0 and step > 0:
-            # Set range = step, steps = 2
-            return SamplingParams(count=2, range=step, step=step)
-        elif range_val >= 0 and step <= 0:
-            # step size = range, steps = 2
-            return SamplingParams(count=2, range=range_val, step=range_val)
-        elif range_val >= 0 and step > 0:
-            # steps = ceil(range / step)
-            steps = math.ceil(range_val / step) if step > 0 else 1
-            return SamplingParams(count=steps, range=range_val, step=step)
-
-    # Apply rules when step count > 0
-    else:
-        if range_val < 0 and step <= 0:
-            # Set nominal range and calculate step size
-            nominal_range = default_range
-            step_size = nominal_range / max(count - 1, 1)
-            return SamplingParams(count=count, range=nominal_range, step=step_size)
-        elif range_val < 0 and step > 0:
-            # range = step, steps = 2 (override provided count)
-            return SamplingParams(count=2, range=step, step=step)
-        elif range_val >= 0 and step <= 0:
-            # step size = range / max(steps - 1, 1)
-            step_size = range_val / max(count - 1, 1)
-            return SamplingParams(count=count, range=range_val, step=step_size)
+        if range_val < 0.0:
+            if step <= 0.0:
+                count, range_val, step = 1, 0.0, 0.0
+            else:
+                range_val, count = step, 2
+        elif step <= 0.0:
+            step = range_val / 2.0 if parameter_type == "thickness" else range_val
+            count = 2
         else:
-            # Both range and step provided with count - use as-is
-            return SamplingParams(count=count, range=range_val, step=step)
+            count = math.ceil(range_val / step)
+    elif range_val < 0.0:
+        if step <= 0.0:
+            range_val = default_range
+            step = range_val / count
+        else:
+            range_val, count = step, 2
+    elif step <= 0.0:
+        if count <= 1:
+            count = 2
+        step = range_val / (count - 1)
+
+    if range_val <= 0.0 or step <= 0.0 or count <= 0:
+        return SamplingParams(count=1, range=0.0, step=0.0)
+    return SamplingParams(count=count, range=range_val, step=step)
 
 
 def auto_select_divergence(
@@ -187,8 +152,9 @@ def auto_select_dispersion(
         count=dispsteps,
         range_val=dispersion,
         step=dispstep,
-        default_range=0.1,  # Default 10% dispersion when only count provided
-        parameter_type="dispersion"
+        default_range=1.0,  # nanoBragg.c:1563, reached only by a negative -dispersion
+        parameter_type="dispersion",
+        unset_range=0.0,  # so -dispsteps alone changes nothing
     )
 
 
@@ -212,8 +178,9 @@ def auto_select_thickness(
         count=thicksteps,
         range_val=detector_thick,
         step=thickstep,
-        default_range=0.5e-6,  # 0.5 μm for thickness
-        parameter_type="thickness"
+        default_range=0.5e-6,  # nanoBragg.c:1614, reached only by a negative thickness
+        parameter_type="thickness",
+        unset_range=0.0,
     )
 
 
@@ -229,13 +196,12 @@ def generate_sources_from_divergence_dispersion(
     dtype=torch.float32,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Generate source arrays from divergence and dispersion parameters.
+    Generate source arrays from divergence and dispersion parameters, as nanoBragg.c:2352-2415.
 
-    Per spec section "Generated sources":
     - Horizontal/vertical divergence grids with optional elliptical trimming
     - Each divergence point starts from vector −source_distance·b
     - Rotated about polarization axis by vertical angle and vertical axis by horizontal angle
-    - Wavelength sampled across [λ0·(1 − dispersion/2), λ0·(1 + dispersion/2)]
+    - Wavelengths λ0·(1 + dispstep·tic − dispersion/2)
 
     Args:
         hdiv_params: Horizontal divergence sampling parameters
@@ -253,26 +219,19 @@ def generate_sources_from_divergence_dispersion(
         - weights: (N,) tensor of weights (all equal per spec)
         - wavelengths: (N,) tensor of wavelengths in meters
     """
+    # In double, as C has it, whatever dtype the caller wants back.
     if beam_direction is None:
-        beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)  # MOSFLM default
+        beam_direction = torch.tensor([1.0, 0.0, 0.0])  # MOSFLM default
     if polarization_axis is None:
-        polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)  # Default vertical
+        polarization_axis = torch.tensor([0.0, 0.0, 1.0])  # Default vertical
+    beam_direction = beam_direction.to(torch.float64)
+    polarization_axis = polarization_axis.to(torch.float64)
 
-    # Generate divergence angle grids using vectorized operations
-    # Horizontal divergence angles
-    if hdiv_params.count == 1:
-        hdiv_angles = torch.tensor([0.0], dtype=torch.float64)
-    else:
-        # Use manual arithmetic to avoid torch.linspace gradient issues
-        start = -hdiv_params.range / 2
-        hdiv_angles = start + torch.arange(hdiv_params.count, dtype=torch.float64) * hdiv_params.step
-
-    # Vertical divergence angles
-    if vdiv_params.count == 1:
-        vdiv_angles = torch.tensor([0.0], dtype=torch.float64)
-    else:
-        start = -vdiv_params.range / 2
-        vdiv_angles = start + torch.arange(vdiv_params.count, dtype=torch.float64) * vdiv_params.step
+    # Divergence angles: hdiv = hdivstep*tic - hdivrange/2 (nanoBragg.c:2356-2357), also for
+    # a single step, so that count 1 with a nonzero range sits off axis.
+    # Use manual arithmetic to avoid torch.linspace gradient issues
+    hdiv_angles = torch.arange(hdiv_params.count, dtype=torch.float64) * hdiv_params.step - hdiv_params.range / 2
+    vdiv_angles = torch.arange(vdiv_params.count, dtype=torch.float64) * vdiv_params.step - vdiv_params.range / 2
 
     # Create 2D meshgrid of divergence angles: (H, V)
     h_grid, v_grid = torch.meshgrid(hdiv_angles, vdiv_angles, indexing='ij')
@@ -293,21 +252,18 @@ def generate_sources_from_divergence_dispersion(
 
     n_div = h_flat.shape[0]
 
-    # Generate wavelengths using vectorized operations
-    if disp_params.count == 1:
-        wavelengths = torch.tensor([central_wavelength_m], dtype=dtype)
-    else:
-        lambda_min = central_wavelength_m * (1 - disp_params.range/2)
-        lambda_max = central_wavelength_m * (1 + disp_params.range/2)
-        # Use manual arithmetic for gradient preservation
-        wavelengths = lambda_min + torch.arange(disp_params.count, dtype=dtype) * (lambda_max - lambda_min) / (disp_params.count - 1)
+    # lambda = lambda0*(1 + dispstep*tic - dispersion/2) (nanoBragg.c:2405)
+    # Use manual arithmetic for gradient preservation
+    wavelengths = central_wavelength_m * (
+        1.0 + torch.arange(disp_params.count, dtype=torch.float64) * disp_params.step - disp_params.range / 2
+    )
 
     n_wave = wavelengths.shape[0]
 
     # Broadcast divergence and wavelengths: each divergence point gets all wavelengths
     # Shape: (n_div, n_wave)
-    h_angles_expanded = h_flat.to(dtype).unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
-    v_angles_expanded = v_flat.to(dtype).unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
+    h_angles_expanded = h_flat.unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
+    v_angles_expanded = v_flat.unsqueeze(1).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
     wavelengths_expanded = wavelengths.unsqueeze(0).expand(n_div, n_wave).reshape(-1)  # (n_div * n_wave,)
 
     n_sources = h_angles_expanded.shape[0]
@@ -363,10 +319,11 @@ def generate_sources_from_divergence_dispersion(
     # Create weights (all equal per spec)
     weights = torch.ones(n_sources, dtype=dtype)
 
-    # Handle edge case of no sources
+    # C divides by zero steps here and writes a NaN image (-divsteps 1 rounds its one point
+    # away). Keep the beam, rather than copying that.
     if n_sources == 0:
-        directions = torch.tensor([[0.0, 0.0, 1.0]], dtype=dtype)
+        directions = -beam_direction.unsqueeze(0)
         weights = torch.tensor([1.0], dtype=dtype)
-        wavelengths_expanded = torch.tensor([central_wavelength_m], dtype=dtype)
+        wavelengths_expanded = torch.tensor([central_wavelength_m], dtype=torch.float64)
 
-    return directions, weights, wavelengths_expanded
+    return directions.to(dtype), weights, wavelengths_expanded.to(dtype)
