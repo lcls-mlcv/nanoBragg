@@ -197,3 +197,49 @@ def test_short_sourcefile_lines_take_the_default_for_each_missing_column(tmp_pat
 def test_short_sourcefile_lines_match_c(tmp_path, text, extra):
     (tmp_path / "sources.txt").write_text(text)
     assert_matches_c(DETECTOR + ["-sourcefile", "sources.txt"] + extra, tmp_path)
+
+
+@pytest.mark.parametrize("text", [
+    "-1,0,0,1,1.1e-10\n-1,0,0,1,1e-10\n",  # comma-delimited
+    "-1;0:0!1,1.1e-10\n-1\t0 0  1  1e-10\n",  # every delimiter C knows
+    ",, -1 0 0 1 1.1e-10\n",  # leading delimiters
+    "-1 0 0 \n",  # trailing one
+    "#1 0 0 1 1e-10\n-1 0 0 1 1e-10\n",  # reads as a zero vector at wavelength 1e-10
+    "# 1 2 3\n-1 0 0 1 1e-10\n",  # reads as (0,1,2) with weight 3
+    "-1abc 0x10 0 1\n",  # the leading number of each token
+    "0 0 0\n-1 0 0\n",  # a zero vector stays zero
+    "1e0 0 0 1 1.1e-10 7 8 9\n-1 0 0\n",  # columns past the fifth
+    "\n\n  \n,\n-1 0.01 0 1 1.1e-10\n",  # blank lines
+])
+def test_sourcefile_lines_read_as_c_reads_them(tmp_path, text):
+    (tmp_path / "sources.txt").write_text(text)
+    assert_matches_c(DETECTOR + ["-sourcefile", "sources.txt", "-nopolar"], tmp_path)
+
+
+@pytest.mark.parametrize("text, expected_wavelengths", [
+    ("# a comment\n-1 0 0 1 2e-10\n", [2e-10]),  # a comment with no numbers in it
+    ("# X Y Z weight wavelength\n-1 0 0 1 2e-10\n", [2e-10]),
+    ("-1 0.01 0 1 2e-10\n-1 0 0.01", [2e-10, 1e-10]),  # no newline at the end of the file
+    ("-1 0.01 0\r\n-1 0 0.01\r\n", [1e-10, 1e-10]),  # CRLF
+    ("-1 0 0 nan\n", [1e-10]),  # a last token that is not a number
+])
+def test_lines_that_give_c_a_nan_image_stay_finite(tmp_path, text, expected_wavelengths):
+    """C runs past the end of these lines and stores wavelength 0, which is no output to copy.
+    The first test pins that it still does, so this stays a decision about broken output."""
+    (tmp_path / "sources.txt").write_bytes(text.encode())
+    args = DETECTOR + ["-sourcefile", "sources.txt"]
+    assert np.isnan(_render([_c_binary()], args, tmp_path)[0]).all()
+    assert np.isfinite(_render([sys.executable, "-m", "nanobrag_torch"], args, tmp_path)[0]).all()
+    _, _, wavelengths = _sources(tmp_path, text)
+    assert wavelengths.tolist() == expected_wavelengths
+
+
+def test_a_wavelength_of_zero_in_the_file_is_nan_in_both(tmp_path):
+    (tmp_path / "sources.txt").write_text("-1 0 0 1 0\n-1 0 0 1 1e-10\n")
+    c_image, torch_image, _ = compare_with_c(DETECTOR + ["-sourcefile", "sources.txt"], tmp_path)
+    assert np.isnan(c_image).all() and np.isnan(torch_image).all()
+
+
+def test_a_sourcefile_with_only_comments_has_no_sources(tmp_path):
+    with pytest.raises(ValueError, match="No valid source lines"):
+        _sources(tmp_path, "# nothing\n# here at all\n")

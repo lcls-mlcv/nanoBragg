@@ -8,10 +8,64 @@ as in nanoBragg.c:2341-2343 and 2748.
 """
 
 import math
+import re
 from pathlib import Path
 from typing import List, Tuple, Optional
 import torch
 import numpy as np
+
+
+# nanoBragg.c:3884-3885
+_DELIMITERS = " \t,;:!"
+_NUMBER_CHARACTERS = "0123456789-+.EGeg"
+_N_COLUMNS = 5
+_STRTOD = re.compile(
+    r"\s*([-+]?(?:nan(?:\(\w*\))?|inf(?:inity)?|0x[0-9a-f]*\.?[0-9a-f]+(?:p[-+]?\d+)?|(?:\d+\.?\d*|\.\d+)(?:e[-+]?\d+)?))",
+    re.IGNORECASE,
+)
+
+
+def _atof(text: str) -> float:
+    """C's atof(): the leading number of the string, 0.0 when there is none."""
+    match = _STRTOD.match(text)
+    if match is None:
+        return 0.0
+    number = match.group(1)
+    if "0x" in number.lower():
+        return float.fromhex(number)
+    return float(number.split("(")[0])
+
+
+def _read_columns(line: str) -> Tuple[Optional[List[float]], bool]:
+    """
+    One line of a source file, as read_text_file reads it (nanoBragg.c:3931-3962).
+
+    Returns the values, NaN where the line has none, and whether the line ended without the
+    newline C's loop waits for. Each value is the leading number of its token, and a token
+    that isn't one reads as 0. Returns None for a blank line. C stops reading a line at
+    "\\n" alone, so it goes on past the end of an unterminated last line, a CRLF line, or a last
+    token that isn't a number, and stores 0 in every column left. That wavelength of 0 makes its
+    image NaN, so here those columns stay missing, and the caller says what becomes of them.
+    """
+    token = line.lstrip(_DELIMITERS)
+    if not token.strip():
+        return None, False
+    values = [math.nan] * _N_COLUMNS
+    column = 0
+    while True:
+        if not token:
+            return values, True
+        values[column] = _atof(token)
+        token = token.lstrip(_NUMBER_CHARACTERS)
+        if token == "\n":
+            return values, False
+        end = next((i for i, character in enumerate(token) if character in _DELIMITERS), len(token))
+        token = token[end:].lstrip(_DELIMITERS)
+        if token == "\n":
+            return values, False
+        column += 1
+        if column >= _N_COLUMNS:
+            return values, False
 
 
 def read_sourcefile(
@@ -26,7 +80,7 @@ def read_sourcefile(
 
     Per spec section "Sources, Divergence & Dispersion" (spec-a-core.md:150-151):
     Each line contains up to 5 columns: X, Y, Z (position in meters),
-    weight (dimensionless), λ (wavelength in meters).
+    weight (dimensionless), λ (wavelength in meters), split on any of " \\t,;:!" as C does.
 
     Missing fields default to:
     - Each position component from -source_distance·b (source_distance default 10 m)
@@ -49,7 +103,7 @@ def read_sourcefile(
     Returns:
         Tuple of:
         - directions: (N, 3) tensor of unit direction vectors
-        - weights: (N,) tensor of weights (currently all 1.0 per spec)
+        - weights: (N,) tensor of weights as read
         - wavelengths: (N,) tensor of wavelengths in meters
     """
     # Resolve dtype: use caller's dtype if provided, else torch default
@@ -66,43 +120,29 @@ def read_sourcefile(
     # Default position is along -source_distance·b
     default_position = -default_source_distance_m * beam_direction.to(dtype=dtype, device=device)
 
-    with open(filepath, 'r') as f:
-        for line_num, line in enumerate(f, 1):
-            line = line.strip()
-            if not line or line.startswith('#'):
+    defaults = default_position.tolist() + [1.0, default_wavelength_m]
+
+    with open(filepath, 'r', newline='') as f:
+        for line in f:
+            values, ran_off_the_end = _read_columns(line)
+            if values is None:
+                continue
+            # C reads a # line like any other. Where that gives it a wavelength of 0 and a NaN
+            # image, skip the line, as a comment.
+            if line.lstrip(_DELIMITERS).startswith('#') and (ran_off_the_end or values[4] == 0.0):
                 continue
 
-            parts = line.split()
-            if len(parts) == 0:
-                continue
+            # NaN is C's mark for a missing value, in the file or not (nanoBragg.c:2329-2343).
+            x, y, z, weight, wavelength = (
+                default if math.isnan(value) else value for value, default in zip(values, defaults)
+            )
 
-            # Parse available columns. C fills in whatever a line leaves out, position
-            # columns included, with the component of -source_distance·b (nanoBragg.c:2329-2337).
-            position = default_position.clone()
-            for column, part in enumerate(parts[:3]):
-                position[column] = float(part)
+            # Unit vector, and a zero vector stays zero, as in unitize() (nanoBragg.c:3993).
+            position = torch.tensor([x, y, z], dtype=torch.float64, device=device)
+            norm = torch.linalg.norm(position)
+            direction = position / norm if norm != 0.0 else position
 
-            if len(parts) >= 4:
-                # Weight provided
-                weight = float(parts[3])
-            else:
-                # Default weight
-                weight = 1.0
-
-            wavelength = float(parts[4]) if len(parts) >= 5 else default_wavelength_m
-
-            # A literal nan is C's mark for a missing value (nanoBragg.c:2329-2343).
-            if torch.isnan(position).any():
-                position = torch.where(torch.isnan(position), default_position, position)
-            if math.isnan(weight):
-                weight = 1.0
-            if math.isnan(wavelength):
-                wavelength = default_wavelength_m
-
-            # Normalize position to unit direction vector
-            direction = position / torch.linalg.norm(position)
-
-            directions.append(direction)
+            directions.append(direction.to(dtype))
             weights.append(weight)
             wavelengths.append(wavelength)
 
@@ -111,8 +151,6 @@ def read_sourcefile(
 
     # Convert to tensors
     directions = torch.stack(directions)
-    # Per spec line 151: weights are read but ignored (equal weighting)
-    # All sources get weight=1.0; normalization is via steps division
     weights = torch.tensor(weights, dtype=dtype, device=device)
     wavelengths = torch.tensor(wavelengths, dtype=dtype, device=device)
 
