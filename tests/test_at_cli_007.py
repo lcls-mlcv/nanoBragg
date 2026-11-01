@@ -13,6 +13,8 @@ import pytest
 
 from nanobrag_torch.io.smv import read_smv
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 
 class TestATCLI007NoiseDeterminism:
     """Test CLI noise determinism with seeds."""
@@ -57,7 +59,7 @@ class TestATCLI007NoiseDeterminism:
 
         # Run the command
         result = subprocess.run(
-            cmd, capture_output=True, text=True, check=False, cwd=hkl_file.parent  # -hkl writes Fdump.bin here
+            cmd, capture_output=True, text=True, check=False
         )
 
         if result.returncode != 0:

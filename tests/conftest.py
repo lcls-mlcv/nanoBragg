@@ -55,6 +55,12 @@ def _restore_process_globals():
     torch.use_deterministic_algorithms(deterministic, warn_only=deterministic_warn_only)
 
 
+@pytest.fixture
+def in_tmp_cwd(tmp_path, monkeypatch):
+    """Run in a scratch folder, for tests whose CLI runs read -hkl and so write Fdump.bin."""
+    monkeypatch.chdir(tmp_path)
+
+
 @pytest.fixture(autouse=True)
 def _no_fdump_left_in_repo_root():
     """A -hkl run writes Fdump.bin to its cwd, and every later -default_F run there reads it."""
@@ -63,7 +69,7 @@ def _no_fdump_left_in_repo_root():
     yield
     if fdump.exists() and not was_there:
         fdump.unlink()
-        pytest.fail("this test left Fdump.bin in the repo root: run the CLI in a tmp cwd")
+        pytest.fail("this test left Fdump.bin in the repo root: give it the in_tmp_cwd fixture")
 
 
 @pytest.fixture(autouse=True, scope="session")
