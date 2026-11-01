@@ -136,4 +136,4 @@ def mrad_to_radians(value: Union[float, torch.Tensor]) -> Union[float, torch.Ten
     Returns:
         Value in radians (1 mrad = 0.001 rad)
     """
-    return value * 0.001
+    return value / 1000.0  # as C divides, so a ceil(range/step) lands on the same integer

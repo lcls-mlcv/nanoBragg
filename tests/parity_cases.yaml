@@ -1858,3 +1858,6 @@ cases:
       - name: dispersion-at-energy-zero
         extra_args: >-
           -dispersion 10 -energy 0
+      - name: step-count-rounds-as-in-c
+        extra_args: >-
+          -divergence 0.9 -hdivstep 0.3
