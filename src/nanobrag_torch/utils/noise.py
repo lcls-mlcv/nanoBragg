@@ -187,6 +187,15 @@ def lcg_random(
 
     return values
 
+def _c_seed(flag_value: int) -> int:
+    """C's ``seed = -atoi(argv[i+1])``: atoi clamps to a long and returns an int, and -INT_MIN wraps."""
+
+    def wrap(value):
+        return (value + 2**31) % 2**32 - 2**31
+
+    return wrap(-wrap(max(-2**63, min(2**63 - 1, flag_value))))
+
+
 def roi_pixels(shape: Tuple[int, int], roi: Optional[Tuple[int, int, int, int]]) -> np.ndarray:
     """True inside the inclusive (xmin, xmax, ymin, ymax), the test at nanoBragg.c:3251."""
     if roi is None:
@@ -232,7 +241,7 @@ def fast_noise_image(
     Args, returns: as c_noise_image.
     """
     generator = torch.Generator(device=image.device)
-    generator.manual_seed(seed)
+    generator.manual_seed(_c_seed(seed))
     in_roi = roi_pixels(tuple(image.shape), roi)
     photons = _poisson_photons(image.detach(), generator).double().cpu().numpy()[in_roi]
     output, overloads = _noise_image_pixels(photons, adc_offset, in_roi)
@@ -244,6 +253,9 @@ def c_noise_image(
     seed: int,
     adc_offset: float = 40.0,
     roi: Optional[Tuple[int, int, int, int]] = None,
+    mosaic_seed: int = 12345678,
+    mosaic_domains: int = 1,
+    misset_seed: Optional[int] = None,
 ) -> Tuple[np.ndarray, float, int]:
     """
     Noise image as nanoBragg.c:3245-3265 makes it, bit for bit given its float image.
@@ -253,15 +265,22 @@ def c_noise_image(
     loses the sequence for every pixel after it. This is a Python loop, about a second per
     million pixels. fast_noise_image is the fast alternative.
 
+    ran1 keeps its shuffle table in statics shared with the crystal setup, and reloads it only
+    for a seed <= 0. C negates -seed, so a negative flag doesn't reload: the stream is that
+    seed run through the table the mosaic domains left, which is why they are arguments here.
+
     As in C, variance is up to 16% high for means from about 6e5 to 1e6, where float32 rounds
     the acceptance exponent; those pixels clip at 65535, so only the photon count sees it.
 
     Args:
         image: Photons per pixel, (slow, fast). Read as float32, like C's floatimage.
-        seed: The value given to -seed. C negates it, and ran1 starts from its magnitude,
-            or from 1 for seed 0.
+        seed: The value given to -seed.
         adc_offset: Added to each pixel after the draw.
         roi: Inclusive (xmin, xmax, ymin, ymax). Pixels outside stay 0 and draw nothing.
+        mosaic_seed: The value given to -mosaic_seed. C's default is the flag value 12345678.
+        mosaic_domains: Domains C draws before the image, three ran1 calls each (:2440-2441).
+        misset_seed: The value given to -misset_seed if -misset random drew an orientation,
+            three ran1 calls ahead of the domains (:1902), or None if not.
 
     Returns:
         uint16 image, photons drawn, overloaded pixels.
@@ -283,19 +302,22 @@ def c_noise_image(
     AM = 1.0 / IM
     RNMX = 1.0 - 1.2e-7
 
-    idum = abs(seed) or 1
+    idum = 0
+    iy = 0
     iv = [0] * NTAB
-    for j in range(NTAB + 7, -1, -1):
-        k = idum // IQ
-        idum = IA * (idum - k * IQ) - IR * k
-        if idum < 0:
-            idum += IM
-        if j < NTAB:
-            iv[j] = idum
-    iy = iv[0]
 
     def ran1():
         nonlocal idum, iy
+        if idum <= 0 or not iy:
+            idum = 1 if -idum < 1 else -idum
+            for j in range(NTAB + 7, -1, -1):
+                k = idum // IQ
+                idum = IA * (idum - k * IQ) - IR * k
+                if idum < 0:
+                    idum += IM
+                if j < NTAB:
+                    iv[j] = idum
+            iy = iv[0]
         k = idum // IQ
         idum = IA * (idum - k * IQ) - IR * k
         if idum < 0:
@@ -364,6 +386,15 @@ def c_noise_image(
                     * math.exp(f32(f32(f32(em * alxm) - gammln(f32(em + 1.0))) - g)))
             if not ran1() > t:
                 return em
+
+    if misset_seed is not None:
+        idum = _c_seed(misset_seed)
+        for _ in range(3):
+            ran1()
+    idum = _c_seed(mosaic_seed)
+    for _ in range(3 * mosaic_domains):
+        ran1()
+    idum = _c_seed(seed)
 
     photons = 0.0
     draws = []

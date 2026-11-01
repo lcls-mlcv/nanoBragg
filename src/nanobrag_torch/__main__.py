@@ -1321,7 +1321,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['scale'] = args.scale
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
-    config['seed'] = args.seed if args.seed is not None else int(-time.time())
+    config['seed'] = args.seed if args.seed is not None else int(time.time())  # C: seed = -time, flag negated
     config['fast_noise'] = args.fast_noise
 
     # Sourcefile (store path for later processing)
@@ -1521,6 +1521,8 @@ def build_simulation(
             phi_steps=config.get('phi_steps', 1),
             phi_step_deg=config.get('phi_step_deg'),
             mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
+            mosaic_domains=config.get('mosaic_domains', 1),
+            mosaic_seed=config.get('mosaic_seed'),
             shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
             fudge=config.get('fudge', 1.0),
             default_F=config.get('default_F', 0.0),
@@ -2037,7 +2039,10 @@ def main():
                 noisy_int, photons, overloads = fast_noise_image(intensity, config['seed'], adc, roi)
             else:
                 noisy_int, photons, overloads = c_noise_image(
-                    intensity.detach().cpu().numpy(), config['seed'], adc, roi
+                    intensity.detach().cpu().numpy(), config['seed'], adc, roi,
+                    mosaic_seed=config.get('mosaic_seed', 12345678),
+                    mosaic_domains=config['mosaic_domains'],
+                    misset_seed=(config.get('misset_seed', config['seed']) if config.get('misset_random') else None),
                 )
             print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
 

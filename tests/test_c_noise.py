@@ -4,11 +4,13 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 import pytest
 import torch
 
+from nanobrag_torch import __main__ as cli
 from nanobrag_torch.utils.noise import c_noise_image, fast_noise_image, generate_poisson_noise
 
 REPO_ROOT = Path(__file__).parents[1]
@@ -20,6 +22,7 @@ CASES = {
     "bright": "-seed 7 -fluence 1e27",
     "very-bright": "-seed 7 -fluence 1e30",
     "overloaded": "-seed 7 -fluence 1e33",
+    "seed-zero": "-seed 0 -fluence 1e27",
     "adc": "-seed 3 -adc 10",
     "roi": "-seed 3 -roi 10 40 20 70 -fluence 1e27",
 }
@@ -85,6 +88,15 @@ def test_cli_noise_image_uses_cs_generator(tmp_path):
 ENV = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), KMP_DUPLICATE_LIB_OK="TRUE", NANOBRAGG_DISABLE_COMPILE="1")
 # What reaches the noise image through the CLI: every line here is a run of both programs
 CLI_CASES = {
+    "seed-zero": "-seed 0",
+    "seed-zero-dim": "-seed 0 -fluence 1e27",
+    "negative-seed": "-seed -5",  # 14303 photons in C
+    "negative-seed-other-table": "-seed -5 -mosaic_seed 99",
+    "negative-seed-positive-mosaic-seed": "-seed -5 -mosaic_seed -3",
+    "negative-seed-mosaic-domains": "-seed -7 -mosaic 0.5 -mosaic_dom 3 -fluence 1e27",
+    "seed-is-IM": "-seed 2147483647 -fluence 1e27",  # 118 photons in C
+    "seed-is-minus-IM": "-seed -2147483647 -fluence 1e27",
+    "seed-wraps-as-int": "-seed 2147483648",
     "adc-wraps": "-seed 9 -adc -5",
     "adc-fractional": "-seed 9 -adc -5.7",
     "adc-wraps-twice": "-seed 9 -adc -70000",
@@ -130,6 +142,29 @@ def test_cli_noise_image_at_a_fluence_float32_cannot_hold(tmp_path):
     assert (noise_pixels(py_dir / "n.img") == noise_pixels(c_dir / "n.img")).mean() > 0.99
     assert float(photon_line(py_out).split()[0]) == pytest.approx(float(photon_line(c_out).split()[0]), rel=1e-5)
     assert photon_line(py_out).split("(")[1] == photon_line(c_out).split("(")[1]
+
+
+def test_cli_seed_zero_is_a_seed(tmp_path):
+    """0 is not "no seed": two runs agree, and differ from a run seeded from the clock."""
+    for name in ["a", "b", "clock"]:
+        (tmp_path / name).mkdir()
+    run_torch(tmp_path / "a", "-seed 0")
+    run_torch(tmp_path / "b", "-seed 0")
+    run_torch(tmp_path / "clock", "")
+    assert (tmp_path / "a" / "n.img").read_bytes() == (tmp_path / "b" / "n.img").read_bytes()
+    assert (tmp_path / "a" / "n.img").read_bytes() != (tmp_path / "clock" / "n.img").read_bytes()
+
+
+def test_omitted_seed_is_c_minus_time():
+    """C starts from seed = -time and reloads the table, so -mosaic_seed can't reach the image."""
+    with mock.patch.object(sys, "argv", ["nanoBragg"] + ARGS):
+        args = cli.create_parser().parse_args()
+    args._argv = ARGS
+    with mock.patch.object(cli.time, "time", return_value=1234.5):
+        seed = cli.build_simulation(args).config["seed"]
+    assert seed == 1234  # in the sign of the flag, so C's -1234
+    image = np.full((8, 8), 3.0)
+    assert np.array_equal(c_noise_image(image, seed)[0], c_noise_image(image, seed, mosaic_seed=99)[0])
 
 
 def test_nan_and_inf_pixels_are_drawn_as_c_does():
