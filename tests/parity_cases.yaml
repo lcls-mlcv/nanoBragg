@@ -2013,3 +2013,34 @@ cases:
       - name: divergence-about-tilted-beam
         extra_args: >-
           -hdivrange 2 -hdivsteps 3 -square_div -beam_vector 1 0.1 0 -nopolar
+
+  - id: PARITY-WATER-002
+    description: Water background and the -oversample_ flags, which take corrections away from it
+    base_args: >-
+      -dtype float64 -cell 90.6 105.4 62.2 96.1 105.6 106.4 -default_F 1000 -Na 10 -Nb 9 -Nc 6 -detpixels 32 -distance 125 -water 100 -seed 1
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: omega-oversample-1
+        extra_args: >-
+          -oversample 1 -oversample_omega
+      - name: polar-oversample-1
+        extra_args: >-
+          -oversample 1 -oversample_polar
+      - name: polar-oversample-2
+        extra_args: >-
+          -oversample 2 -oversample_polar
+      - name: omega-polar-oversample-2
+        extra_args: >-
+          -oversample 2 -oversample_omega -oversample_polar
+      - name: omega-polar-thick
+        extra_args: >-
+          -oversample 2 -oversample_omega -oversample_polar -detector_thick 100 -detector_abs 300 -detector_thicksteps 3 -oversample_thick
+      - name: polar-thick-last-layer
+        extra_args: >-
+          -oversample 2 -oversample_polar -detector_thick 100 -detector_abs 300 -detector_thicksteps 3
+      - name: omega-thin-sensor
+        extra_args: >-
+          -oversample 1 -oversample_omega -detector_thick 100 -detector_abs 300 -detector_thicksteps 1

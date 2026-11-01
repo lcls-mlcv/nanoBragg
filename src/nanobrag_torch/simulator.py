@@ -928,6 +928,7 @@ class Simulator:
         source_weights: Optional[torch.Tensor],
         oversample: int,
         oversample_omega: bool,
+        oversample_polar: bool,
         oversample_thick: bool,
         panel_axes: Optional[tuple] = None,
     ):
@@ -1126,11 +1127,10 @@ class Simulator:
 
             # Apply last-value semantics if omega flag is not set
             if self.beam_config.water_size_um > 0:
-                # C: I = I_bg before the sample loop, so omega/capture below also apply.
-                # Its polarization factor is the cached one, from the first subpixel of the
-                # front layer, which is sample 0 here.
+                # C: I = I_bg before the sample loop, so the corrections applied once per pixel
+                # below reach it, and the ones applied per sample above do not.
                 accumulated_intensity = accumulated_intensity + self._water_background_pre_scale(
-                    subpixel_coords_all[:, :, 0, :]
+                    subpixel_coords_all[:, :, 0, :], oversample_polar
                 )
 
             # nanoBragg.c computes omega once per pixel, at the FIRST subpixel of the front
@@ -1221,11 +1221,13 @@ class Simulator:
                     / airpath_m
                 )
 
-            if self.beam_config.water_size_um > 0:
-                normalized_intensity = normalized_intensity + self._water_background_pre_scale(pixel_coords_meters)
-
             # Apply omega directly
             normalized_intensity = normalized_intensity * omega_pixel
+
+            if self.beam_config.water_size_um > 0:
+                # Under -oversample_omega the pixel's omega goes on each sample, so not on I_bg
+                water = self._water_background_pre_scale(pixel_coords_meters, oversample_polar)
+                normalized_intensity = normalized_intensity + (water if oversample_omega else water * omega_pixel)
 
         return (
             normalized_intensity,
@@ -1599,7 +1601,8 @@ class Simulator:
             rot_a_star=rot_a_star, rot_b_star=rot_b_star, rot_c_star=rot_c_star,
             n_sources=n_sources, source_directions=source_directions,
             source_wavelengths_A=source_wavelengths_A, source_weights=source_weights,
-            oversample=oversample, oversample_omega=oversample_omega, oversample_thick=oversample_thick,
+            oversample=oversample, oversample_omega=oversample_omega, oversample_polar=oversample_polar,
+            oversample_thick=oversample_thick,
         )
         if pixel_batch_size is not None and pixel_batch_size < S:
             chunks = [
@@ -2258,21 +2261,22 @@ class Simulator:
                 print(f"  = {normalized_intensity[target_slow, target_fast].item():.12e} * {self.r_e_sqr:.12e} * {self.fluence:.12e}")
                 print(f"  = {physical_intensity[target_slow, target_fast].item():.12e}")
 
-    def _water_background_pre_scale(self, pixel_coords_meters: torch.Tensor) -> torch.Tensor:
+    def _water_background_pre_scale(self, pixel_coords_meters: torch.Tensor, oversample_polar: bool) -> torch.Tensor:
         """
         Water background as nanoBragg.c seeds it, before the r_e^2*fluence/steps scaling.
 
         C sets ``I = I_bg`` for each pixel and then adds the Bragg contributions, so the
         background goes through the same tail as everything else: it is multiplied by
-        r_e^2*fluence a second time, divided by steps, and picks up the polarization
-        factor, the solid angle and the capture fraction (nanoBragg.c:2515, 2665, 3344).
-        Torch applies polarization per sub-sample inside the kernel, so the factor is
-        computed here at the pixel centre, which is where C evaluates it for a pixel.
+        r_e^2*fluence a second time, divided by steps, and picks up whichever of the
+        polarization factor, solid angle and capture fraction C applies once per pixel
+        (nanoBragg.c:2515, 2665, 3048-3050). With -oversample_polar those go on each sample
+        instead, so I_bg gets none. Otherwise, torch applying polarization per sample inside
+        the kernel, the factor C cached for the pixel is computed here.
 
         Returns (S, F); the caller adds it to the accumulated intensity.
         """
         I_bg = self._calculate_water_background_amplitude()
-        if self.beam_config.nopolar:
+        if self.beam_config.nopolar or oversample_polar:
             return I_bg.expand(pixel_coords_meters.shape[:2])
 
         diffracted = pixel_coords_meters / torch.linalg.norm(
