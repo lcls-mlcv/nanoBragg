@@ -319,6 +319,10 @@ def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
     ["-detector_rotz", "5", "-xds"], ["-ORGX", "10", "-ORGY", "12", "-xds"], ["-Xclose", "5", "-Yclose", "3", "-xds"],
     ["-phi", "5", "-osc", "1", "-phisteps", "2"], ["-distance", "123.456", "-pixel", "0.172"],
     ["-close_distance", "90", "-detector_rotx", "5"],
+    # These land next to a %g rounding boundary, where float32 radians move the last digit
+    ["-twotheta", "20", "-detector_rotx", "3", "-detector_roty", "4", "-detector_rotz", "5"],
+    "-xds -distance 194.238 -detector_rotx -0.303 -detector_roty -6.067 -detector_rotz 0.051 -twotheta -15.657".split(),
+    "-distance 286.3 -detector_rotx 6.1 -detector_roty -1.0 -detector_rotz 4.2 -twotheta -9.258".split(),
 ], ids=lambda extra: " ".join(extra) or "defaults")
 def test_smv_header_is_byte_identical_to_c(extra, tmp_path):
     args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 2 -lambda 1 -distance 100 -pixel 0.1 -detpixels 32 "
