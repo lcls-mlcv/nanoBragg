@@ -1649,6 +1649,19 @@ cases:
         extra_args: >-
           -misset_seed 0
           -misset random
+      - name: misset-seed-negative
+        extra_args: >-
+          -misset_seed -3
+          -misset random
+      - name: mosaic-seed-negative
+        extra_args: >-
+          -mosaic 1 -mosaic_domains 5 -mosaic_seed -7
+      - name: mosaic-seed-negative-after-misset
+        extra_args: >-
+          -misset_seed 3 -misset random -mosaic 1 -mosaic_domains 5 -mosaic_seed -7
+      - name: both-seeds-negative
+        extra_args: >-
+          -misset_seed -3 -misset random -mosaic 1 -mosaic_domains 5 -mosaic_seed -7
   - id: PARITY-CLIFLAGS-002
     description: >-
       Flags nanoBragg.c reads with strstr or advertises under a longer name, flags it

@@ -1576,6 +1576,7 @@ def build_simulation(
             mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
             mosaic_domains=config.get('mosaic_domains', 1),
             mosaic_seed=config.get('mosaic_seed'),
+            mosaic_seed_reloads=config.get('mosaic_seed', 0) >= 0,
             shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
             fudge=config.get('fudge', 1.0),
             default_F=config.get('default_F', 0.0),
@@ -1593,6 +1594,7 @@ def build_simulation(
 
         if 'misset_seed' in config:
             crystal_config.misset_seed = config['misset_seed']
+            crystal_config.misset_seed_reloads = config['misset_seed'] >= 0
 
         if 'custom_spindle_axis' in config:
             crystal_config.spindle_axis = config['custom_spindle_axis']

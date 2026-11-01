@@ -137,6 +137,7 @@ class CrystalConfig:
     # Random misset generation (for AT-PARALLEL-024)
     misset_random: bool = False  # If True, generate random misset angles using seed
     misset_seed: Optional[int] = None  # Seed for random misset generation (C-compatible LCG)
+    misset_seed_reloads: bool = True  # False for a negative -misset_seed, which ran1 does not reseed from
 
     # MOSFLM matrix orientation (Phase G - CLI-FLAGS-003)
     # When -mat file is provided, these store the MOSFLM A* orientation in Å⁻¹
@@ -159,6 +160,7 @@ class CrystalConfig:
     mosaic_spread_deg: float = 0.0
     mosaic_domains: int = 1
     mosaic_seed: Optional[int] = None
+    mosaic_seed_reloads: bool = True  # False for a negative -mosaic_seed, which ran1 does not reseed from
 
     # Crystal size (number of unit cells in each direction)
     N_cells: Tuple[int, int, int] = (1, 1, 1)  # Matches C default

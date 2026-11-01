@@ -748,13 +748,15 @@ class Crystal:
         # This must happen BEFORE applying misset rotation
         if hasattr(self.config, "misset_random") and self.config.misset_random:
             # Generate random misset angles using C-compatible LCG
-            from ..utils.c_random import mosaic_rotation_umat, umat2misset
+            from ..utils.c_random import CLCG, mosaic_rotation_umat, umat2misset
 
             # Use 90.0 as the cap for random orientation to match C code behavior
             # NOTE: The C code passes 90.0 (degrees) but mosaic_rotation_umat treats it as radians!
             # This is a bug in the C code, but we replicate it for exact parity.
             # C code: mosaic_rotation_umat(90.0, umat, &misset_seed)
-            umat = mosaic_rotation_umat(90.0, seed=self.config.misset_seed, dtype=self.dtype, device=self.device)
+            # A negative -misset_seed is a positive idum in C, which reloads as 1 on a fresh table
+            self._ran1_after_misset = CLCG(self.config.misset_seed if self.config.misset_seed_reloads else 1)
+            umat = mosaic_rotation_umat(90.0, dtype=self.dtype, device=self.device, rng=self._ran1_after_misset)
 
             # Extract Euler angles from the rotation matrix
             rotx, roty, rotz = umat2misset(umat)
@@ -1372,7 +1374,7 @@ class Crystal:
         Returns:
             torch.Tensor: Rotation matrices with shape (N_mos, 3, 3).
         """
-        from ..utils.c_random import mosaic_rotation_umats
+        from ..utils.c_random import CLCG, mosaic_rotation_umats
 
         if isinstance(config.mosaic_spread_deg, torch.Tensor):
             mosaic_spread_rad = torch.deg2rad(config.mosaic_spread_deg)
@@ -1383,12 +1385,19 @@ class Crystal:
 
         # C: long mosaic_seed = -12345678, and "-mosaic_seed N" stores -N; CLCG takes |seed|
         seed = config.mosaic_seed if config.mosaic_seed is not None else -12345678
+        rng = None
+        if not config.mosaic_seed_reloads:
+            # A negative -mosaic_seed is a positive idum in C: ran1 keeps a table -misset random
+            # loaded, and on a fresh one reloads as seed 1
+            after_misset = getattr(self, "_ran1_after_misset", None)
+            rng = CLCG(1) if after_misset is None else after_misset.reseeded_without_reload(seed)
         return mosaic_rotation_umats(
             mosaic_spread_rad,
             config.mosaic_domains,
             seed=seed,
             dtype=self.dtype,
             device=self.device,
+            rng=rng,
         )
 
     def _apply_static_orientation(self, vectors: dict) -> dict:

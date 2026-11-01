@@ -50,6 +50,7 @@ References:
 
 import math
 import torch
+import copy
 from typing import Optional, Tuple
 import numpy as np
 
@@ -129,6 +130,13 @@ class CLCG:
         self.iv = [0] * self.NTAB
         self._initialized = False
 
+    def reseeded_without_reload(self, seed: int) -> "CLCG":
+        """A generator as C has it after storing a positive seed: ran1 reloads its table only
+        for a seed <= 0, so this keeps the table and carries on with |seed|."""
+        rng = copy.deepcopy(self)
+        rng.idum = abs(seed)
+        return rng
+
     def ran1(self) -> float:
         """Generate a uniform random deviate between 0 and 1.
 
@@ -170,7 +178,8 @@ def mosaic_rotation_umat(
     mosaicity: float,
     seed: Optional[int] = None,
     dtype: Optional[torch.dtype] = None,
-    device: torch.device = torch.device('cpu')
+    device: torch.device = torch.device('cpu'),
+    rng: Optional[CLCG] = None,
 ) -> torch.Tensor:
     """Generate a random unitary rotation matrix within a spherical cap.
 
@@ -261,7 +270,7 @@ def mosaic_rotation_umat(
     if dtype is None:
         dtype = torch.get_default_dtype()
 
-    rng = CLCG(seed)
+    rng = rng if rng is not None else CLCG(seed)
 
     # Make three random uniform deviates on [-1:1]
     r1 = 2.0 * rng.ran1() - 1.0
@@ -311,6 +320,7 @@ def mosaic_rotation_umats(
     seed: Optional[int] = None,
     dtype: Optional[torch.dtype] = None,
     device: torch.device = torch.device('cpu'),
+    rng: Optional[CLCG] = None,
 ) -> torch.Tensor:
     """Every mosaic domain's rotation matrix, exactly as nanoBragg.c builds them.
 
@@ -334,7 +344,7 @@ def mosaic_rotation_umats(
     """
     if dtype is None:
         dtype = torch.get_default_dtype()
-    rng = CLCG(seed)
+    rng = rng if rng is not None else CLCG(seed)
 
     mosaicity_t = mosaicity if isinstance(mosaicity, torch.Tensor) else torch.as_tensor(
         mosaicity, dtype=dtype, device=device
