@@ -29,7 +29,7 @@ def read_sourcefile(
     weight (dimensionless), λ (wavelength in meters).
 
     Missing fields default to:
-    - Position along -source_distance·b (source_distance default 10 m)
+    - Each position component from -source_distance·b (source_distance default 10 m)
     - Weight = 1.0
     - λ = λ0 (default wavelength)
 
@@ -76,22 +76,11 @@ def read_sourcefile(
             if len(parts) == 0:
                 continue
 
-            # Parse available columns
-            if len(parts) >= 3:
-                # X, Y, Z provided
-                x, y, z = float(parts[0]), float(parts[1]), float(parts[2])
-                position = torch.tensor([x, y, z], dtype=dtype, device=device)
-            elif len(parts) == 2:
-                # X, Y provided, Z defaults to 0
-                x, y = float(parts[0]), float(parts[1])
-                position = torch.tensor([x, y, 0.0], dtype=dtype, device=device)
-            elif len(parts) == 1:
-                # Only X provided, Y and Z default to 0
-                x = float(parts[0])
-                position = torch.tensor([x, 0.0, 0.0], dtype=dtype, device=device)
-            else:
-                # Use default position (should not happen since we skip empty lines)
-                position = default_position.clone()
+            # Parse available columns. C fills in whatever a line leaves out, position
+            # columns included, with the component of -source_distance·b (nanoBragg.c:2329-2337).
+            position = default_position.clone()
+            for column, part in enumerate(parts[:3]):
+                position[column] = float(part)
 
             if len(parts) >= 4:
                 # Weight provided

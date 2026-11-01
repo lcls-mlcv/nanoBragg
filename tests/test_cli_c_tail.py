@@ -175,3 +175,25 @@ def test_header_size_is_where_the_flags_start_from(tmp_path, header_40x24, flags
     assert c_size == size
     assert np.corrcoef(c_image, torch_image)[0, 1] > 0.9999
     assert torch_image.sum() / c_image.sum() == pytest.approx(1.0, abs=1e-3)
+
+
+def test_short_sourcefile_lines_take_the_default_for_each_missing_column(tmp_path):
+    directions, weights, wavelengths = _sources(tmp_path, "0.01\n0.01 0.02\n", beam=(0.0, 0.0, 1.0))
+    expected = torch.tensor([[0.01, -0.0, -10.0], [0.01, 0.02, -10.0]], dtype=torch.float64)
+    torch.testing.assert_close(directions, expected / expected.norm(dim=1, keepdim=True))
+    assert weights.tolist() == [1.0, 1.0]
+    assert wavelengths.tolist() == [1e-10, 1e-10]
+
+
+@pytest.mark.parametrize("text, extra", [
+    ("-1\n-1 0.01\n", []),
+    ("-1\n-1 0.01\n", ["-denzo"]),
+    ("0.01\n0.01 0.02\n", ["-adxv"]),
+    ("0.01\n0.01 0.02\n", ["-xds"]),
+    ("0.01\n0.01 0.02\n", ["-dials"]),
+    ("0.01\n0.01 0.02\n", "-beam_vector 0 0 1 -fdet_vector 1 0 0 -sdet_vector 0 1 0 -odet_vector 0 0 1".split()),
+    ("0.01\n0.01 0.02\n", "-sdet_vector 0 -1 0 -nopolar".split()),  # far off the beam: polarization per source
+])
+def test_short_sourcefile_lines_match_c(tmp_path, text, extra):
+    (tmp_path / "sources.txt").write_text(text)
+    assert_matches_c(DETECTOR + ["-sourcefile", "sources.txt"] + extra, tmp_path)

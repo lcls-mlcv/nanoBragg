@@ -1699,21 +1699,14 @@ def build_simulation(
         # Load sources from file
         wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
 
-        # Get beam direction based on detector convention.
-        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0];
-        # ADXV/XDS/DIALS use [0,0,1].
-        if detector_config.detector_convention in (
-            DetectorConvention.MOSFLM, DetectorConvention.DENZO
-        ):
-            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-        else:
-            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
+        beam_direction, _ = resolve_beam_and_polar_vectors(config)
 
         source_directions, source_weights, source_wavelengths = read_sourcefile(
             config['sourcefile'],
             default_wavelength_m=wavelength_m,
             default_source_distance_m=10.0,  # C code default
-            beam_direction=beam_direction
+            beam_direction=beam_direction,
+            dtype=dtype,
         )
 
         if not torch.all(source_weights == source_weights[0]):
