@@ -8,6 +8,7 @@ Detector objects as input and producing the final diffraction pattern.
 from dataclasses import dataclass
 from typing import Optional, Callable
 
+import logging
 import math
 import os
 import warnings
@@ -21,6 +22,8 @@ from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sinc3, polarization_factor
 from .utils.tensor_utils import as_tensor_preserving_grad
+
+logger = logging.getLogger(__name__)
 
 
 def compute_physics_for_position(
@@ -265,7 +268,7 @@ def compute_physics_for_position(
             # and proceed with eager-mode logging.
             is_compiling = False
 
-        if not is_compiling:
+        if not is_compiling and logger.isEnabledFor(logging.DEBUG):
             # Compute HKL bounds (keep tensors on device per input.md:37)
             h0_min = h0.min().item()
             h0_max = h0.max().item()
@@ -279,7 +282,7 @@ def compute_physics_for_position(
             hit_rate = (nonzero_F / total_pixels * 100) if total_pixels > 0 else 0.0
 
             # Single-line structured log per panel (bounded)
-            print(
+            logger.debug(
                 f"[HKL stats] h=[{h0_min:.0f},{h0_max:.0f}] "
                 f"k=[{k0_min:.0f},{k0_max:.0f}] "
                 f"l=[{l0_min:.0f},{l0_max:.0f}] "
@@ -569,7 +572,7 @@ class Simulator:
             temp = torch.zeros(1, device=device)
             self.device = temp.device
         else:
-            self.device = torch.device("cpu")
+            self.device = crystal.device
         self.dtype = dtype
 
         # PERF-PYTORCH-004 Attempt #14: Ensure detector is on the same device/dtype as simulator
@@ -1206,7 +1209,7 @@ class Simulator:
         wavelength, distance_mm, pixel_size_mm = (value(x) for x in geometry)
         reciprocal_pixel_size = (wavelength * 1e-10) * (distance_mm / 1000.0) / (pixel_size_mm / 1000.0)
         oversample = max(1, math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size))
-        print(f"auto-selected {oversample}-fold oversampling")
+        logger.info(f"auto-selected {oversample}-fold oversampling")
 
         if any(isinstance(x, torch.Tensor) and x.requires_grad for x in cells + geometry):
             self._frozen_auto_oversample = oversample

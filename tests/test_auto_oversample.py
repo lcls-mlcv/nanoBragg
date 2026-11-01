@@ -16,6 +16,8 @@ from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.models.detector import Detector
 from nanobrag_torch.simulator import Simulator
 
+pytestmark = pytest.mark.usefixtures("library_log_on_stdout")
+
 DTYPE = torch.float64
 
 

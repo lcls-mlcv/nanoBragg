@@ -39,6 +39,7 @@ to_raw_pixels(image)
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import replace
 from typing import Iterable, List, Optional, Sequence, Tuple, Union
@@ -58,6 +59,8 @@ from ..config import (
 from ..models.crystal import Crystal
 from ..models.detector import Detector
 from ..simulator import Simulator
+
+logger = logging.getLogger(__name__)
 
 Vec3 = Tuple[float, float, float]
 
@@ -140,7 +143,7 @@ def detector_config_from_dxtbx_panel(
         close_distance_m = float(np.dot(pix0_m, odet))
         righthanded = False
         if verbose:
-            print("WARNING: dxtbx panel is left handed; inverting odet_vector")
+            logger.warning("WARNING: dxtbx panel is left handed; inverting odet_vector")
 
     # Point of closest approach, expressed along the panel axes (metres).
     fclose_m = -float(np.dot(pix0_m, fdet))

@@ -13,6 +13,8 @@ import torch
 from nanobrag_torch.config import CrystalConfig
 from nanobrag_torch.models.crystal import Crystal
 
+pytestmark = pytest.mark.usefixtures("library_log_on_stdout")
+
 # Set environment variable to avoid MKL conflicts
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 

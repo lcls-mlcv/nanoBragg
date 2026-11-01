@@ -4,12 +4,15 @@ HKL file reader and Fdump binary cache for nanoBragg PyTorch.
 Implements AT-STR-001, AT-STR-002, and AT-IO-003 from spec-a.md.
 """
 
+import logging
 import struct
 from pathlib import Path
 from typing import Tuple, Optional
 
 import torch
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def read_hkl_file(
@@ -62,7 +65,7 @@ def read_hkl_file(
                     # Check for non-integer indices and warn
                     if not non_integer_warned:
                         if h != int(h) or k != int(k) or l != int(l):
-                            print(f"WARNING: Non-integer h,k,l values found: {h}, {k}, {l}")
+                            logger.warning(f"WARNING: Non-integer h,k,l values found: {h}, {k}, {l}")
                             non_integer_warned = True
 
                     # Track bounds
@@ -289,7 +292,7 @@ def try_load_hkl_or_fdump(
             try:
                 write_fdump(F_grid, metadata, fdump_path)
             except Exception as e:
-                print(f"Warning: Could not write Fdump cache: {e}")
+                logger.warning(f"Warning: Could not write Fdump cache: {e}")
 
         return F_grid, metadata
 
@@ -298,7 +301,7 @@ def try_load_hkl_or_fdump(
         try:
             return read_fdump(fdump_path, device, dtype)
         except Exception as e:
-            print(f"Warning: Could not read Fdump cache: {e}")
+            logger.warning(f"Warning: Could not read Fdump cache: {e}")
 
     # No data available
     if default_F == 0:

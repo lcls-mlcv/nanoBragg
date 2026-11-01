@@ -25,20 +25,15 @@ name = "nanobrag-torch"
 version = "0.1.0"
 description = "PyTorch implementation of nanoBragg diffraction simulator"
 authors = [{name = "nanoBragg Team"}]
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.3",
-    "fabio",
     "numpy",
-    "pytest",
-    "matplotlib",
     "scipy",
-    "pyyaml",
-    "psutil",
 ]
 
 [project.scripts]
 nanoBragg = "nanobrag_torch.__main__:main"
-nb-compare = "scripts.nb_compare:main"
 
 [project.optional-dependencies]
 dev = [
@@ -47,7 +42,11 @@ dev = [
     "isort"
 ]
 test = [
-    "pytest-timeout"
+    "matplotlib",
+    "psutil",
+    "pytest",
+    "pytest-timeout",
+    "pyyaml",
 ]
 
 [tool.pytest.ini_options]
