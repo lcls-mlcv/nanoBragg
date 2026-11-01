@@ -175,3 +175,22 @@ def test_every_file_of_a_masked_run_matches_c(extra, tmp_path):
     # The int image has 55000 counts across a float32 pixel, so the odd one can round apart
     assert np.abs(c_image.astype(int) - py_image.astype(int)).max() <= 1
     assert np.array_equal(c_image[mask == 0], py_image[mask == 0])
+
+
+@pytest.mark.parametrize("extra", [[], ["-adxv"], ["-adxv", "-Xbeam", "5", "-Ybeam", "7"], ["-denzo"]],
+                         ids=lambda extra: " ".join(extra) or "mosflm")
+def test_header_keeps_a_detsize_the_pixels_dont_fill(extra, tmp_path):
+    """C's detsize_s stays 30.7 with 61 pixels of 0.5, and sets BEAM_CENTER_Y and ADXV_CENTER_Y."""
+    args = BASE + "-detsize_f 20.3 -detsize_s 30.7 -pixel 0.5 -distance 100 -nonoise -intfile i.img -floatfile f.bin".split()
+    render([c_binary()], tmp_path / "c", args + extra)
+    render(torch_cmd(), tmp_path / "py", args + extra)
+    assert (tmp_path / "py" / "i.img").read_bytes()[:512] == (tmp_path / "c" / "i.img").read_bytes()[:512]
+
+
+def test_pgm_of_a_faint_image_matches_c(tmp_path):
+    """rmsd sets the PGM's scale, and float32 squares underflow on pixels like these."""
+    args = BASE + "-detpixels 32 -pixel 0.1 -distance 100 -default_F 1e5 -fluence 1e-17 -nonoise -pgmfile p.pgm".split()
+    args = [word for word in args if word != "-nopgm"]
+    render([c_binary()], tmp_path / "c", args + ["-floatfile", "f.bin", "-intfile", "i.img"])
+    render(torch_cmd(), tmp_path / "py", args + ["-floatfile", "f.bin", "-intfile", "i.img"])
+    assert (tmp_path / "py" / "p.pgm").read_bytes() == (tmp_path / "c" / "p.pgm").read_bytes()

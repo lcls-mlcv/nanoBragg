@@ -352,9 +352,7 @@ def test_fdump_from_hkl_is_byte_identical_to_c(default_F, tmp_path):
     # A zero's sign: C's dot products give +0 in DIALS_ORIGIN, and -phi -0 prints -0
     "-adxv -Xbeam 0 -Ybeam 0".split(), "-xds -ORGX 0.5 -ORGY 0.5".split(), "-dials -ORGX 0.5 -ORGY 0.5".split(),
     "-phi -0 -osc 0".split(),
-    # detsize_s, which the pixels don't fill, sets BEAM_CENTER_Y and ADXV_CENTER_Y
-    "-detsize_f 2.03 -detsize_s 3.07".split(), "-adxv -detsize_f 2.03 -detsize_s 3.07".split(),
-    "-adxv -detsize_f 2.03 -detsize_s 3.07 -Xbeam 1 -Ybeam 2".split(), "-Xbeam 5 -Ybeam 7 -adxv".split(),
+    "-Xbeam 5 -Ybeam 7 -adxv".split(),
     "-Xbeam 5 -Ybeam 7 -xds -detpixels_f 40 -detpixels_s 20 -pixel 0.5".split(),
 ], ids=lambda extra: " ".join(extra) or "defaults")
 def test_smv_header_is_byte_identical_to_c(extra, tmp_path):

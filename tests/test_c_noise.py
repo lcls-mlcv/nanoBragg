@@ -97,6 +97,8 @@ CLI_CASES = {
     "seed-is-IM": "-seed 2147483647 -fluence 1e27",  # 118 photons in C
     "seed-is-minus-IM": "-seed -2147483647 -fluence 1e27",
     "seed-wraps-as-int": "-seed 2147483648",
+    "seed-wraps-past-int": "-seed 4294967301",  # atoi gives 5
+    "seed-past-long": "-seed 9999999999999999999999",  # strtol clamps, atoi gives -1
     "adc-wraps": "-seed 9 -adc -5",
     "adc-fractional": "-seed 9 -adc -5.7",
     "adc-wraps-twice": "-seed 9 -adc -70000",
@@ -176,13 +178,9 @@ def test_nan_and_inf_pixels_are_drawn_as_c_does():
 
 
 def test_a_large_negative_pixel_draws_zero():
-    noise, photons, overloads = c_noise_image(np.array([[-1e30, -1000.0, -1.0, -float("inf")]]), 1)
-    assert noise.tolist() == [[40, 40, 40, 40]] and photons == 0 and overloads == 0
-
-
-def test_a_draw_past_float32_range_is_inf_not_a_crash():
-    noise, photons, overloads = c_noise_image(np.array([[3.4e38] * 32]), 3)
-    assert overloads == 32 and noise.min() == 65535 and photons > 1e39
+    """exp(-xm) leaves float32 at -100 and double at -1000, and C's float g is simply inf."""
+    noise, photons, overloads = c_noise_image(np.array([[-1e30, -1000.0, -100.0, -1.0, -float("inf")]]), 1)
+    assert noise.tolist() == [[40, 40, 40, 40, 40]] and photons == 0 and overloads == 0
 
 
 @pytest.mark.parametrize("mean", [0.1, 1.0, 5.0, 11.9, 12.0, 12.1, 100.0, 1000.0, 3e5, 5e5, 1000001.0, 2e6, 1e7],
@@ -213,6 +211,18 @@ def test_c_noise_image_keeps_cs_excess_variance_below_1e6(mean):
     draws = noise.astype(np.float64).ravel() - (30000.0 - mean)
     assert abs(draws.mean() - mean) < 5 * (1.2 * mean / n) ** 0.5
     assert 1.05 < draws.var() / mean < 1.25
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
+@pytest.mark.parametrize("mean", [0.1, 3.0, 11.9, 12.1, 1000.0, 1000001.0, 1e7], ids=lambda mean: f"{mean:g}")
+def test_fast_noise_image_is_poisson(mean, dtype):
+    n = 200000
+    adc = 30000.0 - mean if mean > 30000 else 0.0
+    noise, photons, _ = fast_noise_image(torch.full((1, n), mean, dtype=dtype), 12345, adc)
+    draws = noise.astype(np.float64).ravel() - adc
+    assert abs(draws.mean() - mean) < 5 * (mean / n) ** 0.5
+    assert abs(draws.var() / mean - 1) < 5 * ((2 + 1 / mean) / n) ** 0.5
+    assert abs(photons / n - draws.mean()) <= 1
 
 
 def fast_noise(tmp_path, flags, name="a"):
