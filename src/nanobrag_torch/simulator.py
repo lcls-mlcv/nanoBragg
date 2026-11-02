@@ -659,13 +659,7 @@ class Simulator:
         self.r_e_sqr = R_E_SQR
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
-        self.fluence = as_tensor_preserving_grad(
-            self.beam_config.fluence, device=self.device, dtype=self.dtype
-        )
-        # The config may hold digits that the run's dtype does not
-        self._fluence_exact = as_tensor_preserving_grad(
-            self.beam_config.fluence, device=self.device, dtype=self._scale_dtype
-        )
+        self.fluence = self.beam_config.fluence
         # Polarization setup from beam config
         # PERF-PYTORCH-006: Store as tensor with correct dtype
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad when nopolar is False
@@ -823,48 +817,39 @@ class Simulator:
         if self._source_directions is not None and source_weights is not None:
             self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
 
-    def _public_and_exact(self, value):
-        """value in the run's dtype for callers, and at full width for the scale."""
+    def _scale_source(self, value) -> torch.Tensor:
+        """The one tensor a scale factor is kept in: value itself if a tensor, else a double.
+
+        Nothing is copied from it, so there is no second value to fall behind: an in-place change,
+        through .data or by anyone who holds this tensor, is the change. A number takes the scale's
+        width, so a float32 run keeps its digits.
+        """
         if isinstance(value, torch.Tensor):
-            return value, value.to(device=self.device, dtype=self._scale_dtype)
-        return (torch.tensor(float(value), device=self.device, dtype=self.dtype),
-                torch.tensor(float(value), device=self.device, dtype=self._scale_dtype))
+            return value
+        return torch.tensor(float(value), device=self.device, dtype=self._scale_dtype)
 
     @property
     def fluence(self) -> torch.Tensor:
-        """Photons per square metre, in the run's dtype. Assign to it, or change it in place."""
+        """Photons per square metre: the tensor given, or a double. Assign, or change it in place."""
         return self._fluence
 
     @fluence.setter
     def fluence(self, value) -> None:
-        self._fluence, self._fluence_exact = self._public_and_exact(value)
+        self._fluence = self._scale_source(value)
 
     @property
     def r_e_sqr(self) -> torch.Tensor:
-        """Classical electron radius squared, in the run's dtype. Assignable, as fluence is."""
+        """Classical electron radius squared, kept and assignable as fluence is."""
         return self._r_e_sqr
 
     @r_e_sqr.setter
     def r_e_sqr(self, value) -> None:
-        self._r_e_sqr, self._r_e_sqr_exact = self._public_and_exact(value)
-
-    def _at_scale_width(self, public: torch.Tensor, exact: torch.Tensor) -> torch.Tensor:
-        """A scale factor at the scale's width, following whatever was done to the public one.
-
-        exact has the digits, but public is what callers hold and may fill_ in place or through
-        .data, or turn into a leaf with requires_grad_. Then exact is stale or cut off from the
-        graph, and public, which is all there is, gives the value.
-        """
-        if not torch.equal(exact.detach().to(public), public.detach()):
-            return public.to(device=self.device, dtype=self._scale_dtype)
-        if public.requires_grad and not exact.requires_grad:
-            return public.to(device=self.device, dtype=self._scale_dtype)
-        return exact
+        self._r_e_sqr = self._scale_source(value)
 
     def _r_e_sqr_fluence(self) -> torch.Tensor:
-        """r_e^2*fluence at the scale's width, whatever the run's dtype."""
-        return (self._at_scale_width(self._r_e_sqr, self._r_e_sqr_exact)
-                * self._at_scale_width(self._fluence, self._fluence_exact))
+        """r_e^2*fluence at the scale's width, whatever the run's dtype, read afresh each time."""
+        return (self._r_e_sqr.to(device=self.device, dtype=self._scale_dtype)
+                * self._fluence.to(device=self.device, dtype=self._scale_dtype))
 
     def _polarized(self, oversample_polar: bool) -> bool:
         """-nopolar only stops polarization being cached: nanoBragg.c:2772 tests oversample_polar

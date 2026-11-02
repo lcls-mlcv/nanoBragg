@@ -104,6 +104,52 @@ def test_gradient_reaches_an_r_e_sqr_leaf():
     assert sim.r_e_sqr.grad.item() == pytest.approx(image.sum().item() / R_E_SQR, rel=1e-12)
 
 
+LEAF_CHANGES = {
+    "data_mul_": lambda leaf: leaf.data.mul_(2),
+    "no_grad_mul_": lambda leaf: _under_no_grad(leaf.mul_, 2.0),
+    "fill_": lambda leaf: _under_no_grad(leaf.fill_, 2e24),
+    "copy_": lambda leaf: _under_no_grad(leaf.copy_, torch.tensor(2e24)),
+    "data_assign": lambda leaf: setattr(leaf, "data", torch.tensor(2e24, dtype=leaf.dtype)),
+}
+
+
+def _under_no_grad(update, *args):
+    with torch.no_grad():
+        update(*args)
+
+
+@pytest.mark.parametrize("change", sorted(LEAF_CHANGES))
+@pytest.mark.parametrize("leaf_dtype", [torch.float32, torch.float64], ids=["leaf32", "leaf64"])
+@pytest.mark.parametrize("run_dtype", [torch.float32, torch.float64], ids=["run32", "run64"])
+def test_a_config_leaf_changed_in_place_changes_the_image(run_dtype, leaf_dtype, change):
+    """Whatever the two widths, with no copy of the leaf to go stale, and the gradient follows."""
+    leaf = torch.tensor(1e24, dtype=leaf_dtype, requires_grad=True)
+    sim = make(run_dtype, fluence=leaf)
+    assert sim.fluence is leaf
+    base = sim.run().to(torch.float64).sum().item()
+    LEAF_CHANGES[change](leaf)
+    doubled = sim.run().to(torch.float64).sum()
+    assert doubled.item() / base == pytest.approx(2.0, rel=2e-6)
+    doubled.backward()
+    assert leaf.grad.item() == pytest.approx(base / 1e24, rel=1e-5)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64], ids=["float32", "float64"])
+@pytest.mark.parametrize("change", sorted(CHANGES))
+def test_the_scale_is_the_public_value(change, dtype):
+    """There is no second value: the scale is always what the public tensors hold, to the bit."""
+    sim = make(dtype, fluence=1.0000000123e24)
+    CHANGES[change](sim)
+    assert sim._r_e_sqr_fluence().item() == sim.r_e_sqr.double().item() * sim.fluence.double().item()
+
+
+def test_a_double_leaf_keeps_its_digits_in_a_float32_run_after_a_change():
+    leaf = torch.tensor(1e24, dtype=torch.float64, requires_grad=True)
+    sim = make(torch.float32, fluence=leaf)
+    leaf.data.fill_(1.0000000123e24)
+    assert sim._r_e_sqr_fluence().item() == R_E_SQR * 1.0000000123e24
+
+
 def test_only_mps_lacks_doubles():
     assert simulator_module._widest_float(torch.device("mps")) is torch.float32
     assert simulator_module._widest_float(torch.device("cpu")) is torch.float64
