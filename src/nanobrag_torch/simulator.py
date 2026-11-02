@@ -2713,7 +2713,7 @@ class Simulator:
         # Apply external mask if provided
         if self.detector.config.mask_array is not None:
             if self.detector.config.mask_array.shape == float_image.shape:
-                roi_mask = roi_mask & (self.detector.config.mask_array > 0)
+                roi_mask = roi_mask & (self.detector.config.mask_array.to(float_image.device) > 0)
 
         # Get masked pixels, in double as C sums them: a float32 square underflows on a faint image
         masked_pixels = float_image[roi_mask].cpu().to(torch.float64)
