@@ -170,7 +170,7 @@ class CLCG:
         self.iy = self.iv[j]
         self.iv[j] = self.idum
 
-        temp = self.AM * self.iy
+        temp = float(np.float32(self.AM * self.iy))  # C keeps it in a float
         return min(temp, self.RNMX)
 
 
@@ -278,7 +278,7 @@ def mosaic_rotation_umat(
     r3 = 2.0 * rng.ran1() - 1.0
 
     xyrad = math.sqrt(1.0 - r2 * r2)
-    rot = mosaicity * math.pow(1.0 - r3 * r3, 1.0/3.0)
+    rot = float(np.float32(mosaicity) * _rot_scale(r3))
 
     v1 = xyrad * math.sin(math.pi * r1)
     v2 = xyrad * math.cos(math.pi * r1)
@@ -312,6 +312,11 @@ def mosaic_rotation_umat(
     umat[2, 2] = t1 + t2 * t24      # uzz
 
     return umat
+
+
+def _rot_scale(r3: float) -> np.float32:
+    """powf((1.0-r3*r3),(1.0/3.0)) of nanoBragg.c:3466, which is single precision."""
+    return np.float32(1.0 - r3 * r3) ** np.float32(1.0 / 3.0)
 
 
 def mosaic_rotation_umats(
@@ -370,13 +375,17 @@ def mosaic_rotation_umats(
         v1_l.append(xyrad * math.sin(math.pi * r1))
         v2_l.append(xyrad * math.cos(math.pi * r1))
         v3_l.append(r2)
-        rot_scale_l.append(math.pow(1.0 - r3 * r3, 1.0 / 3.0))
+        rot_scale_l.append(float(_rot_scale(r3)))
 
     v1 = torch.tensor(v1_l, dtype=dtype, device=device)
     v2 = torch.tensor(v2_l, dtype=dtype, device=device)
     v3 = torch.tensor(v3_l, dtype=dtype, device=device)
     # mosaicity_t is the only tensor input, so the gradient path runs through rot alone
-    rot = mosaicity_t * torch.tensor(rot_scale_l, dtype=dtype, device=device)
+    rot_scale = torch.tensor(rot_scale_l, dtype=dtype, device=device)
+    rot = mosaicity_t * rot_scale
+    # C rounds rot to single, which is 8e-6 rad at the 90 rad of a random orientation. A shift, so
+    # that d(rot)/d(mosaicity) stays rot_scale.
+    rot = rot + ((mosaicity_t.detach().to(torch.float32) * rot_scale.to(torch.float32)).to(dtype) - rot.detach())
 
     t1 = torch.cos(rot)
     t2 = 1.0 - t1

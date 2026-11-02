@@ -2119,3 +2119,25 @@ cases:
       - name: gauss-misset-phi
         extra_args: >-
           -gauss_xtal -misset 10 20 30 -phi 5 -osc 1 -phisteps 2
+
+  - id: PARITY-RANDOM-001
+    description: ran1 and the rotation in mosaic_rotation_umat are single precision in C
+    base_args: >-
+      -dtype float64 -cell 47.4 92.8 86.9 90 90 90 -default_F 30 -Na 10 -Nb 5 -Nc 5 -pixel 0.172 -detpixels 50 -distance 232.9 -oversample 1 -seed 9
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: random-misset
+        extra_args: >-
+          -misset_seed 80725 -misset random
+      - name: random-misset-curved
+        extra_args: >-
+          -misset_seed 80725 -misset random -curved_det
+      - name: mosaic-domains
+        extra_args: >-
+          -mosaic 1.34 -mosaic_dom 3 -mosaic_seed 87101
+      - name: random-misset-phi-mosaic
+        extra_args: >-
+          -misset_seed 80725 -misset random -phi 45.4 -osc 2.79 -phisteps 2 -mosaic 1.34 -mosaic_dom 2 -mosaic_seed 87101
