@@ -18,6 +18,7 @@ import torch
 from .config import BeamConfig, CrystalConfig, CrystalShape, SpotMetric
 from .models.crystal import Crystal
 from .models.detector import Detector
+from .utils.c_cell import c_ceil_to_int, c_cell_lengths_m
 from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sincg_miller, sinc3, polarization_factor
@@ -519,6 +520,11 @@ def _memory_available_bytes(device: torch.device) -> Optional[int]:
     return min(limits) if limits else None
 
 
+def _as_double(x) -> float:
+    """A config value or scalar tensor as a Python float."""
+    return float(x.detach()) if isinstance(x, torch.Tensor) else float(x)
+
+
 def _widest_float(device: torch.device) -> torch.dtype:
     """float64, or float32 on a device that has no doubles (MPS)."""
     return torch.float32 if torch.device(device).type == "mps" else torch.float64
@@ -654,6 +660,8 @@ class Simulator:
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
+        # Whatever was given, as digits the run's dtype may not hold: see _wavelength_in_double
+        self._wavelength_given = self.beam_config.wavelength_A
         # The scale is computed in double, as in C, where the device has doubles
         self._scale_dtype = _widest_float(self.device)
         self.r_e_sqr = R_E_SQR
@@ -811,6 +819,7 @@ class Simulator:
     def set_spectrum(self, wavelength_A, source_wavelengths=None, source_weights=None) -> None:
         """Replace the wavelengths (A; sources in metres) and source weights of this Simulator."""
         self.wavelength = as_tensor_preserving_grad(wavelength_A, device=self.device, dtype=self.dtype)
+        self._wavelength_given = wavelength_A
         if self._source_directions is not None and source_wavelengths is not None:
             self._source_wavelengths = source_wavelengths.to(device=self.device, dtype=self.dtype)
             self._source_wavelengths_A = self._source_wavelengths * 1e10
@@ -1300,17 +1309,21 @@ class Simulator:
         geometry = (self.wavelength, self.detector.config.distance_mm,
                     self.detector.config.pixel_size_mm)
 
-        def value(x):
-            return float(x.detach()) if isinstance(x, torch.Tensor) else float(x)
-
-        # Maximum crystal dimension in meters (a*Na, b*Nb, c*Nc)
-        xtalsize_max = max(abs(value(c) * 1e-10 * n) for c, n in zip(cells, cfg.N_cells))
-        # reciprocal_pixel_size = lambda * distance / pixel_size (all in meters). C's distance by now
-        # is close_distance/ratio of nanoBragg.c:1758, with the ratio from before -twotheta.
-        wavelength, _, pixel_size_mm = (value(x) for x in geometry)
-        distance_m = value(torch.dot(self.detector.pix0_vector, self.detector.odet_vec)) / value(self.detector.r_factor)
-        reciprocal_pixel_size = (wavelength * 1e-10) * distance_m / (pixel_size_mm / 1000.0)
-        oversample = max(1, math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size))
+        # All in double, as in C, whatever the run's dtype: where the argument is a whole number
+        # float32 rounding moves the ceil
+        with torch.no_grad():
+            detector = Detector(self.detector.config, device="cpu", dtype=torch.float64)
+            distance_m = (_as_double(torch.dot(detector.pix0_vector, detector.odet_vec))
+                          / _as_double(detector.r_factor))
+        # C's distance is close_distance/ratio by now (nanoBragg.c:1758), with the ratio from
+        # before -twotheta. Lengths are divided down as C reads them.
+        xtalsize_max = max(length * max(_as_double(n), 1.0)
+                           for length, n in zip(self._cell_lengths_m(), cfg.N_cells))
+        reciprocal_pixel_size = (self._wavelength_in_double() / 1.0e10) * distance_m / (
+            _as_double(self.detector.config.pixel_size_mm) / 1000.0)
+        oversample = c_ceil_to_int(3.0 * xtalsize_max / reciprocal_pixel_size)
+        if oversample <= 0:
+            oversample = 1
         logger.info(f"auto-selected {oversample}-fold oversampling")
 
         if any(isinstance(x, torch.Tensor) and x.requires_grad for x in cells + geometry):
@@ -1323,6 +1336,27 @@ class Simulator:
                 stacklevel=3,
             )
         return oversample
+
+    def _cell_lengths_m(self) -> tuple:
+        """a[0], b[0], c[0] of C, in double."""
+        cfg = self.crystal.config
+        cell = [_as_double(getattr(cfg, f"cell_{name}")) for name in ("a", "b", "c", "alpha", "beta", "gamma")]
+        reciprocal = None
+        if cfg.mosflm_a_star is not None:
+            reciprocal = [tuple(float(x) for x in star)
+                          for star in (cfg.mosflm_a_star, cfg.mosflm_b_star, cfg.mosflm_c_star)]
+        misset = [_as_double(angle) for angle in cfg.misset_deg]
+        return c_cell_lengths_m(cell, misset, reciprocal)
+
+    def _wavelength_in_double(self) -> float:
+        """The run's wavelength, with the digits it was given if the run's dtype cut them off."""
+        live = self.wavelength
+        given = _as_double(self._wavelength_given)
+        if isinstance(live, torch.Tensor):
+            still_given = float(torch.tensor(given, dtype=live.dtype)) == float(live.detach())
+        else:
+            still_given = float(live) == given
+        return given if still_given else _as_double(live)
 
     def _warn_if_tophat_severs_cell_gradients(self) -> None:
         """Warn once when TOPHAT leaves differentiable cell parameters with no path.
