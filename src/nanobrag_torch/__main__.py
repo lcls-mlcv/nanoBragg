@@ -1092,7 +1092,7 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         if not wavelength_A:
             wavelength_A = resolve_wavelength_A(args)
             if wavelength_A is None:
-                raise ValueError("Wavelength must be specified (via -lambda or -energy) when using -mat")
+                wavelength_A = 1.0  # as nanoBragg.c, whose lambda0 starts at 1e-10
 
         # Read the MOSFLM matrix and convert to cell parameters
         a_star, b_star, c_star = read_mosflm_matrix(args.mat, wavelength_A)

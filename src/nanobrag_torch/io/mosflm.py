@@ -46,7 +46,7 @@ def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple
 
     Raises:
         FileNotFoundError: If the matrix file doesn't exist
-        ValueError: If the file doesn't contain exactly 9 numeric values
+        ValueError: If the file doesn't start with 9 numeric values
     """
     filepath = Path(filepath)
 
@@ -70,14 +70,15 @@ def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple
                 except ValueError:
                     continue
 
-    if len(values) != 9:
+    if len(values) < 9:
         raise ValueError(
-            f"MOSFLM matrix file must contain exactly 9 numeric values, "
+            f"MOSFLM matrix file must start with 9 numeric values, "
             f"found {len(values)} in {filepath}"
         )
 
-    # Reshape into 3x3 matrix (row-major order from file)
-    matrix = np.array(values).reshape(3, 3)
+    # Reshape into 3x3 matrix (row-major order from file). The rest of a real MOSFLM file, the
+    # missets, U matrix and cell, C never reads (nanoBragg.c:1885-1887), and nor does this.
+    matrix = np.array(values[:9]).reshape(3, 3)
 
     # C-code reads this matrix in column-major order (see lines 26-28 above):
     # First row  -> a_star[1], b_star[1], c_star[1]  (components of each vector)
