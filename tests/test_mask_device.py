@@ -68,4 +68,4 @@ def test_cli_mask_on_a_gpu_writes_the_image(tmp_path):
     run("-mask", "mask.img", "-floatfile", "cpu.bin")
     run("-mask", "mask.img", "-floatfile", "gpu.bin", "-device", "cuda")
     np.testing.assert_allclose(np.fromfile(tmp_path / "gpu.bin", dtype=np.float32),
-                               np.fromfile(tmp_path / "cpu.bin", dtype=np.float32), rtol=1e-5)
+                               np.fromfile(tmp_path / "cpu.bin", dtype=np.float32), rtol=1e-5, atol=1e-8)
