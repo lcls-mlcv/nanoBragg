@@ -173,16 +173,32 @@ def test_no_double_is_made_on_a_device_without_them(monkeypatch):
             raise TypeError("Cannot convert a MPS Tensor to float64 dtype")
         return real_tensor(*args, **kwargs)
 
-    expected = make(torch.float32).run()
+    expected = make(torch.float32).run(oversample=2)
     sim = None
     monkeypatch.setattr(simulator_module, "_widest_float", lambda device: torch.float32)
     sim = make(torch.float32)
     monkeypatch.setattr(torch.Tensor, "to", to)
     monkeypatch.setattr(torch, "tensor", tensor)
-    image = sim.run()
+    image = sim.run(oversample=2)
     sim.fluence.fill_(2e24)
-    doubled = sim.run()
+    doubled = sim.run(oversample=2)
     monkeypatch.undo()
     assert image.dtype == torch.float32
     assert torch.allclose(image, expected, rtol=1e-5)
     assert torch.allclose(doubled, 2 * image, rtol=1e-5)
+
+
+def test_auto_oversample_takes_its_doubles_on_the_cpu(monkeypatch):
+    """MPS has no doubles, and the double copy of the detector is on the CPU whatever the run's device."""
+    made = []
+
+    class Recording(simulator_module.Detector):
+        def __init__(self, config, device, dtype):
+            made.append((device, dtype))
+            super().__init__(config, device=device, dtype=dtype)
+
+    monkeypatch.setattr(simulator_module, "_widest_float", lambda device: torch.float32)
+    sim = make(torch.float32)
+    monkeypatch.setattr(simulator_module, "Detector", Recording)
+    assert sim._auto_oversample() >= 1
+    assert made == [("cpu", torch.float64)]
