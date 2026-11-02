@@ -1327,7 +1327,12 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['dispersion'] = args.dispersion / 100.0  # Convert percent to fraction
 
     # Interpolation
-    if args.interpolate:
+    if args.interpolate and args.nointerpolate:
+        # nanoBragg.c:1060-1069 walks argv, so the last wins
+        argv = getattr(args, '_argv', None) or []
+        interpolate_flags = [token for token in argv if token in ('-interpolate', '-nointerpolate')]
+        config['interpolate'] = not interpolate_flags or interpolate_flags[-1] == '-interpolate'
+    elif args.interpolate:
         config['interpolate'] = True
     elif args.nointerpolate:
         config['interpolate'] = False
