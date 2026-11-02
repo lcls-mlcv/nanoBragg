@@ -91,7 +91,7 @@ def test_warning_gives_the_memory_and_leaves_the_run_alone(monkeypatch):
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         quiet = simulator.run(oversample=2)
-    with pytest.warns(UserWarning, match=r"needs about 0\.000164 GB and 1e-06 GB is available") as caught:
+    with pytest.warns(UserWarning, match=r"may need about 0\.000197 GB, an estimate good to a factor of 2, and 1e-06 GB is available") as caught:
         monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1000)
         warned = simulator.run(oversample=2)
     assert "2-fold oversampling" in str(caught[0].message)
@@ -99,17 +99,46 @@ def test_warning_gives_the_memory_and_leaves_the_run_alone(monkeypatch):
 
 
 @pytest.mark.parametrize("flags, gigabytes", [
-    ("-oversample 1000", 16 ** 2 * 1000 ** 2 * 160 / 1e9),
-    ("-oversample 1000 -phisteps 3 -osc 1", 3 * 16 ** 2 * 1000 ** 2 * 160 / 1e9),
-    ("-oversample 1000 -dtype float64", 2 * 16 ** 2 * 1000 ** 2 * 160 / 1e9),
-    ("-oversample 1000 -detector_thick 100 -detector_abs 300 -detector_thicksteps 4", 4 * 16 ** 2 * 1000 ** 2 * 160 / 1e9),
+    ("-oversample 1000", 16 ** 2 * 1000 ** 2 * 4 * 48 / 1e9),
+    ("-oversample 1000 -phisteps 3 -osc 1", 16 ** 2 * 1000 ** 2 * 4 * 84 / 1e9),
+    ("-oversample 1000 -mosaic 1 -mosaic_dom 20", 16 ** 2 * 1000 ** 2 * 4 * 390 / 1e9),
+    ("-oversample 1000 -dtype float64", 16 ** 2 * 1000 ** 2 * 8 * 48 / 1e9),
+    ("-oversample 1000 -detector_thick 100 -detector_abs 300 -detector_thicksteps 4", 4 * 16 ** 2 * 1000 ** 2 * 4 * 48 / 1e9),
 ])
 def test_expected_memory_counts_what_multiplies_it(flags, gigabytes, monkeypatch):
     monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1000)
     simulator = bundle(BASE + flags.split()).simulator
     with pytest.warns(UserWarning) as caught:
         simulator._warn_if_memory_runs_out(16, 16, 1000, 1, None)
-    assert float(re.search(r"needs about ([0-9.e+]+) GB", str(caught[0].message)).group(1)) == pytest.approx(gigabytes, rel=2e-2)
+    assert float(re.search(r"may need about ([0-9.e+]+) GB", str(caught[0].message)).group(1)) == pytest.approx(gigabytes, rel=2e-2)
+
+
+@pytest.mark.parametrize("pixels, oversample, sources, flags, measured_gb", [
+    # Peak above the import, measured on exxa with mem.sh, rv5 report
+    (2463, 1, 1, "-mosaic 1 -mosaic_dom 20", 9.4),
+    (2048, 1, 1, "-mosaic 1 -mosaic_dom 20", 6.6),
+    (1024, 1, 1, "-mosaic 1 -mosaic_dom 20 -dtype float64", 3.23),
+    (1024, 2, 1, "-mosaic 1 -mosaic_dom 10", 3.37),
+    (1024, 2, 1, "", 0.82),
+    (1024, 1, 3, "-mosaic 1 -mosaic_dom 5", 1.19),
+])
+def test_estimate_is_near_what_was_measured(pixels, oversample, sources, flags, measured_gb, monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1000)
+    simulator = bundle(BASE + flags.split()).simulator
+    with pytest.warns(UserWarning) as caught:
+        simulator._warn_if_memory_runs_out(pixels, pixels, oversample, sources, None)
+    estimate = float(re.search(r"may need about ([0-9.e+]+) GB", str(caught[0].message)).group(1))
+    assert estimate == pytest.approx(measured_gb, rel=0.15)
+
+
+def test_warning_makes_no_prediction_and_stops_nothing(monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1)
+    simulator = bundle(BASE + "-N 3 -oversample 1".split()).simulator
+    with pytest.warns(UserWarning) as caught:
+        image = simulator.run()
+    message = str(caught[0].message)
+    assert "probably fail" not in message and "goes ahead anyway" in message
+    assert image.max() > 0
 
 
 def test_pixel_batch_size_is_counted(monkeypatch):
@@ -137,7 +166,7 @@ def test_oversized_run_under_a_cap_warns_and_fails_without_growing(tmp_path):
     run = subprocess.run(["bash", "-c", f"ulimit -v 8000000; exec {cmd}"], cwd=tmp_path, env=ENV,
                          capture_output=True, text=True, timeout=120)
     assert run.returncode == 1
-    assert "This run needs about 59.1 GB" in run.stderr
+    assert "This run may need about 70.9 GB" in run.stderr
     assert "1201-fold oversampling" in run.stderr
     assert "Traceback" not in run.stderr
     assert not (tmp_path / "f.bin").exists()

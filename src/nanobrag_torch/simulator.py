@@ -1271,24 +1271,30 @@ class Simulator:
 
     def _warn_if_memory_runs_out(self, S: int, F: int, oversample: int, n_sources: int,
                                  pixel_batch_size: Optional[int]) -> None:
-        """Say what a run will need when that is more than there is. The run still goes ahead.
+        """Say what a run may need when that is more than there is. The run always goes ahead.
 
         C holds one sample at a time, so its time grows with oversample^2 and torch's memory does.
-        Measured, CPU: 40 words of the run's dtype per sample, phi step, mosaic domain and source.
+        Measured peak above the import, CPU, 21 runs: 30 words of the run's dtype per sample, plus 18
+        per sample, phi step, mosaic domain and source, a sample being one subpixel of one sensor
+        layer. That is within 20% from 10 such units up (2463^2, 20 domains: 9.5 GB here, 9.4 measured),
+        and otherwise reads from half (9 sources alone) to twice (a plain run) what was measured.
         """
         n_layers = self.detector.thickness_layers()[0]
         n_phi = max(int(self.crystal.config.phi_steps), 1)
         n_mosaic = max(int(self.crystal.config.mosaic_domains), 1)
         rows = S if pixel_batch_size is None else min(pixel_batch_size, S)
-        needed = (40 * torch.finfo(self.dtype).bits // 8 * rows * F * oversample * oversample
-                  * max(n_layers, 1) * max(n_sources, 1) * n_phi * n_mosaic)
+        samples = rows * F * oversample * oversample * max(n_layers, 1)
+        words = 30 + 18 * max(n_sources, 1) * n_phi * n_mosaic
+        needed = torch.finfo(self.dtype).bits // 8 * samples * words
         available = _memory_available_bytes(self.device)
         if available is not None and needed > available:
             warnings.warn(
-                f"This run needs about {needed / 1e9:.3g} GB and {available / 1e9:.3g} GB is available: "
+                f"This run may need about {needed / 1e9:.3g} GB, an estimate good to a factor of 2, and "
+                f"{available / 1e9:.3g} GB is available: "
                 f"{F}x{S} pixels at {oversample}-fold oversampling, {n_layers} sensor layers, {n_sources} "
                 f"sources, {n_phi} phi steps, {n_mosaic} mosaic domains. Memory grows as oversample^2, "
-                f"and C picks the same oversample but holds one sample at a time. It will probably fail. "
+                f"and C picks the same oversample but holds one sample at a time. It goes ahead anyway; "
+                f"if memory does run out it stops there, with no image. "
                 f"A lower -oversample changes the image; pixel_batch_size in Simulator.run does not.",
                 stacklevel=3,
             )
