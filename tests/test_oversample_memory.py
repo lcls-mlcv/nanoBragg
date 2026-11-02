@@ -26,7 +26,9 @@ def bundle(flags):
 
 
 @pytest.mark.parametrize("flags", ["-samplesize 0.04", "-samplesize 0.004", "-N 3", "-N 40", "-samplesize 0.0123",
-                                   "-samplesize 0.04 -lambda 2.3 -pixel 0.172", "-Na 100 -Nb 3 -Nc 7"])
+                                   "-samplesize 0.04 -lambda 2.3 -pixel 0.172", "-Na 100 -Nb 3 -Nc 7",
+                                   "-N 20 -twotheta -24.7 -lambda 1.71", "-N 20 -twotheta 24.7 -pivot sample",
+                                   "-N 20 -close_distance 80 -detector_rotx 20"])
 def test_auto_oversample_is_cs(flags, tmp_path):
     c_bin = os.environ.get("NB_C_BIN")
     if not c_bin or not Path(c_bin).exists():

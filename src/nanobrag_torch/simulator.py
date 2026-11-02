@@ -1320,9 +1320,11 @@ class Simulator:
 
         # Maximum crystal dimension in meters (a*Na, b*Nb, c*Nc)
         xtalsize_max = max(abs(value(c) * 1e-10 * n) for c, n in zip(cells, cfg.N_cells))
-        # reciprocal_pixel_size = lambda * distance / pixel_size (all in meters)
-        wavelength, distance_mm, pixel_size_mm = (value(x) for x in geometry)
-        reciprocal_pixel_size = (wavelength * 1e-10) * (distance_mm / 1000.0) / (pixel_size_mm / 1000.0)
+        # reciprocal_pixel_size = lambda * distance / pixel_size (all in meters). C's distance by now
+        # is close_distance/ratio of nanoBragg.c:1758, with the ratio from before -twotheta.
+        wavelength, _, pixel_size_mm = (value(x) for x in geometry)
+        distance_m = value(torch.dot(self.detector.pix0_vector, self.detector.odet_vec)) / value(self.detector.r_factor)
+        reciprocal_pixel_size = (wavelength * 1e-10) * distance_m / (pixel_size_mm / 1000.0)
         oversample = max(1, math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size))
         logger.info(f"auto-selected {oversample}-fold oversampling")
 
