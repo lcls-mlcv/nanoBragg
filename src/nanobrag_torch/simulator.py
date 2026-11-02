@@ -1134,7 +1134,7 @@ class Simulator:
                 # C: I = I_bg before the sample loop, so the corrections applied once per pixel
                 # below reach it, and the ones applied per sample above do not.
                 accumulated_intensity = accumulated_intensity + self._water_background_pre_scale(
-                    subpixel_coords_all[:, :, 0, :], oversample_polar
+                    subpixel_coords_all, oversample_polar, source_directions, source_wavelengths_A
                 )
 
             # nanoBragg.c computes omega once per pixel, at the FIRST subpixel of the front
@@ -1232,7 +1232,9 @@ class Simulator:
 
             if self.beam_config.water_size_um > 0:
                 # Under -oversample_omega the pixel's omega goes on each sample, so not on I_bg
-                water = self._water_background_pre_scale(pixel_coords_meters, oversample_polar)
+                water = self._water_background_pre_scale(
+                    pixel_coords_meters.unsqueeze(2), oversample_polar, source_directions, source_wavelengths_A
+                )
                 normalized_intensity = normalized_intensity + (water if oversample_omega else water * omega_pixel)
 
         return (
@@ -2271,7 +2273,13 @@ class Simulator:
                 print(f"  = {normalized_intensity[target_slow, target_fast].item():.12e} * {self.r_e_sqr:.12e} * {self.fluence:.12e}")
                 print(f"  = {physical_intensity[target_slow, target_fast].item():.12e}")
 
-    def _water_background_pre_scale(self, pixel_coords_meters: torch.Tensor, oversample_polar: bool) -> torch.Tensor:
+    def _water_background_pre_scale(
+        self,
+        sample_coords_meters: torch.Tensor,
+        oversample_polar: bool,
+        source_directions: Optional[torch.Tensor] = None,
+        source_wavelengths_A: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Water background as nanoBragg.c seeds it, before the r_e^2*fluence/steps scaling.
 
@@ -2281,26 +2289,53 @@ class Simulator:
         polarization factor, solid angle and capture fraction C applies once per pixel
         (nanoBragg.c:2515, 2665, 3048-3050). With -oversample_polar those go on each sample
         instead, so I_bg gets none. Otherwise, torch applying polarization per sample inside
-        the kernel, the factor C cached for the pixel is computed here.
+        the kernel, the factor C cached for the pixel is computed here: the one from the first
+        sample and source that -dmin lets through (nanoBragg.c:2765, 2772), and none, so a zero
+        pixel, if -dmin stops them all.
 
-        Returns (S, F); the caller adds it to the accumulated intensity.
+        sample_coords_meters is (S, F, n_samples, 3), in the order of C's loops. Returns (S, F);
+        the caller adds it to the accumulated intensity.
         """
         I_bg = self._calculate_water_background_amplitude()
+        S, F, n_samples = sample_coords_meters.shape[:3]
         if self.beam_config.nopolar or oversample_polar:
-            return I_bg.expand(pixel_coords_meters.shape[:2])
+            return I_bg.expand(S, F)
 
-        diffracted = pixel_coords_meters / torch.linalg.norm(
-            pixel_coords_meters, dim=-1, keepdim=True
+        if source_directions is None:
+            incident = self.incident_beam_direction.reshape(-1, 3)
+            wavelength_A = self.wavelength.reshape(-1)
+        else:
+            incident = -source_directions
+            wavelength_A = source_wavelengths_A
+        n_sources = incident.shape[0]
+
+        diffracted = sample_coords_meters / torch.linalg.norm(
+            sample_coords_meters, dim=-1, keepdim=True
         ).clamp_min(1e-30)
-        incident = self.incident_beam_direction
-        if incident.dim() == 2:  # multiple sources: C caches the factor from the first one
-            incident = incident[0]
+        dmin = self.beam_config.dmin
+        if dmin is not None and dmin > 0:
+            scattering = (diffracted.unsqueeze(3) - incident) / wavelength_A.unsqueeze(-1)
+            stol = 0.5 * torch.linalg.norm(scattering, dim=-1)
+            reached = ~((stol > 0) & (dmin > 0.5 / stol))  # (S, F, n_samples, n_sources)
+            reached = reached.flatten(2)
+            first = reached.int().argmax(dim=-1)
+            any_reached = reached.any(dim=-1)
+        else:
+            first = torch.zeros((S, F), dtype=torch.long, device=self.device)
+            any_reached = None
+
+        first_sample = torch.div(first, n_sources, rounding_mode="floor")
+        first_diffracted = diffracted.gather(
+            2, first_sample.view(S, F, 1, 1).expand(S, F, 1, 3)
+        ).squeeze(2)
         polar = polarization_factor(
             torch.as_tensor(self.beam_config.polarization_factor, device=self.device, dtype=self.dtype),
-            incident.expand_as(diffracted).reshape(-1, 3).contiguous(),
-            diffracted.reshape(-1, 3).contiguous(),
+            incident[first % n_sources].reshape(-1, 3).contiguous(),
+            first_diffracted.reshape(-1, 3).contiguous(),
             torch.as_tensor(self.beam_config.polarization_axis, device=self.device, dtype=self.dtype),
-        ).reshape(pixel_coords_meters.shape[:2])
+        ).reshape(S, F)
+        if any_reached is not None:
+            polar = polar * any_reached.to(polar.dtype)
         return I_bg * polar
 
     def _calculate_water_background_amplitude(self) -> torch.Tensor:

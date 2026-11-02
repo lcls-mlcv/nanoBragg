@@ -2141,3 +2141,31 @@ cases:
       - name: random-misset-phi-mosaic
         extra_args: >-
           -misset_seed 80725 -misset random -phi 45.4 -osc 2.79 -phisteps 2 -mosaic 1.34 -mosaic_dom 2 -mosaic_seed 87101
+
+  - id: PARITY-WATER-003
+    description: Water's cached polarization is that of the first sample and source -dmin lets through, and nothing if there is none
+    base_args: >-
+      -dtype float64 -cell 76.5 97.5 98.8 78.6 73.1 94.1 -default_F 100 -Na 8 -Nb 6 -Nc 2 -pixel 1 -detpixels 53 -distance 57 -wave 0.95 -polar 0.25 -square_xtal -water 286 -seed 9450615
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: sources
+        extra_args: >-
+          -oversample 1 -hdivrange 4 -hdivsteps 3
+      - name: sources-curved
+        extra_args: >-
+          -oversample 1 -hdivrange 4 -hdivsteps 3 -curved_det -pixel 0.05 -distance 113.8
+      - name: two-wavelengths-curved-dmin
+        extra_args: >-
+          -oversample 1 -dispersion 1.17 -dispsteps 2 -curved_det -dmin 2.94
+      - name: sources-dmin-subpixels
+        extra_args: >-
+          -oversample 2 -hdivrange 4 -hdivsteps 3 -dmin 3
+      - name: single-beam-dmin
+        extra_args: >-
+          -oversample 1 -dmin 3
+      - name: dmin-sensor-layers
+        extra_args: >-
+          -oversample 2 -dmin 3 -hdivrange 4 -hdivsteps 3 -detector_thick 100 -detector_abs 300 -detector_thicksteps 2
