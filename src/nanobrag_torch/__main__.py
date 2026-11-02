@@ -194,10 +194,11 @@ Examples:
                         help='Spindle rotation axis')
     parser.add_argument('-pix0_vector', nargs=3, type=float,
                         metavar=('X', 'Y', 'Z'),
-                        help='Detector origin offset (meters)')
+                        help='Selects the CUSTOM convention and nothing else, as in nanoBragg.c, which '
+                             'recomputes the detector origin from the beam centre and discards the value (meters)')
     parser.add_argument('-pix0_vector_mm', nargs=3, type=float,
                         metavar=('X', 'Y', 'Z'),
-                        help='Detector origin offset (millimeters)')
+                        help='As -pix0_vector: selects CUSTOM, and the value is discarded (millimeters)')
 
     # Beam centers
     parser.add_argument('-Xbeam', type=float, metavar='MM',

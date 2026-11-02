@@ -2404,11 +2404,13 @@ class Simulator:
         - r_e^2 = classical electron radius squared
         - fluence = photons per square meter
         - water_size = water thickness in micrometers converted to meters
+        - 1e6 = density of water, g/m^3
         - Avogadro = 6.02214179e23 mol^-1
         - water_MW = 18 g/mol
 
-        Note: The 1e6 factor is as specified in the C code; it creates a unit inconsistency
-        but we replicate it exactly for compatibility.
+        So the factors after r_e^2*fluence count the molecules in a cube of water_size on a side.
+        The pixel loop multiplies by r_e^2*fluence again, so the image is quadratic in fluence,
+        as in C: see docs/bugs/verified_c_bugs.md.
 
         Returns:
             I_bg as a scalar tensor, before any of the per-pixel corrections.
@@ -2421,8 +2423,7 @@ class Simulator:
         # Convert water size from micrometers to meters
         water_size_m = self.beam_config.water_size_um * 1e-6
 
-        # Calculate background intensity per spec formula
-        # Note: The 1e6 factor creates unit inconsistency but matches C code
+        # nanoBragg.c:2515; 1e6 is the density of water in g/m^3
         I_bg = (
             F_bg * F_bg
             * self._r_e_sqr_fluence()
