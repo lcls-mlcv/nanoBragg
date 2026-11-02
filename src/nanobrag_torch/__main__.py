@@ -2112,6 +2112,9 @@ def main():
 
     except Exception as e:
         import traceback
+        if isinstance(e, MemoryError) or "allocate" in str(e):  # torch's CPU allocator raises RuntimeError
+            print(f"Error: out of memory, no image written: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"Error: {e}", file=sys.stderr)
         traceback.print_exc()
         sys.exit(1)

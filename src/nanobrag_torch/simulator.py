@@ -492,6 +492,33 @@ def compute_physics_for_position(
 R_E_SQR = 7.94079248018965e-30  # classical electron radius squared (meters squared)
 
 
+def _memory_available_bytes(device: torch.device) -> Optional[int]:
+    """What this process can still allocate on device, or None if there is no telling."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.cuda.mem_get_info(device)[0]
+    if device.type != "cpu":
+        return None
+    limits = []
+    try:
+        with open("/proc/meminfo") as meminfo:
+            limits += [int(line.split()[1]) * 1024 for line in meminfo if line.startswith("MemAvailable:")]
+    except OSError:
+        if hasattr(os, "sysconf_names") and "SC_PHYS_PAGES" in os.sysconf_names:
+            limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    try:
+        import resource
+
+        address_space = resource.getrlimit(resource.RLIMIT_AS)[0]
+        if address_space != resource.RLIM_INFINITY:
+            with open("/proc/self/statm") as statm:
+                used = int(statm.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+            limits.append(max(address_space - used, 0))
+    except (ImportError, OSError):
+        pass
+    return min(limits) if limits else None
+
+
 def _widest_float(device: torch.device) -> torch.dtype:
     """float64, or float32 on a device that has no doubles (MPS)."""
     return torch.float32 if torch.device(device).type == "mps" else torch.float64
@@ -1245,6 +1272,30 @@ class Simulator:
             capture_fraction_for_trace,
         )
 
+    def _warn_if_memory_runs_out(self, S: int, F: int, oversample: int, n_sources: int,
+                                 pixel_batch_size: Optional[int]) -> None:
+        """Say what a run will need when that is more than there is. The run still goes ahead.
+
+        C holds one sample at a time, so its time grows with oversample^2 and torch's memory does.
+        Measured, CPU: 40 words of the run's dtype per sample, phi step, mosaic domain and source.
+        """
+        n_layers = self.detector.thickness_layers()[0]
+        n_phi = max(int(self.crystal.config.phi_steps), 1)
+        n_mosaic = max(int(self.crystal.config.mosaic_domains), 1)
+        rows = S if pixel_batch_size is None else min(pixel_batch_size, S)
+        needed = (40 * torch.finfo(self.dtype).bits // 8 * rows * F * oversample * oversample
+                  * max(n_layers, 1) * max(n_sources, 1) * n_phi * n_mosaic)
+        available = _memory_available_bytes(self.device)
+        if available is not None and needed > available:
+            warnings.warn(
+                f"This run needs about {needed / 1e9:.3g} GB and {available / 1e9:.3g} GB is available: "
+                f"{F}x{S} pixels at {oversample}-fold oversampling, {n_layers} sensor layers, {n_sources} "
+                f"sources, {n_phi} phi steps, {n_mosaic} mosaic domains. Memory grows as oversample^2, "
+                f"and C picks the same oversample but holds one sample at a time. It will probably fail. "
+                f"A lower -oversample changes the image; pixel_batch_size in Simulator.run does not.",
+                stacklevel=3,
+            )
+
     def _auto_oversample(self) -> int:
         """nanoBragg.c's auto oversample, frozen once any of its inputs requires grad.
 
@@ -1495,8 +1546,8 @@ class Simulator:
         if oversample_thick is None:
             oversample_thick = self.detector.config.oversample_thick
 
-        # Auto-select oversample if set to -1 (matches C behavior)
-        if oversample == -1:
+        # Auto-select oversample if it is not positive (nanoBragg.c:2081)
+        if oversample <= 0:
             oversample = self._auto_oversample()
 
         # For now, we'll implement the base case without oversampling for this test
@@ -1608,6 +1659,7 @@ class Simulator:
         # bound peak memory; scaling, background, ROI and trace below are applied once to the
         # assembled image, so chunked and unchunked runs give the same result.
         S, F, _ = pixel_coords_meters.shape
+        self._warn_if_memory_runs_out(S, F, oversample, n_sources, pixel_batch_size)
         kernel_args = dict(
             rot_a=rot_a, rot_b=rot_b, rot_c=rot_c,
             rot_a_star=rot_a_star, rot_b_star=rot_b_star, rot_c_star=rot_c_star,
