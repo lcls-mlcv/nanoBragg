@@ -326,6 +326,7 @@ def mosaic_rotation_umats(
     dtype: Optional[torch.dtype] = None,
     device: torch.device = torch.device('cpu'),
     rng: Optional[CLCG] = None,
+    single_precision_rot: bool = True,
 ) -> torch.Tensor:
     """Every mosaic domain's rotation matrix, exactly as nanoBragg.c builds them.
 
@@ -344,6 +345,9 @@ def mosaic_rotation_umats(
     ``mosaicity`` is the spread in radians and may be a tensor: it enters only through
     ``rot = mosaicity * (1 - r3^2)^(1/3)``, so gradients flow while the deviates stay
     frozen, exactly the reparameterisation the Gaussian sampler used to provide.
+
+    C rounds rot to single. ``single_precision_rot=False`` keeps it in dtype, for a mosaicity being
+    refined, where rounding would make the value a staircase under a gradient that is not zero.
 
     Returns (n_domains, 3, 3).
     """
@@ -383,9 +387,10 @@ def mosaic_rotation_umats(
     # mosaicity_t is the only tensor input, so the gradient path runs through rot alone
     rot_scale = torch.tensor(rot_scale_l, dtype=dtype, device=device)
     rot = mosaicity_t * rot_scale
-    # C rounds rot to single, which is 8e-6 rad at the 90 rad of a random orientation. A shift, so
-    # that d(rot)/d(mosaicity) stays rot_scale.
-    rot = rot + ((mosaicity_t.detach().to(torch.float32) * rot_scale.to(torch.float32)).to(dtype) - rot.detach())
+    if single_precision_rot:
+        # 8e-6 rad at the 90 rad of a random orientation. A shift, so that d(rot)/d(mosaicity)
+        # stays rot_scale.
+        rot = rot + ((mosaicity_t.detach().to(torch.float32) * rot_scale.to(torch.float32)).to(dtype) - rot.detach())
 
     t1 = torch.cos(rot)
     t2 = 1.0 - t1

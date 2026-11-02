@@ -1413,6 +1413,9 @@ class Crystal:
             dtype=self.dtype,
             device=self.device,
             rng=rng,
+            # C has no refinement to keep smooth, so everything else stays C's to the bit. Read from
+            # the config, so that a line search under no_grad gets the same values.
+            single_precision_rot=not getattr(config.mosaic_spread_deg, "requires_grad", False),
         )
 
     def _apply_static_orientation(self, vectors: dict) -> dict:
