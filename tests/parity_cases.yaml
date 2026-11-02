@@ -2066,3 +2066,37 @@ cases:
           max_rel_max: 2.0e-7
         extra_args: >-
           -adc 10 -dmin 2.72 -dtype float64
+
+  - id: PARITY-POLAR-001
+    description: -nopolar only stops the cached factor, and -polar and -nopolar go by argv order
+    base_args: >-
+      -dtype float64 -cell 70 80 90 90 90 90 -default_F 100 -N 5 -detpixels 32 -oversample 1 -seed 1
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: nopolar-oversample-polar
+        extra_args: >-
+          -nopolar -oversample_polar
+      - name: nopolar-oversample-polar-subpixels
+        extra_args: >-
+          -nopolar -oversample_polar -oversample 2
+      - name: polar-then-nopolar-oversample-polar
+        extra_args: >-
+          -polar 0.7 -nopolar -oversample_polar
+      - name: nopolar-then-polar-oversample-polar
+        extra_args: >-
+          -nopolar -polar 0.7 -oversample_polar
+      - name: nopolar-then-polar
+        extra_args: >-
+          -nopolar -polar 0.7
+      - name: polar-then-nopolar
+        extra_args: >-
+          -polar 0.7 -nopolar
+      - name: nopolar-oversample-polar-water
+        extra_args: >-
+          -nopolar -oversample_polar -water 100
+      - name: nopolar-oversample-polar-sources
+        extra_args: >-
+          -nopolar -oversample_polar -hdivrange 0.5 -hdivsteps 3

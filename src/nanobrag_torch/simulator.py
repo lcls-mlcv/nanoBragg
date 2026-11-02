@@ -643,12 +643,10 @@ class Simulator:
         # PERF-PYTORCH-006: Store as tensor with correct dtype
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad when nopolar is False
         # to maintain gradient graph for differentiable polarization_factor
-        if self.beam_config.nopolar:
-            self.kahn_factor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        else:
-            self.kahn_factor = as_tensor_preserving_grad(
-                self.beam_config.polarization_factor, device=self.device, dtype=self.dtype
-            )
+        # -nopolar keeps the factor: -oversample_polar puts polarization back regardless
+        self.kahn_factor = as_tensor_preserving_grad(
+            self.beam_config.polarization_factor, device=self.device, dtype=self.dtype
+        )
         self.polarization_axis = torch.tensor(
             self.beam_config.polarization_axis, device=self.device, dtype=self.dtype
         )
@@ -841,6 +839,11 @@ class Simulator:
         return (self._at_scale_width(self._r_e_sqr, self._r_e_sqr_exact)
                 * self._at_scale_width(self._fluence, self._fluence_exact))
 
+    def _polarized(self, oversample_polar: bool) -> bool:
+        """-nopolar only stops polarization being cached: nanoBragg.c:2772 tests oversample_polar
+        alone, so with it each sample is polarized anyway."""
+        return oversample_polar or not self.beam_config.nopolar
+
     def _weights_for_kernel(self) -> Optional[torch.Tensor]:
         """Per-source multipliers, or None for C's equal weighting.
 
@@ -852,7 +855,7 @@ class Simulator:
         weights = self._source_weights
         return len(weights) * weights / weights.sum()
 
-    def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None):
+    def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None, oversample_polar=False):
         """Compatibility shim - calls the pure function compute_physics_for_position.
 
         REFACTORING NOTE (PERF-PYTORCH-004 Phase 0):
@@ -907,7 +910,7 @@ class Simulator:
             crystal_fudge=self.crystal.config.fudge,
             spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
             # PERF-PYTORCH-004 P3.0b: Pass polarization parameters
-            apply_polarization=not self.beam_config.nopolar,
+            apply_polarization=self._polarized(oversample_polar),
             kahn_factor=self.kahn_factor,
             polarization_axis=self.polarization_axis,
         )
@@ -1039,7 +1042,8 @@ class Simulator:
                     coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     incident_beam_direction=incident_dirs_batched,
                     wavelength=wavelengths_batched,
-                    source_weights=source_weights
+                    source_weights=source_weights,
+                    oversample_polar=oversample_polar,
                 )
 
                 # Reshape back to (S, F, oversample*oversample)
@@ -1054,7 +1058,8 @@ class Simulator:
                 # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
                 physics_intensity_flat, physics_intensity_pre_polar_flat = self._compute_physics_for_position(
-                    coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star
+                    coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
+                    oversample_polar=oversample_polar,
                 )
 
                 # Reshape back to (S, F, oversample*oversample)
@@ -1175,14 +1180,16 @@ class Simulator:
                     pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     incident_beam_direction=incident_dirs_batched,
                     wavelength=wavelengths_batched,
-                    source_weights=source_weights
+                    source_weights=source_weights,
+                    oversample_polar=oversample_polar,
                 )
                 # The weighted sum over sources is done inside _compute_physics_for_position
             else:
                 # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
                 intensity, I_before_normalization_pre_polar = self._compute_physics_for_position(
-                    pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star
+                    pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
+                    oversample_polar=oversample_polar,
                 )
 
             # CLI-FLAGS-003 Phase M1: Save both post-polar (current intensity) and pre-polar for trace
@@ -2120,7 +2127,7 @@ class Simulator:
                                 crystal_shape=self.crystal.config.shape,
                                 crystal_fudge=self.crystal.config.fudge,
                                 spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
-                                apply_polarization=not self.beam_config.nopolar,
+                                apply_polarization=self._polarized(oversample_polar),
                                 kahn_factor=self.kahn_factor,
                                 polarization_axis=self.polarization_axis,
                             )

@@ -1293,10 +1293,13 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['fluence'] = args.fluence
 
     # Polarization
-    if args.nopolar:
-        config['nopolar'] = True
-    elif args.polar is not None:
+    # nanoBragg.c:818-826 walks argv: -polar clears nopolar, and -nopolar leaves the factor set
+    if args.polar is not None:
         config['polarization_factor'] = args.polar
+    if args.nopolar:
+        argv = getattr(args, '_argv', None) or []
+        polar_flags = [token for token in argv if token in ('-polar', '-nopolar')]
+        config['nopolar'] = not polar_flags or polar_flags[-1] == '-nopolar'
 
     # Divergence and dispersion parameters for source generation
     # Convert from mrad to radians for divergence parameters
@@ -1816,10 +1819,10 @@ def build_simulation(
     beam_config = BeamConfig(**beam_kwargs)
 
     # Polarization
+    if 'polarization_factor' in config:
+        beam_config.polarization_factor = config['polarization_factor']
     if config.get('nopolar'):
         beam_config.nopolar = True
-    elif 'polarization_factor' in config:
-        beam_config.polarization_factor = config['polarization_factor']
 
     # Set generated sources if available
     if 'source_directions' in config:
