@@ -855,10 +855,10 @@ class Simulator:
         .data, or turn into a leaf with requires_grad_. Then exact is stale or cut off from the
         graph, and public, which is all there is, gives the value.
         """
-        if not torch.equal(exact.detach().to(public.dtype), public.detach()):
-            return public.to(self._scale_dtype)
+        if not torch.equal(exact.detach().to(public), public.detach()):
+            return public.to(device=self.device, dtype=self._scale_dtype)
         if public.requires_grad and not exact.requires_grad:
-            return public.to(self._scale_dtype)
+            return public.to(device=self.device, dtype=self._scale_dtype)
         return exact
 
     def _r_e_sqr_fluence(self) -> torch.Tensor:

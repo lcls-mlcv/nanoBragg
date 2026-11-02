@@ -212,21 +212,17 @@ def sinc3(x: torch.Tensor) -> torch.Tensor:
         return 3.0 * (torch.sin(x_part) / x_part - torch.cos(x_part)) / (x_part * x_part)
 
     result = closed_form(torch.where(near_zero, torch.ones_like(x), x))
-    if near_zero.any():
-        # The closed form's derivative cancels worse than its value, so the gradient here is the
-        # series'. The value stays C's down to 1e-6. Below that it has no digits left, and C
-        # gets 1 only from exact x == 0, and 0 from any x under 1e-8. That is the forward beam
-        # on a sample point, where what C gets turns on the last bit of its pixel position,
-        # which torch's arithmetic does not reproduce. See docs/bugs/verified_c_bugs.md.
-        x2 = x * x
-        series = 1.0 + x2 * (-1.0 / 10.0 + x2 / 280.0)
-        with torch.no_grad():
-            keep_series = torch.abs(x) < 1e-6
-            value = closed_form(torch.where(keep_series, torch.ones_like(x), x))
-            value = torch.where(keep_series, series, value)
-        result = torch.where(near_zero, series + (value - series).detach(), result)
 
-    return result
+    # The closed form's derivative cancels worse than its value, so the gradient here is the
+    # series'. The value stays C's down to 1e-6. Below that it has no digits left, and C
+    # gets 1 only from exact x == 0, and 0 from any x under 1e-8. That is the forward beam
+    # on a sample point, where what C gets turns on the last bit of its pixel position,
+    # which torch's arithmetic does not reproduce. See docs/bugs/verified_c_bugs.md.
+    x2 = x * x
+    series = 1.0 + x2 * (-1.0 / 10.0 + x2 / 280.0)
+    keep_series = torch.abs(x) < 1e-6
+    value = torch.where(keep_series, series, closed_form(torch.where(keep_series, torch.ones_like(x), x))).detach()
+    return torch.where(near_zero, series + (value - series.detach()), result)
 
 
 def _sinc3_series(x: torch.Tensor) -> torch.Tensor:
