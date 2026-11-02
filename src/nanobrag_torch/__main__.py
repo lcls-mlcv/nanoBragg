@@ -1219,8 +1219,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['detector_thicksteps'] = args.detector_thicksteps
 
     # Crystal parameters
+    cells_from_flags = resolve_n_cells(args)
     config['Na'], config['Nb'], config['Nc'] = resolve_n_cells_from_sample(
-        args, config['cell_params'], resolve_n_cells(args)
+        args, config['cell_params'], cells_from_flags
     )
 
     # Crystal shape
@@ -1330,6 +1331,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['interpolate'] = True
     elif args.nointerpolate:
         config['interpolate'] = False
+    else:
+        # C chooses before -samplesize has set Na (nanoBragg.c:1779, 2065), so from the -N flags
+        config['interpolate'] = any(n <= 2 for n in cells_from_flags)
 
     # Output files. nanoBragg.c initialises all four filenames to defaults
     # (nanoBragg.c:145-150) and writes them whether or not a flag was given, so
