@@ -1770,7 +1770,7 @@ class Simulator:
             polarization_value = None
             if not oversample or oversample == 1:
                 # Calculate polarization factor for the entire detector when needed for trace
-                if self.beam_config.nopolar:
+                if not self._polarized(oversample_polar):
                     polarization_value = torch.ones_like(omega_pixel)
                 elif self.trace_pixel:
                     # Recompute polarization for the trace pixel
@@ -1809,7 +1809,8 @@ class Simulator:
                 steps,
                 capture_fraction_for_trace,
                 I_before_normalization,  # Post-polar accumulated intensity
-                I_before_normalization_pre_polar  # Pre-polar accumulated intensity
+                I_before_normalization_pre_polar,  # Pre-polar accumulated intensity
+                oversample_polar,
             )
 
         # PERF-PYTORCH-006: Ensure output matches requested dtype
@@ -1830,7 +1831,8 @@ class Simulator:
                            steps=None,
                            capture_fraction=None,
                            I_total=None,
-                           I_total_pre_polar=None):
+                           I_total_pre_polar=None,
+                           oversample_polar=False):
         """Apply debug output for -printout and -trace_pixel options.
 
         Args:
@@ -1944,9 +1946,9 @@ class Simulator:
                     b_vec = rot_b[0, 0] if len(rot_b.shape) > 1 else rot_b
                     c_vec = rot_c[0, 0] if len(rot_c.shape) > 1 else rot_c
 
-                    print(f"TRACE_PY: rot_a_angstroms {a_vec[0].item():.15g} {a_vec[1].item():.15g} {a_vec[2].item():.15g}")
-                    print(f"TRACE_PY: rot_b_angstroms {b_vec[0].item():.15g} {b_vec[1].item():.15g} {b_vec[2].item():.15g}")
-                    print(f"TRACE_PY: rot_c_angstroms {c_vec[0].item():.15g} {c_vec[1].item():.15g} {c_vec[2].item():.15g}")
+                    print(f"TRACE_PY: rot_a_angstroms {a_vec[0].item() * 1e10:.15g} {a_vec[1].item() * 1e10:.15g} {a_vec[2].item() * 1e10:.15g}")
+                    print(f"TRACE_PY: rot_b_angstroms {b_vec[0].item() * 1e10:.15g} {b_vec[1].item() * 1e10:.15g} {b_vec[2].item() * 1e10:.15g}")
+                    print(f"TRACE_PY: rot_c_angstroms {c_vec[0].item() * 1e10:.15g} {c_vec[1].item() * 1e10:.15g} {c_vec[2].item() * 1e10:.15g}")
 
                     # Spindle-axis instrumentation (CLI-FLAGS-003 Phase L3g)
                     # Emit raw spindle axis from config and normalized axis used by rotate_axis
@@ -1973,7 +1975,8 @@ class Simulator:
                     pixel_mag = torch.sqrt(torch.sum(coords_ang * coords_ang))
                     diffracted_unit = coords_ang / pixel_mag
                     incident_unit = self.incident_beam_direction
-                    scattering_vec = (diffracted_unit - incident_unit) / self.wavelength
+                    # rot_a etc. are in metres here, as in C, so the scattering vector is in 1/m
+                    scattering_vec = (diffracted_unit - incident_unit) / self.wavelength * 1e10
 
                     from nanobrag_torch.utils.geometry import dot_product
                     h = dot_product(scattering_vec.unsqueeze(0), a_vec.unsqueeze(0)).item()
@@ -2101,7 +2104,7 @@ class Simulator:
 
                     # Oversample flags
                     print(f"TRACE_PY: oversample_thick {1 if self.detector.config.oversample_thick else 0}")
-                    print(f"TRACE_PY: oversample_polar {1 if self.detector.config.oversample_polar else 0}")
+                    print(f"TRACE_PY: oversample_polar {1 if oversample_polar else 0}")
                     print(f"TRACE_PY: oversample_omega {1 if self.detector.config.oversample_omega else 0}")
 
                     # Capture fraction from detector absorption (actual value, not placeholder)
@@ -2198,7 +2201,7 @@ class Simulator:
 
                             # Compute per-source polarization factor (matches C-code calculation)
                             # The polarization is already applied in intensity_src, so we can derive it
-                            if I_pre_polar_src > 0 and not self.beam_config.nopolar:
+                            if I_pre_polar_src > 0 and self._polarized(oversample_polar):
                                 polar_src = I_post_polar_src / I_pre_polar_src
                             else:
                                 polar_src = 1.0
