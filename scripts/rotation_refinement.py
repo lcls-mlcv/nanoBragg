@@ -19,7 +19,7 @@ from scitbx.matrix import sqr
 from nanobrag_torch.compat.cctbx import _axis_angle_matrix, asu_structure_factors, experiment_model_from_dxtbx
 from nanobrag_torch.models.experiment import SerialExperiment
 from nanobrag_torch.utils.losses import gaussian_nll
-from nanobrag_torch.utils.refinement import refine_lbfgsb
+from nanobrag_torch.utils.refinement import git_commit, refine_lbfgsb
 
 P = argparse.ArgumentParser()
 P.add_argument("--expt", required=True, help="scan-varying refined experiments, one per lattice")
@@ -213,7 +213,7 @@ start = {i: score(f) for i, f in frames.items()}
 print("start (cc, nll/px):", start, flush=True)
 print("start G:", {i: [float(f"{g:.3g}") for g in G_of(f)] for i, f in frames.items()}, flush=True)
 print("peak GiB", round(torch.cuda.max_memory_allocated() / 2**30, 2), flush=True)
-result = dict(args=vars(A), start=start, dropped=[[int(v) for v in d] for d in dropped])
+result = dict(commit=git_commit(), args=vars(A), start=start, dropped=[[int(v) for v in d] for d in dropped])
 if not A.start_only:
     for f in (frames[i] for i in fit):
         for m in f["models"]:

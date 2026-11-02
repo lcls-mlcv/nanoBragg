@@ -172,3 +172,26 @@ def test_an_empty_list_of_terms_is_an_error():
     model, _ = _two_terms()
     with pytest.raises(ValueError, match="empty"):
         refine_lbfgsb(model, [])
+
+
+def test_git_commit_names_the_checkout(tmp_path, monkeypatch):
+    import subprocess
+    from pathlib import Path
+
+    from nanobrag_torch.utils import refinement
+
+    repo = Path(refinement.__file__).resolve().parent
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], capture_output=True, text=True)
+    if head.returncode != 0:
+        pytest.skip("not a git checkout")
+    assert refinement.git_commit().split("+")[0] == head.stdout.strip()
+
+    monkeypatch.setattr(refinement, "__file__", str(tmp_path / "refinement.py"))
+    assert refinement.git_commit() == "unknown"
+
+
+def test_rotation_refinement_records_the_commit():
+    from pathlib import Path
+
+    script = (Path(__file__).resolve().parents[1] / "scripts" / "rotation_refinement.py").read_text()
+    assert "result = dict(commit=git_commit()," in script

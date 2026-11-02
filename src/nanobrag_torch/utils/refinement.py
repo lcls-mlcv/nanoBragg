@@ -7,6 +7,8 @@ loop stalls: on a shot hopper refines to 0.0013 degrees in 112 iterations, Adam 
 torch.optim.LBFGS on the raw parameters stopped with G 34% off. Rescaling to comparable
 sensitivity, as hopper does, and using SciPy's L-BFGS-B gives hopper's answer.
 """
+import os
+import subprocess
 import warnings
 from typing import Callable, Optional, Sequence, Union
 
@@ -31,6 +33,21 @@ DEFAULT_SCALES = {
     "wavelength": 0.001,  # Angstrom, log scale
     "source_weights": 0.1,  # log weight
 }
+
+
+def git_commit() -> str:
+    """The commit this package runs from, "+dirty" if tracked files differ, "unknown" outside git.
+
+    For result files, so that a number can be traced to the code that made it.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        status = subprocess.run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no"],
+                                capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return head.stdout.strip() + ("+dirty" if status.stdout.strip() else "")
 
 
 def scaled_parameters(model, scales: Optional[dict] = None) -> list:
