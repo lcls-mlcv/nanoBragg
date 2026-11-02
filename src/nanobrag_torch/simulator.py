@@ -1321,7 +1321,9 @@ class Simulator:
                            for length, n in zip(self._cell_lengths_m(), cfg.N_cells))
         reciprocal_pixel_size = (self._wavelength_in_double() / 1.0e10) * distance_m / (
             _as_double(self.detector.config.pixel_size_mm) / 1000.0)
-        oversample = c_ceil_to_int(3.0 * xtalsize_max / reciprocal_pixel_size)
+        # A beam along the detector plane has distance 0; C divides by it, gets inf and so 1
+        oversample = c_ceil_to_int(3.0 * xtalsize_max / reciprocal_pixel_size
+                                   if reciprocal_pixel_size != 0.0 else math.inf)
         if oversample <= 0:
             oversample = 1
         logger.info(f"auto-selected {oversample}-fold oversampling")

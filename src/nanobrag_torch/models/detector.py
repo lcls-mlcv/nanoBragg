@@ -660,20 +660,9 @@ class Detector:
             rotation_matrix = angles_to_rotation_matrix(detector_rotx, detector_roty, detector_rotz)
             ratio = torch.dot(beam_vector, torch.matmul(rotation_matrix, odet_initial))
 
-            # Prevent division by zero while maintaining gradient flow
-            # Use torch operations to preserve gradients
-            min_ratio = torch.tensor(1e-10, device=self.device, dtype=self.dtype)
-            ratio = torch.where(
-                torch.abs(ratio) < min_ratio,
-                torch.sign(ratio) * min_ratio,
-                ratio
-            )
-            # Handle zero case
-            ratio = torch.where(
-                ratio == 0,
-                min_ratio,
-                ratio
-            )
+            # Only an exact zero is replaced, by the smallest normal number (nanoBragg.c:1712). A
+            # small ratio stays: -detector_roty 90 leaves 6e-17, and C's distance comes from it.
+            ratio = torch.where(ratio == 0, torch.finfo(self.dtype).tiny, ratio)
 
             # Update distance based on r-factor
             # If close_distance is specified, use it; otherwise calculate from nominal distance
