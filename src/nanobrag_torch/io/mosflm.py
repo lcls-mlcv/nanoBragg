@@ -4,9 +4,31 @@ This module provides functions for reading MOSFLM-style orientation matrices,
 which contain reciprocal lattice vectors scaled by wavelength.
 """
 
+import re
+
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Union
+
+
+# One %lg. fscanf takes the longest number it can and leaves the rest, so tokens need no space
+# between them; a mantissa followed by a bare exponent letter is a matching failure.
+_FSCANF_DOUBLE = re.compile(
+    r"\s*([+-]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+|(?![eE]))|inf(?:inity)?|nan))", re.IGNORECASE
+)
+
+
+def _read_doubles_as_fscanf(text: str, count: int) -> list:
+    """Up to count numbers from the start of text, stopping where %lg would."""
+    values = []
+    position = 0
+    while len(values) < count:
+        match = _FSCANF_DOUBLE.match(text, position)
+        if match is None:
+            break
+        values.append(float(match.group(1)))
+        position = match.end()
+    return values
 
 
 def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -46,29 +68,18 @@ def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple
 
     Raises:
         FileNotFoundError: If the matrix file doesn't exist
-        ValueError: If the file doesn't start with 9 numeric values
+        ValueError: If the file doesn't start with 9 numeric values. C reads them with
+            fscanf("%lg%lg%lg") three times, and at a heading or a stray token it carries
+            on with uninitialized vectors and a NaN cell, so here that is an error.
     """
     filepath = Path(filepath)
 
     if not filepath.exists():
         raise FileNotFoundError(f"MOSFLM matrix file not found: {filepath}")
 
-    # Read all values from the file
-    values = []
-    with open(filepath, 'r') as f:
-        for line in f:
-            # Skip comments and empty lines
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-
-            # Parse numeric values
-            parts = line.split()
-            for part in parts:
-                try:
-                    values.append(float(part))
-                except ValueError:
-                    continue
+    # A whole-line # comment is torch's own: C has no value to give for such a file (see Raises)
+    lines = filepath.read_text().splitlines(keepends=True)
+    values = _read_doubles_as_fscanf("".join(l for l in lines if not l.lstrip().startswith("#")), 9)
 
     if len(values) < 9:
         raise ValueError(
