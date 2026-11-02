@@ -1462,18 +1462,28 @@ def print_configuration(crystal_config, detector_config, beam_config, simulator_
     print("="*60 + "\n")
 
 
+def _c_atof(token: str) -> float:
+    """atof: the number a string starts with, 0 if it does not start with one."""
+    match = re.match(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", token)
+    return float(match.group(0)) if match else 0.0
+
+
 def warn_c_misset_seed_order(argv) -> None:
     """
-    Warn when ``-misset_seed`` follows ``-misset random``. nanoBragg.c matches
-    flags with strstr(), so it reads the later "-misset_seed N" as
-    "-misset N <next> <next>" and renders fixed angles instead of a random
-    orientation; the PyTorch CLI keeps the random orientation.
+    Warn when nanoBragg.c would read ``-misset_seed N`` as a fixed misset. It matches flags with
+    strstr(), so that token is also "-misset N <next> <next>", in degrees, whatever the next two
+    arguments are, unless a later -misset replaces it or fewer than three arguments follow.
+    Torch takes the flag for the seed it is. Copying C would orient the crystal by the text of
+    unrelated flags, so it warns instead, and says how to ask for C's angles.
     """
-    randoms = [i for i, a in enumerate(argv[:-1]) if a == '-misset' and argv[i + 1].startswith('rand')]
-    if randoms and '-misset_seed' in argv[randoms[-1] + 2:]:
+    last = max((i for i, a in enumerate(argv) if a in ('-misset', '-misset_seed')), default=None)
+    if last is not None and argv[last] == '-misset_seed' and last + 3 < len(argv):
+        angles = " ".join(f"{_c_atof(token):g}" for token in argv[last + 1:last + 4])
         warnings.warn(
-            "-misset_seed after -misset random: nanoBragg.c would use fixed misset angles here. "
-            "Put -misset_seed first to get the same random orientation from both programs.",
+            f"-misset_seed: nanoBragg.c reads this flag as a misset too, and would render fixed angles "
+            f"of {angles} deg here, taken from the arguments after it. This run does not. "
+            f"To get C's orientation pass -misset {angles}. For a random one put -misset_seed before "
+            "-misset random in both programs.",
             stacklevel=2,
         )
 
