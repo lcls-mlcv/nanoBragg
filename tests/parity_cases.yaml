@@ -2100,3 +2100,22 @@ cases:
       - name: nopolar-oversample-polar-sources
         extra_args: >-
           -nopolar -oversample_polar -hdivrange 0.5 -hdivsteps 3
+
+  - id: PARITY-SPOTRADIUS-001
+    description: A skewed cell's spot radius reads C's reciprocal vectors, which are 1/V_cell, not the inverse of a, b, c
+    base_args: >-
+      -dtype float64 -cell 115.8 44.5 46.8 103.4 99.4 96.8 -default_F 30 -N 4 -pixel 0.2 -detpixels 43 -distance 209.6 -energy 12108.8 -dials -nopolar -oversample 2 -seed 8
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: gauss
+        extra_args: >-
+          -gauss_xtal
+      - name: tophat
+        extra_args: >-
+          -tophat_spots
+      - name: gauss-misset-phi
+        extra_args: >-
+          -gauss_xtal -misset 10 20 30 -phi 5 -osc 1 -phisteps 2

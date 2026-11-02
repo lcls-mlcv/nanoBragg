@@ -1530,6 +1530,10 @@ class Simulator:
             rot_a = rot_a.to(device=self.device, dtype=self.dtype)
             rot_b = rot_b.to(device=self.device, dtype=self.dtype)
             rot_c = rot_c.to(device=self.device, dtype=self.dtype)
+            if (self.crystal.config.shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT)
+                    and getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL) is SpotMetric.RECIPROCAL):
+                scale = self.crystal.c_reciprocal_scale
+                rot_a_star, rot_b_star, rot_c_star = rot_a_star * scale, rot_b_star * scale, rot_c_star * scale
             rot_a_star = rot_a_star.to(device=self.device, dtype=self.dtype)
             rot_b_star = rot_b_star.to(device=self.device, dtype=self.dtype)
             rot_c_star = rot_c_star.to(device=self.device, dtype=self.dtype)

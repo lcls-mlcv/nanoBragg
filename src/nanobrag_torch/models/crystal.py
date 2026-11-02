@@ -963,6 +963,9 @@ class Crystal:
         b_star = c_cross_a * V_star_actual
         c_star = a_cross_b * V_star_actual
 
+        # C keeps dividing by the volume it had; only the spot radius below reads C's vectors
+        c_reciprocal_scale = V_actual / V
+
         # Update V to the actual volume
         V = V_actual
 
@@ -974,6 +977,7 @@ class Crystal:
             "b_star": b_star,
             "c_star": c_star,
             "V": V,
+            "c_reciprocal_scale": c_reciprocal_scale,
         }
 
     def _compute_cell_tensors_cached(self):
@@ -1002,6 +1006,17 @@ class Crystal:
     def c(self) -> torch.Tensor:
         """Real-space lattice vector c (Angstroms)."""
         return self._compute_cell_tensors_cached()["c"]
+
+    @property
+    def c_reciprocal_scale(self) -> torch.Tensor:
+        """C's a_star, b_star, c_star over these, 1.0005 for a skewed -cell.
+
+        A skewed cell's real vectors, of the lengths asked for, enclose a little more than the
+        formula's V_cell, and nanoBragg.c:1958 regenerates the reciprocal vectors with 1/V_cell,
+        so they are not quite the inverse of a, b, c. Torch's are, as the metric needs. C's show
+        only in the radius of -gauss_xtal and -tophat_spots, which uses them (nanoBragg.c:2852).
+        """
+        return self.compute_cell_tensors()["c_reciprocal_scale"]
 
     @property
     def a_star(self) -> torch.Tensor:
