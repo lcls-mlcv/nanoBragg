@@ -720,6 +720,8 @@ class Simulator:
         self._refresh_pixel_coords()
 
         self._frozen_auto_oversample = None  # see _auto_oversample
+        if self.detector.config.oversample <= 0:
+            self._freeze_auto_oversample_if_differentiable()
         self._refresh_roi_mask()
 
         # Compile the physics computation function with appropriate mode
@@ -1294,20 +1296,56 @@ class Simulator:
         """nanoBragg.c's auto oversample, frozen once any of its inputs requires grad.
 
         C picks ceil(3 * xtalsize / reciprocal_pixel_size) per run. That is a step
-        function of the cell, wavelength, distance and pixel size: recomputing it while
-        one of them is being refined makes the loss jump wherever the argument crosses
-        an integer (cell_a = 200 A with the default geometry flips 3 -> 4 across 1e-6).
-        So when any input requires grad, the first value chosen is kept for the life of
-        this Simulator and a warning says so; pass oversample explicitly to choose it.
-        With no differentiable inputs it is recomputed every run, as C does.
+        function of everything in _auto_oversample_inputs: recomputing it while one of
+        them is being refined makes the loss jump wherever the argument crosses an
+        integer (cell_a = 200 A with the default geometry flips 3 -> 4 across 1e-6).
+        So when any input requires grad, the value is chosen at construction, or at the
+        run that first finds one, and kept for the life of this Simulator, and a warning
+        says so; pass oversample explicitly to choose it. With no differentiable inputs
+        it is recomputed every run, as C does.
         """
+        self._freeze_auto_oversample_if_differentiable()
         if self._frozen_auto_oversample is not None:
             return self._frozen_auto_oversample
+        return self._select_auto_oversample()
 
+    def _auto_oversample_inputs(self) -> dict:
+        """Everything _select_auto_oversample reads, by name.
+
+        That is C's a[0]*Na, b[0]*Nb, c[0]*Nc, its lambda0, its pixel size, and its
+        close_distance/ratio, which every field the detector's geometry is built from enters.
+        """
         cfg = self.crystal.config
-        cells = (cfg.cell_a, cfg.cell_b, cfg.cell_c)
-        geometry = (self.wavelength, self.detector.config.distance_mm,
-                    self.detector.config.pixel_size_mm)
+        inputs = {f"cell_{name}": getattr(cfg, f"cell_{name}") for name in ("a", "b", "c", "alpha", "beta", "gamma")}
+        inputs.update(N_cells=cfg.N_cells, misset_deg=cfg.misset_deg, mosflm_a_star=cfg.mosflm_a_star,
+                      mosflm_b_star=cfg.mosflm_b_star, mosflm_c_star=cfg.mosflm_c_star,
+                      wavelength=self.wavelength, wavelength_A=self._wavelength_given)
+        inputs.update((name, getattr(self.detector.config, name, None)) for name in Detector._GEOMETRY_FIELDS)
+        return inputs
+
+    def _freeze_auto_oversample_if_differentiable(self) -> None:
+        if self._frozen_auto_oversample is not None:
+            return
+
+        def differentiable(x):
+            if isinstance(x, (tuple, list)):
+                return any(differentiable(item) for item in x)
+            return isinstance(x, torch.Tensor) and x.requires_grad
+
+        names = [name for name, x in self._auto_oversample_inputs().items() if differentiable(x)]
+        if names:
+            self._frozen_auto_oversample = self._select_auto_oversample()
+            warnings.warn(
+                f"oversample=-1 (auto) with differentiable inputs ({', '.join(names)}): "
+                f"keeping the auto-selected {self._frozen_auto_oversample}-fold oversampling for this "
+                f"Simulator, since re-selecting it as the parameters move would make the loss "
+                f"discontinuous. Pass oversample explicitly to choose the value.",
+                stacklevel=3,
+            )
+
+    def _select_auto_oversample(self) -> int:
+        """C's ceil(3 * xtalsize / reciprocal_pixel_size) for the inputs as they stand."""
+        cfg = self.crystal.config
 
         # All in double, as in C, whatever the run's dtype: where the argument is a whole number
         # float32 rounding moves the ceil
@@ -1328,15 +1366,6 @@ class Simulator:
             oversample = 1
         logger.info(f"auto-selected {oversample}-fold oversampling")
 
-        if any(isinstance(x, torch.Tensor) and x.requires_grad for x in cells + geometry):
-            self._frozen_auto_oversample = oversample
-            warnings.warn(
-                f"oversample=-1 (auto) with differentiable cell/wavelength/detector inputs: "
-                f"keeping the auto-selected {oversample}-fold oversampling for this Simulator, "
-                f"since re-selecting it as the parameters move would make the loss "
-                f"discontinuous. Pass oversample explicitly to choose the value.",
-                stacklevel=3,
-            )
         return oversample
 
     def _cell_lengths_m(self) -> tuple:
