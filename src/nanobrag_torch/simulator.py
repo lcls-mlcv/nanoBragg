@@ -366,8 +366,9 @@ def compute_physics_for_position(
             F_latt = Na * Nb * Nc * torch.exp(-(rad_sqr / 0.63) * fudge)
         else:
             inside_cutoff = (rad_sqr * fudge) < 0.3969
+            # N may be a tensor with a graph, in ExperimentModel, which full_like will not take
             F_latt = torch.where(inside_cutoff,
-                                torch.full_like(rad_sqr, Na * Nb * Nc),
+                                Na * Nb * Nc * torch.ones_like(rad_sqr),
                                 torch.zeros_like(rad_sqr))
     else:
         raise ValueError(f"Unsupported crystal shape: {shape}")

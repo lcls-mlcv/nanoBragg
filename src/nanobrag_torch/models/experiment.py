@@ -183,14 +183,22 @@ class CrystalStageAParams(nn.Module):
         # SQUARE's sincg(pi*h, N) = sin(N*pi*h)/sin(pi*h) only has a finite limit at
         # integer h for integer N: at N = 5.3 the image sum is 157x and the peak 4000x
         # the N = 5 values, and d(sum)/dN changes sign between 5.0 and 5.001. Continuous
-        # Ncells is only meaningful for the smooth shapes (GAUSS, ROUND, TOPHAT), which
-        # is also what diffBragg refines.
-        self.ncells_refinable = base_config.shape != CrystalShape.SQUARE
-        if not self.ncells_refinable:
+        # Ncells is only meaningful for the smooth shapes (GAUSS, ROUND), which is also
+        # what diffBragg refines. TOPHAT's value is fine, but its edge is a step in N: the
+        # gradient sees the N^6 inside and not the spot shrinking: d(log sum)/d(log N) reads 6,
+        # and a finite difference at h = 0.03 in log N gives -0.65.
+        self.ncells_refinable = base_config.shape not in (CrystalShape.SQUARE, CrystalShape.TOPHAT)
+        if base_config.shape == CrystalShape.SQUARE:
             self.unrefinable["delta_log_N_cells"] = (
                 "Ncells is not refinable with shape=SQUARE: sin(N*pi*h)/sin(pi*h) "
                 "diverges next to every Bragg peak for non-integer N. Use "
-                "CrystalShape.GAUSS (as diffBragg does), ROUND or TOPHAT."
+                "CrystalShape.GAUSS (as diffBragg does) or ROUND."
+            )
+        elif base_config.shape == CrystalShape.TOPHAT:
+            self.unrefinable["delta_log_N_cells"] = (
+                "Ncells is not refinable with shape=TOPHAT: the spot's edge is a hard cutoff that "
+                "moves with N, which a gradient cannot see, so it follows the N^6 inside the spot "
+                "and misses the spot shrinking. Use CrystalShape.GAUSS (as diffBragg does) or ROUND."
             )
 
         self.crystal_system = normalize_crystal_system(crystal_system)
