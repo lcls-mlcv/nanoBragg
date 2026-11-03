@@ -1,6 +1,7 @@
 """A -mat file as C reads it: the first nine numbers, and lambda 1 A if no flag gave one."""
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -86,3 +87,29 @@ def test_glued_numbers_give_cs_image(tmp_path):
         images[label] = np.fromfile(tmp_path / label / "f.bin", dtype=np.float32).astype(np.float64)
     assert images["c"].max() > 0
     assert np.abs(images["c"] - images["py"]).max() <= 2e-7 * images["c"].max()
+
+
+GLUED_FREE = "-0.00863950 -0.00757690 -0.01048150\n 0.01012530 0.00702000 -0.00317500\n 0.00232420 -0.01111500 -0.00891000\n"
+
+
+@pytest.mark.parametrize("cell", ["60 60 60 90 90 90", "70 80 90 75 85 95", "100 100 150 90 90 120"])
+@pytest.mark.parametrize("misset", ["", "-misset 10 20 30"], ids=["no_misset", "misset"])
+def test_cell_with_a_matrix_sets_the_lengths_as_in_c(cell, misset, tmp_path):
+    """-cell with -mat: C's user_cell stays 1, so the matrix orients and -cell sets lengths (nanoBragg.c:1935)."""
+    c_bin = os.environ.get("NB_C_BIN")
+    if not c_bin or not Path(c_bin).exists():
+        pytest.skip("set NB_C_BIN to the oracle binary")
+    (tmp_path / "x.mat").write_text(GLUED_FREE)
+    args = (f"-mat ../x.mat -cell {cell} -default_F 100 -N 5 -detpixels 32 -oversample 0 -lambda 1.3 {misset} "
+            "-floatfile f.bin").split()
+    images, chosen = {}, {}
+    for label, cmd in (("c", [str(Path(c_bin).resolve())]),
+                       ("py", [sys.executable, "-m", "nanobrag_torch", "-dtype", "float64"])):
+        (tmp_path / label).mkdir()
+        run = subprocess.run(cmd + args, cwd=tmp_path / label, env=ENV, capture_output=True, text=True, timeout=120,
+                             check=True)
+        chosen[label] = re.search(r"auto-selected (\d+)-fold oversampling", run.stdout + run.stderr).group(1)
+        images[label] = np.fromfile(tmp_path / label / "f.bin", dtype=np.float32).astype(np.float64)
+    assert chosen["py"] == chosen["c"]
+    assert images["c"].max() > 0
+    assert np.abs(images["c"] - images["py"]).max() <= 1e-5 * images["c"].max()

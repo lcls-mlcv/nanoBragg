@@ -145,6 +145,9 @@ class CrystalConfig:
     mosflm_a_star: Optional[np.ndarray] = None  # MOSFLM a* reciprocal vector (Å⁻¹)
     mosflm_b_star: Optional[np.ndarray] = None  # MOSFLM b* reciprocal vector (Å⁻¹)
     mosflm_c_star: Optional[np.ndarray] = None  # MOSFLM c* reciprocal vector (Å⁻¹)
+    # -cell given as well as -mat: C's user_cell is still set, so the matrix gives the orientation
+    # and cell_a..cell_gamma give the lengths and the volume (nanoBragg.c:1935-1942)
+    mosflm_with_user_cell: bool = False
 
     # Spindle rotation parameters
     phi_start_deg: float = 0.0

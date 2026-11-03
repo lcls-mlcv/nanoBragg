@@ -843,7 +843,8 @@ class Crystal:
             and hasattr(self.config, "mosflm_c_star") and self.config.mosflm_c_star is not None
         )
 
-        if mosflm_provided:
+        # With -cell as well, C's user_cell is still 1 and it rescales as below (nanoBragg.c:1935-1942)
+        if mosflm_provided and not getattr(self.config, "mosflm_with_user_cell", False):
             # MOSFLM matrix provided (CLI-FLAGS-003 Phase K3g1)
             # Recompute cell volume and real vectors from MOSFLM reciprocal vectors
             #

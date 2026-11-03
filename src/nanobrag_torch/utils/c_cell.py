@@ -84,19 +84,22 @@ def c_cell_lengths_m(
     cell: Sequence[float],
     misset_deg: Sequence[float] = (0.0, 0.0, 0.0),
     reciprocal: Optional[Sequence[Vector]] = None,
+    user_cell: bool = True,
 ) -> Vector:
     """a[0], b[0], c[0] as nanoBragg.c:2071 has them, in metres.
 
     Args:
         cell: a, b, c in A, alpha, beta, gamma in degrees
         misset_deg: the misset angles
-        reciprocal: a*, b*, c* of a matrix, in 1/A, in place of the cell
+        reciprocal: a*, b*, c* of a matrix, in 1/A, in place of the cell's orientation
+        user_cell: whether -cell was given; with a matrix it still sets the lengths and volume
+            (nanoBragg.c:1935-1942)
     """
     a, b, c = cell[:3]
     V_user = None
-    if reciprocal is None:
+    if user_cell:
         stars, V_user = _reciprocal_from_cell(a, b, c, *(angle / RTD for angle in cell[3:]))
-    else:
+    if reciprocal is not None:
         stars = reciprocal
     a_star, b_star, c_star = (_rotate(star, *(angle / RTD for angle in misset_deg)) for star in stars)
 

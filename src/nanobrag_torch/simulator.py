@@ -1388,7 +1388,8 @@ class Simulator:
             reciprocal = [tuple(float(x) for x in star)
                           for star in (cfg.mosflm_a_star, cfg.mosflm_b_star, cfg.mosflm_c_star)]
         misset = [_as_double(angle) for angle in cfg.misset_deg]
-        return c_cell_lengths_m(cell, misset, reciprocal)
+        return c_cell_lengths_m(cell, misset, reciprocal,
+                                user_cell=reciprocal is None or getattr(cfg, "mosflm_with_user_cell", False))
 
     def _wavelength_in_double(self) -> float:
         """The run's wavelength, with the digits it was given if the run's dtype cut them off."""

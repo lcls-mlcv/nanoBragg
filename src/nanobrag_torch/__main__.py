@@ -1108,6 +1108,10 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # Also store wavelength if not already set
         if 'wavelength_A' not in config:
             config['wavelength_A'] = wavelength_A
+        if args.cell:
+            # C keeps user_cell with -mat: the matrix orients, -cell sets the lengths (nanoBragg.c:1935)
+            config['cell_params'] = args.cell
+            config['mosflm_with_user_cell'] = True
     elif args.cell:
         config['cell_params'] = args.cell
 
@@ -1605,7 +1609,8 @@ def build_simulation(
             # Phase G1: Pass MOSFLM orientation if provided
             mosflm_a_star=config.get('mosflm_a_star'),
             mosflm_b_star=config.get('mosflm_b_star'),
-            mosflm_c_star=config.get('mosflm_c_star')
+            mosflm_c_star=config.get('mosflm_c_star'),
+            mosflm_with_user_cell=config.get('mosflm_with_user_cell', False),
         )
 
         if 'misset_deg' in config:
