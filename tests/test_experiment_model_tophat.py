@@ -46,3 +46,19 @@ def test_a_refinable_parameter_still_has_its_gradient():
         warnings.simplefilter("ignore")
         model().sum().backward()
     assert model.trainable_parameters()[0].grad.abs().sum() > 0
+
+
+def test_a_simulator_with_an_ncells_leaf_runs_tophat():
+    """The ExperimentModel tests leave N without a graph, so only this one reaches the full_like fix."""
+    leaf = torch.tensor(10.0, dtype=torch.float64, requires_grad=True)
+    config = CrystalConfig(cell_a=70, cell_b=70, cell_c=70, N_cells=(leaf, 10, 10), default_F=100.0,
+                           shape=CrystalShape.TOPHAT)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        image = Simulator(Crystal(config, dtype=torch.float64), Detector(DETECTOR, dtype=torch.float64),
+                          beam_config=BEAM, dtype=torch.float64).run()
+        expected = Simulator(Crystal(CRYSTAL, dtype=torch.float64), Detector(DETECTOR, dtype=torch.float64),
+                             beam_config=BEAM, dtype=torch.float64).run()
+    assert expected.max() > 0
+    assert torch.equal(image.detach(), expected)
+    assert image.requires_grad
