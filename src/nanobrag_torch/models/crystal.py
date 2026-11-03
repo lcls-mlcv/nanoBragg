@@ -42,6 +42,11 @@ class _Kept:
     by the next read and the gradient reaches it at its current value, whatever its dtype or
     device. A copy converted once at construction fell behind such a change. A number becomes
     a tensor once, in the Crystal's dtype and device, and is remade from the number by to().
+
+    With a tensor of another dtype or device each read is a new copy, so change the tensor
+    that was given (or assign a new one): ``crystal.cell_a.requires_grad_()`` or
+    ``crystal.cell_a.data.fill_(x)`` then acts on a copy and is lost. Simulator's
+    wavelength, kahn_factor, polarization_axis and source tensors behave the same way.
     """
 
     def __set_name__(self, owner, name):
@@ -51,7 +56,11 @@ class _Kept:
     def __get__(self, obj, objtype=None):
         if obj is None:
             return self
-        return obj.__dict__[self.slot].to(device=obj.device, dtype=obj.dtype)
+        try:
+            value = obj.__dict__[self.slot]
+        except KeyError:
+            raise AttributeError(self.slot[len("_kept_"):]) from None
+        return value.to(device=obj.device, dtype=obj.dtype)
 
     def __set__(self, obj, value):
         if isinstance(value, torch.Tensor):
@@ -206,7 +215,7 @@ class Crystal:
 
         # Cell and N_cells are converted at each read; only those made from numbers are remade
         for name in self._KEPT:
-            type(self).__dict__[name].remake(self)
+            getattr(type(self), name).remake(self)  # through the class, so a subclass finds it
 
         if self.hkl_data is not None:
             self.hkl_data = self.hkl_data.to(device=self.device, dtype=self.dtype)

@@ -22,7 +22,6 @@ from .utils.c_cell import c_ceil_to_int, c_cell_lengths_m
 from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sincg_miller, sinc3, polarization_factor
-from .utils.tensor_utils import as_tensor_preserving_grad
 
 logger = logging.getLogger(__name__)
 
@@ -664,7 +663,7 @@ class Simulator:
         self._scale_dtype = _widest_float(self.device)
         self.r_e_sqr = R_E_SQR
         # Use fluence from beam config (AT-FLU-001)
-        # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
+        # Kept as given and converted at each use, as the wavelength is
         self.fluence = self.beam_config.fluence
         # Polarization setup from beam config, kept as the wavelength is
         # -nopolar keeps the factor: -oversample_polar puts polarization back regardless
@@ -819,10 +818,12 @@ class Simulator:
         given = self._source_wavelengths_given
         if given is None:
             n_sources = len(self._source_directions_given)
-            primary_m = self._wavelength_given * 1e-10
-            if isinstance(primary_m, torch.Tensor):
-                return self._at_run(primary_m).expand(n_sources)
-            return torch.full((n_sources,), primary_m, device=self.device, dtype=self.dtype)
+            primary = self._wavelength_given
+            if isinstance(primary, torch.Tensor):
+                # In the wider of the two dtypes, so a float32 leaf in a float64 run keeps its digits
+                wide = torch.promote_types(primary.dtype, self.dtype)
+                return self._at_run(primary.to(device=self.device, dtype=wide) * 1e-10).expand(n_sources)
+            return torch.full((n_sources,), primary * 1e-10, device=self.device, dtype=self.dtype)
         return self._at_run(given)
 
     @property
@@ -864,6 +865,9 @@ class Simulator:
     @wavelength.setter
     def wavelength(self, value) -> None:
         self._wavelength = self._kept(value)
+        # The digits as given, for what C reads as lambda0: the auto oversample and the
+        # wavelength of sources given none, so these follow an assignment as set_spectrum's
+        self._wavelength_given = value
 
     @property
     def kahn_factor(self) -> torch.Tensor:
@@ -2273,11 +2277,15 @@ class Simulator:
                         # Re-compute per-source intensities using single-source calls to avoid
                         # modifying the compiled production path
 
-                        for src_idx in range(len(self._source_directions)):
+                        # Converted once for the loop; each property converts on every read
+                        all_directions = self._source_directions
+                        all_wavelengths_A = self._source_wavelengths_A
+                        all_weights = self._source_weights
+                        for src_idx in range(len(all_directions)):
                             # Extract single source parameters
-                            src_direction = self._source_directions[src_idx:src_idx+1]  # Keep batch dim
-                            src_wavelength_A = self._source_wavelengths_A[src_idx:src_idx+1]
-                            src_weight = self._source_weights[src_idx].item() if self._source_weights is not None else 1.0
+                            src_direction = all_directions[src_idx:src_idx+1]  # Keep batch dim
+                            src_wavelength_A = all_wavelengths_A[src_idx:src_idx+1]
+                            src_weight = all_weights[src_idx].item() if all_weights is not None else 1.0
 
                             # Get pixel coordinate for trace pixel (single point)
                             coords_meters = pixel_coords_meters[target_slow:target_slow+1, target_fast:target_fast+1]  # (1, 1, 3)
