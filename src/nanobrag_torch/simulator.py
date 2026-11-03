@@ -1490,7 +1490,7 @@ class Simulator:
         `_geometry_version` rather than asking callers to rebuild.
         """
         # Touch the detector's own guard first, so its version is up to date.
-        self.detector._ensure_geometry_current()
+        self.detector._ensure_geometry_current(new_run=True)
         if self.detector._geometry_version != getattr(
             self, "_pixel_coords_geometry_version", None
         ):

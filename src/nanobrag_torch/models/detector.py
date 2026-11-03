@@ -94,6 +94,10 @@ class Detector:
         rather than two that can drift.
         """
         config = self.config
+        # Default beam centres are derived from the pixel size, so derive them again here
+        refresh = getattr(config, "refresh_default_beam_centers", None)
+        if refresh is not None:
+            refresh()
 
         # Copy dimension parameters
         self.spixels = config.spixels
@@ -391,7 +395,15 @@ class Detector:
             for name in self._GEOMETRY_FIELDS
         )
 
-    def _ensure_geometry_current(self) -> bool:
+    def _geometry_requires_grad(self) -> bool:
+        """Whether any input of the derived geometry is a tensor that requires grad."""
+        def differentiable(value):
+            if isinstance(value, (tuple, list)):
+                return any(differentiable(v) for v in value)
+            return isinstance(value, torch.Tensor) and value.requires_grad
+        return any(differentiable(getattr(self.config, name, None)) for name in self._GEOMETRY_FIELDS)
+
+    def _ensure_geometry_current(self, new_run: bool = False) -> bool:
         """Rebuild the derived geometry if the config has changed since last time.
 
         Returns True when a rebuild happened, so callers can also drop whatever
@@ -411,7 +423,12 @@ class Detector:
         config on each read would cost a device sync per read on CUDA.
         """
         fingerprint = self._current_geometry_fingerprint()
-        if fingerprint == self._geometry_fingerprint:
+        # At the start of a run with a differentiable geometry the derived tensors are built
+        # again, unchanged config or not: those of the last run carry its graph, which its
+        # backward has freed, so a second backward at the same value would go through it.
+        # Simulator.run asks once per run, so later calls in the run see it as current.
+        rebuild_for_grad = new_run and torch.is_grad_enabled() and self._geometry_requires_grad()
+        if fingerprint == self._geometry_fingerprint and not rebuild_for_grad:
             return False
 
         self._close_distance_cached = None
