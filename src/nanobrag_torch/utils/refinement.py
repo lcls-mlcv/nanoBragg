@@ -20,6 +20,7 @@ DEFAULT_SCALES = {
     "scale": 1.0,
     "fluence": 1.0,
     "Ncells": 0.1,
+    "Ndef": 0.5,  # cells, additive off-diagonals
     "eta": 0.1,
     "misset": 0.002,  # tanh(misset / 10 deg): 0.02 degrees
     "cell": 0.002,  # log a, b, c; raw angles
