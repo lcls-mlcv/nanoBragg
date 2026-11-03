@@ -317,12 +317,18 @@ class TestATParallel013CrossPlatformConsistency:
 
         for field in expected_fields:
             assert field in fingerprint, f"Missing platform field: {field}"
-            assert fingerprint[field], f"Empty platform field: {field}"
+            # platform.processor() is '' where it cannot be determined, as on GitHub's Linux runners
+            if field != 'processor':
+                assert fingerprint[field], f"Empty platform field: {field}"
 
         # Log fingerprint for record
         print("\n=== Platform Fingerprint ===")
         for key, value in fingerprint.items():
             print(f"{key}: {value}")
+
+    def test_platform_fingerprint_allows_an_unknown_processor(self, monkeypatch):
+        monkeypatch.setattr(platform, "processor", lambda: "")
+        self.test_platform_fingerprint()
 
     def test_numerical_precision_float64(self):
         """Test that float64 precision is maintained throughout."""
