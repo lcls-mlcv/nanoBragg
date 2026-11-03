@@ -832,9 +832,9 @@ class Crystal:
         #
         # vector_rescale normalizes and scales: new_vec = (target_mag / |old_vec|) * old_vec
         #
-        # CRITICAL (CLI-FLAGS-003 Phase K3a): The C code sets user_cell=0 when MOSFLM matrices
-        # are provided via -mat, which SKIPS this rescale path. When MOSFLM reciprocal vectors
-        # are supplied, they already encode the exact orientation and should not be altered.
+        # C sets user_cell only from -cell (nanoBragg.c:533) and never clears it. With -mat alone
+        # user_cell is 0 and this rescale is skipped, so the matrix's vectors stand as given; with
+        # -cell as well the rescale runs on the matrix's vectors (mosflm_with_user_cell).
 
         # Check if MOSFLM orientation was provided - if so, skip rescale
         mosflm_provided = (
