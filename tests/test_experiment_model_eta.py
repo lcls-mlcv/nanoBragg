@@ -153,3 +153,42 @@ def test_anisotropic_eta_lies_along_the_starting_crystal_axes():
     torch.testing.assert_close(umats, diffbragg_umats(eta, 10, crystal_axes=model.crystal_params.eta_axes),
                                rtol=0, atol=1e-15)
     assert (umats - diffbragg_umats(eta, 10)).abs().max() > 1e-4  # not the lab frame
+
+
+def _phi_model(anisotropic, phi_deg):
+    crystal, detector, beam = _configs(eta=0.5, domains=10)
+    crystal = replace(crystal, spindle_axis=(0.3, 0.2, 0.93), phi_start_deg=phi_deg, osc_range_deg=0.0, phi_steps=1)
+    model = ExperimentModel(crystal, detector, beam, dtype=torch.float64, anisotropic_mosaicity=anisotropic)
+    if anisotropic:
+        with torch.no_grad():  # eta_a = 2, eta_b = 0.3, eta_c = 0.05 degrees
+            model.crystal_params.delta_log_eta.copy_(torch.log(torch.tensor([4.0, 0.6, 0.1], dtype=torch.float64)))
+    model()
+    return model
+
+
+def _unrotated_domain_vectors(model, phi_deg):
+    """Each domain's a, b, c at this phi, turned back about the spindle by phi."""
+    from nanobrag_torch.utils.geometry import rotate_axis
+
+    crystal = model._crystal
+    (a, b, c), _ = crystal.get_rotated_real_vectors(crystal.config)
+    axis = torch.tensor(crystal.config.spindle_axis, dtype=torch.float64)
+    axis = (axis / axis.norm()).expand(a.shape[1], 3)
+    angle = torch.full((a.shape[1],), -math.radians(phi_deg), dtype=torch.float64)
+    return [rotate_axis(v[0], axis, angle) for v in (a, b, c)]
+
+
+@pytest.mark.parametrize("phi_deg", [30.0, 90.0])
+def test_the_anisotropic_ellipsoid_turns_with_the_crystal(phi_deg):
+    """Every domain at phi, turned back by phi, is the same domain at phi = 0: the spread
+    is fixed to the crystal's axes, as eta_a, eta_b, eta_c are defined."""
+    turned_back = _unrotated_domain_vectors(_phi_model(True, phi_deg), phi_deg)
+    at_zero = _unrotated_domain_vectors(_phi_model(True, 0.0), 0.0)
+    for got, want in zip(turned_back, at_zero):
+        torch.testing.assert_close(got, want, rtol=0, atol=1e-12)
+
+
+def test_isotropic_domains_keep_their_order_of_rotations():
+    """Isotropic domains are applied after phi, as before (and as nanoBragg.c applies its own)."""
+    model = _phi_model(False, 90.0)
+    assert not getattr(model._crystal, "mosaic_umats_in_crystal_frame", False)
