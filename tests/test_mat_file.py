@@ -47,6 +47,11 @@ def test_too_few_numbers_is_an_error(tmp_path):
     ("-0.00863950-0.00757690 -0.01048150 1 2 3 4 5 6", [-0.0086395, -0.0075769, -0.0104815, 1, 2, 3, 4, 5, 6]),
     ("1e-3-2E+2+3.5 .5 5. 0.1.2 1e2 7", [1e-3, -200, 3.5, 0.5, 5, 0.1, 0.2, 100, 7]),
     ("1\t2\n\n3 4\r\n5 6 7 8 9 trailing text", [1, 2, 3, 4, 5, 6, 7, 8, 9]),
+    # glibc's %lg takes an exponent letter (and sign) with no digits and returns the mantissa
+    ("1 2 3 4 5 6 7 8 1e", [1, 2, 3, 4, 5, 6, 7, 8, 1]),
+    ("1e 2 3 4 5 6 7 8 9", [1, 2, 3, 4, 5, 6, 7, 8, 9]),
+    ("1e+ 2 3 4 5 6 7 8 9", [1, 2, 3, 4, 5, 6, 7, 8, 9]),
+    ("1E- 2 3 4 5 6 7 8 9", [1, 2, 3, 4, 5, 6, 7, 8, 9]),
 ])
 def test_numbers_are_split_as_fscanf_splits_them(text, expected):
     from nanobrag_torch.io.mosflm import _read_doubles_as_fscanf
@@ -55,7 +60,7 @@ def test_numbers_are_split_as_fscanf_splits_them(text, expected):
 
 
 @pytest.mark.parametrize("text", [
-    "A matrix\n" + A_MATRIX, "1 2 3 x 4 5 6 7 8 9", "1 2 3 4 5 6 7 8 1e", "1 2 3 4 - 5 6 7 8 9",
+    "A matrix\n" + A_MATRIX, "1 2 3 x 4 5 6 7 8 9", "1ex 2 3 4 5 6 7 8 9", "1 2 3 4 - 5 6 7 8 9",
 ])
 def test_what_fscanf_stops_at_is_an_error(text, tmp_path):
     """C's vectors are then uninitialized and its cell is NaN."""

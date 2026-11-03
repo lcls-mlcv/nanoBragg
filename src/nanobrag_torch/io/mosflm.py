@@ -12,9 +12,11 @@ from typing import Tuple, Union
 
 
 # One %lg. fscanf takes the longest number it can and leaves the rest, so tokens need no space
-# between them; a mantissa followed by a bare exponent letter is a matching failure.
+# between them. glibc's %lg also consumes an exponent letter and sign with no digits after them
+# ("1e", "1e+", "1E-") and returns the mantissa; "1ex" reads 1 and stops at the x.
+# Hex floats (0x...) are not handled.
 _FSCANF_DOUBLE = re.compile(
-    r"\s*([+-]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+|(?![eE]))|inf(?:inity)?|nan))", re.IGNORECASE
+    r"\s*([+-]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d*)?|inf(?:inity)?|nan))", re.IGNORECASE
 )
 
 
@@ -26,7 +28,7 @@ def _read_doubles_as_fscanf(text: str, count: int) -> list:
         match = _FSCANF_DOUBLE.match(text, position)
         if match is None:
             break
-        values.append(float(match.group(1)))
+        values.append(float(match.group(1).rstrip("eE+-")))
         position = match.end()
     return values
 
