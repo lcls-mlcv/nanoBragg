@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Optional, Tuple, Union
 
+import weakref
 import numpy as np
 import torch
 
@@ -192,6 +193,18 @@ class CrystalConfig:
         self.sample_x = self.N_cells[0] * self.cell_a * 1e-10  # Convert Å to meters
         self.sample_y = self.N_cells[1] * self.cell_b * 1e-10
         self.sample_z = self.N_cells[2] * self.cell_c * 1e-10
+
+
+# The beam centres DetectorConfig.__post_init__ defaulted, by config id, kept outside the instance
+# so that DetectorConfig(**config.__dict__) and dataclasses.replace() copy only real fields (a
+# copy's centres then count as given). An entry goes when its config is freed.
+_AUTO_BEAM_CENTERS: dict = {}
+
+
+def _remember_default_beam_centers(config, auto_s, auto_f) -> None:
+    key = id(config)
+    _AUTO_BEAM_CENTERS[key] = (auto_s, auto_f)
+    weakref.finalize(config, _AUTO_BEAM_CENTERS.pop, key, None)
 
 
 @dataclass
@@ -331,14 +344,14 @@ class DetectorConfig:
         # refined or changed in place moves them as a fresh config would, and a differentiable
         # one gets a fresh graph. A centre assigned later replaces the remembered object and is
         # then left alone.
-        self._auto_beam_center_s = None
-        self._auto_beam_center_f = None
         if self.beam_center_s is None or self.beam_center_f is None:
             default_s, default_f = self._default_beam_centers()
+            auto_s = auto_f = None
             if self.beam_center_s is None:
-                self.beam_center_s = self._auto_beam_center_s = default_s
+                self.beam_center_s = auto_s = default_s
             if self.beam_center_f is None:
-                self.beam_center_f = self._auto_beam_center_f = default_f
+                self.beam_center_f = auto_f = default_f
+            _remember_default_beam_centers(self, auto_s, auto_f)
 
         # Set default twotheta axis if not provided
         if self.twotheta_axis is None:
@@ -428,17 +441,17 @@ class DetectorConfig:
 
     def refresh_default_beam_centers(self) -> None:
         """Derive again the beam centres __post_init__ defaulted, from the current pixel size."""
-        auto_s = getattr(self, "_auto_beam_center_s", None)
-        auto_f = getattr(self, "_auto_beam_center_f", None)
+        auto_s, auto_f = _AUTO_BEAM_CENTERS.get(id(self), (None, None))
         refresh_s = auto_s is not None and self.beam_center_s is auto_s
         refresh_f = auto_f is not None and self.beam_center_f is auto_f
         if not (refresh_s or refresh_f):
             return
         default_s, default_f = self._default_beam_centers()
         if refresh_s:
-            self.beam_center_s = self._auto_beam_center_s = default_s
+            self.beam_center_s = auto_s = default_s
         if refresh_f:
-            self.beam_center_f = self._auto_beam_center_f = default_f
+            self.beam_center_f = auto_f = default_f
+        _AUTO_BEAM_CENTERS[id(self)] = (auto_s, auto_f)
 
     @classmethod
     def from_cli_args(

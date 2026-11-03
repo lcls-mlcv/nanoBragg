@@ -103,3 +103,10 @@ def test_a_geometry_built_under_no_grad_is_rebuilt_for_a_grad_run():
     loss(sim.run()).backward()
     _, expected_grad = fresh("distance_mm", 101.0, DetectorConvention.MOSFLM)
     assert leaf.grad.item() == pytest.approx(expected_grad, rel=1e-10)
+
+
+def test_a_config_copied_through_its_dict_builds():
+    """DetectorConfig(**config.__dict__) is a common copy; private bookkeeping must not be in it."""
+    config = DetectorConfig(distance_mm=100.0, pixel_size_mm=1.0, spixels=24, fpixels=24)
+    copy = DetectorConfig(**{**config.__dict__, "distance_mm": 120.0})
+    assert copy.beam_center_s == config.beam_center_s
