@@ -1033,6 +1033,8 @@ class ExperimentModel(nn.Module):
         if umats is not None:
             crystal.mosaic_umats_override = umats
             crystal.config.mosaic_domains = int(umats.shape[0])
+            # Anisotropic domains are built on the starting crystal's axes, so they turn with it
+            crystal.mosaic_umats_in_crystal_frame = self.crystal_params.anisotropic_mosaicity
 
     # Fields the Stage-A blocks produce. Everything else in the configs is fixed at
     # construction.

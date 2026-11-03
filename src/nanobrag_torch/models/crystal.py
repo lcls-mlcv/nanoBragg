@@ -1246,10 +1246,26 @@ class Crystal:
 
         # Apply mosaic rotations to ONLY real vectors (a, b, c)
         # The C code does NOT rotate reciprocal vectors - it recomputes them from rotated real vectors
-        # Broadcast phi and mosaic dimensions: (N_phi, 1, 3) x (1, N_mos, 3, 3) -> (N_phi, N_mos, 3)
-        a_phi_mos = rotate_umat(a_phi.unsqueeze(1), mosaic_umats.unsqueeze(0))
-        b_phi_mos = rotate_umat(b_phi.unsqueeze(1), mosaic_umats.unsqueeze(0))
-        c_phi_mos = rotate_umat(c_phi.unsqueeze(1), mosaic_umats.unsqueeze(0))
+        if override is not None and getattr(self, "mosaic_umats_in_crystal_frame", False):
+            # Domains defined on the crystal's own axes (diffBragg's anisotropic eta) turn with
+            # it: the domain rotation comes first and phi after, R_phi U v, so eta_a stays the
+            # spread about a at every phi. After phi (U R_phi v, C's order, below) the ellipsoid
+            # stayed where the axes were at phi = 0.
+            n_phi, n_mos = config.phi_steps, mosaic_umats.shape[0]
+            axis_rows = spindle_axis.expand(n_phi * n_mos, 3)
+            angles = phi_rad.reshape(-1).repeat_interleave(n_mos) if torch.is_tensor(phi_rad) else phi_rad
+
+            def mosaic_then_phi(v):
+                domains = rotate_umat(v.unsqueeze(0), mosaic_umats)  # (N_mos, 3)
+                flat = domains.unsqueeze(0).expand(n_phi, n_mos, 3).reshape(-1, 3)
+                return rotate_axis(flat, axis_rows, angles).reshape(n_phi, n_mos, 3)
+
+            a_phi_mos, b_phi_mos, c_phi_mos = (mosaic_then_phi(cell[k]) for k in ("a", "b", "c"))
+        else:
+            # Broadcast phi and mosaic dimensions: (N_phi, 1, 3) x (1, N_mos, 3, 3) -> (N_phi, N_mos, 3)
+            a_phi_mos = rotate_umat(a_phi.unsqueeze(1), mosaic_umats.unsqueeze(0))
+            b_phi_mos = rotate_umat(b_phi.unsqueeze(1), mosaic_umats.unsqueeze(0))
+            c_phi_mos = rotate_umat(c_phi.unsqueeze(1), mosaic_umats.unsqueeze(0))
 
         # Phase M5c (CLI-FLAGS-003): Reciprocal vector recomputation per C code
         # The C code recalculates reciprocal vectors FROM rotated real vectors
