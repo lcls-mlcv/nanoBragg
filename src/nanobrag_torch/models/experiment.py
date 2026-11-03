@@ -8,7 +8,7 @@ parameters while delegating all physics and geometry to the core components.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Optional
 
 import numpy as np
@@ -854,6 +854,7 @@ class ExperimentModel(nn.Module):
         panel_configs = list(detector_config) if isinstance(detector_config, (list, tuple)) else [detector_config]
         if len({(cfg.spixels, cfg.fpixels) for cfg in panel_configs}) != 1:
             raise ValueError("all panels must have the same size")
+        self._panel_configs = panel_configs  # as given, for SerialExperiment(share_detector=True)
 
         # Stage-A parameter blocks.
         self.crystal_params = CrystalStageAParams(
@@ -1296,6 +1297,36 @@ class ExperimentModel(nn.Module):
         return images + background.image() * masks
 
 
+def _config_value_key(value):
+    """A value of a config field, comparable by contents.
+
+    Numbers, numeric tuples and tensors become (shape, numbers), so 60.0, torch.tensor(60.0)
+    and a tuple or a tensor of the same three components compare equal.
+    """
+    if isinstance(value, torch.Tensor):
+        return (tuple(value.shape), tuple(value.detach().cpu().double().reshape(-1).tolist()))
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return ((), (float(value),))
+    if isinstance(value, (tuple, list)):
+        if value and all(isinstance(v, (int, float, torch.Tensor)) and not isinstance(v, bool) for v in value):
+            numbers = [float(v.detach()) if isinstance(v, torch.Tensor) else float(v) for v in value]
+            if all(not isinstance(v, torch.Tensor) or v.dim() == 0 for v in value):
+                return ((len(value),), tuple(numbers))
+        return tuple(_config_value_key(v) for v in value)
+    return value
+
+
+def _first_detector_difference(panels, other_panels) -> Optional[str]:
+    """The first DetectorConfig field in which two panel lists differ, or None if they agree."""
+    if len(panels) != len(other_panels):
+        return f"number of panels ({len(panels)} vs {len(other_panels)})"
+    for index, (panel, other) in enumerate(zip(panels, other_panels)):
+        for field in fields(panel):
+            if _config_value_key(getattr(panel, field.name)) != _config_value_key(getattr(other, field.name)):
+                return f"{field.name} of panel {index}"
+    return None
+
+
 class SerialExperiment(nn.Module):
     """Several shots refined together, each an ExperimentModel, sharing structure factors.
 
@@ -1315,6 +1346,14 @@ class SerialExperiment(nn.Module):
         self.shots = nn.ModuleList(shots)
         first = self.shots[0]
         self.share_detector = share_detector
+        if share_detector:
+            # Every shot is rendered on the first shot's Detector: a shot whose detector differs
+            # would otherwise be simulated silently on the wrong geometry
+            for number, shot in enumerate(self.shots[1:], start=1):
+                difference = _first_detector_difference(first._panel_configs, shot._panel_configs)
+                if difference is not None:
+                    raise ValueError(f"share_detector=True needs the same detector on every shot: shot {number} "
+                                     f"differs from shot 0 in {difference}")
         for shot in self.shots[1:]:
             if shot._simulator is not None:
                 raise ValueError("give shots that have not run yet: they share state built on the first run")
