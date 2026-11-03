@@ -40,8 +40,9 @@ from src.nanobrag_torch.io.smv import read_smv
 
 
 # Check if C binary exists
-C_BINARY = Path(__file__).parent.parent / "nanoBragg"
-HAS_C_BINARY = C_BINARY.exists()
+from tests.conftest import _resolve_c_binary
+C_BINARY = _resolve_c_binary()  # NB_C_BIN, then the repo fallbacks
+HAS_C_BINARY = C_BINARY is not None
 # Check if parallel tests should be run
 RUN_PARALLEL = os.environ.get("NB_RUN_PARALLEL", "0") == "1"
 SKIP_REASON = "C binary not available" if not HAS_C_BINARY else "NB_RUN_PARALLEL not set"
