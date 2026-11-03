@@ -8,7 +8,7 @@ parameters while delegating all physics and geometry to the core components.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import Optional
 
 import numpy as np
@@ -851,6 +851,7 @@ class ExperimentModel(nn.Module):
         panel_configs = list(detector_config) if isinstance(detector_config, (list, tuple)) else [detector_config]
         if len({(cfg.spixels, cfg.fpixels) for cfg in panel_configs}) != 1:
             raise ValueError("all panels must have the same size")
+        self._panel_configs = panel_configs  # as given, for SerialExperiment(share_detector=True)
 
         # Stage-A parameter blocks.
         self.crystal_params = CrystalStageAParams(
@@ -1299,6 +1300,52 @@ class ExperimentModel(nn.Module):
         return images + background.image() * masks
 
 
+def _as_numbers(value):
+    """A number, numeric sequence, numpy array or tensor as a CPU float64 tensor, else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, torch.Tensor):
+        return value.detach().to(device="cpu", dtype=torch.float64)
+    if isinstance(value, np.ndarray) and value.dtype.kind in "biuf":
+        return torch.as_tensor(value, dtype=torch.float64)
+    if isinstance(value, (int, float)):
+        return torch.tensor(float(value), dtype=torch.float64)
+    if isinstance(value, (tuple, list)) and value and all(
+            isinstance(v, (int, float, torch.Tensor)) and not isinstance(v, bool)
+            and (not isinstance(v, torch.Tensor) or v.dim() == 0) for v in value):
+        return torch.tensor([float(v) for v in value], dtype=torch.float64)
+    return None
+
+
+def _same_config_value(a, b) -> bool:
+    """Whether two values of a config field are equal by contents.
+
+    The same object is equal at once (the usual case for a mask shared by every shot); numbers,
+    numeric tuples, numpy arrays and tensors compare by value with torch.equal, so 60.0 and
+    torch.tensor(60.0), or a tuple and a tensor of the same components, agree.
+    """
+    if a is b:
+        return True
+    numbers_a, numbers_b = _as_numbers(a), _as_numbers(b)
+    if numbers_a is not None or numbers_b is not None:
+        return (numbers_a is not None and numbers_b is not None
+                and numbers_a.shape == numbers_b.shape and torch.equal(numbers_a, numbers_b))
+    if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+        return len(a) == len(b) and all(_same_config_value(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _first_detector_difference(panels, other_panels) -> Optional[str]:
+    """The first DetectorConfig field in which two panel lists differ, or None if they agree."""
+    if len(panels) != len(other_panels):
+        return f"number of panels ({len(panels)} vs {len(other_panels)})"
+    for index, (panel, other) in enumerate(zip(panels, other_panels)):
+        for field in fields(panel):
+            if not _same_config_value(getattr(panel, field.name), getattr(other, field.name)):
+                return f"{field.name} of panel {index}"
+    return None
+
+
 class SerialExperiment(nn.Module):
     """Several shots refined together, each an ExperimentModel, sharing structure factors.
 
@@ -1318,6 +1365,14 @@ class SerialExperiment(nn.Module):
         self.shots = nn.ModuleList(shots)
         first = self.shots[0]
         self.share_detector = share_detector
+        if share_detector:
+            # Every shot is rendered on the first shot's Detector: a shot whose detector differs
+            # would otherwise be simulated silently on the wrong geometry
+            for number, shot in enumerate(self.shots[1:], start=1):
+                difference = _first_detector_difference(first._panel_configs, shot._panel_configs)
+                if difference is not None:
+                    raise ValueError(f"share_detector=True needs the same detector on every shot: shot {number} "
+                                     f"differs from shot 0 in {difference}")
         for shot in self.shots[1:]:
             if shot._simulator is not None:
                 raise ValueError("give shots that have not run yet: they share state built on the first run")

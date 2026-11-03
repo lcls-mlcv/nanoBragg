@@ -4,6 +4,8 @@ tests/test_diffbragg_parity.py compares shoeboxes on a multi-panel dxtbx detecto
 diffBragg's pan_fast_slow simulation.
 """
 import numpy as np
+from dataclasses import replace
+
 import pytest
 import torch
 from torch.func import functional_call
@@ -11,6 +13,7 @@ from torch.func import functional_call
 from nanobrag_torch.config import (
     BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
 )
+import nanobrag_torch.models.experiment as experiment_module
 from nanobrag_torch.models.experiment import ExperimentModel, SerialExperiment
 from nanobrag_torch.utils.losses import gaussian_nll
 from nanobrag_torch.utils.structure_factors import StructureFactors
@@ -411,3 +414,40 @@ def test_refinement_recovers_shared_amplitudes_from_several_shots():
     first = float(closure())
     optimizer.step(closure)
     assert float(closure()) < 1e-3 * first
+
+
+@pytest.mark.parametrize("field, value", [("distance_mm", 61.0), ("beam_center_f", 6.5), ("pixel_size_mm", 0.41),
+                                          ("detector_rotx_deg", 0.5)])
+def test_shared_detector_refuses_shots_whose_detectors_differ(field, value):
+    """The other shots would be rendered silently on the first shot's detector."""
+    sf = _sf()
+    other = ExperimentModel(_crystal(MISSETS[1]), replace(_panel(), **{field: value}), _beam(), dtype=DTYPE,
+                            structure_factors=sf)
+    with pytest.raises(ValueError, match=field):
+        SerialExperiment([_shot(sf, MISSETS[0]), other], share_detector=True)
+
+
+def test_shared_detector_accepts_equal_detectors_given_as_separate_objects():
+    sf = _sf()
+    tensor_panel = replace(_panel(), distance_mm=torch.tensor(60.0, dtype=DTYPE))
+    shots = [_shot(sf, MISSETS[0]),
+             ExperimentModel(_crystal(MISSETS[1]), tensor_panel, _beam(), dtype=DTYPE, structure_factors=sf)]
+    SerialExperiment(shots, share_detector=True)
+    SerialExperiment([_shot(sf, MISSETS[0]), _shot(sf, MISSETS[1])], share_detector=False)
+
+
+def test_shared_detector_compares_a_large_mask_quickly_and_takes_numpy():
+    import time
+
+    big = torch.ones(2527, 2463, dtype=torch.bool)
+    first = replace(_panel(), spixels=2527, fpixels=2463, mask_array=big)
+    copy = replace(first, mask_array=big.clone())
+    start = time.perf_counter()
+    for _ in range(20):
+        assert experiment_module._first_detector_difference([first], [copy]) is None
+    assert time.perf_counter() - start < 1.0  # was 0.64 s a pair
+    as_numpy = replace(first, mask_array=big.numpy())
+    assert experiment_module._first_detector_difference([first], [as_numpy]) is None
+    edited = big.clone()
+    edited[0, 0] = False
+    assert "mask_array" in experiment_module._first_detector_difference([first], [replace(first, mask_array=edited)])
