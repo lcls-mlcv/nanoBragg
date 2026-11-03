@@ -181,6 +181,22 @@ def test_gradient_through_wavelength_matches_finite_difference():
     assert float(wavelength.grad) == pytest.approx(float(fd), rel=1e-6)
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_mps_runs_the_term_in_float32_and_matches_the_cpu():
+    """MPS has no doubles; the term used to be evaluated in float64 there and raised TypeError."""
+    detector = dict(detector_thick_um=500.0, detector_abs_um=300.0, detector_thicksteps=4)
+    images = {}
+    for device in ["cpu", "mps"]:
+        d = torch.device(device)
+        sim = Simulator(Crystal(CrystalConfig(**{**CRYSTAL, "default_F": 0.0}), device=d, dtype=torch.float32),
+                        Detector(DetectorConfig(**{**DETECTOR, **detector}), device=d, dtype=torch.float32),
+                        beam_config=BeamConfig(**BEAM), device=d, dtype=torch.float32,
+                        diffuse=constant(F0 ** 2))
+        images[device] = sim.run(oversample=1).cpu()
+    assert torch.isfinite(images["mps"]).all() and images["cpu"].max() > 0
+    assert torch.abs(images["mps"] / images["cpu"] - 1).max() < 1e-5
+
+
 def test_unknown_orientation_mode_is_refused():
     with pytest.raises(ValueError, match="diffuse_orientations"):
         simulator(diffuse=constant(1.0), diffuse_orientations="some")
