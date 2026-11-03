@@ -13,6 +13,7 @@ from torch.func import functional_call
 from nanobrag_torch.config import (
     BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
 )
+import nanobrag_torch.models.experiment as experiment_module
 from nanobrag_torch.models.experiment import ExperimentModel, SerialExperiment
 from nanobrag_torch.utils.losses import gaussian_nll
 from nanobrag_torch.utils.structure_factors import StructureFactors
@@ -433,3 +434,20 @@ def test_shared_detector_accepts_equal_detectors_given_as_separate_objects():
              ExperimentModel(_crystal(MISSETS[1]), tensor_panel, _beam(), dtype=DTYPE, structure_factors=sf)]
     SerialExperiment(shots, share_detector=True)
     SerialExperiment([_shot(sf, MISSETS[0]), _shot(sf, MISSETS[1])], share_detector=False)
+
+
+def test_shared_detector_compares_a_large_mask_quickly_and_takes_numpy():
+    import time
+
+    big = torch.ones(2527, 2463, dtype=torch.bool)
+    first = replace(_panel(), spixels=2527, fpixels=2463, mask_array=big)
+    copy = replace(first, mask_array=big.clone())
+    start = time.perf_counter()
+    for _ in range(20):
+        assert experiment_module._first_detector_difference([first], [copy]) is None
+    assert time.perf_counter() - start < 1.0  # was 0.64 s a pair
+    as_numpy = replace(first, mask_array=big.numpy())
+    assert experiment_module._first_detector_difference([first], [as_numpy]) is None
+    edited = big.clone()
+    edited[0, 0] = False
+    assert "mask_array" in experiment_module._first_detector_difference([first], [replace(first, mask_array=edited)])

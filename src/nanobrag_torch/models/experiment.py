@@ -1297,23 +1297,39 @@ class ExperimentModel(nn.Module):
         return images + background.image() * masks
 
 
-def _config_value_key(value):
-    """A value of a config field, comparable by contents.
-
-    Numbers, numeric tuples and tensors become (shape, numbers), so 60.0, torch.tensor(60.0)
-    and a tuple or a tensor of the same three components compare equal.
-    """
+def _as_numbers(value):
+    """A number, numeric sequence, numpy array or tensor as a CPU float64 tensor, else None."""
+    if isinstance(value, bool):
+        return None
     if isinstance(value, torch.Tensor):
-        return (tuple(value.shape), tuple(value.detach().cpu().double().reshape(-1).tolist()))
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return ((), (float(value),))
-    if isinstance(value, (tuple, list)):
-        if value and all(isinstance(v, (int, float, torch.Tensor)) and not isinstance(v, bool) for v in value):
-            numbers = [float(v.detach()) if isinstance(v, torch.Tensor) else float(v) for v in value]
-            if all(not isinstance(v, torch.Tensor) or v.dim() == 0 for v in value):
-                return ((len(value),), tuple(numbers))
-        return tuple(_config_value_key(v) for v in value)
-    return value
+        return value.detach().to(device="cpu", dtype=torch.float64)
+    if isinstance(value, np.ndarray) and value.dtype.kind in "biuf":
+        return torch.as_tensor(value, dtype=torch.float64)
+    if isinstance(value, (int, float)):
+        return torch.tensor(float(value), dtype=torch.float64)
+    if isinstance(value, (tuple, list)) and value and all(
+            isinstance(v, (int, float, torch.Tensor)) and not isinstance(v, bool)
+            and (not isinstance(v, torch.Tensor) or v.dim() == 0) for v in value):
+        return torch.tensor([float(v) for v in value], dtype=torch.float64)
+    return None
+
+
+def _same_config_value(a, b) -> bool:
+    """Whether two values of a config field are equal by contents.
+
+    The same object is equal at once (the usual case for a mask shared by every shot); numbers,
+    numeric tuples, numpy arrays and tensors compare by value with torch.equal, so 60.0 and
+    torch.tensor(60.0), or a tuple and a tensor of the same components, agree.
+    """
+    if a is b:
+        return True
+    numbers_a, numbers_b = _as_numbers(a), _as_numbers(b)
+    if numbers_a is not None or numbers_b is not None:
+        return (numbers_a is not None and numbers_b is not None
+                and numbers_a.shape == numbers_b.shape and torch.equal(numbers_a, numbers_b))
+    if isinstance(a, (tuple, list)) and isinstance(b, (tuple, list)):
+        return len(a) == len(b) and all(_same_config_value(x, y) for x, y in zip(a, b))
+    return a == b
 
 
 def _first_detector_difference(panels, other_panels) -> Optional[str]:
@@ -1322,7 +1338,7 @@ def _first_detector_difference(panels, other_panels) -> Optional[str]:
         return f"number of panels ({len(panels)} vs {len(other_panels)})"
     for index, (panel, other) in enumerate(zip(panels, other_panels)):
         for field in fields(panel):
-            if _config_value_key(getattr(panel, field.name)) != _config_value_key(getattr(other, field.name)):
+            if not _same_config_value(getattr(panel, field.name), getattr(other, field.name)):
                 return f"{field.name} of panel {index}"
     return None
 
