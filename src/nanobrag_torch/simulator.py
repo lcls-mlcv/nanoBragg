@@ -721,6 +721,7 @@ class Simulator:
         self._refresh_pixel_coords()
 
         self._frozen_auto_oversample = None  # see _auto_oversample
+        self._oversample_freeze_warning = None  # said when the frozen value is first used
         if self.detector.config.oversample <= 0:
             self._freeze_auto_oversample_if_differentiable()
         self._refresh_roi_mask()
@@ -1313,6 +1314,9 @@ class Simulator:
         """
         self._freeze_auto_oversample_if_differentiable()
         if self._frozen_auto_oversample is not None:
+            if self._oversample_freeze_warning is not None:
+                warnings.warn(self._oversample_freeze_warning, stacklevel=3)
+                self._oversample_freeze_warning = None
             return self._frozen_auto_oversample
         return self._select_auto_oversample()
 
@@ -1342,12 +1346,12 @@ class Simulator:
         names = [name for name, x in self._auto_oversample_inputs().items() if differentiable(x)]
         if names:
             self._frozen_auto_oversample = self._select_auto_oversample()
-            warnings.warn(
+            # Said at first use, not here: a caller passing oversample to every run never uses it
+            self._oversample_freeze_warning = (
                 f"oversample=-1 (auto) with differentiable inputs ({', '.join(names)}): "
                 f"keeping the auto-selected {self._frozen_auto_oversample}-fold oversampling for this "
                 f"Simulator, since re-selecting it as the parameters move would make the loss "
-                f"discontinuous. Pass oversample explicitly to choose the value.",
-                stacklevel=3,
+                f"discontinuous. Pass oversample explicitly to choose the value."
             )
 
     def _select_auto_oversample(self) -> int:

@@ -55,9 +55,9 @@ def test_persistent_simulator_is_continuous_at_the_oversample_boundary():
 
 
 def test_auto_value_frozen_and_warned_when_an_input_requires_grad(capsys):
+    sim = _simulator(torch.tensor(200.0, dtype=DTYPE, requires_grad=True))
     with pytest.warns(UserWarning, match="keeping the auto-selected 3-fold"):
-        sim = _simulator(torch.tensor(200.0, dtype=DTYPE, requires_grad=True))
-    sim.run()
+        sim.run()
     _set_cell_a(sim, torch.tensor(400.0, dtype=DTYPE, requires_grad=True))
     sim.run()
     assert _selected(capsys) == [3]  # selected once; the second run reuses it silently
@@ -123,10 +123,12 @@ INPUTS = {
 @pytest.mark.parametrize("name", sorted(INPUTS))
 def test_every_input_freezes_at_construction_and_says_which(name):
     kwargs, reported = INPUTS[name]
-    with pytest.warns(UserWarning, match=rf"differentiable inputs \(.*{reported}.*\): keeping the auto-selected"):
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*keeping the auto-selected")  # frozen, not used yet
         sim = _made(**kwargs)
     assert sim._frozen_auto_oversample >= 1
-    assert sim._auto_oversample() == sim._frozen_auto_oversample
+    with pytest.warns(UserWarning, match=rf"differentiable inputs \(.*{reported}.*\): keeping the auto-selected"):
+        assert sim._auto_oversample() == sim._frozen_auto_oversample
 
 
 def test_every_detector_geometry_field_is_an_input():
@@ -143,6 +145,19 @@ def test_a_later_leaf_freezes_at_the_next_run():
     assert sim._frozen_auto_oversample == 10
 
 
+def test_no_warning_when_every_run_passes_an_oversample():
+    """The value is frozen at construction, but a run with its own oversample never uses it."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*keeping the auto-selected")
+        sim = _made(detector_args=dict(detector_twotheta_deg=_leaf(5.0)))
+        sim.run(oversample=1)
+        sim.run(oversample=2)
+    with pytest.warns(UserWarning, match="keeping the auto-selected") as record:
+        sim.run()
+        sim.run()
+    assert sum("keeping the auto-selected" in str(w.message) for w in record) == 1
+
+
 def test_no_freeze_with_an_explicit_oversample():
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -154,8 +169,9 @@ def test_no_freeze_with_an_explicit_oversample():
 def test_moving_leaf_cannot_step_the_oversample(pivot):
     """twotheta takes the auto value 9 -> 18 by 60 degrees: frozen, it stays at the first."""
     leaf = _leaf(0.0)
-    with pytest.warns(UserWarning):
-        sim = _made(detector_args=dict(detector_twotheta_deg=leaf, detector_pivot=pivot))
+    sim = _made(detector_args=dict(detector_twotheta_deg=leaf, detector_pivot=pivot))
+    with pytest.warns(UserWarning, match="keeping the auto-selected 9-fold"):
+        assert sim._auto_oversample() == 9
     for degrees in (20.0, 30.0, 40.0, 60.0):
         leaf.data.fill_(degrees)
         sim.detector.get_pixel_coords()
@@ -166,9 +182,9 @@ def test_the_loss_does_not_jump_across_the_crossing():
     """Between these two angles the free auto value steps from 9 to 10."""
     low, high = 1.0456460586283356e-06, 1.045664248522371e-06
     leaf = _leaf(low)
-    with pytest.warns(UserWarning):
-        sim = _made(detector_args=dict(detector_twotheta_deg=leaf, spixels=24, fpixels=24))
-    a = sim.run().sum().item()
+    sim = _made(detector_args=dict(detector_twotheta_deg=leaf, spixels=24, fpixels=24))
+    with pytest.warns(UserWarning, match="keeping the auto-selected"):
+        a = sim.run().sum().item()
     leaf.data.fill_(high)
     b = sim.run().sum().item()
     assert abs(b - a) / a < 1e-11
