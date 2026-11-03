@@ -413,12 +413,9 @@ class DetectorStageAParams(nn.Module):
                     for name in ("fdet", "sdet", "odet"))
         )
         if self.origin_defined:
-            # pix0 = -beam_center_f·f - beam_center_s·s + close_distance·o, so a lab-z shift
-            # of the origin moves those three by -dz·f_z, -dz·s_z and +dz·o_z.
-            for name in ("fdet", "sdet", "odet"):
-                vec = torch.as_tensor(getattr(base_config, f"custom_{name}_vector"),
-                                      device=self.device, dtype=self.dtype)
-                self.register_buffer(f"{name}_z", vec[2].clone())
+            # The shift is applied by Detector to the final origin (origin_shift_z_mm), after the
+            # refined rotations; splitting it into close distance and beam centre here, along the
+            # unrotated axes, tilted it by the refined rotx/roty
             self.unrefinable["delta_log_distance_mm"] = (
                 "this detector is given by its origin (dxtbx panel): refine 'detz_shift', "
                 "diffBragg's origin shift along z, instead of 'distance'"
@@ -475,10 +472,8 @@ class DetectorStageAParams(nn.Module):
 
         cfg = replace(self._base_config)
         if self.origin_defined:
-            dz = self.delta_detz_shift_mm
-            cfg.close_distance_mm = self.base_close_distance_mm + dz * self.odet_z
-            beam_center_f = beam_center_f - dz * self.fdet_z
-            beam_center_s = beam_center_s - dz * self.sdet_z
+            base_shift = cfg.origin_shift_z_mm if cfg.origin_shift_z_mm is not None else 0.0
+            cfg.origin_shift_z_mm = base_shift + self.delta_detz_shift_mm
         elif self.close_distance_drives:
             cfg.close_distance_mm = self.base_close_distance_mm * torch.exp(self.delta_log_distance_mm)
         else:
@@ -1045,7 +1040,7 @@ class ExperimentModel(nn.Module):
     )
     _DETECTOR_FIELDS = (
         "distance_mm", "close_distance_mm", "detector_rotx_deg", "detector_roty_deg", "detector_rotz_deg",
-        "detector_twotheta_deg", "beam_center_s", "beam_center_f",
+        "detector_twotheta_deg", "beam_center_s", "beam_center_f", "origin_shift_z_mm",
     )
 
     def _sync(self):

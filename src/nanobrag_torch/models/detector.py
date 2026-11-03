@@ -382,7 +382,7 @@ class Detector:
         "detector_twotheta_deg", "twotheta_axis",
         "detector_convention", "detector_pivot", "curved_detector",
         "custom_fdet_vector", "custom_sdet_vector", "custom_odet_vector",
-        "custom_beam_vector", "pix0_override_m",
+        "custom_beam_vector", "pix0_override_m", "origin_shift_z_mm",
         "close_center_f_mm", "close_center_s_mm",
         "beam_center_source",
     )
@@ -893,6 +893,15 @@ class Detector:
             # The C code (nanoBragg.c:1739-1745) shows that pix0_override is IGNORED for SAMPLE pivot;
             # instead, Fclose/Sclose from beam centers are used in the standard formula, then rotated.
             self.pix0_vector = pix0_rotated
+
+        # diffBragg's detz_shift: the origin moves along lab z after every rotation, so the
+        # shift stays along z whatever the tilts. close_distance and Fbeam/Sbeam are derived
+        # from the final pix0 just below, so the solid angle and obliquity follow it.
+        shift_z = getattr(c, "origin_shift_z_mm", None)
+        if shift_z is not None and (isinstance(shift_z, torch.Tensor) or shift_z != 0):
+            lab_z = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=self.dtype)
+            shift_m = torch.as_tensor(shift_z, device=self.device, dtype=self.dtype) / 1000.0
+            self.pix0_vector = self.pix0_vector + shift_m * lab_z
 
         # ALWAYS recalculate close_distance from final pix0_vector (C code nanoBragg.c:1846)
         # This ensures consistency between pix0 and close_distance for all pivot modes
