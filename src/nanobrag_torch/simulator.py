@@ -671,35 +671,21 @@ class Simulator:
         self.kahn_factor = self.beam_config.polarization_factor
         self.polarization_axis = self.beam_config.polarization_axis
 
-        # PERF-PYTORCH-004 P1.2 + P3.0: Pre-normalize source tensors to avoid repeated .to() calls in run()
-        # Move source direction/wavelength/weight tensors to correct device/dtype once during init
-        # P3.0: Seed fallback tensors (equal weights, primary wavelength) when omitted before device cast
+        # Source tensors are kept as given and converted at each run (the _source_* properties).
+        # Converting them once here, and taking wavelengths to Angstroms here, left a copy that
+        # missed an in-place change and, for the Angstroms, a graph freed by the first backward.
         _has_sources = (self.beam_config.source_directions is not None and
                        len(self.beam_config.source_directions) > 0)
         if _has_sources:
-            self._source_directions = self.beam_config.source_directions.to(device=self.device, dtype=self.dtype)
-
-            # P3.0: Default source_wavelengths to primary wavelength if not provided (AT-SRC-001)
-            if self.beam_config.source_wavelengths is not None:
-                self._source_wavelengths = self.beam_config.source_wavelengths.to(device=self.device, dtype=self.dtype)  # meters
-            else:
-                # Use primary wavelength for all sources
-                primary_wavelength_m = self.beam_config.wavelength_A * 1e-10
-                n_sources = len(self.beam_config.source_directions)
-                self._source_wavelengths = torch.full((n_sources,), primary_wavelength_m, device=self.device, dtype=self.dtype)
-
-            self._source_wavelengths_A = self._source_wavelengths * 1e10  # Convert to Angstroms once
-
-            # P3.0: Default source_weights to equal weights if not provided
-            if self.beam_config.source_weights is not None:
-                self._source_weights = self.beam_config.source_weights.to(device=self.device, dtype=self.dtype)
-            else:
-                # Default to equal weights if not provided
-                self._source_weights = torch.ones(len(self.beam_config.source_directions), device=self.device, dtype=self.dtype)
+            self._source_directions_given = self.beam_config.source_directions
+            # Without source_wavelengths each source has the primary wavelength (AT-SRC-001)
+            self._source_wavelengths_given = self.beam_config.source_wavelengths  # metres, or None
+            # Without source_weights the sources weigh the same
+            self._source_weights_given = self.beam_config.source_weights
         else:
-            self._source_directions = None
-            self._source_wavelengths_A = None
-            self._source_weights = None
+            self._source_directions_given = None
+            self._source_wavelengths_given = None
+            self._source_weights_given = None
 
         # PERF-PYTORCH-004 P3.4: Cache frequently-accessed tensors to reduce per-run allocations
         # Pre-convert pixel coordinates to correct device/dtype once
@@ -814,11 +800,46 @@ class Simulator:
         """Replace the wavelengths (A; sources in metres) and source weights of this Simulator."""
         self.wavelength = wavelength_A
         self._wavelength_given = wavelength_A
-        if self._source_directions is not None and source_wavelengths is not None:
-            self._source_wavelengths = source_wavelengths.to(device=self.device, dtype=self.dtype)
-            self._source_wavelengths_A = self._source_wavelengths * 1e10
-        if self._source_directions is not None and source_weights is not None:
-            self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+        if self._source_directions_given is not None and source_wavelengths is not None:
+            self._source_wavelengths_given = source_wavelengths
+        if self._source_directions_given is not None and source_weights is not None:
+            self._source_weights_given = source_weights
+
+    @property
+    def _source_directions(self) -> Optional[torch.Tensor]:
+        """(N, 3) directions from sample to source in the run's dtype, or None without sources."""
+        given = self._source_directions_given
+        return None if given is None else self._at_run(given)
+
+    @property
+    def _source_wavelengths(self) -> Optional[torch.Tensor]:
+        """(N,) source wavelengths in metres, the primary wavelength for each if none were given."""
+        if self._source_directions_given is None:
+            return None
+        given = self._source_wavelengths_given
+        if given is None:
+            n_sources = len(self._source_directions_given)
+            primary_m = self._wavelength_given * 1e-10
+            if isinstance(primary_m, torch.Tensor):
+                return self._at_run(primary_m).expand(n_sources)
+            return torch.full((n_sources,), primary_m, device=self.device, dtype=self.dtype)
+        return self._at_run(given)
+
+    @property
+    def _source_wavelengths_A(self) -> Optional[torch.Tensor]:
+        """(N,) source wavelengths in Angstroms, taken from metres at each run."""
+        metres = self._source_wavelengths
+        return None if metres is None else metres * 1e10
+
+    @property
+    def _source_weights(self) -> Optional[torch.Tensor]:
+        """(N,) source weights in the run's dtype, equal if none were given."""
+        if self._source_directions_given is None:
+            return None
+        given = self._source_weights_given
+        if given is None:
+            return torch.ones(len(self._source_directions_given), device=self.device, dtype=self.dtype)
+        return self._at_run(given)
 
     def _kept(self, value) -> torch.Tensor:
         """value itself if a tensor, else a tensor in the run's dtype; see _at_run."""
