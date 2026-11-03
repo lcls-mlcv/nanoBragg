@@ -652,12 +652,9 @@ class Simulator:
             self.incident_beam_direction = torch.tensor(
                 [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype
             )
-        # PERF-PYTORCH-006: Store wavelength as tensor with correct dtype
-        # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
-        # when wavelength_A is already a tensor with requires_grad=True
-        self.wavelength = as_tensor_preserving_grad(
-            self.beam_config.wavelength_A, device=self.device, dtype=self.dtype
-        )
+        # Kept as given and converted at each use (see _kept), so an in-place change to a tensor
+        # of another dtype or device is seen and its gradient arrives at it.
+        self.wavelength = self.beam_config.wavelength_A
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
@@ -669,17 +666,10 @@ class Simulator:
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
         self.fluence = self.beam_config.fluence
-        # Polarization setup from beam config
-        # PERF-PYTORCH-006: Store as tensor with correct dtype
-        # DBEX-GRADIENT-001: Use as_tensor_preserving_grad when nopolar is False
-        # to maintain gradient graph for differentiable polarization_factor
+        # Polarization setup from beam config, kept as the wavelength is
         # -nopolar keeps the factor: -oversample_polar puts polarization back regardless
-        self.kahn_factor = as_tensor_preserving_grad(
-            self.beam_config.polarization_factor, device=self.device, dtype=self.dtype
-        )
-        self.polarization_axis = torch.tensor(
-            self.beam_config.polarization_axis, device=self.device, dtype=self.dtype
-        )
+        self.kahn_factor = self.beam_config.polarization_factor
+        self.polarization_axis = self.beam_config.polarization_axis
 
         # PERF-PYTORCH-004 P1.2 + P3.0: Pre-normalize source tensors to avoid repeated .to() calls in run()
         # Move source direction/wavelength/weight tensors to correct device/dtype once during init
@@ -822,13 +812,55 @@ class Simulator:
 
     def set_spectrum(self, wavelength_A, source_wavelengths=None, source_weights=None) -> None:
         """Replace the wavelengths (A; sources in metres) and source weights of this Simulator."""
-        self.wavelength = as_tensor_preserving_grad(wavelength_A, device=self.device, dtype=self.dtype)
+        self.wavelength = wavelength_A
         self._wavelength_given = wavelength_A
         if self._source_directions is not None and source_wavelengths is not None:
             self._source_wavelengths = source_wavelengths.to(device=self.device, dtype=self.dtype)
             self._source_wavelengths_A = self._source_wavelengths * 1e10
         if self._source_directions is not None and source_weights is not None:
             self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+
+    def _kept(self, value) -> torch.Tensor:
+        """value itself if a tensor, else a tensor in the run's dtype; see _at_run."""
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.tensor(value, device=self.device, dtype=self.dtype)
+
+    def _at_run(self, value: torch.Tensor) -> torch.Tensor:
+        """A kept tensor in the run's dtype and device, converted afresh at each use.
+
+        A copy made once, at construction, falls behind when a tensor of another dtype or
+        device is changed in place (.data, an optimizer step), and its gradient is then
+        taken at the old value. In the run's dtype and device this is the tensor itself.
+        """
+        return value.to(device=self.device, dtype=self.dtype)
+
+    @property
+    def wavelength(self) -> torch.Tensor:
+        """Wavelength in Angstroms, in the run's dtype. Assign, or change the tensor given in place."""
+        return self._at_run(self._wavelength)
+
+    @wavelength.setter
+    def wavelength(self, value) -> None:
+        self._wavelength = self._kept(value)
+
+    @property
+    def kahn_factor(self) -> torch.Tensor:
+        """Kahn polarization factor, kept as the wavelength is."""
+        return self._at_run(self._kahn_factor)
+
+    @kahn_factor.setter
+    def kahn_factor(self, value) -> None:
+        self._kahn_factor = self._kept(value)
+
+    @property
+    def polarization_axis(self) -> torch.Tensor:
+        """Polarization E-vector, kept as the wavelength is."""
+        return self._at_run(self._polarization_axis)
+
+    @polarization_axis.setter
+    def polarization_axis(self, value) -> None:
+        self._polarization_axis = self._kept(value)
 
     def _scale_source(self, value) -> torch.Tensor:
         """The one tensor a scale factor is kept in: value itself if a tensor, else a double.
