@@ -547,6 +547,11 @@ class PanelPixels:
     mask: torch.Tensor  # (N,)
 
 
+
+def _tensor_version(value):
+    """A tensor's in-place version counter (bumped by mask[...] = 0, fill_, mul_), else None."""
+    return value._version if isinstance(value, torch.Tensor) else None
+
 class Simulator:
     """
     Main diffraction simulator class.
@@ -737,11 +742,13 @@ class Simulator:
         """What the cached ROI mask was built from, apart from mask_array.
 
         `mask_array` is tracked separately, by holding a reference to the
-        tensor and comparing with `is` (see _roi_mask_is_current): replacing
-        it is detected, editing it in place is not (hashing its contents every
-        run would cost a full pass over the image). Not `id()`: CPython reuses
-        the id of a freed tensor, so `cfg.mask_array = None` followed by a new
-        mask could land on the old id and keep the stale mask.
+        tensor and comparing with `is`, plus its in-place version counter (see
+        _roi_mask_is_current): replacing it is detected, and so is an in-place
+        edit (mask[...] = 0, fill_, mul_). An edit through `.data` bypasses the
+        counter and is not seen; hashing the contents every run would cost a full
+        pass over the image. Not `id()`: CPython reuses the id of a freed tensor,
+        so `cfg.mask_array = None` followed by a new mask could land on the old
+        id and keep the stale mask.
         """
         cfg = self.detector.config
         return (
@@ -753,6 +760,7 @@ class Simulator:
         return (
             self._roi_mask_key() == self._roi_mask_built_from
             and self.detector.config.mask_array is self._roi_mask_source
+            and _tensor_version(self._roi_mask_source) == self._roi_mask_source_version
         )
 
     def _refresh_roi_mask(self) -> None:
@@ -791,6 +799,7 @@ class Simulator:
             self._cached_roi_mask = self._cached_roi_mask * mask_array
         self._roi_mask_built_from = self._roi_mask_key()
         self._roi_mask_source = self.detector.config.mask_array
+        self._roi_mask_source_version = _tensor_version(self._roi_mask_source)
 
     def _compile_physics_fn(self) -> None:
         # The wrapper method _compute_physics_for_position should NOT be compiled
