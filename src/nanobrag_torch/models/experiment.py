@@ -1080,7 +1080,9 @@ class ExperimentModel(nn.Module):
         # Simulator's auto-oversample choice reads the config copy.
         crystal.config.N_cells = crystal_cfg.N_cells
         self._apply_mosaicity(crystal)
-        if self.fhkl_params.active:
+        # A fixed grid in another dtype or device is a copy, so it is made again from the caller's
+        # tensor at each forward; in the model's own dtype and device .to() returns the tensor itself
+        if self.fhkl_params.active or self._external_hkl_data is not None:
             self._apply_structure_factors(crystal)
 
         if not self._detectors_synced_by_serial:
