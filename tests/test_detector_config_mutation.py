@@ -366,3 +366,32 @@ def test_replaced_mask_is_seen_even_if_the_old_one_was_freed():
     sim.detector.config.mask_array = None
     sim.detector.config.mask_array = torch.zeros(32, 32, dtype=torch.float64)
     assert sim.run(oversample=1).sum().item() == 0.0
+
+
+def test_a_mask_edited_in_place_is_seen():
+    """Masking pixels in the same tensor (as an outlier pass does) must reach the next run.
+
+    The mask was tracked by reference only, so an in-place edit was missed: zeroing half of
+    a 32x32 mask left the next run's image unchanged, where a fresh build is 0 there.
+    """
+    cfg = DetectorConfig(**BASE, beam_center_s=1.6, beam_center_f=1.7)
+    cfg.mask_array = torch.ones(32, 32, dtype=torch.float64)
+    sim = _simulator(cfg)
+    before = sim.run(oversample=1)
+    assert before[:, :16].sum() > 0
+
+    sim.detector.config.mask_array[:, :16] = 0
+    after = sim.run(oversample=1)
+    assert after[:, :16].sum().item() == 0.0
+    torch.testing.assert_close(after[:, 16:], before[:, 16:], rtol=0, atol=0)
+
+
+def test_a_mask_made_under_inference_mode_runs():
+    """Inference tensors keep no version counter; such a mask is tracked by reference alone."""
+    with torch.inference_mode():
+        mask = torch.ones(32, 32, dtype=torch.float64)
+    cfg = DetectorConfig(**BASE, beam_center_s=1.6, beam_center_f=1.7)
+    cfg.mask_array = mask
+    sim = _simulator(cfg)
+    assert sim.run(oversample=1).sum() > 0
+    assert sim.run(oversample=1).sum() > 0
