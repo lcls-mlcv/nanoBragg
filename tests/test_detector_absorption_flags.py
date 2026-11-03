@@ -26,6 +26,15 @@ CASES = [
     "-detector_thick 100 -detector_abs 50",
     "-detector_abs 50 -detector_thick 100",
     "-detector_thick 100",
+    # a negative value gives a negative mu, which nanoBragg.c:1652-1656 replaces with 1/thickness
+    "-detector_thick 100 -detector_abs -5",
+    "-detector_thick 100 -detector_abs -5 -detector_thicksteps 3",
+    "-detector_abs 0",
+    "-detector_abs inf",
+    "-detector_abs 50",
+    "-detector_abs 0 -detector_thick 100 -detector_thicksteps 1",
+    "-detector_thick 100 -detector_abs 0 -detector_abs 50",
+    "-detector_thick 100 -detector_abs abc",
 ]
 
 

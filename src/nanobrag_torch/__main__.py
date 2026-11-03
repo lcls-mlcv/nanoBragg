@@ -597,7 +597,8 @@ def resolve_detector_absorption(args: argparse.Namespace) -> Tuple[Optional[floa
 
     nanoBragg.c:762-773 walks argv: -detector_abs with "inf" in its value, or a value atof()
     reads as 0, sets detector_thick = 0 and detector_mu = 0 (an infinite attenuation depth); any
-    other value sets mu = 1/(value*1e-6); -detector_thick sets the thickness. So
+    other value sets mu = 1/(value*1e-6), and a negative mu becomes 1/thickness after the loop;
+    -detector_thick sets the thickness. So
     "-detector_abs 0 -detector_thick 100" is a transparent 100 um sensor that captures nothing.
     Without ``args._argv`` -detector_abs is taken after -detector_thick.
     """
@@ -614,12 +615,16 @@ def resolve_detector_absorption(args: argparse.Namespace) -> Tuple[Optional[floa
     if argv is None:
         if args.detector_abs:
             absorb(args.detector_abs)
-        return thick, depth
-    for token, value in zip(argv, argv[1:]):
-        if token == '-detector_thick':
-            thick = c_atof(value)
-        elif token in ('-detector_abs', '-detector_absorb'):
-            absorb(value)
+    else:
+        for token, value in zip(argv, argv[1:]):
+            if token == '-detector_thick':
+                thick = c_atof(value)
+            elif token in ('-detector_abs', '-detector_absorb'):
+                absorb(value)
+    # A negative value leaves mu negative, which nanoBragg.c:1652-1656 replaces with 1/thickness
+    # after the argv loop: the same as no -detector_abs
+    if depth is not None and depth < 0:
+        depth = None
     return thick, depth
 
 
