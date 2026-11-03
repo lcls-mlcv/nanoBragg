@@ -56,6 +56,10 @@ Rotated or long-numbered geometry can take the `%g` header text past 512 bytes. 
 
 `nanoBragg.c` matches flags with `strstr`, so `-misset_seed N` is also `-misset N <next> <next>`, and `-misset_seed 7 -distance 90` renders a fixed misset of 7 0 90 degrees, unless a later `-misset` replaces it or fewer than three arguments follow. Those angles come from the text of unrelated flags, so torchBragg reads the flag as a seed and warns with the `-misset` that gives C's orientation.
 
+## `-detector_abs 0` or `inf` followed by `-detector_thick`
+
+`nanoBragg.c:762-773` reads `-detector_abs` with "inf" in its value, or a value `atof()` reads as 0, as "no absorption": it sets `detector_thick = 0` and `detector_mu = 0`. A later `-detector_thick` sets the thickness again and leaves mu at 0, a transparent sensor, so every layer captures `exp(0) - exp(0) = 0` and the image is zero (measured: `-detector_abs 0 -detector_thick 100` sums to 0, against 37527.6 with the flags the other way round). By ruling (2026-11-03) torchBragg keeps absorption off whatever follows `-detector_abs 0`/`inf`, which gives C's image for the flags the other way round; every other order of these flags, including a negative `-detector_abs` (mu becomes 1/thickness, `nanoBragg.c:1652-1656`), follows C. Pinned by `tests/test_detector_absorption_flags.py`.
+
 # Bugs in nanoBragg.c that torchBragg reproduces
 
 These are wrong physics that stay as C has them, by ruling, so that images remain comparable. The numbers below were measured on both programs, and the two agree.

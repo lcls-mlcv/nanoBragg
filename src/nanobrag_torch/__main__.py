@@ -592,6 +592,49 @@ def resolve_divsteps(args: argparse.Namespace) -> Tuple[Optional[int], Optional[
     return hsteps, vsteps
 
 
+def resolve_detector_absorption(args: argparse.Namespace) -> Tuple[Optional[float], Optional[float]]:
+    """(sensor thickness in um, attenuation depth in um), each None if no flag gave it.
+
+    nanoBragg.c:762-773 walks argv: -detector_abs with "inf" in its value, or a value atof()
+    reads as 0, sets detector_thick = 0 and detector_mu = 0 (an infinite attenuation depth); any
+    other value sets mu = 1/(value*1e-6), and a negative mu becomes 1/thickness after the loop;
+    -detector_thick sets the thickness. So C reads "-detector_abs 0 -detector_thick 100" as a
+    transparent 100 um sensor that captures nothing, a zero image. torchBragg diverges there
+    (docs/bugs/verified_c_bugs.md): -detector_abs 0/inf keeps absorption off whatever follows.
+    Without ``args._argv`` -detector_abs is taken after -detector_thick.
+    """
+    thick, depth = args.detector_thick, None
+    absorption_off = False
+
+    def absorb(value):
+        nonlocal thick, depth, absorption_off
+        if "inf" in value or c_atof(value) == 0.0:
+            thick, depth, absorption_off = 0.0, math.inf, True
+        else:
+            depth, absorption_off = c_atof(value), False
+
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        if args.detector_abs:
+            absorb(args.detector_abs)
+    else:
+        for token, value in zip(argv, argv[1:]):
+            if token == '-detector_thick':
+                thick = c_atof(value)
+            elif token in ('-detector_abs', '-detector_absorb'):
+                absorb(value)
+    # Divergence from C (docs/bugs/verified_c_bugs.md): -detector_abs 0/inf turns absorption off
+    # whatever follows it. C lets a later -detector_thick bring a transparent sensor back, which
+    # captures nothing and gives a zero image.
+    if absorption_off:
+        thick = 0.0
+    # A negative value leaves mu negative, which nanoBragg.c:1652-1656 replaces with 1/thickness
+    # after the argv loop: the same as no -detector_abs
+    if depth is not None and depth < 0:
+        depth = None
+    return thick, depth
+
+
 def resolve_wavelength_A(args: argparse.Namespace) -> Optional[float]:
     """
     Wavelength in Å, None if no flag gave one. nanoBragg.c:853-859 walks argv, so the last of
@@ -1210,14 +1253,13 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['custom_pix0_vector'] = config['pix0_override_m']
 
     # Detector absorption
-    if args.detector_abs:
-        if args.detector_abs in ['inf', '0']:
-            config['detector_abs_um'] = 0.0
-        else:
-            config['detector_abs_um'] = float(args.detector_abs)
-
-    if args.detector_thick:
-        config['detector_thick_um'] = args.detector_thick
+    thick_um, abs_um = resolve_detector_absorption(args)
+    if abs_um is not None:
+        config['detector_abs_um'] = abs_um
+    if thick_um:
+        config['detector_thick_um'] = thick_um
+    elif thick_um == 0.0 and 'detector_abs_um' in config:
+        config['detector_thick_um'] = 0.0  # -detector_abs 0/inf took the thickness away, as in C
 
     if args.detector_thicksteps:
         config['detector_thicksteps'] = args.detector_thicksteps
