@@ -26,6 +26,9 @@ INPUTS = {
     "wavelength_A": ("beam", "wavelength_A", 1.0, 1.02),
     "polarization_factor": ("beam", "polarization_factor", 0.5, 0.8),
     "polarization_axis": ("beam", "polarization_axis", (0.0, 0.0, 1.0), (0.0, 0.6, 0.8)),
+    "cell_a": ("crystal", "cell_a", 70.0, 70.5),
+    "cell_gamma": ("crystal", "cell_gamma", 90.0, 91.0),
+    "N_cells_a": ("crystal", "N_cells", 5.0, 6.0),
 }
 
 
@@ -34,6 +37,8 @@ def simulate(name, leaf, run):
     crystal = dict(cell_a=70.0, cell_b=80.0, cell_c=90.0, N_cells=(5, 5, 5), default_F=100.0,
                    misset_deg=(10.0, 20.0, 30.0))
     beam = dict(wavelength_A=1.0, fluence=1e24, polarization_factor=0.5)
+    if field == "N_cells":
+        leaf = (leaf, 5, 5)
     dict(crystal=crystal, beam=beam)[where][field] = leaf
     detector = DetectorConfig(distance_mm=100.0, pixel_size_mm=1.0, spixels=24, fpixels=24, oversample=1)
     return Simulator(Crystal(CrystalConfig(**crystal), **run), Detector(detector, **run),
