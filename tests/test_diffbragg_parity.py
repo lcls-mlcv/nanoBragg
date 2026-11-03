@@ -223,6 +223,36 @@ def test_eta_gradients_match_diffbragg(case, device):
             assert abs(got - ref) <= 1e-7 * scale, f"d(w·I)/d(eta{i}) ({wname} w): torch {got!r} vs diffBragg {ref!r}"
 
 
+# Off-diagonal Ncells (plan step 3a): ExperimentModel's Ndef against diffBragg's NCELLS_OFFDIAG (21).
+# The GAUSS lattice factor with NABC = [[Na, Nd, Nf], [Nd, Nb, Ne], [Nf, Ne, Nc]]; the parameters are
+# additive, so d/d(delta) is d/d(Nd, Ne, Nf).
+NDEF_CASES = {
+    "small": ["--ncells", "7", "--ncells-def", "0.8", "-0.5", "1.1"],
+    "triclinic": ["--ncells", "6", "--ncells-def", "1.5", "0.4", "-0.9", "--ucell", "61", "73", "84", "87", "95",
+                  "101", "--symbol", "P1", "--randomrotate", "2"],
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("case", list(NDEF_CASES))
+def test_ndef_gradients_match_diffbragg(case, device):
+    args = cmp.build_parser().parse_args(["--detpixels", "128"] + NDEF_CASES[case])
+    args.device = device
+    sim = cmp.build_sim(args)
+    db_img, db_derivs = cmp.diffbragg_ndef_forward_and_derivs(sim)
+    model = cmp.torch_experiment_model(sim, args)
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-9, atol=1e-12 * db_img.max())
+    rng = np.random.default_rng(3)
+    for wname, w in {"uniform": np.ones_like(db_img), "random": rng.uniform(0.0, 1.0, db_img.shape)}.items():
+        (g,) = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                                   [model.crystal_params.delta_N_cells_def], retain_graph=True)
+        for i, ref_pixels in enumerate(db_derivs):
+            ref = float((w * ref_pixels).sum())
+            scale = float(np.abs(w * ref_pixels).sum())
+            assert abs(float(g[i]) - ref) <= 1e-7 * scale, f"d(w·I)/dN{'def'[i]} ({wname} w): torch {float(g[i])!r} vs diffBragg {ref!r}"
+
+
 # detz_shift (plan C3): ExperimentModel's origin shift along lab z against diffBragg's DETZ_ID (10).
 # diffBragg's shift is in metres, ExperimentModel's in mm. diffBragg applies the solid angle and the
 # polarization once per pixel and leaves both out of its analytic detz derivative (pinned by the

@@ -91,6 +91,8 @@ def build_sim(args):
                               auto_set_spotscale=False)
     SIM.D.oversample_omega = args.oversample_omega
     SIM.D.nopolar = args.nopolar
+    if getattr(args, "ncells_def", None):
+        SIM.D.Ncells_def = tuple(args.ncells_def)
     if args.fhkl_dmin:
         # SimData.update_Fhkl_tuple's resolution filter drops reflections beyond the detector
         # corner and also the lowest-resolution one (its d_max bound is exclusive); load all
@@ -228,6 +230,18 @@ def diffbragg_eta_forward_and_derivs(SIM):
     return img, [p.as_numpy_array().reshape(slow, fast).copy() for p in pixels]
 
 
+def diffbragg_ndef_forward_and_derivs(SIM):
+    """diffBragg image and d(image)/d(Nd, Ne, Nf) (NCELLS_OFFDIAG, refine id 21)."""
+    D = SIM.D
+    D.refine(21)
+    D.initialize_managers()
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[0].get_image_size()
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+    return img, [p.as_numpy_array().reshape(slow, fast).copy() for p in D.get_ncells_def_derivative_pixels()]
+
+
 def diffbragg_detz_forward_and_derivs(SIM):
     """diffBragg image and d(image)/d(detz_shift) (DETZ_ID 10; the shift is in metres)."""
     from simtbx.diffBragg.hopper_utils import DETZ_ID
@@ -314,6 +328,8 @@ def torch_experiment_model(SIM, args, **kwargs):
                                 shape=args.shape, default_F=args.default_F,
                                 spot_metric=SpotMetric(args.spot_metric),
                                 mosaic_spread_deg=eta[0], mosaic_domains=args.mosaic_domains if args.eta else 1)
+    if getattr(args, "ncells_def", None):
+        cfg.N_cells_def = tuple(args.ncells_def)
     model = ExperimentModel(cfg, det_cfg, beam_cfg, device=torch.device(args.device), dtype=torch.float64,
                             anisotropic_mosaicity=len(eta) == 3, **kwargs)
     if len(eta) == 3:
@@ -414,6 +430,8 @@ def build_parser():
     p.add_argument("--symbol", default="P121")
     p.add_argument("--ncells", type=int, default=7)
     p.add_argument("--shape", choices=["square", "round", "gauss"], default="gauss")
+    p.add_argument("--ncells-def", dest="ncells_def", type=float, nargs=3, default=None,
+                   metavar=("Nd", "Ne", "Nf"), help="diffBragg's off-diagonal Ncells")
     p.add_argument("--detpixels", type=int, default=256)
     p.add_argument("--pixel", type=float, default=0.1)
     p.add_argument("--distance", type=float, default=220.0)
