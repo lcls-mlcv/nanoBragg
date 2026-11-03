@@ -121,3 +121,49 @@ def test_c_convention_detector_refines_distance():
         model.refine("detz_shift")
     model().sum().backward()
     assert model.detector_params.delta_log_distance_mm.grad.abs() > 0
+
+
+def _axes_panel(fast, slow, origin):
+    return SimpleNamespace(get_fast_axis=lambda: tuple(fast), get_slow_axis=lambda: tuple(slow),
+                           get_origin=lambda: tuple(origin), get_pixel_size=lambda: (0.1, 0.1),
+                           get_image_size=lambda: (64, 64))
+
+
+def _set_tilts(model, rotx_deg, roty_deg):
+    params = model.detector_params
+    with torch.no_grad():
+        params.delta_rotx_raw.fill_(math.atanh(rotx_deg / params.max_tilt_delta_deg))
+        params.delta_roty_raw.fill_(math.atanh(roty_deg / params.max_tilt_delta_deg))
+
+
+@pytest.mark.parametrize("rotx_deg, roty_deg", [(1.0, 0.0), (0.0, 3.0), (2.0, -1.5)])
+def test_detz_shift_stays_along_lab_z_when_the_detector_rotation_is_refined(rotx_deg, roty_deg):
+    """diffBragg's detz_shift moves the panel origin along lab z, whatever the panel's rotation."""
+    from nanobrag_torch.models.detector import Detector
+
+    model = _dxtbx_model(tilt_deg=12.0)
+    _set_tilts(model, rotx_deg, roty_deg)
+    params = model.detector_params
+
+    def geometry(dz):
+        with torch.no_grad():
+            params.delta_detz_shift_mm.fill_(dz)
+            det = Detector(params.build_config(), dtype=DTYPE)
+        return det.pix0_vector, det.fdet_vec, det.sdet_vec, det.odet_vec
+
+    pix0, f, s, o = geometry(0.0)
+    pix0_moved, f_moved, s_moved, o_moved = geometry(-1.5)
+    torch.testing.assert_close(pix0_moved - pix0, torch.tensor([0.0, 0.0, -1.5e-3], dtype=DTYPE), rtol=0, atol=1e-15)
+    for a, b in ((f, f_moved), (s, s_moved), (o, o_moved)):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    # The image is that of a panel given by the rotated axes, its origin moved along lab z
+    with torch.no_grad():
+        params.delta_detz_shift_mm.fill_(-1.5)
+        stepped = model()
+    origin_mm = (pix0 * 1000).tolist()
+    origin_mm[2] -= 1.5
+    det = detector_config_from_dxtbx_panel(_axes_panel(f.tolist(), s.tolist(), origin_mm), (0, 0, -1), oversample=1)
+    with torch.no_grad():
+        moved = ExperimentModel(_crystal(), det, _beam(), dtype=DTYPE, param_init="frozen")()
+    torch.testing.assert_close(stepped, moved, rtol=1e-9, atol=0.0)

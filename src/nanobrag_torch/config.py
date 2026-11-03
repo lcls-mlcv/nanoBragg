@@ -261,6 +261,9 @@ class DetectorConfig:
 
     # Detector origin override (CLI-FLAGS-003)
     pix0_override_m: Optional[Union[Tuple[float, float, float], torch.Tensor]] = None  # Override pix0 vector (meters)
+    # Shift of the detector origin along lab z (mm), after every rotation: diffBragg's detz_shift.
+    # Not a nanoBragg.c flag; None or 0 leaves C's geometry untouched.
+    origin_shift_z_mm: Optional[Union[float, torch.Tensor]] = None
 
     # Custom basis vectors for CUSTOM convention (unit vectors)
     custom_fdet_vector: Optional[Tuple[float, float, float]] = None  # Fast axis direction
