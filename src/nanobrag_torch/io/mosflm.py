@@ -106,8 +106,9 @@ def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple
 
     # Scale to remove wavelength and convert to Å^-1
     # The values in the file are in units of Å^-1·(1/λ_Å)
-    # We scale by (1e-10/lambda_m) where lambda_m = wavelength_A * 1e-10
-    lambda_m = wavelength_A * 1e-10
+    # We scale by (1e-10/lambda0) where C reads lambda0 = atof(arg)/1e10 (nanoBragg.c:874, 1892).
+    # wavelength_A*1e-10 is an ulp away for many wavelengths, which moves the auto-oversample ceil.
+    lambda_m = wavelength_A / 1e10
     scale_factor = 1e-10 / lambda_m  # This equals 1/wavelength_A
 
     a_star = a_star_raw * scale_factor

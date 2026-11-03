@@ -72,13 +72,20 @@ def test_the_reported_case_gives_six():
     assert bundle(argv + ["-dtype", "float32"]).simulator._auto_oversample() == 6
 
 
-def test_cell_lengths_follow_a_matrix(tmp_path):
+@pytest.mark.parametrize("matrix, flags", [
+    ("0.01 0 0\n0 0.0125 0\n0 0 0.02\n", "-N 10 -lambda 1"),
+    # C divides the matrix by lambda0 = atof(arg)/1e10 (nanoBragg.c:874, 1892); lambda*1e-10 is an ulp
+    # away for these, and 3*N*p/(m*d) is a whole number whatever lambda is, so the ulp moves the ceil
+    ("0.015 0 0\n0 0.015 0\n0 0 0.015\n", "-N 15 -lambda 2.008 -distance 100 -pixel 0.1"),
+    ("0.0125 0 0\n0 0.0125 0\n0 0 0.0125\n", "-N 25 -energy 11203.05 -distance 100 -pixel 0.1"),
+])
+def test_cell_lengths_follow_a_matrix(matrix, flags, tmp_path):
     """-mat: the lengths come from the reciprocal vectors, at the file's wavelength."""
     c_bin = os.environ.get("NB_C_BIN")
     if not c_bin or not Path(c_bin).exists():
         pytest.skip("set NB_C_BIN to the oracle binary")
-    (tmp_path / "a.mat").write_text("0.01 0 0\n0 0.0125 0\n0 0 0.02\n")
-    argv = f"-default_F 100 -detpixels 8 -mat {tmp_path / 'a.mat'} -N 10 -lambda 1 -oversample 0".split()
+    (tmp_path / "a.mat").write_text(matrix)
+    argv = f"-default_F 100 -detpixels 8 -mat {tmp_path / 'a.mat'} {flags} -oversample 0".split()
     c = subprocess.run([str(Path(c_bin).resolve())] + argv + "-roi 0 0 0 0 -nopgm -nonoise -nointfile -floatfile f.bin".split(),
                        cwd=tmp_path, capture_output=True, text=True, timeout=120, check=True)
     expected = int(re.search(r"auto-selected (\d+)-fold oversampling", c.stdout).group(1))
