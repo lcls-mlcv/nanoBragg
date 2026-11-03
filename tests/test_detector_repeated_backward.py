@@ -77,3 +77,29 @@ def test_numbers_rebuild_nothing_between_runs():
     version = sim.detector._geometry_version
     sim.run()
     assert sim.detector._geometry_version == version
+
+
+def test_forward_only_runs_with_a_leaf_rebuild_nothing():
+    """The rebuild is for a second backward: runs with no backward in between keep the geometry."""
+    leaf = torch.tensor(100.0, dtype=DT, requires_grad=True)
+    sim = simulator("distance_mm", leaf, DetectorConvention.MOSFLM)
+    sim.run()
+    version = sim.detector._geometry_version
+    sim.run()
+    sim.run()
+    assert sim.detector._geometry_version == version
+    loss(sim.run()).backward()
+    sim.run()
+    assert sim.detector._geometry_version == version + 1
+
+
+def test_a_geometry_built_under_no_grad_is_rebuilt_for_a_grad_run():
+    leaf = torch.tensor(100.0, dtype=DT, requires_grad=True)
+    sim = simulator("distance_mm", leaf, DetectorConvention.MOSFLM)
+    with torch.no_grad():
+        with torch.no_grad():
+            leaf.fill_(101.0)
+        sim.run()
+    loss(sim.run()).backward()
+    _, expected_grad = fresh("distance_mm", 101.0, DetectorConvention.MOSFLM)
+    assert leaf.grad.item() == pytest.approx(expected_grad, rel=1e-10)

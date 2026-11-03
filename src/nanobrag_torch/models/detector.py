@@ -187,6 +187,20 @@ class Detector:
         # Calculate and cache pix0_vector (position of first pixel)
         self._calculate_pix0_vector()
 
+        # The derived tensors carry the graph of this build. A backward through any of them frees
+        # it, after which the next run must build again (see _ensure_geometry_current); a hook
+        # on each records that a backward went through, so forward-only runs keep the geometry.
+        derived = [value for value in vars(self).values()
+                   if isinstance(value, torch.Tensor) and value.grad_fn is not None]
+        self._geometry_built_with_grad = bool(derived)
+        self._geometry_graph_used = False
+        for tensor in derived:
+            tensor.register_hook(self._mark_geometry_graph_used)
+
+    def _mark_geometry_graph_used(self, grad):
+        self._geometry_graph_used = True
+        return None
+
     # =========================================================================
     # DBEX-GRADIENT-001: Dynamic properties for geometry parameters
     # =========================================================================
@@ -424,10 +438,15 @@ class Detector:
         """
         fingerprint = self._current_geometry_fingerprint()
         # At the start of a run with a differentiable geometry the derived tensors are built
-        # again, unchanged config or not: those of the last run carry its graph, which its
-        # backward has freed, so a second backward at the same value would go through it.
-        # Simulator.run asks once per run, so later calls in the run see it as current.
-        rebuild_for_grad = new_run and torch.is_grad_enabled() and self._geometry_requires_grad()
+        # again, unchanged config or not, when a backward has gone through the last build (its
+        # graph is freed, so a second backward at the same value would go through it) or the
+        # last build was made without grad (under no_grad: no graph back to the leaves at all).
+        # Forward-only runs keep the geometry. Simulator.run asks once per run, so later calls in
+        # the run see it as current.
+        rebuild_for_grad = (
+            new_run and torch.is_grad_enabled() and self._geometry_requires_grad()
+            and (self._geometry_graph_used or not self._geometry_built_with_grad)
+        )
         if fingerprint == self._geometry_fingerprint and not rebuild_for_grad:
             return False
 
