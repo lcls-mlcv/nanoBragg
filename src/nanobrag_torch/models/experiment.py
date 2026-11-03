@@ -1166,13 +1166,17 @@ class ExperimentModel(nn.Module):
         # (Simulator imports models.crystal / models.detector).
         from ..simulator import Simulator
 
-        return Simulator(
+        simulator = Simulator(
             crystal=self._crystal,
             detector=detector,
             beam_config=self._beam_config,
             device=self.device,
             dtype=self.dtype,
         )
+        # _sync writes fresh parameter tensors into the detector config each forward, which
+        # rebuilds the geometry once per pass; per-run rebuilds would split a shared Detector
+        simulator.rebuild_geometry_each_run = False
+        return simulator
 
     def _whole_panel_simulators(self) -> list:
         """A Simulator per panel, built when whole images are first asked for."""
