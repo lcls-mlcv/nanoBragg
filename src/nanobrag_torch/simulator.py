@@ -349,7 +349,7 @@ def compute_physics_for_position(
         k_frac = k - k0
         l_frac = l - l0
         n_scale = Na * Nb * Nc
-        if spot_metric is SpotMetric.HKL and N_cells_def is not None:
+        if spot_metric is SpotMetric.HKL and N_cells_def is not None and shape == CrystalShape.GAUSS:
             # diffBragg (diffBragg_cpu_kernel.cpp:521-536): V = NABC (h - h0) with the symmetric
             # NABC = [[Na, Nd, Nf], [Nd, Nb, Ne], [Nf, Ne, Nc]], scale det(NABC). The determinant is
             # written so that at Nd = Ne = Nf = 0 it is Na*Nb*Nc to the bit.
@@ -971,20 +971,25 @@ class Simulator:
         return len(weights) * weights / weights.sum()
 
     def _n_cells_def(self) -> Optional[torch.Tensor]:
-        """diffBragg's (Nd, Ne, Nf) in the run's dtype, or None when they are zeros that need no gradient.
+        """diffBragg's (Nd, Ne, Nf) in the run's dtype, or None when they are zero numbers.
 
         None keeps the diagonal lattice factor's arithmetic, so nanoBragg.c's images are unchanged.
-        Off-diagonals exist only for the hkl metric (cctbx/diffBragg); the reciprocal-space metric
-        of nanoBragg.c has none.
+        A tensor always takes the matrix path (testing its value would cost a device sync each run);
+        at zeros that path agrees with the diagonal one to the last bit or so (1e-14 in float64,
+        1e-5 in float32 tails), so a model's image can differ by that between grad and no_grad.
+        diffBragg defines the off-diagonals for its Gaussian lattice factor in hkl only: any other
+        shape or the reciprocal-space metric (nanoBragg.c's) refuses them. Nothing bounds them:
+        like diffBragg, det(NABC) can reach 0 (no image; diffBragg's derivatives are NaN there).
         """
         values = getattr(self.crystal.config, "N_cells_def", None)
         if values is None:
             return None
-        needed = any((isinstance(v, torch.Tensor) and v.requires_grad) or float(v) != 0.0 for v in values)
-        if not needed:
+        if not any(isinstance(v, torch.Tensor) or float(v) != 0.0 for v in values):
             return None
-        if getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL) is not SpotMetric.HKL:
-            raise ValueError("N_cells_def (diffBragg's off-diagonal Ncells) needs spot_metric=SpotMetric.HKL")
+        cfg = self.crystal.config
+        if cfg.shape != CrystalShape.GAUSS or getattr(cfg, "spot_metric", SpotMetric.RECIPROCAL) is not SpotMetric.HKL:
+            raise ValueError("N_cells_def (diffBragg's off-diagonal Ncells) needs shape=CrystalShape.GAUSS and "
+                             "spot_metric=SpotMetric.HKL, the lattice factor diffBragg defines it for")
         return torch.stack([torch.as_tensor(v, device=self.device, dtype=self.dtype) for v in values])
 
     def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None, oversample_polar=False):

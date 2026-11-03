@@ -211,6 +211,9 @@ class CrystalStageAParams(nn.Module):
             )
 
         if base_config.shape != CrystalShape.GAUSS or base_config.spot_metric is not SpotMetric.HKL:
+            if any(float(v) != 0.0 for v in getattr(base_config, "N_cells_def", (0.0, 0.0, 0.0))):
+                raise ValueError("N_cells_def (diffBragg's off-diagonal Ncells) needs shape=CrystalShape.GAUSS "
+                                 "and spot_metric=SpotMetric.HKL; this crystal would ignore or refuse it")
             self.unrefinable["delta_N_cells_def"] = (
                 "Ndef (diffBragg's off-diagonal Ncells) is refinable only with shape=CrystalShape.GAUSS "
                 "and spot_metric=SpotMetric.HKL, the lattice factor diffBragg defines it for"

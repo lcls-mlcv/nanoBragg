@@ -120,3 +120,24 @@ def test_ndef_is_unrefinable_outside_gauss_with_the_hkl_metric(shape, metric):
     assert "crystal_params.delta_N_cells_def" in m.unrefinable
     with pytest.raises(ValueError, match="Ndef"):
         m.refine("Ndef")
+
+
+def test_ndef_is_refinable_under_gauss_with_the_hkl_metric_and_gets_a_gradient():
+    m = model(ncells_def=NDEF)
+    assert "crystal_params.delta_N_cells_def" not in m.unrefinable
+    m().sum().backward()
+    assert m.crystal_params.delta_N_cells_def.grad.abs().min() > 0
+
+
+@pytest.mark.parametrize("shape", [CrystalShape.TOPHAT, CrystalShape.SQUARE, CrystalShape.ROUND])
+def test_off_diagonals_outside_gauss_are_refused(shape):
+    """diffBragg defines Ndef for its Gaussian lattice factor only; elsewhere a value would be ignored."""
+    with pytest.raises(ValueError, match="N_cells_def"):
+        simulator(NDEF, shape=shape).run()
+
+
+@pytest.mark.parametrize("shape, metric", [(CrystalShape.TOPHAT, SpotMetric.HKL), (CrystalShape.SQUARE, SpotMetric.HKL),
+                                           (CrystalShape.GAUSS, SpotMetric.RECIPROCAL)])
+def test_a_nonzero_ndef_the_model_cannot_use_is_refused_at_construction(shape, metric):
+    with pytest.raises(ValueError, match="N_cells_def"):
+        model(shape=shape, metric=metric, ncells_def=NDEF)
