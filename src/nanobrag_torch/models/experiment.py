@@ -787,7 +787,9 @@ class ExperimentModel(nn.Module):
     instead of one eta (diffBragg's ensemble; see CrystalStageAParams).
     ``structure_factors`` (a StructureFactors) makes F refinable, one amplitude per
     unique reflection (see StructureFactorStageAParams); a fixed grid can be given
-    instead with ``hkl_data``/``hkl_metadata`` or set_structure_factors().
+    instead with ``hkl_data``/``hkl_metadata`` or set_structure_factors(). A grid in
+    another dtype or device is converted again at every forward, so that an in-place
+    change to it is seen; give it in the model's dtype and device to avoid the copy.
     ``background_rois`` and ``tilt_abc`` give the regions and starting coefficients of
     the background planes (see BackgroundStageAParams); by default the whole image is
     one plane starting at zero. ``model(roi_only=True)`` evaluates just the pixels of
@@ -1080,7 +1082,9 @@ class ExperimentModel(nn.Module):
         # Simulator's auto-oversample choice reads the config copy.
         crystal.config.N_cells = crystal_cfg.N_cells
         self._apply_mosaicity(crystal)
-        if self.fhkl_params.active:
+        # A fixed grid in another dtype or device is a copy, so it is made again from the caller's
+        # tensor at each forward; in the model's own dtype and device .to() returns the tensor itself
+        if self.fhkl_params.active or self._external_hkl_data is not None:
             self._apply_structure_factors(crystal)
 
         if not self._detectors_synced_by_serial:

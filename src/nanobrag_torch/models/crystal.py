@@ -35,6 +35,48 @@ def _is_compiling() -> bool:
         return False
 
 
+class _Kept:
+    """A Crystal parameter kept as given and converted to the Crystal's dtype and device at each read.
+
+    A tensor is stored as it is, so an in-place change to it (.data, an optimizer step) is seen
+    by the next read and the gradient reaches it at its current value, whatever its dtype or
+    device. A copy converted once at construction fell behind such a change. A number becomes
+    a tensor once, in the Crystal's dtype and device, and is remade from the number by to().
+
+    With a tensor of another dtype or device each read is a new copy, so change the tensor
+    that was given (or assign a new one): ``crystal.cell_a.requires_grad_()`` or
+    ``crystal.cell_a.data.fill_(x)`` then acts on a copy and is lost. Simulator's
+    wavelength, kahn_factor, polarization_axis and source tensors behave the same way.
+    """
+
+    def __set_name__(self, owner, name):
+        self.slot = "_kept_" + name
+        self.number = "_kept_number_" + name
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        try:
+            value = obj.__dict__[self.slot]
+        except KeyError:
+            raise AttributeError(self.slot[len("_kept_"):]) from None
+        return value.to(device=obj.device, dtype=obj.dtype)
+
+    def __set__(self, obj, value):
+        if isinstance(value, torch.Tensor):
+            obj.__dict__[self.slot] = value
+            obj.__dict__[self.number] = None
+        else:
+            obj.__dict__[self.slot] = torch.as_tensor(value, device=obj.device, dtype=obj.dtype)
+            obj.__dict__[self.number] = value
+
+    def remake(self, obj):
+        """After a change of dtype or device: a number is converted again from its digits."""
+        number = obj.__dict__.get(self.number)
+        if number is not None:
+            obj.__dict__[self.slot] = torch.as_tensor(number, device=obj.device, dtype=obj.dtype)
+
+
 class Crystal:
     """
     Crystal model managing unit cell, orientation, and structure factors.
@@ -53,6 +95,18 @@ class Crystal:
     2. Dynamic spindle (phi) rotation (applied during simulation)
     3. Mosaic domain rotations (applied during simulation)
     """
+
+    cell_a = _Kept()
+    cell_b = _Kept()
+    cell_c = _Kept()
+    cell_alpha = _Kept()
+    cell_beta = _Kept()
+    cell_gamma = _Kept()
+    N_cells_a = _Kept()
+    N_cells_b = _Kept()
+    N_cells_c = _Kept()
+    _KEPT = ("cell_a", "cell_b", "cell_c", "cell_alpha", "cell_beta", "cell_gamma",
+             "N_cells_a", "N_cells_b", "N_cells_c")
 
     def __init__(
         self, config: Optional[CrystalConfig] = None, beam_config: Optional[BeamConfig] = None, device=None, dtype=torch.float32
@@ -80,39 +134,20 @@ class Crystal:
         self.config = config if config is not None else CrystalConfig()
 
         # Initialize cell parameters from config with validation
-        # These are the fundamental parameters that can be differentiable
-        self.cell_a = torch.as_tensor(
-            self.config.cell_a, device=self.device, dtype=self.dtype
-        )
-        self.cell_b = torch.as_tensor(
-            self.config.cell_b, device=self.device, dtype=self.dtype
-        )
-        self.cell_c = torch.as_tensor(
-            self.config.cell_c, device=self.device, dtype=self.dtype
-        )
-        self.cell_alpha = torch.as_tensor(
-            self.config.cell_alpha, device=self.device, dtype=self.dtype
-        )
-        self.cell_beta = torch.as_tensor(
-            self.config.cell_beta, device=self.device, dtype=self.dtype
-        )
-        self.cell_gamma = torch.as_tensor(
-            self.config.cell_gamma, device=self.device, dtype=self.dtype
-        )
+        # These are the fundamental parameters that can be differentiable. Kept as given (_Kept):
+        # a tensor is read through at each use, whatever its dtype or device.
+        self.cell_a = self.config.cell_a
+        self.cell_b = self.config.cell_b
+        self.cell_c = self.config.cell_c
+        self.cell_alpha = self.config.cell_alpha
+        self.cell_beta = self.config.cell_beta
+        self.cell_gamma = self.config.cell_gamma
 
         # Validate cell parameters for numerical stability
         self._validate_cell_parameters()
 
         # Crystal size from config
-        self.N_cells_a = torch.as_tensor(
-            self.config.N_cells[0], device=self.device, dtype=self.dtype
-        )
-        self.N_cells_b = torch.as_tensor(
-            self.config.N_cells[1], device=self.device, dtype=self.dtype
-        )
-        self.N_cells_c = torch.as_tensor(
-            self.config.N_cells[2], device=self.device, dtype=self.dtype
-        )
+        self.N_cells_a, self.N_cells_b, self.N_cells_c = self.config.N_cells
 
         # Clear the cache when parameters change
         self._geometry_cache = {}
@@ -178,17 +213,9 @@ class Crystal:
         if dtype is not None:
             self.dtype = dtype
 
-        # Move all tensors to new device/dtype
-        self.cell_a = self.cell_a.to(device=self.device, dtype=self.dtype)
-        self.cell_b = self.cell_b.to(device=self.device, dtype=self.dtype)
-        self.cell_c = self.cell_c.to(device=self.device, dtype=self.dtype)
-        self.cell_alpha = self.cell_alpha.to(device=self.device, dtype=self.dtype)
-        self.cell_beta = self.cell_beta.to(device=self.device, dtype=self.dtype)
-        self.cell_gamma = self.cell_gamma.to(device=self.device, dtype=self.dtype)
-
-        self.N_cells_a = self.N_cells_a.to(device=self.device, dtype=self.dtype)
-        self.N_cells_b = self.N_cells_b.to(device=self.device, dtype=self.dtype)
-        self.N_cells_c = self.N_cells_c.to(device=self.device, dtype=self.dtype)
+        # Cell and N_cells are converted at each read; only those made from numbers are remade
+        for name in self._KEPT:
+            getattr(type(self), name).remake(self)  # through the class, so a subclass finds it
 
         if self.hkl_data is not None:
             self.hkl_data = self.hkl_data.to(device=self.device, dtype=self.dtype)

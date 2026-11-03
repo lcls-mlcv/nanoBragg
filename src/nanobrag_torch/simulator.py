@@ -22,7 +22,6 @@ from .utils.c_cell import c_ceil_to_int, c_cell_lengths_m
 from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sincg_miller, sinc3, polarization_factor
-from .utils.tensor_utils import as_tensor_preserving_grad
 
 logger = logging.getLogger(__name__)
 
@@ -652,12 +651,9 @@ class Simulator:
             self.incident_beam_direction = torch.tensor(
                 [1.0, 0.0, 0.0], device=self.device, dtype=self.dtype
             )
-        # PERF-PYTORCH-006: Store wavelength as tensor with correct dtype
-        # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
-        # when wavelength_A is already a tensor with requires_grad=True
-        self.wavelength = as_tensor_preserving_grad(
-            self.beam_config.wavelength_A, device=self.device, dtype=self.dtype
-        )
+        # Kept as given and converted at each use (see _kept), so an in-place change to a tensor
+        # of another dtype or device is seen and its gradient arrives at it.
+        self.wavelength = self.beam_config.wavelength_A
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
@@ -667,49 +663,28 @@ class Simulator:
         self._scale_dtype = _widest_float(self.device)
         self.r_e_sqr = R_E_SQR
         # Use fluence from beam config (AT-FLU-001)
-        # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
+        # Kept as given and converted at each use, as the wavelength is
         self.fluence = self.beam_config.fluence
-        # Polarization setup from beam config
-        # PERF-PYTORCH-006: Store as tensor with correct dtype
-        # DBEX-GRADIENT-001: Use as_tensor_preserving_grad when nopolar is False
-        # to maintain gradient graph for differentiable polarization_factor
+        # Polarization setup from beam config, kept as the wavelength is
         # -nopolar keeps the factor: -oversample_polar puts polarization back regardless
-        self.kahn_factor = as_tensor_preserving_grad(
-            self.beam_config.polarization_factor, device=self.device, dtype=self.dtype
-        )
-        self.polarization_axis = torch.tensor(
-            self.beam_config.polarization_axis, device=self.device, dtype=self.dtype
-        )
+        self.kahn_factor = self.beam_config.polarization_factor
+        self.polarization_axis = self.beam_config.polarization_axis
 
-        # PERF-PYTORCH-004 P1.2 + P3.0: Pre-normalize source tensors to avoid repeated .to() calls in run()
-        # Move source direction/wavelength/weight tensors to correct device/dtype once during init
-        # P3.0: Seed fallback tensors (equal weights, primary wavelength) when omitted before device cast
+        # Source tensors are kept as given and converted at each run (the _source_* properties).
+        # Converting them once here, and taking wavelengths to Angstroms here, left a copy that
+        # missed an in-place change and, for the Angstroms, a graph freed by the first backward.
         _has_sources = (self.beam_config.source_directions is not None and
                        len(self.beam_config.source_directions) > 0)
         if _has_sources:
-            self._source_directions = self.beam_config.source_directions.to(device=self.device, dtype=self.dtype)
-
-            # P3.0: Default source_wavelengths to primary wavelength if not provided (AT-SRC-001)
-            if self.beam_config.source_wavelengths is not None:
-                self._source_wavelengths = self.beam_config.source_wavelengths.to(device=self.device, dtype=self.dtype)  # meters
-            else:
-                # Use primary wavelength for all sources
-                primary_wavelength_m = self.beam_config.wavelength_A * 1e-10
-                n_sources = len(self.beam_config.source_directions)
-                self._source_wavelengths = torch.full((n_sources,), primary_wavelength_m, device=self.device, dtype=self.dtype)
-
-            self._source_wavelengths_A = self._source_wavelengths * 1e10  # Convert to Angstroms once
-
-            # P3.0: Default source_weights to equal weights if not provided
-            if self.beam_config.source_weights is not None:
-                self._source_weights = self.beam_config.source_weights.to(device=self.device, dtype=self.dtype)
-            else:
-                # Default to equal weights if not provided
-                self._source_weights = torch.ones(len(self.beam_config.source_directions), device=self.device, dtype=self.dtype)
+            self._source_directions_given = self.beam_config.source_directions
+            # Without source_wavelengths each source has the primary wavelength (AT-SRC-001)
+            self._source_wavelengths_given = self.beam_config.source_wavelengths  # metres, or None
+            # Without source_weights the sources weigh the same
+            self._source_weights_given = self.beam_config.source_weights
         else:
-            self._source_directions = None
-            self._source_wavelengths_A = None
-            self._source_weights = None
+            self._source_directions_given = None
+            self._source_wavelengths_given = None
+            self._source_weights_given = None
 
         # PERF-PYTORCH-004 P3.4: Cache frequently-accessed tensors to reduce per-run allocations
         # Pre-convert pixel coordinates to correct device/dtype once
@@ -822,13 +797,95 @@ class Simulator:
 
     def set_spectrum(self, wavelength_A, source_wavelengths=None, source_weights=None) -> None:
         """Replace the wavelengths (A; sources in metres) and source weights of this Simulator."""
-        self.wavelength = as_tensor_preserving_grad(wavelength_A, device=self.device, dtype=self.dtype)
+        self.wavelength = wavelength_A
         self._wavelength_given = wavelength_A
-        if self._source_directions is not None and source_wavelengths is not None:
-            self._source_wavelengths = source_wavelengths.to(device=self.device, dtype=self.dtype)
-            self._source_wavelengths_A = self._source_wavelengths * 1e10
-        if self._source_directions is not None and source_weights is not None:
-            self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+        if self._source_directions_given is not None and source_wavelengths is not None:
+            self._source_wavelengths_given = source_wavelengths
+        if self._source_directions_given is not None and source_weights is not None:
+            self._source_weights_given = source_weights
+
+    @property
+    def _source_directions(self) -> Optional[torch.Tensor]:
+        """(N, 3) directions from sample to source in the run's dtype, or None without sources."""
+        given = self._source_directions_given
+        return None if given is None else self._at_run(given)
+
+    @property
+    def _source_wavelengths(self) -> Optional[torch.Tensor]:
+        """(N,) source wavelengths in metres, the primary wavelength for each if none were given."""
+        if self._source_directions_given is None:
+            return None
+        given = self._source_wavelengths_given
+        if given is None:
+            n_sources = len(self._source_directions_given)
+            primary = self._wavelength_given
+            if isinstance(primary, torch.Tensor):
+                # In the wider of the two dtypes, so a float32 leaf in a float64 run keeps its digits
+                wide = torch.promote_types(primary.dtype, self.dtype)
+                return self._at_run(primary.to(device=self.device, dtype=wide) * 1e-10).expand(n_sources)
+            return torch.full((n_sources,), primary * 1e-10, device=self.device, dtype=self.dtype)
+        return self._at_run(given)
+
+    @property
+    def _source_wavelengths_A(self) -> Optional[torch.Tensor]:
+        """(N,) source wavelengths in Angstroms, taken from metres at each run."""
+        metres = self._source_wavelengths
+        return None if metres is None else metres * 1e10
+
+    @property
+    def _source_weights(self) -> Optional[torch.Tensor]:
+        """(N,) source weights in the run's dtype, equal if none were given."""
+        if self._source_directions_given is None:
+            return None
+        given = self._source_weights_given
+        if given is None:
+            return torch.ones(len(self._source_directions_given), device=self.device, dtype=self.dtype)
+        return self._at_run(given)
+
+    def _kept(self, value) -> torch.Tensor:
+        """value itself if a tensor, else a tensor in the run's dtype; see _at_run."""
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.tensor(value, device=self.device, dtype=self.dtype)
+
+    def _at_run(self, value: torch.Tensor) -> torch.Tensor:
+        """A kept tensor in the run's dtype and device, converted afresh at each use.
+
+        A copy made once, at construction, falls behind when a tensor of another dtype or
+        device is changed in place (.data, an optimizer step), and its gradient is then
+        taken at the old value. In the run's dtype and device this is the tensor itself.
+        """
+        return value.to(device=self.device, dtype=self.dtype)
+
+    @property
+    def wavelength(self) -> torch.Tensor:
+        """Wavelength in Angstroms, in the run's dtype. Assign, or change the tensor given in place."""
+        return self._at_run(self._wavelength)
+
+    @wavelength.setter
+    def wavelength(self, value) -> None:
+        self._wavelength = self._kept(value)
+        # The digits as given, for what C reads as lambda0: the auto oversample and the
+        # wavelength of sources given none, so these follow an assignment as set_spectrum's
+        self._wavelength_given = value
+
+    @property
+    def kahn_factor(self) -> torch.Tensor:
+        """Kahn polarization factor, kept as the wavelength is."""
+        return self._at_run(self._kahn_factor)
+
+    @kahn_factor.setter
+    def kahn_factor(self, value) -> None:
+        self._kahn_factor = self._kept(value)
+
+    @property
+    def polarization_axis(self) -> torch.Tensor:
+        """Polarization E-vector, kept as the wavelength is."""
+        return self._at_run(self._polarization_axis)
+
+    @polarization_axis.setter
+    def polarization_axis(self, value) -> None:
+        self._polarization_axis = self._kept(value)
 
     def _scale_source(self, value) -> torch.Tensor:
         """The one tensor a scale factor is kept in: value itself if a tensor, else a double.
@@ -2220,11 +2277,15 @@ class Simulator:
                         # Re-compute per-source intensities using single-source calls to avoid
                         # modifying the compiled production path
 
-                        for src_idx in range(len(self._source_directions)):
+                        # Converted once for the loop; each property converts on every read
+                        all_directions = self._source_directions
+                        all_wavelengths_A = self._source_wavelengths_A
+                        all_weights = self._source_weights
+                        for src_idx in range(len(all_directions)):
                             # Extract single source parameters
-                            src_direction = self._source_directions[src_idx:src_idx+1]  # Keep batch dim
-                            src_wavelength_A = self._source_wavelengths_A[src_idx:src_idx+1]
-                            src_weight = self._source_weights[src_idx].item() if self._source_weights is not None else 1.0
+                            src_direction = all_directions[src_idx:src_idx+1]  # Keep batch dim
+                            src_wavelength_A = all_wavelengths_A[src_idx:src_idx+1]
+                            src_weight = all_weights[src_idx].item() if all_weights is not None else 1.0
 
                             # Get pixel coordinate for trace pixel (single point)
                             coords_meters = pixel_coords_meters[target_slow:target_slow+1, target_fast:target_fast+1]  # (1, 1, 3)
