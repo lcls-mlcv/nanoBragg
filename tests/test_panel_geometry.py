@@ -31,12 +31,14 @@ def panel(fast, slow, origin, size=(32, 32), pixel=0.2):
                            get_image_size=lambda: size)
 
 
-def three_panels():
+def three_panels(left_handed=False):
+    """Three panels; left-handed ones have fast x slow pointing away from the sample (dxtbx allows both)."""
     tilt = math.radians(8.0)
     tilted_fast = (math.cos(tilt), 0.0, math.sin(tilt))
-    return [panel((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (-3.2, 3.2, -60.0)),
-            panel((1.0, 0.0, 0.0), (0.0, -1.0, 0.0), (3.6, 3.2, -60.0)),
-            panel(tilted_fast, (0.0, -1.0, 0.0), (-3.2, -4.0, -59.0))]
+    slow, y = ((0.0, 1.0, 0.0), -1.0) if left_handed else ((0.0, -1.0, 0.0), 1.0)
+    return [panel((1.0, 0.0, 0.0), slow, (-3.2, 3.2 * y, -60.0)),
+            panel((1.0, 0.0, 0.0), slow, (3.6, 3.2 * y, -60.0)),
+            panel(tilted_fast, slow, (-3.2, -4.0 * y, -59.0))]
 
 
 def crystal():
@@ -58,6 +60,8 @@ def rodrigues(axis, angle):
 def moved(p, rot, shift_mm, pivot_mm):
     f, s, origin = (np.asarray(v, dtype=float) for v in (p.get_fast_axis(), p.get_slow_axis(), p.get_origin()))
     o = np.cross(f, s)
+    if np.dot(origin, o) < 0:  # left-handed: both diffBragg and compat.cctbx flip odet
+        o = -o
     R = rodrigues(o, rot[0]) @ rodrigues(f, rot[1]) @ rodrigues(s, rot[2])
     new_origin = pivot_mm + R @ (origin - pivot_mm) + np.asarray(shift_mm, dtype=float)
     return panel(R @ f, R @ s, new_origin, p.get_image_size(), p.get_pixel_size()[0])
@@ -75,8 +79,9 @@ def test_zero_offsets_give_the_panels_as_given():
                                    rtol=1e-12, atol=0)
 
 
-def test_group_moves_match_the_panels_moved_as_diffbragg_moves_them():
-    panels = three_panels()
+@pytest.mark.parametrize("left_handed", [False, True], ids=["right_handed", "left_handed"])
+def test_group_moves_match_the_panels_moved_as_diffbragg_moves_them(left_handed):
+    panels = three_panels(left_handed)
     groups = [0, 0, 1]
     rot = [[0.004, -0.003, 0.002], [-0.002, 0.005, 0.001]]
     shift = [[0.15, -0.1, 0.3], [-0.05, 0.2, -0.4]]
@@ -128,3 +133,30 @@ def test_panel_groups_take_over_the_shared_detector_offsets():
     m.freeze().refine("panel_rotation", "panel_shift")
     assert m.panel_group_params.delta_panel_rot_rad.requires_grad
     assert m.panel_group_params.delta_panel_shift_mm.requires_grad
+
+
+def test_shared_detector_shots_share_the_panel_groups():
+    from nanobrag_torch.models.experiment import SerialExperiment
+
+    shots = [model(three_panels(), panel_groups=[0, 0, 1]) for _ in range(2)]
+    serial = SerialExperiment(shots, share_detector=True)
+    assert shots[1].panel_group_params is shots[0].panel_group_params
+    names = [n for n, p in serial.named_parameters() if "delta_panel" in n]
+    assert len(names) == 2  # one rotation and one shift tensor for the whole series
+
+
+def test_shared_detector_refuses_shots_with_other_panel_groups():
+    from nanobrag_torch.models.experiment import SerialExperiment
+
+    with pytest.raises(ValueError, match="panel_groups"):
+        SerialExperiment([model(three_panels(), panel_groups=[0, 0, 1]), model(three_panels())], share_detector=True)
+
+
+@pytest.mark.parametrize("groups", ["001", [0.7, 0, 1.2], [True, False, True]])
+def test_panel_groups_must_be_integers(groups):
+    with pytest.raises(ValueError, match="panel_groups"):
+        model(three_panels(), panel_groups=groups)
+
+
+def test_the_pivot_is_not_saved_with_the_parameters():
+    assert "panel_group_params.pivot_mm" not in model(three_panels(), panel_groups=[0, 0, 1]).state_dict()

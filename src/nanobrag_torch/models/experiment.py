@@ -811,6 +811,9 @@ class PanelGroupStageAParams(nn.Module):
                  param_init: str = "trainable") -> None:
         super().__init__()
         self.active = panel_groups is not None
+        if panel_groups is not None and (isinstance(panel_groups, (str, bytes)) or not all(
+                isinstance(g, (int, np.integer)) and not isinstance(g, (bool, np.bool_)) for g in panel_groups)):
+            raise ValueError(f"panel_groups must be a sequence of integer group ids, got {panel_groups!r}")
         groups = [0] * len(panel_configs) if panel_groups is None else [int(g) for g in panel_groups]
         if len(groups) != len(panel_configs):
             raise ValueError(f"panel_groups has {len(groups)} entries for {len(panel_configs)} panels")
@@ -828,7 +831,8 @@ class PanelGroupStageAParams(nn.Module):
                                  "convention, SAMPLE pivot, close distance)")
             origins.append(self._origin_mm(cfg, dtype, device) if given_by_origin else torch.zeros(3, dtype=dtype, device=device))
         first_of_group = [groups.index(g) for g in range(n_groups)]
-        self.register_buffer("pivot_mm", torch.stack([origins[i] for i in first_of_group]).detach())
+        # Derived from the panels, not a parameter: not saved, so a state_dict cannot move it
+        self.register_buffer("pivot_mm", torch.stack([origins[i] for i in first_of_group]).detach(), persistent=False)
         param_cls = _param_factory(param_init)
         self.delta_panel_rot_rad = param_cls(torch.zeros((n_groups, 3), device=device, dtype=dtype))
         self.delta_panel_shift_mm = param_cls(torch.zeros((n_groups, 3), device=device, dtype=dtype))
@@ -1486,7 +1490,9 @@ class SerialExperiment(nn.Module):
     Every shot keeps its own crystal and beam parameters, as hopper's per-shot refinement
     does, and all shots share the first shot's Fhkl, as its ensemble stage does. With
     ``share_detector`` (identical panels on every shot) they also share one Detector, so
-    the panels' pixel coordinates exist once, and one set of detector offsets.
+    the panels' pixel coordinates exist once, and one set of detector offsets and panel-group
+    rotations and shifts, which is how diffBragg refines panel geometry (one global set). Without
+    it each shot has its own.
 
         serial = SerialExperiment(models)
         serial.freeze().refine("Fhkl", "scale")
@@ -1514,8 +1520,12 @@ class SerialExperiment(nn.Module):
                 raise ValueError("all shots must be built with the same StructureFactors object")
             shot.fhkl_params = first.fhkl_params
             if share_detector:
+                if shot.panel_group_params.group_of_panel != first.panel_group_params.group_of_panel or (
+                        shot.panel_group_params.active != first.panel_group_params.active):
+                    raise ValueError("share_detector=True needs the same panel_groups on every shot")
                 shot.detector_params = first.detector_params
                 shot.panel_params = first.panel_params
+                shot.panel_group_params = first.panel_group_params
                 shot._shared_detectors_from = first
                 shot._detectors_synced_by_serial = True
         first._detectors_synced_by_serial = share_detector

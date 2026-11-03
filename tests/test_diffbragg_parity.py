@@ -255,10 +255,10 @@ def test_ndef_gradients_match_diffbragg(case, device):
 
 # Per-panel geometry (plan step 3b): ExperimentModel's panel-group rotations and shifts against
 # diffBragg's PANEL_ROTO/F/S (14, 17, 18) and PANELX/Y/Z (15, 16, 10), for a one-panel group rotating
-# about its own origin. Shifts are in metres in diffBragg and in mm here. As for detz_shift, diffBragg
-# leaves the solid angle and polarization out of these analytic derivatives, so per-subpixel omega on
-# and polarization off. diffBragg's analytic rot_F and rot_S derivatives are not its image's (next test),
-# so those two are compared with central differences of diffBragg's own image.
+# about its own origin. Shifts are in metres in diffBragg and in mm here. As for detz_shift, the exact
+# comparison turns on per-subpixel omega and turns polarization off. diffBragg's analytic rot_F and rot_S
+# derivatives miss a solid-angle term (see the pinned test below), so those two are compared with
+# central differences of diffBragg's own image.
 PANEL_CASES = {
     "flat": ["--oversample-omega", "--nopolar"],
     "tilted": ["--oversample-omega", "--nopolar", "--tilt-deg", "12", "--randomrotate", "4"],
@@ -291,11 +291,79 @@ def test_panel_geometry_gradients_match_diffbragg(case, device):
             assert abs(value - ref) <= tol * scale, f"d(w·I)/d{name} ({wname} w): torch {value!r} vs diffBragg {ref!r}"
 
 
+def _two_panel_detector(left_handed, tilt_deg, n=64, pixel=0.1, distance=100.0):
+    """Two dxtbx panels, the second tilted about (1, 1, 0) and 2 mm further; left-handed if asked."""
+    from dxtbx.model import Detector, Panel
+    from scitbx.matrix import col
+
+    detector = Detector()
+    for i in range(2):
+        R = col((1, 1, 0)).normalize().axis_and_angle_as_r3_rotation_matrix(tilt_deg * i, deg=True)
+        fast, slow = R * col((1, 0, 0)), R * col((0, 1 if left_handed else -1, 0))
+        centre = col(((i - 0.5) * 7.0, 1.0, -distance - 2 * i))
+        panel = Panel()
+        panel.set_image_size((n, n))
+        panel.set_pixel_size((pixel, pixel))
+        panel.set_frame(fast, slow, centre - fast * (n * pixel / 2) - slow * (n * pixel / 2))
+        detector.add_panel(panel)
+    return detector
+
+
+@pytest.mark.parametrize("left_handed", [False, True], ids=["right_handed", "left_handed"])
+@pytest.mark.parametrize("tilt_deg", [0.0, 10.0])
+def test_moved_panel_group_matches_diffbragg(left_handed, tilt_deg, monkeypatch):
+    """A two-panel group rotated and shifted at finite values about panel 0's origin, against
+    diffBragg's update_dxtbx_geoms: composition order, pivot and handedness, axes, origin and image."""
+    import simtbx.nanoBragg.sim_data as sim_data
+    from nanobrag_torch.compat.cctbx import beam_config_from_dxtbx, crystal_config_from_A, detector_config_from_dxtbx_panel
+    from nanobrag_torch.config import SpotMetric
+    from nanobrag_torch.models.experiment import ExperimentModel
+
+    angles, shift_mm = (0.02, -0.015, 0.03), (0.2, -0.1, 0.3)
+    detector = _two_panel_detector(left_handed, tilt_deg)
+    monkeypatch.setattr(sim_data.SimData, "simple_detector", staticmethod(lambda *a: detector))
+    args = cmp.build_parser().parse_args(["--detpixels", "64", "--distance", "100", "--nopolar", "--randomrotate", "3"])
+    sim = cmp.build_sim(args)
+    D, beam = sim.D, sim.beam.nanoBragg_constructor_beam
+    db_geometry, db_images = [], []
+    for pid in (0, 1):
+        D.reference_origin = detector[0].get_origin()
+        D.update_dxtbx_geoms(detector, beam, pid, *angles, *(v / 1000 for v in shift_mm), True)
+        db_geometry.append([np.array(v) for v in (D.fdet_vector, D.sdet_vector, D.odet_vector, D.get_origin())])
+        D.raw_pixels_roi *= 0
+        D.add_diffBragg_spots()
+        db_images.append(D.raw_pixels_roi.as_numpy_array()[:64 * 64].reshape(64, 64).copy())
+    xtal = sim.crystal.dxtbx_crystal
+    panels = [detector_config_from_dxtbx_panel(detector[p], beam.get_s0(), oversample=1) for p in (0, 1)]
+    beam_cfg = beam_config_from_dxtbx(beam, fluence=float(D.fluence), spot_scale=float(D.spot_scale))
+    beam_cfg.nopolar = True
+    crystal_cfg = crystal_config_from_A(xtal.get_unit_cell().parameters(), xtal.get_A(), Ncells_abc=args.ncells,
+                                        shape=args.shape, default_F=args.default_F,
+                                        spot_metric=SpotMetric(args.spot_metric), mosaic_spread_deg=0.0, mosaic_domains=1)
+    model = ExperimentModel(crystal_cfg, panels, beam_cfg, dtype=torch.float64, panel_groups=[0, 0])
+    model.set_structure_factors(torch.zeros((1, 1, 1), dtype=torch.float64),
+                                dict(h_min=0, h_max=0, k_min=0, k_max=0, l_min=0, l_max=0))
+    with torch.no_grad():
+        model.panel_group_params.delta_panel_rot_rad[0] = torch.tensor(angles, dtype=torch.float64)
+        model.panel_group_params.delta_panel_shift_mm[0] = torch.tensor(shift_mm, dtype=torch.float64)
+        images = model().numpy()
+    for pid in (0, 1):
+        det = model._detectors[pid]
+        f, s, o, origin = db_geometry[pid]
+        for got, want in ((det.fdet_vec, f), (det.sdet_vec, s), (det.odet_vec, o)):
+            np.testing.assert_allclose(got.detach().numpy(), want, rtol=0, atol=1e-14)
+        np.testing.assert_allclose(det.pix0_vector.detach().numpy() * 1000, origin, rtol=0, atol=1e-11)
+        np.testing.assert_allclose(images[pid], db_images[pid], rtol=1e-10, atol=1e-12 * db_images[pid].max())
+
+
 @pytest.mark.parametrize("case, index, off_by", [("flat", 1, 0.019), ("tilted", 1, 0.050), ("tilted", 2, 0.35)])
 def test_diffbragg_analytic_panel_rotation_derivatives_are_not_its_images(case, index, off_by):
     """diffBragg's analytic d/d(rot_F) and d/d(rot_S) differ from central differences of its own image
     (rot_O agrees): measured 1.9% for rot_F on a flat panel, and 5% and 35% for rot_F and rot_S on a
-    tilted, rotated one. Pinned so that a fix in diffBragg shows up here; not reported upstream."""
+    tilted, rotated one. The cause: get_panel_increment (diffBragg.cpp:446-447) takes the solid angle's
+    derivative from o.dk alone and drops d(odet)/dtheta.k, which is zero for rot_O; adding
+    sum I (do.pos)/(o.pos), do = f x o or s x o, gives the finite difference to 1e-9 (rv17 review).
+    Pinned so that a fix in diffBragg shows up here; not reported upstream."""
     args = cmp.build_parser().parse_args(["--detpixels", "128"] + PANEL_CASES[case])
     sim = cmp.build_sim(args)
     _, db_derivs = cmp.diffbragg_panel_forward_and_derivs(sim)
