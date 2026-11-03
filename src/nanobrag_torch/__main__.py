@@ -598,18 +598,20 @@ def resolve_detector_absorption(args: argparse.Namespace) -> Tuple[Optional[floa
     nanoBragg.c:762-773 walks argv: -detector_abs with "inf" in its value, or a value atof()
     reads as 0, sets detector_thick = 0 and detector_mu = 0 (an infinite attenuation depth); any
     other value sets mu = 1/(value*1e-6), and a negative mu becomes 1/thickness after the loop;
-    -detector_thick sets the thickness. So
-    "-detector_abs 0 -detector_thick 100" is a transparent 100 um sensor that captures nothing.
+    -detector_thick sets the thickness. So C reads "-detector_abs 0 -detector_thick 100" as a
+    transparent 100 um sensor that captures nothing, a zero image. torchBragg diverges there
+    (docs/bugs/verified_c_bugs.md): -detector_abs 0/inf keeps absorption off whatever follows.
     Without ``args._argv`` -detector_abs is taken after -detector_thick.
     """
     thick, depth = args.detector_thick, None
+    absorption_off = False
 
     def absorb(value):
-        nonlocal thick, depth
+        nonlocal thick, depth, absorption_off
         if "inf" in value or c_atof(value) == 0.0:
-            thick, depth = 0.0, math.inf
+            thick, depth, absorption_off = 0.0, math.inf, True
         else:
-            depth = c_atof(value)
+            depth, absorption_off = c_atof(value), False
 
     argv = getattr(args, '_argv', None)
     if argv is None:
@@ -621,6 +623,11 @@ def resolve_detector_absorption(args: argparse.Namespace) -> Tuple[Optional[floa
                 thick = c_atof(value)
             elif token in ('-detector_abs', '-detector_absorb'):
                 absorb(value)
+    # Divergence from C (docs/bugs/verified_c_bugs.md): -detector_abs 0/inf turns absorption off
+    # whatever follows it. C lets a later -detector_thick bring a transparent sensor back, which
+    # captures nothing and gives a zero image.
+    if absorption_off:
+        thick = 0.0
     # A negative value leaves mu negative, which nanoBragg.c:1652-1656 replaces with 1/thickness
     # after the argv loop: the same as no -detector_abs
     if depth is not None and depth < 0:
