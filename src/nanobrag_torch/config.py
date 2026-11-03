@@ -62,6 +62,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, Optional, Tuple, Union
 
+import weakref
 import numpy as np
 import torch
 
@@ -192,6 +193,18 @@ class CrystalConfig:
         self.sample_x = self.N_cells[0] * self.cell_a * 1e-10  # Convert Å to meters
         self.sample_y = self.N_cells[1] * self.cell_b * 1e-10
         self.sample_z = self.N_cells[2] * self.cell_c * 1e-10
+
+
+# The beam centres DetectorConfig.__post_init__ defaulted, by config id, kept outside the instance
+# so that DetectorConfig(**config.__dict__) and dataclasses.replace() copy only real fields (a
+# copy's centres then count as given). An entry goes when its config is freed.
+_AUTO_BEAM_CENTERS: dict = {}
+
+
+def _remember_default_beam_centers(config, auto_s, auto_f) -> None:
+    key = id(config)
+    _AUTO_BEAM_CENTERS[key] = (auto_s, auto_f)
+    weakref.finalize(config, _AUTO_BEAM_CENTERS.pop, key, None)
 
 
 @dataclass
@@ -325,47 +338,20 @@ class DetectorConfig:
                 # Setup A: Only -distance provided -> pivot SHALL be BEAM
                 self.detector_pivot = DetectorPivot.BEAM
 
-        # Auto-calculate beam centers if not explicitly provided
-        # This ensures beam centers scale correctly with detector size
-        # NOTE: We do NOT apply the MOSFLM +0.5 pixel offset here.
-        # The offset is part of the MOSFLM beam-center MAPPING formula and should
-        # be applied when converting beam centers to Fbeam/Sbeam in the Detector class.
+        # Auto-calculate beam centers if not explicitly provided. They are derived from the
+        # pixel size, so the values written here are remembered: refresh_default_beam_centers()
+        # derives them again (Detector does at each geometry rebuild), so a pixel size that is
+        # refined or changed in place moves them as a fresh config would, and a differentiable
+        # one gets a fresh graph. A centre assigned later replaces the remembered object and is
+        # then left alone.
         if self.beam_center_s is None or self.beam_center_f is None:
-            detsize_s = self.detsize_s_mm or self.spixels * self.pixel_size_mm  # Total detector size in slow axis (mm)
-            detsize_f = self.detsize_f_mm or self.fpixels * self.pixel_size_mm  # Total detector size in fast axis (mm)
-
-            # Per spec-a-core.md §71-72:
-            # MOSFLM/DENZO: Default Xbeam = Ybeam = (detsize + pixel)/2
-            # ADXV: Default Xbeam = (detsize_f + pixel)/2, Ybeam = (detsize_s - pixel)/2
-            # Others: beam_center = detsize / 2 (simple center)
-            if self.detector_convention == DetectorConvention.MOSFLM:
-                # Per spec-a-core.md §71: "Default Xbeam = (detsize_s + pixel)/2, Ybeam = (detsize_f + pixel)/2"
-                if self.beam_center_s is None:
-                    self.beam_center_s = (detsize_s + self.pixel_size_mm) / 2.0
-                if self.beam_center_f is None:
-                    self.beam_center_f = (detsize_f + self.pixel_size_mm) / 2.0
-            elif self.detector_convention == DetectorConvention.DENZO:
-                # DENZO uses same defaults as MOSFLM (per spec-a-core.md §73)
-                if self.beam_center_s is None:
-                    self.beam_center_s = (detsize_s + self.pixel_size_mm) / 2.0
-                if self.beam_center_f is None:
-                    self.beam_center_f = (detsize_f + self.pixel_size_mm) / 2.0
-            elif self.detector_convention == DetectorConvention.ADXV:
-                # C defaults Xbeam = (detsize_f + pixel)/2 and Ybeam = (detsize_s - pixel)/2,
-                # then maps them with Fbeam = Xbeam and Sbeam = detsize_s - Ybeam
-                # (nanoBragg.c:1175-1186). beam_center_s holds Sbeam, so the default is the
-                # flipped value (detsize_s + pixel)/2, not Ybeam itself; the CLI applies the
-                # same flip for an explicit -Ybeam.
-                if self.beam_center_s is None:
-                    self.beam_center_s = (detsize_s + self.pixel_size_mm) / 2.0
-                if self.beam_center_f is None:
-                    self.beam_center_f = (detsize_f + self.pixel_size_mm) / 2.0
-            else:
-                # XDS, DIALS, CUSTOM: simple center (detsize / 2)
-                if self.beam_center_s is None:
-                    self.beam_center_s = detsize_s / 2.0
-                if self.beam_center_f is None:
-                    self.beam_center_f = detsize_f / 2.0
+            default_s, default_f = self._default_beam_centers()
+            auto_s = auto_f = None
+            if self.beam_center_s is None:
+                self.beam_center_s = auto_s = default_s
+            if self.beam_center_f is None:
+                self.beam_center_f = auto_f = default_f
+            _remember_default_beam_centers(self, auto_s, auto_f)
 
         # Set default twotheta axis if not provided
         if self.twotheta_axis is None:
@@ -435,6 +421,37 @@ class DetectorConfig:
         if self.mask_array is not None:
             if self.mask_array.shape != (self.spixels, self.fpixels):
                 raise ValueError(f"Mask array shape {self.mask_array.shape} must match detector dimensions ({self.spixels}, {self.fpixels})")
+
+    def _default_beam_centers(self):
+        """(beam_center_s, beam_center_f) in mm that this convention defaults to.
+
+        MOSFLM, DENZO: (detsize + pixel)/2 for both. ADXV: C defaults Xbeam = (detsize_f + pixel)/2
+        and Ybeam = (detsize_s - pixel)/2, then maps them with Fbeam = Xbeam and Sbeam =
+        detsize_s - Ybeam (nanoBragg.c:1175-1186); beam_center_s holds Sbeam, so the default is the
+        flipped value (detsize_s + pixel)/2, not Ybeam itself. XDS, DIALS, CUSTOM: detsize/2.
+        The MOSFLM +0.5 pixel offset is not applied here: it is part of the mapping to Fbeam/Sbeam,
+        applied by Detector.
+        """
+        detsize_s = self.detsize_s_mm or self.spixels * self.pixel_size_mm
+        detsize_f = self.detsize_f_mm or self.fpixels * self.pixel_size_mm
+        if self.detector_convention in (DetectorConvention.MOSFLM, DetectorConvention.DENZO,
+                                        DetectorConvention.ADXV):
+            return (detsize_s + self.pixel_size_mm) / 2.0, (detsize_f + self.pixel_size_mm) / 2.0
+        return detsize_s / 2.0, detsize_f / 2.0
+
+    def refresh_default_beam_centers(self) -> None:
+        """Derive again the beam centres __post_init__ defaulted, from the current pixel size."""
+        auto_s, auto_f = _AUTO_BEAM_CENTERS.get(id(self), (None, None))
+        refresh_s = auto_s is not None and self.beam_center_s is auto_s
+        refresh_f = auto_f is not None and self.beam_center_f is auto_f
+        if not (refresh_s or refresh_f):
+            return
+        default_s, default_f = self._default_beam_centers()
+        if refresh_s:
+            self.beam_center_s = auto_s = default_s
+        if refresh_f:
+            self.beam_center_f = auto_f = default_f
+        _AUTO_BEAM_CENTERS[id(self)] = (auto_s, auto_f)
 
     @classmethod
     def from_cli_args(

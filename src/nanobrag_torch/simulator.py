@@ -695,6 +695,12 @@ class Simulator:
         self._curved_detector = bool(getattr(self.detector.config, "curved_detector", False))
         self._refresh_pixel_coords()
 
+        # A differentiable detector geometry is built again at the start of each run, so that a
+        # second backward at an unchanged value does not go through the last run's freed graph
+        # (see Detector._ensure_geometry_current). ExperimentModel turns this off: it writes new
+        # parameter tensors into the detector config at every forward, which rebuilds it once a
+        # pass, and shots sharing one Detector (SerialExperiment) must not rebuild it per shot.
+        self.rebuild_geometry_each_run = True
         self._frozen_auto_oversample = None  # see _auto_oversample
         self._oversample_freeze_warning = None  # said when the frozen value is first used
         if self.detector.config.oversample <= 0:
@@ -1547,7 +1553,7 @@ class Simulator:
         `_geometry_version` rather than asking callers to rebuild.
         """
         # Touch the detector's own guard first, so its version is up to date.
-        self.detector._ensure_geometry_current()
+        self.detector._ensure_geometry_current(new_run=self.rebuild_geometry_each_run)
         if self.detector._geometry_version != getattr(
             self, "_pixel_coords_geometry_version", None
         ):
