@@ -933,7 +933,8 @@ class ExperimentModel(nn.Module):
         "scale": ("beam_params.delta_log_spot_scale",),
         "Ncells": ("crystal_params.delta_log_N_cells",),
         "Ndef": ("crystal_params.delta_N_cells_def",),
-        "panel_geometry": ("panel_group_params.delta_panel_rot_rad", "panel_group_params.delta_panel_shift_mm"),
+        "panel_rotation": ("panel_group_params.delta_panel_rot_rad",),
+        "panel_shift": ("panel_group_params.delta_panel_shift_mm",),
         "eta": ("crystal_params.delta_log_eta",),
         "Fhkl": ("fhkl_params.delta_log_F",),
         "background": ("background_params.delta_tilt_abc",),
@@ -1000,7 +1001,7 @@ class ExperimentModel(nn.Module):
         if self.panel_group_params.active:
             # The groups' rotations and shifts are the panels' geometry; the shared offsets would
             # repeat their common motion
-            why = "with panel_groups the panels move by their groups' rotations and shifts (panel_geometry)"
+            why = "with panel_groups the panels move by their groups' rotations and shifts (panel_rotation, panel_shift)"
             for name in ("delta_rotx_raw", "delta_roty_raw", "delta_rotz_raw", "delta_twotheta_raw",
                          "delta_beam_s_raw", "delta_beam_f_raw", "delta_detz_shift_mm", "delta_log_distance_mm"):
                 self.detector_params.unrefinable.setdefault(name, why)

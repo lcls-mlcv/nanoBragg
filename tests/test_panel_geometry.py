@@ -115,8 +115,9 @@ def test_panel_geometry_gradcheck():
 def test_without_panel_groups_the_parameters_are_unrefinable_and_change_nothing():
     m = model(three_panels())
     assert ROT in m.unrefinable and SHIFT in m.unrefinable
-    with pytest.raises(ValueError, match="panel_groups"):
-        m.refine("panel_geometry")
+    for group in ("panel_rotation", "panel_shift"):
+        with pytest.raises(ValueError, match="panel_groups"):
+            m.refine(group)
 
 
 def test_panel_groups_take_over_the_shared_detector_offsets():
@@ -124,5 +125,6 @@ def test_panel_groups_take_over_the_shared_detector_offsets():
     for name in ("detector_params.delta_rotx_raw", "detector_params.delta_beam_f_raw",
                  "detector_params.delta_detz_shift_mm"):
         assert name in m.unrefinable
-    m.refine("panel_geometry")
+    m.freeze().refine("panel_rotation", "panel_shift")
     assert m.panel_group_params.delta_panel_rot_rad.requires_grad
+    assert m.panel_group_params.delta_panel_shift_mm.requires_grad
