@@ -6,7 +6,7 @@ own orientation with --misset, fitted to the same likelihood as the other frames
 
     OMP_NUM_THREADS=2 NANOBRAGG_DISABLE_COMPILE=1 PYTHONPATH=src:$PYTHONPATH libtbx.python \
         scripts/rotation_refinement.py --expt sv.expt --refl sv.refl --pdb model.pdb \
-        --images 'data/H4_7_%05d.cbf' --hot hot.npz --out result.json
+        --images 'images/frame_%05d.cbf' --hot hot.npz --out result.json
 """
 import argparse, copy, json, math, os, time
 import numpy as np, torch
@@ -92,9 +92,8 @@ def rois_of(i, img, good):
     """Strongest indexed spots of frame i, one tilted plane each; returns rois, tilt_abc.
 
     A box bright on one frame alone is a cosmic ray that DIALS happened to index, and the
-    model can never fit it. Real spots leave at least 7% of their counts on a neighbour in
-    CYP119 at 0.2 degrees a frame; on sharper data a real spot can pass --flash, so check
-    what it dropped. A pixel masked on a neighbour says nothing, so such a box stays.
+    model can never fit it. On 0.2 degree frames real spots left at least 7% of their counts
+    on a neighbour; on sharper data a real spot can pass --flash, so check what it dropped. A pixel masked on a neighbour says nothing, so such a box stays.
     """
     sel = np.where((zo >= i - 0.5) & (zo < i + 1.5) & (lattice >= 0) & (np.hypot(xo - bx, yo - by) > A.rmin))[0]
     sel = sel[np.argsort(-intensity[sel])]

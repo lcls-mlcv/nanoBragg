@@ -21,7 +21,7 @@
 #SBATCH --output=parity-%j.out
 #SBATCH --error=parity-%j.err
 #SBATCH --partition=ampere
-#SBATCH --account=lcls:prjlumine22
+#SBATCH --account=YOUR_ACCOUNT
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
