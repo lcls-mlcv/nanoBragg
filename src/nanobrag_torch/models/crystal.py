@@ -1413,9 +1413,11 @@ class Crystal:
             dtype=self.dtype,
             device=self.device,
             rng=rng,
-            # C has no refinement to keep smooth, so everything else stays C's to the bit. Read from
-            # the config, so that a line search under no_grad gets the same values.
-            single_precision_rot=not getattr(config.mosaic_spread_deg, "requires_grad", False),
+            # C has no refinement to keep smooth: a float spread, as the CLI and compat.cctbx give it,
+            # stays C's to the bit. A tensor keeps the dtype whether or not it requires grad, since a
+            # spread derived from a parameter (0.057*exp(p)) requires grad only in grad mode, and a
+            # line search under no_grad must get the same values.
+            single_precision_rot=not isinstance(config.mosaic_spread_deg, torch.Tensor),
         )
 
     def _apply_static_orientation(self, vectors: dict) -> dict:

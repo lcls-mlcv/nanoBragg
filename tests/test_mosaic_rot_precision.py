@@ -40,15 +40,29 @@ def test_a_line_search_under_no_grad_sees_the_same_value():
         assert image_sum(leaf).item() == value
 
 
-def test_a_fixed_spread_keeps_cs_rounding():
-    """float and plain tensor alike, in both dtypes, as the CLI gives them: PARITY-RANDOM-001."""
+def test_a_derived_spread_gives_the_same_image_under_grad_and_no_grad():
+    """0.057*exp(p) requires grad only in grad mode; under no_grad nothing marks it as refined."""
+    p = torch.tensor(0.0, dtype=torch.float64, requires_grad=True)
+    value = image_sum(SPREAD_DEG * torch.exp(p)).item()
+    with torch.no_grad():
+        assert image_sum(SPREAD_DEG * torch.exp(p)).item() == value
+
+
+def test_a_float_spread_keeps_cs_rounding():
+    """The CLI and compat.cctbx give the spread as a float, in both dtypes: PARITY-RANDOM-001."""
     radians = torch.deg2rad(torch.tensor(SPREAD_DEG, dtype=torch.float64))
     rounded = mosaic_rotation_umats(radians, 5, seed=7, dtype=torch.float64)
     crystal = Crystal(CrystalConfig(mosaic_spread_deg=SPREAD_DEG, mosaic_domains=5, mosaic_seed=7), dtype=torch.float64)
     assert torch.equal(crystal._generate_mosaic_rotations(crystal.config), rounded)
+
+
+def test_a_tensor_spread_keeps_the_dtype():
+    """Whether or not it requires grad: a tensor is how a refined spread arrives, also under no_grad."""
+    radians = torch.deg2rad(torch.tensor(SPREAD_DEG, dtype=torch.float64))
+    exact = mosaic_rotation_umats(radians, 5, seed=7, dtype=torch.float64, single_precision_rot=False)
     tensor_spread = torch.tensor(SPREAD_DEG, dtype=torch.float64)
     crystal = Crystal(CrystalConfig(mosaic_spread_deg=tensor_spread, mosaic_domains=5, mosaic_seed=7), dtype=torch.float64)
-    assert torch.equal(crystal._generate_mosaic_rotations(crystal.config), rounded)
+    assert torch.equal(crystal._generate_mosaic_rotations(crystal.config), exact)
 
 
 def test_the_two_differ_by_a_float32_rounding_at_most():
