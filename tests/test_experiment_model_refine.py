@@ -43,7 +43,8 @@ def _grads(model):
 def test_default_is_trainable_and_reproduces_the_config_image():
     model = ExperimentModel(*_configs(), dtype=DTYPE)
     # eta has nothing to refine without mosaic spread, detz_shift is for origin-defined
-    # (dxtbx) detectors, Ndef needs the hkl metric; every other parameter trains
+    # (dxtbx) detectors, Ndef needs the hkl metric, panel geometry
+    # needs panel_groups; every other parameter trains
     assert set(model.unrefinable) == {"crystal_params.delta_log_eta", "detector_params.delta_detz_shift_mm",
                                        "fhkl_params.delta_log_F", "beam_params.delta_log_source_weights",
                                        "crystal_params.delta_N_cells_def",
