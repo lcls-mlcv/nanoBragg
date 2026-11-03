@@ -1404,9 +1404,7 @@ class Detector:
         elif c.detector_convention == DetectorConvention.CUSTOM:
             # CUSTOM convention uses user-provided vectors or defaults to MOSFLM
             if c.custom_fdet_vector is not None:
-                fdet_vec = torch.tensor(
-                    c.custom_fdet_vector, device=self.device, dtype=self.dtype
-                )
+                fdet_vec = self._custom_vector(c.custom_fdet_vector)
             else:
                 # Default to MOSFLM fast vector
                 fdet_vec = torch.tensor(
@@ -1414,9 +1412,7 @@ class Detector:
                 )
 
             if c.custom_sdet_vector is not None:
-                sdet_vec = torch.tensor(
-                    c.custom_sdet_vector, device=self.device, dtype=self.dtype
-                )
+                sdet_vec = self._custom_vector(c.custom_sdet_vector)
             else:
                 # Default to MOSFLM slow vector
                 sdet_vec = torch.tensor(
@@ -1424,9 +1420,7 @@ class Detector:
                 )
 
             if c.custom_odet_vector is not None:
-                odet_vec = torch.tensor(
-                    c.custom_odet_vector, device=self.device, dtype=self.dtype
-                )
+                odet_vec = self._custom_vector(c.custom_odet_vector)
             else:
                 # Default to MOSFLM normal vector
                 odet_vec = torch.tensor(
@@ -1436,6 +1430,18 @@ class Detector:
             raise ValueError(f"Unknown detector convention: {c.detector_convention}")
 
         return fdet_vec, sdet_vec, odet_vec
+
+    def _custom_vector(self, value) -> torch.Tensor:
+        """A custom axis in the run's dtype; a tensor, or a sequence holding tensors, keeps its graph.
+
+        torch.tensor() copies and detaches, which cut the gradient of a refined panel rotation
+        (ExperimentModel's panel groups). Plain numbers go through torch.tensor() as before.
+        """
+        if isinstance(value, torch.Tensor):
+            return value.to(device=self.device, dtype=self.dtype)
+        if any(isinstance(v, torch.Tensor) for v in value):
+            return torch.stack([torch.as_tensor(v, device=self.device, dtype=self.dtype) for v in value])
+        return torch.tensor(value, device=self.device, dtype=self.dtype)
 
     def _calculate_basis_vectors(
         self,

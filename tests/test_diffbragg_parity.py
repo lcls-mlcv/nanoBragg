@@ -253,6 +253,57 @@ def test_ndef_gradients_match_diffbragg(case, device):
             assert abs(float(g[i]) - ref) <= 1e-7 * scale, f"d(w·I)/dN{'def'[i]} ({wname} w): torch {float(g[i])!r} vs diffBragg {ref!r}"
 
 
+# Per-panel geometry (plan step 3b): ExperimentModel's panel-group rotations and shifts against
+# diffBragg's PANEL_ROTO/F/S (14, 17, 18) and PANELX/Y/Z (15, 16, 10), for a one-panel group rotating
+# about its own origin. Shifts are in metres in diffBragg and in mm here. As for detz_shift, diffBragg
+# leaves the solid angle and polarization out of these analytic derivatives, so per-subpixel omega on
+# and polarization off. diffBragg's analytic rot_F and rot_S derivatives are not its image's (next test),
+# so those two are compared with central differences of diffBragg's own image.
+PANEL_CASES = {
+    "flat": ["--oversample-omega", "--nopolar"],
+    "tilted": ["--oversample-omega", "--nopolar", "--tilt-deg", "12", "--randomrotate", "4"],
+}
+
+
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("case", list(PANEL_CASES))
+def test_panel_geometry_gradients_match_diffbragg(case, device):
+    args = cmp.build_parser().parse_args(["--detpixels", "128"] + PANEL_CASES[case])
+    args.device = device
+    sim = cmp.build_sim(args)
+    db_img, db_derivs = cmp.diffbragg_panel_forward_and_derivs(sim)
+    db_derivs[1] = cmp.diffbragg_panel_rotation_fd(sim, 1)
+    db_derivs[2] = cmp.diffbragg_panel_rotation_fd(sim, 2)
+    model = cmp.torch_experiment_model(sim, args, panel_groups=[0])
+    img = model()
+    np.testing.assert_allclose(img.detach().cpu().numpy(), db_img, rtol=1e-9, atol=1e-12 * db_img.max())
+    names = ["rot_O", "rot_F", "rot_S", "shift_X", "shift_Y", "shift_Z"]
+    params = model.panel_group_params
+    rng = np.random.default_rng(4)
+    for wname, w in {"uniform": np.ones_like(db_img), "random": rng.uniform(0.0, 1.0, db_img.shape)}.items():
+        g_rot, g_shift = torch.autograd.grad((img * torch.as_tensor(w, device=img.device)).sum(),
+                                             [params.delta_panel_rot_rad, params.delta_panel_shift_mm], retain_graph=True)
+        got = [float(v) for v in g_rot[0]] + [1000.0 * float(v) for v in g_shift[0]]  # per metre
+        for name, value, ref_pixels in zip(names, got, db_derivs):
+            ref = float((w * ref_pixels).sum())
+            scale = float(np.abs(w * ref_pixels).sum())
+            tol = 1e-5 if name in ("rot_F", "rot_S") else 1e-7  # central differences at eps 1e-6
+            assert abs(value - ref) <= tol * scale, f"d(w·I)/d{name} ({wname} w): torch {value!r} vs diffBragg {ref!r}"
+
+
+@pytest.mark.parametrize("case, index, off_by", [("flat", 1, 0.019), ("tilted", 1, 0.050), ("tilted", 2, 0.35)])
+def test_diffbragg_analytic_panel_rotation_derivatives_are_not_its_images(case, index, off_by):
+    """diffBragg's analytic d/d(rot_F) and d/d(rot_S) differ from central differences of its own image
+    (rot_O agrees): measured 1.9% for rot_F on a flat panel, and 5% and 35% for rot_F and rot_S on a
+    tilted, rotated one. Pinned so that a fix in diffBragg shows up here; not reported upstream."""
+    args = cmp.build_parser().parse_args(["--detpixels", "128"] + PANEL_CASES[case])
+    sim = cmp.build_sim(args)
+    _, db_derivs = cmp.diffbragg_panel_forward_and_derivs(sim)
+    fd = cmp.diffbragg_panel_rotation_fd(sim, index).sum()
+    analytic = db_derivs[index].sum()
+    assert abs(analytic - fd) / abs(fd) == pytest.approx(off_by, abs=0.01)
+
+
 # detz_shift (plan C3): ExperimentModel's origin shift along lab z against diffBragg's DETZ_ID (10).
 # diffBragg's shift is in metres, ExperimentModel's in mm. diffBragg applies the solid angle and the
 # polarization once per pixel and leaves both out of its analytic detz derivative (pinned by the

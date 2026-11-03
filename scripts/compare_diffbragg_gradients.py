@@ -242,6 +242,44 @@ def diffbragg_ndef_forward_and_derivs(SIM):
     return img, [p.as_numpy_array().reshape(slow, fast).copy() for p in D.get_ncells_def_derivative_pixels()]
 
 
+PANEL_ROT_IDS = (14, 17, 18)  # diffBragg's PANEL_ROTO, PANEL_ROTF, PANEL_ROTS (radians)
+PANEL_SHIFT_IDS = (15, 16, 10)  # PANELX, PANELY, PANELZ (metres)
+
+
+def diffbragg_panel_forward_and_derivs(SIM, pid=0):
+    """diffBragg image of panel pid and d(image)/d(rot_O, rot_F, rot_S, shift_X, shift_Y, shift_Z) at zero,
+    rotating about the panel's own origin (a one-panel group)."""
+    D = SIM.D
+    for i in PANEL_ROT_IDS + PANEL_SHIFT_IDS:
+        D.refine(i)
+    D.initialize_managers()
+    D.reference_origin = SIM.detector[pid].get_origin()
+    D.update_dxtbx_geoms(SIM.detector, SIM.beam.nanoBragg_constructor_beam, pid, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, True)
+    D.raw_pixels_roi *= 0
+    D.add_diffBragg_spots()
+    fast, slow = SIM.detector[pid].get_image_size()
+    img = D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy()
+    derivs = [D.get_derivative_pixels(i).as_numpy_array().reshape(slow, fast).copy()
+              for i in PANEL_ROT_IDS + PANEL_SHIFT_IDS]
+    return img, derivs
+
+
+def diffbragg_panel_rotation_fd(SIM, index, eps=1e-6, pid=0):
+    """Central difference of diffBragg's own image of panel pid in rot_O/F/S (index 0/1/2), radians."""
+    D = SIM.D
+    fast, slow = SIM.detector[pid].get_image_size()
+    images = []
+    for sign in (1, -1):
+        angles = [0.0, 0.0, 0.0]
+        angles[index] = sign * eps
+        D.update_dxtbx_geoms(SIM.detector, SIM.beam.nanoBragg_constructor_beam, pid, *angles, 0.0, 0.0, 0.0, True)
+        D.raw_pixels_roi *= 0
+        D.add_diffBragg_spots()
+        images.append(D.raw_pixels_roi.as_numpy_array().reshape(slow, fast).copy())
+    D.update_dxtbx_geoms(SIM.detector, SIM.beam.nanoBragg_constructor_beam, pid, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, True)
+    return (images[0] - images[1]) / (2 * eps)
+
+
 def diffbragg_detz_forward_and_derivs(SIM):
     """diffBragg image and d(image)/d(detz_shift) (DETZ_ID 10; the shift is in metres)."""
     from simtbx.diffBragg.hopper_utils import DETZ_ID
