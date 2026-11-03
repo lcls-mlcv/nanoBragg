@@ -384,3 +384,14 @@ def test_a_mask_edited_in_place_is_seen():
     after = sim.run(oversample=1)
     assert after[:, :16].sum().item() == 0.0
     torch.testing.assert_close(after[:, 16:], before[:, 16:], rtol=0, atol=0)
+
+
+def test_a_mask_made_under_inference_mode_runs():
+    """Inference tensors keep no version counter; such a mask is tracked by reference alone."""
+    with torch.inference_mode():
+        mask = torch.ones(32, 32, dtype=torch.float64)
+    cfg = DetectorConfig(**BASE, beam_center_s=1.6, beam_center_f=1.7)
+    cfg.mask_array = mask
+    sim = _simulator(cfg)
+    assert sim.run(oversample=1).sum() > 0
+    assert sim.run(oversample=1).sum() > 0

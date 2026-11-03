@@ -549,8 +549,14 @@ class PanelPixels:
 
 
 def _tensor_version(value):
-    """A tensor's in-place version counter (bumped by mask[...] = 0, fill_, mul_), else None."""
-    return value._version if isinstance(value, torch.Tensor) else None
+    """A tensor's in-place version counter (bumped by mask[...] = 0, fill_, mul_), else None.
+
+    Inference tensors (made under torch.inference_mode) keep no counter: None, so they are
+    tracked by reference alone, as before.
+    """
+    if not isinstance(value, torch.Tensor) or value.is_inference():
+        return None
+    return value._version
 
 class Simulator:
     """
