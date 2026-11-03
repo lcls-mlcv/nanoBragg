@@ -265,10 +265,10 @@ class TestSourceWeights:
         - Run B: Sourcefile with equal weights [1.0, 1.0]
         - Assert: Outputs are identical (within 0.3% tolerance for float32 precision)
 
-        Per spec: "Both the weight column and the wavelength column are read but ignored:
-        the CLI -lambda parameter is the sole authoritative wavelength source for all sources,
-        and equal weighting results (all sources contribute equally via division by total
-        source count in the steps normalization)." (spec-a-core.md:151-153)
+        nanoBragg.c reads the weight column and only prints it (nanoBragg.c:2424), so all sources
+        contribute equally via division by the total source count in the steps normalization.
+        The wavelength column is used per source (nanoBragg.c:2748); both files here give
+        the same wavelength as -lambda.
         """
         py_cli = f"{sys.executable} -m nanobrag_torch"
 
@@ -297,7 +297,7 @@ class TestSourceWeights:
                 '-distance', '100',
                 '-detpixels', '128',
                 '-pixel', '0.1',
-                '-lambda', '1.0',  # CLI lambda overrides sourcefile values
+                '-lambda', '1.0',  # same as the file's wavelengths, which win over it
                 '-oversample', '1',
                 '-phisteps', '1',
                 '-mosaic_dom', '1'
@@ -364,113 +364,6 @@ class TestSourceWeights:
                 f"Spec violation: equal weighting should result. " \
                 f"Weighted sum={weighted_sum:.6g}, Equal sum={equal_sum:.6g}. " \
                 f"Metrics: {json.dumps(metrics, indent=2)}"
-
-    def test_cli_lambda_overrides_sourcefile(self, monkeypatch):
-        """
-        Verify CLI -lambda parameter overrides sourcefile wavelengths per spec §4.
-
-        SOURCE-WEIGHT-001 Phase G (TC-Spec-2): CLI lambda override validation
-        Expected behavior:
-        1. UserWarning emitted when sourcefile wavelengths differ from CLI
-        2. All source contributions use CLI wavelength (not file values)
-        3. Physics calculations consistent with CLI lambda only
-
-        Per spec: "the CLI -lambda parameter is the sole authoritative wavelength source
-        for all sources" (spec-a-core.md:151-152)
-        """
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmpdir = Path(tmpdir)
-            py_out = tmpdir / 'py_lambda_override.bin'
-
-            # Create sourcefile with lambda=1.0e-10m (1.0Å), CLI will specify 0.5Å
-            sourcefile = tmpdir / 'sources_with_lambda.txt'
-            with open(sourcefile, 'w') as f:
-                # Format: X Y Z weight lambda(m)
-                f.write("0.0 0.0 -1.0 1.0 1.0e-10\n")  # lambda=1.0Å (should be overridden)
-                f.write("0.1 0.0 -1.0 1.0 1.0e-10\n")  # lambda=1.0Å (should be overridden)
-
-            # Command with CLI lambda override
-            args_with_override = [
-                'nanoBragg',  # Program name
-                '-cell', '100', '100', '100', '90', '90', '90',
-                '-default_F', '300',
-                '-N', '5',
-                '-distance', '100',
-                '-detpixels', '128',
-                '-pixel', '0.1',
-                '-sourcefile', str(sourcefile),
-                '-lambda', '0.5',  # CLI override (different from file's 1.0Å)
-                '-oversample', '1',
-                '-phisteps', '1',
-                '-mosaic_dom', '1',
-                '-floatfile', str(py_out)
-            ]
-
-            # Use monkeypatch to set sys.argv for in-process execution
-            monkeypatch.setattr(sys, 'argv', args_with_override)
-
-            # Import main function
-            from nanobrag_torch.__main__ import main
-
-            # Execute main() under pytest.warns context
-            # The warning should be emitted when sourcefile wavelengths differ from CLI
-            with pytest.warns(UserWarning, match="Sourcefile wavelength column differs") as record:
-                main()
-
-            # Verify warning message contains expected fragments
-            assert len(record) >= 1, "No UserWarning was raised about wavelength override"
-            warning_message = str(record[0].message.args[0])
-
-            # Check for spec reference in warning
-            assert "spec-a-core.md" in warning_message, \
-                f"Warning missing spec reference. Full warning: {warning_message}"
-
-            # Verify output was written
-            assert py_out.exists(), "Output file was not created"
-
-            # Indirect verification: Compare against reference run with CLI lambda only
-            # If CLI override worked correctly, the output should match a run with uniform lambda
-            reference_out = tmpdir / 'py_reference.bin'
-            reference_sourcefile = tmpdir / 'sources_uniform_lambda.txt'
-            with open(reference_sourcefile, 'w') as f:
-                # Same positions, but lambda matches CLI value
-                f.write("0.0 0.0 -1.0 1.0 5.0e-11\n")  # lambda=0.5Å (matches CLI)
-                f.write("0.1 0.0 -1.0 1.0 5.0e-11\n")  # lambda=0.5Å (matches CLI)
-
-            args_reference = [
-                'nanoBragg',
-                '-cell', '100', '100', '100', '90', '90', '90',
-                '-default_F', '300',
-                '-N', '5',
-                '-distance', '100',
-                '-detpixels', '128',
-                '-pixel', '0.1',
-                '-sourcefile', str(reference_sourcefile),
-                '-lambda', '0.5',
-                '-oversample', '1',
-                '-phisteps', '1',
-                '-mosaic_dom', '1',
-                '-floatfile', str(reference_out)
-            ]
-
-            monkeypatch.setattr(sys, 'argv', args_reference)
-            main()
-
-            # Load and compare
-            shape = (128, 128)
-            override_img = read_float_image(py_out, shape)
-            reference_img = read_float_image(reference_out, shape)
-
-            override_sum = np.sum(override_img)
-            reference_sum = np.sum(reference_img)
-            sum_ratio = override_sum / reference_sum if reference_sum > 0 else float('inf')
-
-            # If CLI override worked, outputs should match within float32 precision
-            tolerance_ratio = 3e-3  # 0.3%
-
-            assert abs(sum_ratio - 1.0) <= tolerance_ratio, \
-                f"CLI lambda override failed: sum_ratio={sum_ratio:.6f} (expected ~1.0). " \
-                f"Override sum={override_sum:.6g}, Reference sum={reference_sum:.6g}"
 
     def test_uniform_weights_ignored(self):
         """
@@ -588,14 +481,13 @@ class TestSourceWeightsDivergence:
         Validate C vs PyTorch parity on weighted sources (SOURCE-WEIGHT-001 Phase H).
 
         After Phase G validation (5 consecutive XPASS results), we confirmed that both
-        C and PyTorch correctly ignore source weights per spec-a-core.md:151-153.
+        C and PyTorch both ignore source weights.
 
         Expected parity (from Phase G evidence):
         - Correlation ≥ 0.999 (observed: 0.9999886)
         - |sum_ratio - 1| ≤ 5e-3 / 0.5% (observed: 0.0038 / 0.38%)
 
-        Per spec: "Both the weight column and the wavelength column are read but ignored"
-        (spec-a-core.md:151-152). Both implementations comply with this requirement.
+        Both implementations ignore the weight column. Each source keeps its wavelength.
 
         See parity reassessment memo:
         reports/2025-11-source-weights/phase_h/20251010T002324Z/parity_reassessment.md

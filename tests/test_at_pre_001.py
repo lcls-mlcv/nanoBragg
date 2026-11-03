@@ -13,6 +13,9 @@ import os
 import numpy as np
 from pathlib import Path
 import struct
+import pytest
+
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
 
 def create_simple_hkl_file(filepath):
     """Create a minimal HKL file for testing."""

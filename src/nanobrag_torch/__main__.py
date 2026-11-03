@@ -24,14 +24,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 from .config import (
-    DetectorConfig, CrystalConfig, BeamConfig, NoiseConfig,
+    DetectorConfig, CrystalConfig, BeamConfig,
     DetectorConvention, DetectorPivot, CrystalShape
 )
 from .models.detector import Detector
 from .models.crystal import Crystal
 from .simulator import Simulator
-from .io.hkl import read_hkl_file, try_load_hkl_or_fdump
-from .io.smv import write_smv
+from .io.hkl import read_hkl_file, try_load_hkl_or_fdump, write_fdump
+from .io.smv import smv_geometry, write_smv
 from .io.mosflm import read_mosflm_matrix, reciprocal_to_real_cell
 from .io.pgm import write_pgm
 from .io.mask import (read_smv_mask, parse_smv_header,
@@ -41,7 +41,7 @@ from .utils.units import (
     mm_to_meters, micrometers_to_meters, degrees_to_radians,
     angstroms_to_meters, mrad_to_radians
 )
-from .utils.noise import generate_poisson_noise
+from .utils.noise import c_noise_image, fast_noise_image, roi_pixels
 from .utils.auto_selection import (
     auto_select_divergence, auto_select_dispersion,
     generate_sources_from_divergence_dispersion
@@ -85,11 +85,9 @@ Examples:
                         help='Text file of "h k l F" (P1 reflections)')
     parser.add_argument('-mat', type=str, metavar='FILE',
                         help='3×3 MOSFLM-style A matrix (reciprocal vectors)')
-    # C writes its binary Fhkl cache here after reading -hkl, and re-reads it when
-    # -hkl is absent. We only ever read it; the flag exists so a run can redirect
-    # C's cache away from the working directory.
-    parser.add_argument('-dumpfile', type=str, metavar='FILE', default='Fdump.bin',
-                        help='Binary Fhkl cache read when -hkl is not given (default: Fdump.bin)')
+    # Binary Fhkl cache, written after reading -hkl and re-read when -hkl is absent.
+    parser.add_argument('-dumpfile', '-dump', type=str, metavar='FILE', default='Fdump.bin', dest='dumpfile',
+                        help='Binary Fhkl cache: written after -hkl, read without it (default: Fdump.bin)')
     parser.add_argument('-cell', nargs=6, type=float,
                         metavar=('a', 'b', 'c', 'α', 'β', 'γ'),
                         help='Direct cell in Å and degrees')
@@ -152,7 +150,7 @@ Examples:
                         help='Pixels on sphere equidistant from sample')
 
     # Detector absorption
-    parser.add_argument('-detector_abs', type=str, metavar='µm',
+    parser.add_argument('-detector_abs', '-detector_absorb', type=str, metavar='µm', dest='detector_abs',
                         help='Attenuation depth in µm (inf or 0 to disable)')
     parser.add_argument('-detector_thick', type=float, metavar='µm',
                         help='Sensor thickness in µm')
@@ -196,10 +194,11 @@ Examples:
                         help='Spindle rotation axis')
     parser.add_argument('-pix0_vector', nargs=3, type=float,
                         metavar=('X', 'Y', 'Z'),
-                        help='Detector origin offset (meters)')
+                        help='Selects the CUSTOM convention and nothing else, as in nanoBragg.c, which '
+                             'recomputes the detector origin from the beam centre and discards the value (meters)')
     parser.add_argument('-pix0_vector_mm', nargs=3, type=float,
                         metavar=('X', 'Y', 'Z'),
-                        help='Detector origin offset (millimeters)')
+                        help='As -pix0_vector: selects CUSTOM, and the value is discarded (millimeters)')
 
     # Beam centers
     parser.add_argument('-Xbeam', type=float, metavar='MM',
@@ -216,7 +215,7 @@ Examples:
                         help='XDS-style beam center Y')
 
     # Beam spectrum/divergence
-    parser.add_argument('-lambda', '-wave', type=float, metavar='Å',
+    parser.add_argument('-lambda', '-wave', '-wavelength', type=float, metavar='Å',
                         dest='wavelength', help='Central wavelength in Å')
     parser.add_argument('-energy', type=float, metavar='eV',
                         help='Central energy in eV')
@@ -257,7 +256,7 @@ Examples:
     parser.add_argument('-Nc', type=int, help='Unit cells along c')
     parser.add_argument('-N', type=int, help='Unit cells (all axes)')
 
-    parser.add_argument('-samplesize', '-xtalsize', type=float, metavar='MM',
+    parser.add_argument('-samplesize', '-sample_size', '-xtalsize', '-xtal_size', type=float, metavar='MM',
                         dest='samplesize', help='Crystal size in mm')
     parser.add_argument('-sample_thick', '-sample_x', '-xtal_thick', '-xtal_x',
                         type=float, metavar='MM', dest='sample_x',
@@ -285,7 +284,7 @@ Examples:
     parser.add_argument('-mosaic', '-mosaici', '-mosaic_spr', type=float,
                         metavar='DEG', dest='mosaic',
                         help='Isotropic mosaic spread (degrees)')
-    parser.add_argument('-mosaic_dom', type=int,
+    parser.add_argument('-mosaic_dom', '-mosaic_domains', type=int, dest='mosaic_dom',
                         help='Number of mosaic domains')
     parser.add_argument('-mosaic_seed', type=int,
                         help='Seed for mosaic rotations')
@@ -380,6 +379,8 @@ Examples:
                         help='Enable progress meter')
     parser.add_argument('-seed', type=int,
                         help='Noise RNG seed')
+    parser.add_argument('-fast_noise', action='store_true',
+                        help="torch.poisson instead of C's generator: GPU speed, not reproducible against C")
     parser.add_argument('-show_config', '-echo_config', action='store_true',
                         help='Print configuration parameters for debugging')
 
@@ -571,6 +572,106 @@ _C_SAMPLE_PARSER = (
 )
 
 
+def resolve_divsteps(args: argparse.Namespace) -> Tuple[Optional[int], Optional[int]]:
+    """
+    Divergence steps per axis. nanoBragg.c:909-923 walks argv and -divsteps sets both axes,
+    so the last flag wins. Without ``args._argv`` -divsteps fills the axes left unset.
+    """
+    hsteps, vsteps = args.hdivsteps, args.vdivsteps
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        return (hsteps if hsteps is not None else args.divsteps,
+                vsteps if vsteps is not None else args.divsteps)
+    for token, value in zip(argv, argv[1:]):
+        if token == '-hdivsteps':
+            hsteps = int(value)
+        elif token == '-vdivsteps':
+            vsteps = int(value)
+        elif token == '-divsteps':
+            hsteps = vsteps = int(value)
+    return hsteps, vsteps
+
+
+def resolve_wavelength_A(args: argparse.Namespace) -> Optional[float]:
+    """
+    Wavelength in Å, None if no flag gave one. nanoBragg.c:853-859 walks argv, so the last of
+    -lambda, -wave and -energy wins. Without ``args._argv`` -energy wins.
+    """
+    def from_energy(eV: float) -> float:
+        # C divides doubles, so -energy 0 is an infinite wavelength rather than an error.
+        return 12398.42 / eV if eV != 0.0 else math.copysign(math.inf, eV)
+
+    wavelength = from_energy(args.energy) if args.energy is not None else args.wavelength
+    argv = getattr(args, '_argv', None) or []
+    for token, value in zip(argv, argv[1:]):
+        if token in ('-lambda', '-wave', '-wavelength'):
+            wavelength = float(value)
+        elif token == '-energy':
+            wavelength = from_energy(float(value))
+    return wavelength
+
+
+def resolve_divergence_ranges_mrad(args: argparse.Namespace) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Divergence range per axis. nanoBragg.c:893-904 walks argv and -divergence sets both axes,
+    so the last flag wins. Without ``args._argv`` -divergence fills the axes left unset.
+    """
+    hrange, vrange = args.hdivrange, args.vdivrange
+    argv = getattr(args, '_argv', None)
+    if argv is None:
+        return (hrange if hrange is not None else args.divergence,
+                vrange if vrange is not None else args.divergence)
+    for token, value in zip(argv, argv[1:]):
+        if token == '-hdivrange':
+            hrange = float(value)
+        elif token == '-vdivrange':
+            vrange = float(value)
+        elif token == '-divergence':
+            hrange = vrange = float(value)
+    return hrange, vrange
+
+
+def resolve_detector_size(args: argparse.Namespace, pixel_mm: float) -> Tuple[int, int, float, float]:
+    """
+    fpixels, spixels, detsize_f and detsize_s (mm) as nanoBragg.c:781-804 and 1120-1127 find them.
+
+    C walks argv, so the last flag wins for its axis. A pixel count then sets detsize for that
+    axis, otherwise the count is ceil(detsize/pixel - 0.5) from a default detsize of 102.4 mm.
+    detsize need not be a whole number of pixels, and the default beam centre uses detsize.
+
+    An -img or -mask header starts all four off, so its count stands on any axis no flag
+    counted (a count beats detsize), and -detpixels 0 falls back on the header's detsize.
+    """
+    header_f, header_s, header_size_f, header_size_s = getattr(args, '_header_size', (0, 0, 0.0, 0.0))
+    fpixels = args.detpixels or args.detpixels_f or header_f
+    spixels = args.detpixels or args.detpixels_s or header_s
+    size_f = args.detsize_f or args.detsize or header_size_f or 102.4
+    size_s = args.detsize_s or args.detsize or header_size_s or 102.4
+    argv = getattr(args, '_argv', None) or []
+    for token, value in zip(argv, argv[1:]):
+        if token == '-detsize':
+            size_f = size_s = float(value)
+        elif token == '-detsize_f':
+            size_f = float(value)
+        elif token == '-detsize_s':
+            size_s = float(value)
+        elif token == '-detpixels':
+            fpixels = spixels = int(value)
+        elif token in ('-detpixels_f', '-detpixels_x'):
+            fpixels = int(value)
+        elif token in ('-detpixels_s', '-detpixels_y'):
+            spixels = int(value)
+    if fpixels:
+        size_f = pixel_mm * fpixels
+    if spixels:
+        size_s = pixel_mm * spixels
+    # Divide metres by metres, as C does: at half a pixel over, mm/mm can land on the other
+    # side of the integer and give a different ceil().
+    pixel_m = pixel_mm / 1000.0
+    return (math.ceil((size_f / 1000.0) / pixel_m - 0.5), math.ceil((size_s / 1000.0) / pixel_m - 0.5),
+            size_f, size_s)
+
+
 def resolve_sample_dimensions(args: argparse.Namespace) -> Tuple[float, float, float]:
     """
     Crystal dimensions (x, y, z) in mm exactly as nanoBragg.c reads them.
@@ -749,9 +850,9 @@ def resolve_close_centers_mm(
 
     pixel_mm = config['pixel_size_mm']
     fclose = ((args.ORGX - 0.5) * pixel_mm if args.ORGX is not None
-              else config['fpixels'] * pixel_mm / 2.0)
+              else config['detsize_f_mm'] / 2.0)
     sclose = ((args.ORGY - 0.5) * pixel_mm if args.ORGY is not None
-              else config['spixels'] * pixel_mm / 2.0)
+              else config['detsize_s_mm'] / 2.0)
 
     if config['convention'] == 'CUSTOM':
         # CUSTOM: Xbeam defaults to Xclose (which defaults to Fclose), then Fclose = Xbeam.
@@ -766,9 +867,13 @@ def resolve_close_centers_mm(
     return fclose, sclose
 
 
-def resolve_detector_pivot(args: argparse.Namespace) -> str:
+def resolve_convention_and_pivot(args: argparse.Namespace) -> Tuple[str, str]:
     """
-    Detector pivot exactly as nanoBragg.c chooses it.
+    Beam convention and detector pivot exactly as nanoBragg.c chooses them.
+
+    The convention is the last of -mosflm, -xds, -adxv, -denzo, -dials and the explicit
+    vector flags, which mean CUSTOM (nanoBragg.c:647-728). A convention flag after a vector
+    flag therefore wins, and its block then overwrites every vector.
 
     C walks argv once and every pivot-affecting flag overwrites detector_pivot
     (last one wins). After parsing, the convention block forces BEAM for MOSFLM,
@@ -812,10 +917,15 @@ def resolve_detector_pivot(args: argparse.Namespace) -> str:
                 pivot = action[1]
 
     if convention in ('MOSFLM', 'DENZO', 'ADXV'):
-        return 'BEAM'
+        return convention, 'BEAM'
     if convention in ('XDS', 'DIALS'):
-        return 'SAMPLE'
-    return pivot
+        return convention, 'SAMPLE'
+    return convention, pivot
+
+
+def resolve_detector_pivot(args: argparse.Namespace) -> str:
+    """The detector pivot: see resolve_convention_and_pivot."""
+    return resolve_convention_and_pivot(args)[1]
 
 
 # nanoBragg.c reads the -img/-mask headers in a pre-pass (nanoBragg.c:419-502)
@@ -837,17 +947,11 @@ _HEADER_ARG_SEEDS = {
     'beam_center_y_mm':  ('Ybeam',          ('-Ybeam',)),
     'orgx':              ('ORGX',           ('-ORGX',)),
     'orgy':              ('ORGY',           ('-ORGY',)),
-    'phi_start_deg':     ('phi',            ('-phi', '-phistep', '-phisteps')),
+    'phi_start_deg':     ('phi',            ('-phi',)),  # C checks strlen==4, so not -phistep
     'osc_range_deg':     ('osc',            ('-osc',)),
     # No TWOTHETA entry: see smv_header_defaults() -- C parses it into a
     # pixel-loop scratch variable, so a header TWOTHETA changes nothing.
 }
-
-# Any of these means the user sized the detector themselves, so SIZE1/SIZE2
-# from the header must not be injected.
-_HEADER_SIZE_FLAGS = ('-detpixels', '-detpixels_f', '-detpixels_s',
-                      '-detpixels_x', '-detpixels_y',
-                      '-detsize', '-detsize_f', '-detsize_s')
 
 
 def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
@@ -883,11 +987,11 @@ def seed_args_from_smv_headers(args: argparse.Namespace) -> None:
     if not defaults:
         return
 
-    if not named.intersection(_HEADER_SIZE_FLAGS):
-        if 'fpixels' in defaults:
-            args.detpixels_f = defaults['fpixels']
-        if 'spixels' in defaults:
-            args.detpixels_s = defaults['spixels']
+    # C's pre-pass leaves the header size in fpixels, spixels, detsize_f and detsize_s
+    # (nanoBragg.c:424-430), and the flags then work from there: see resolve_detector_size.
+    pixel_mm = defaults.get('pixel_size_mm', 0.1)
+    fpixels, spixels = defaults.get('fpixels', 0), defaults.get('spixels', 0)
+    args._header_size = (fpixels, spixels, pixel_mm * fpixels, pixel_mm * spixels)
 
     for key, (dest, tokens) in _HEADER_ARG_SEEDS.items():
         if key not in defaults:
@@ -986,12 +1090,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # Need wavelength for proper scaling
         wavelength_A = config.get('wavelength_A')
         if not wavelength_A:
-            if args.energy:
-                wavelength_A = 12398.42 / args.energy
-            elif args.wavelength:
-                wavelength_A = args.wavelength
-            else:
-                raise ValueError("Wavelength must be specified (via -lambda or -energy) when using -mat")
+            wavelength_A = resolve_wavelength_A(args)
+            if wavelength_A is None:
+                wavelength_A = 1.0  # as nanoBragg.c, whose lambda0 starts at 1e-10
 
         # Read the MOSFLM matrix and convert to cell parameters
         a_star, b_star, c_star = read_mosflm_matrix(args.mat, wavelength_A)
@@ -1007,60 +1108,40 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # Also store wavelength if not already set
         if 'wavelength_A' not in config:
             config['wavelength_A'] = wavelength_A
+        if args.cell:
+            # C keeps user_cell with -mat: the matrix orients, -cell sets the lengths (nanoBragg.c:1935)
+            config['cell_params'] = args.cell
+            config['mosflm_with_user_cell'] = True
     elif args.cell:
         config['cell_params'] = args.cell
 
     # Load HKL data
     config['default_F'] = args.default_F
+    # Doubles as in C, so the cache is byte-identical; the run's dtype is applied later
     if args.hkl:
-        config['hkl_data'] = read_hkl_file(args.hkl, default_F=args.default_F)
+        config['hkl_data'] = read_hkl_file(args.hkl, default_F=args.default_F, dtype=torch.float64)
+        try:
+            write_fdump(*config['hkl_data'], args.dumpfile)
+            print(f"writing dump file for next time: {args.dumpfile}")
+        except OSError:
+            print(f"WARNING: unable to open dump file: {args.dumpfile}")
     elif Path(args.dumpfile).exists():
-        config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F)
+        # A leftover cache overrides -default_F, as in C, so say so with C's line (nanoBragg.c:2109)
+        print(f"reading Fs from {args.dumpfile}")
+        config['hkl_data'] = try_load_hkl_or_fdump(None, fdump_path=args.dumpfile, default_F=args.default_F,
+                                                   dtype=torch.float64)
 
     # Wavelength/energy
-    if args.energy:
-        # λ = (12398.42 / E_eV) * 1e-10 meters
-        config['wavelength_A'] = 12398.42 / args.energy
-    elif args.wavelength:
-        config['wavelength_A'] = args.wavelength
-    else:
-        config['wavelength_A'] = 1.0  # Default
+    config['wavelength_A'] = resolve_wavelength_A(args) or 1.0  # Default
 
     # Convention and pivot
-    # nanoBragg.c:665-728 switches to CUSTOM for every explicit basis vector, and
-    # -twotheta_axis (nanoBragg.c:714-720) is one of them.
-    if any([args.fdet_vector, args.sdet_vector, args.odet_vector,
-            args.beam_vector, args.polar_vector, args.spindle_axis,
-            args.twotheta_axis, args.pix0_vector, args.pix0_vector_mm]):
-        config['convention'] = 'CUSTOM'
-    elif args.convention:
-        config['convention'] = args.convention
-    else:
-        config['convention'] = 'MOSFLM'  # Default
-
-    config['pivot'] = resolve_detector_pivot(args)
+    config['convention'], config['pivot'] = resolve_convention_and_pivot(args)
 
     # Detector parameters
     config['pixel_size_mm'] = args.pixel if args.pixel else 0.1
 
-    # Pixel counts - detpixels takes precedence over detsize
-    if args.detpixels:
-        config['fpixels'] = args.detpixels
-        config['spixels'] = args.detpixels
-    elif args.detpixels_f or args.detpixels_s:
-        config['fpixels'] = args.detpixels_f if args.detpixels_f else 1024
-        config['spixels'] = args.detpixels_s if args.detpixels_s else 1024
-    elif args.detsize:
-        # Only use detsize if detpixels not specified
-        config['fpixels'] = int(args.detsize / config['pixel_size_mm'])
-        config['spixels'] = int(args.detsize / config['pixel_size_mm'])
-    elif args.detsize_f and args.detsize_s:
-        config['fpixels'] = int(args.detsize_f / config['pixel_size_mm'])
-        config['spixels'] = int(args.detsize_s / config['pixel_size_mm'])
-    else:
-        # Default values
-        config['fpixels'] = 1024
-        config['spixels'] = 1024
+    config['fpixels'], config['spixels'], config['detsize_f_mm'], config['detsize_s_mm'] = \
+        resolve_detector_size(args, config['pixel_size_mm'])
 
     config['distance_mm'] = args.distance if args.distance else 100.0
     config['close_distance_mm'] = args.close_distance
@@ -1070,6 +1151,10 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['beam_center_x_mm'] = args.Xbeam
     if args.Ybeam is not None:
         config['beam_center_y_mm'] = args.Ybeam
+    if args.Xclose is not None:
+        config['xclose_mm'] = args.Xclose
+    if args.Yclose is not None:
+        config['yclose_mm'] = args.Yclose
 
     # Point of closest approach (-ORGX/-ORGY/-Xclose/-Yclose); only the SAMPLE pivot reads it
     close_centers = resolve_close_centers_mm(args, config)
@@ -1081,25 +1166,28 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['detector_roty_deg'] = args.detector_roty
     config['detector_rotz_deg'] = args.detector_rotz
     config['twotheta_deg'] = resolve_twotheta_deg(args)
-    if args.twotheta_axis:
+    custom = config['convention'] == 'CUSTOM'  # any other convention overwrites these vectors
+    if custom and args.twotheta_axis:
         config['twotheta_axis'] = tuple(args.twotheta_axis)
 
     config['point_pixel'] = args.point_pixel
     config['curved_detector'] = args.curved_det
 
     # Custom vectors for CUSTOM convention
-    if args.fdet_vector:
+    if custom and args.fdet_vector:
         config['custom_fdet_vector'] = tuple(args.fdet_vector)
-    if args.sdet_vector:
+    if custom and args.sdet_vector:
         config['custom_sdet_vector'] = tuple(args.sdet_vector)
-    if args.odet_vector:
+    if custom and args.odet_vector:
         config['custom_odet_vector'] = tuple(args.odet_vector)
-    if args.beam_vector:
+    if custom and args.beam_vector:
         config['custom_beam_vector'] = tuple(args.beam_vector)
-    if args.polar_vector:
+    if custom and args.polar_vector:
         config['custom_polar_vector'] = tuple(args.polar_vector)
-    if args.spindle_axis:
+    if custom and args.spindle_axis:
         config['custom_spindle_axis'] = tuple(args.spindle_axis)
+
+    unitize_custom_vectors(config)
 
     # Convention defaults for both vectors; an explicit flag wins, as in C, where a vector
     # flag switches to CUSTOM and the convention block then leaves them alone.
@@ -1112,10 +1200,6 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         # declared with in nanoBragg.c: beam [1,0,0] (line 191), fdet [0,0,1],
         # sdet [0,-1,0], odet [1,0,0] (lines 246-248), polar and spindle [0,0,1].
         config.setdefault('custom_beam_vector', (1.0, 0.0, 0.0))
-    # Handle pix0 override (validate mutual exclusivity)
-    if args.pix0_vector and args.pix0_vector_mm:
-        raise ValueError("Cannot specify both -pix0_vector and -pix0_vector_mm simultaneously")
-
     if args.pix0_vector:
         config['custom_pix0_vector'] = tuple(args.pix0_vector)
         # pix0_vector is in meters, convert to config
@@ -1139,8 +1223,9 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['detector_thicksteps'] = args.detector_thicksteps
 
     # Crystal parameters
+    cells_from_flags = resolve_n_cells(args)
     config['Na'], config['Nb'], config['Nc'] = resolve_n_cells_from_sample(
-        args, config['cell_params'], resolve_n_cells(args)
+        args, config['cell_params'], cells_from_flags
     )
 
     # Crystal shape
@@ -1172,11 +1257,11 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
             config['misset_random'] = True
         else:
             config['misset_deg'] = [float(x) for x in args.misset[:3]]
-    if args.misset_seed:
+    if args.misset_seed is not None:
         config['misset_seed'] = args.misset_seed
 
     # Phi rotation: -osc/-phistep/-phisteps are resolved together, as in nanoBragg.c
-    config['phi_deg'] = args.phi if args.phi else 0.0
+    config['phi_deg'] = args.phi if args.phi is not None else 0.0
     config['osc_deg'], config['phi_step_deg'], config['phi_steps'] = resolve_phi_sampling(args)
 
     # Sampling
@@ -1214,28 +1299,28 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['fluence'] = args.fluence
 
     # Polarization
-    if args.nopolar:
-        config['nopolar'] = True
-    elif args.polar is not None:
+    # nanoBragg.c:818-826 walks argv: -polar clears nopolar, and -nopolar leaves the factor set
+    if args.polar is not None:
         config['polarization_factor'] = args.polar
+    if args.nopolar:
+        argv = getattr(args, '_argv', None) or []
+        polar_flags = [token for token in argv if token in ('-polar', '-nopolar')]
+        config['nopolar'] = not polar_flags or polar_flags[-1] == '-nopolar'
 
     # Divergence and dispersion parameters for source generation
     # Convert from mrad to radians for divergence parameters
-    if args.divergence is not None:
-        config['hdivrange'] = mrad_to_radians(args.divergence)
-        config['vdivrange'] = mrad_to_radians(args.divergence)
-    if args.hdivrange is not None:
-        config['hdivrange'] = mrad_to_radians(args.hdivrange)
-    if args.vdivrange is not None:
-        config['vdivrange'] = mrad_to_radians(args.vdivrange)
+    hdivrange_mrad, vdivrange_mrad = resolve_divergence_ranges_mrad(args)
+    if hdivrange_mrad is not None:
+        config['hdivrange'] = mrad_to_radians(hdivrange_mrad)
+    if vdivrange_mrad is not None:
+        config['vdivrange'] = mrad_to_radians(vdivrange_mrad)
     if args.hdivstep is not None:
         config['hdivstep'] = mrad_to_radians(args.hdivstep)
     if args.vdivstep is not None:
         config['vdivstep'] = mrad_to_radians(args.vdivstep)
 
     # Store counts directly
-    config['hdivsteps'] = args.hdivsteps
-    config['vdivsteps'] = args.vdivsteps
+    config['hdivsteps'], config['vdivsteps'] = resolve_divsteps(args)
     config['dispsteps'] = args.dispsteps
 
     # Store round_div flag for elliptical trimming
@@ -1246,10 +1331,18 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
         config['dispersion'] = args.dispersion / 100.0  # Convert percent to fraction
 
     # Interpolation
-    if args.interpolate:
+    if args.interpolate and args.nointerpolate:
+        # nanoBragg.c:1060-1069 walks argv, so the last wins
+        argv = getattr(args, '_argv', None) or []
+        interpolate_flags = [token for token in argv if token in ('-interpolate', '-nointerpolate')]
+        config['interpolate'] = not interpolate_flags or interpolate_flags[-1] == '-interpolate'
+    elif args.interpolate:
         config['interpolate'] = True
     elif args.nointerpolate:
         config['interpolate'] = False
+    else:
+        # C chooses before -samplesize has set Na (nanoBragg.c:1779, 2065), so from the -N flags
+        config['interpolate'] = any(n <= 2 for n in cells_from_flags)
 
     # Output files. nanoBragg.c initialises all four filenames to defaults
     # (nanoBragg.c:145-150) and writes them whether or not a flag was given, so
@@ -1265,7 +1358,8 @@ def parse_and_validate_args(args: argparse.Namespace) -> Dict[str, Any]:
     config['scale'] = args.scale
     config['adc'] = args.adc
     config['pgmscale'] = args.pgmscale
-    config['seed'] = args.seed if args.seed else int(-time.time())
+    config['seed'] = args.seed if args.seed is not None else int(time.time())  # C: seed = -time, flag negated
+    config['fast_noise'] = args.fast_noise
 
     # Sourcefile (store path for later processing)
     if args.sourcefile:
@@ -1382,18 +1476,28 @@ def print_configuration(crystal_config, detector_config, beam_config, simulator_
     print("="*60 + "\n")
 
 
+def _c_atof(token: str) -> float:
+    """atof: the number a string starts with, 0 if it does not start with one."""
+    match = re.match(r"\s*[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?", token)
+    return float(match.group(0)) if match else 0.0
+
+
 def warn_c_misset_seed_order(argv) -> None:
     """
-    Warn when ``-misset_seed`` follows ``-misset random``. nanoBragg.c matches
-    flags with strstr(), so it reads the later "-misset_seed N" as
-    "-misset N <next> <next>" and renders fixed angles instead of a random
-    orientation; the PyTorch CLI keeps the random orientation.
+    Warn when nanoBragg.c would read ``-misset_seed N`` as a fixed misset. It matches flags with
+    strstr(), so that token is also "-misset N <next> <next>", in degrees, whatever the next two
+    arguments are, unless a later -misset replaces it or fewer than three arguments follow.
+    Torch takes the flag for the seed it is. Copying C would orient the crystal by the text of
+    unrelated flags, so it warns instead, and says how to ask for C's angles.
     """
-    randoms = [i for i, a in enumerate(argv[:-1]) if a == '-misset' and argv[i + 1].startswith('rand')]
-    if randoms and '-misset_seed' in argv[randoms[-1] + 2:]:
+    last = max((i for i, a in enumerate(argv) if a in ('-misset', '-misset_seed')), default=None)
+    if last is not None and argv[last] == '-misset_seed' and last + 3 < len(argv):
+        angles = " ".join(f"{_c_atof(token):g}" for token in argv[last + 1:last + 4])
         warnings.warn(
-            "-misset_seed after -misset random: nanoBragg.c would use fixed misset angles here. "
-            "Put -misset_seed first to get the same random orientation from both programs.",
+            f"-misset_seed: nanoBragg.c reads this flag as a misset too, and would render fixed angles "
+            f"of {angles} deg here, taken from the arguments after it. This run does not. "
+            f"To get C's orientation pass -misset {angles}. For a random one put -misset_seed before "
+            "-misset random in both programs.",
             stacklevel=2,
         )
 
@@ -1418,6 +1522,38 @@ class SimulationBundle:
     beam_config: BeamConfig
     dtype: torch.dtype
     device: torch.device
+
+
+def unitize_custom_vectors(config: Dict[str, Any]) -> None:
+    """
+    nanoBragg.c:1260-1268 unitizes the vectors the flags gave. An odet whose magnitude isn't
+    exactly 1 is replaced by fdet x sdet, with fdet and sdet at their declared values if unset.
+    """
+    def magnitude(vector):
+        return math.sqrt(sum(component * component for component in vector))
+
+    def unitized(vector):
+        length = magnitude(vector)
+        return tuple(component / length for component in vector) if length != 0.0 else (0.0, 0.0, 0.0)
+
+    for key in ('custom_beam_vector', 'custom_fdet_vector', 'custom_sdet_vector'):
+        if key in config:
+            config[key] = unitized(config[key])
+    if 'custom_odet_vector' in config and magnitude(config['custom_odet_vector']) != 1.0:
+        print("WARNING: auto-generating odet_vector")
+        f = config.get('custom_fdet_vector', (0.0, 0.0, 1.0))
+        s = config.get('custom_sdet_vector', (0.0, -1.0, 0.0))
+        config['custom_odet_vector'] = unitized((f[1] * s[2] - f[2] * s[1],
+                                                 f[2] * s[0] - f[0] * s[2],
+                                                 f[0] * s[1] - f[1] * s[0]))
+
+
+def resolve_beam_and_polar_vectors(config: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Unit beam_vector and polar_vector as nanoBragg.c:1172-1270 leaves them, in double."""
+    default_beam = (1.0, 0.0, 0.0) if config['convention'] in ('MOSFLM', 'DENZO', 'CUSTOM') else (0.0, 0.0, 1.0)
+    beam = torch.tensor(config.get('custom_beam_vector', default_beam), dtype=torch.float64)
+    polar = torch.tensor(config.get('custom_polar_vector', (0.0, 0.0, 1.0)), dtype=torch.float64)
+    return beam / beam.norm(), polar / polar.norm()
 
 
 def build_simulation(
@@ -1466,13 +1602,15 @@ def build_simulation(
             mosaic_spread_deg=config.get('mosaic_spread_deg', 0.0),
             mosaic_domains=config.get('mosaic_domains', 1),
             mosaic_seed=config.get('mosaic_seed'),
+            mosaic_seed_reloads=config.get('mosaic_seed', 0) >= 0,
             shape=CrystalShape[config.get('crystal_shape', 'SQUARE')],
             fudge=config.get('fudge', 1.0),
             default_F=config.get('default_F', 0.0),
             # Phase G1: Pass MOSFLM orientation if provided
             mosflm_a_star=config.get('mosflm_a_star'),
             mosflm_b_star=config.get('mosflm_b_star'),
-            mosflm_c_star=config.get('mosflm_c_star')
+            mosflm_c_star=config.get('mosflm_c_star'),
+            mosflm_with_user_cell=config.get('mosflm_with_user_cell', False),
         )
 
         if 'misset_deg' in config:
@@ -1483,6 +1621,7 @@ def build_simulation(
 
         if 'misset_seed' in config:
             crystal_config.misset_seed = config['misset_seed']
+            crystal_config.misset_seed_reloads = config['misset_seed'] >= 0
 
         if 'custom_spindle_axis' in config:
             crystal_config.spindle_axis = config['custom_spindle_axis']
@@ -1502,6 +1641,8 @@ def build_simulation(
                        if 'twotheta_axis' in config else None),
         close_center_f_mm=config.get('close_center_f_mm'),
         close_center_s_mm=config.get('close_center_s_mm'),
+        detsize_f_mm=config.get('detsize_f_mm'),
+        detsize_s_mm=config.get('detsize_s_mm'),
         detector_convention=DetectorConvention[config.get('convention', 'MOSFLM')],
         detector_pivot=DetectorPivot[config.get('pivot', 'BEAM')] if config.get('pivot') else None,
         oversample=config.get('oversample', -1),  # -1 means auto-select
@@ -1517,8 +1658,8 @@ def build_simulation(
         custom_sdet_vector=config.get('custom_sdet_vector'),
         custom_odet_vector=config.get('custom_odet_vector'),
         custom_beam_vector=config.get('custom_beam_vector'),
-        # Detector origin override (CLI-FLAGS-003)
-        pix0_override_m=config.get('pix0_override_m')
+        # Not pix0_override_m: nanoBragg.c:1719 or 1740 overwrites -pix0_vector under either
+        # pivot, so the flag's only effect is the switch to CUSTOM.
     )
 
     # Set beam center if provided (values are in mm)
@@ -1538,9 +1679,10 @@ def build_simulation(
     convention = detector_config.detector_convention
     pixel_size_mm = detector_config.pixel_size_mm
 
-    if 'beam_center_x_mm' in config and 'beam_center_y_mm' in config:
-        Xbeam_mm = config['beam_center_x_mm']
-        Ybeam_mm = config['beam_center_y_mm']
+    if 'beam_center_x_mm' in config or 'beam_center_y_mm' in config:
+        # An axis left out keeps its DetectorConfig default, like C's isnan(Xbeam) defaults.
+        Xbeam_mm = config.get('beam_center_x_mm')
+        Ybeam_mm = config.get('beam_center_y_mm')
 
         # Check if convention forces SAMPLE pivot (XDS/DIALS)
         # For these conventions, Xbeam/Ybeam are ignored; use detector center instead
@@ -1553,20 +1695,22 @@ def build_simulation(
         elif convention in [DetectorConvention.MOSFLM, DetectorConvention.DENZO]:
             # MOSFLM/DENZO: BEAM pivot with axis swap (Fbeam ← Ybeam, Sbeam ← Xbeam)
             # +0.5 pixel offset is added later in Detector.__init__
-            detector_config.beam_center_f = Ybeam_mm
-            detector_config.beam_center_s = Xbeam_mm
+            if Ybeam_mm is not None:
+                detector_config.beam_center_f = Ybeam_mm
+            if Xbeam_mm is not None:
+                detector_config.beam_center_s = Xbeam_mm
         elif convention == DetectorConvention.ADXV:
             # ADXV: BEAM pivot with Y-axis flip
-            detsize_s_mm = detector_config.spixels * pixel_size_mm
-            detector_config.beam_center_f = Xbeam_mm
-            detector_config.beam_center_s = detsize_s_mm - Ybeam_mm
+            if Xbeam_mm is not None:
+                detector_config.beam_center_f = Xbeam_mm
+            if Ybeam_mm is not None:
+                detector_config.beam_center_s = config['detsize_s_mm'] - Ybeam_mm
         elif convention == DetectorConvention.CUSTOM:
             # CUSTOM: No axis swap (Fbeam ← Xbeam, Sbeam ← Ybeam)
-            detector_config.beam_center_f = Xbeam_mm
-            detector_config.beam_center_s = Ybeam_mm
-    elif 'beam_center_x_mm' in config or 'beam_center_y_mm' in config:
-        # Partial beam center - this shouldn't happen in well-formed input
-        raise ValueError("Both -Xbeam and -Ybeam must be provided together")
+            if Xbeam_mm is not None:
+                detector_config.beam_center_f = Xbeam_mm
+            if Ybeam_mm is not None:
+                detector_config.beam_center_s = Ybeam_mm
 
     # ROI
     if 'roi' in config:
@@ -1608,22 +1752,24 @@ def build_simulation(
         # Load sources from file
         wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
 
-        # Get beam direction based on detector convention.
-        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0];
-        # ADXV/XDS/DIALS use [0,0,1].
-        if detector_config.detector_convention in (
-            DetectorConvention.MOSFLM, DetectorConvention.DENZO
-        ):
-            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-        else:
-            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
+        beam_direction, _ = resolve_beam_and_polar_vectors(config)
 
         source_directions, source_weights, source_wavelengths = read_sourcefile(
             config['sourcefile'],
             default_wavelength_m=wavelength_m,
             default_source_distance_m=10.0,  # C code default
-            beam_direction=beam_direction
+            beam_direction=beam_direction,
+            dtype=dtype,
         )
+
+        if not torch.all(source_weights == source_weights[0]):
+            warnings.warn(
+                "The -sourcefile weights differ, and the CLI ignores them, as nanoBragg.c does: "
+                "every source counts equally. ExperimentModel or BeamConfig.use_source_weights "
+                "honours them.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # Store loaded sources in config
         config['source_directions'] = source_directions
@@ -1651,18 +1797,7 @@ def build_simulation(
 
         # Generate source arrays
         wavelength_m = angstroms_to_meters(config.get('wavelength_A', 1.0))
-
-        # Get beam direction based on detector convention.
-        # nanoBragg.c:1193/1208 give MOSFLM and DENZO beam_vector = [1,0,0] with
-        # polar_vector = [0,0,1]; ADXV/XDS/DIALS use beam_vector = [0,0,1].
-        if detector_config.detector_convention in (
-            DetectorConvention.MOSFLM, DetectorConvention.DENZO
-        ):
-            beam_direction = torch.tensor([1.0, 0.0, 0.0], dtype=dtype)
-            polarization_axis = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-        else:
-            beam_direction = torch.tensor([0.0, 0.0, 1.0], dtype=dtype)
-            polarization_axis = torch.tensor([0.0, 1.0, 0.0], dtype=dtype)
+        beam_direction, polarization_axis = resolve_beam_and_polar_vectors(config)
 
         source_directions, source_weights, source_wavelengths = \
             generate_sources_from_divergence_dispersion(
@@ -1677,10 +1812,10 @@ def build_simulation(
                 dtype=dtype
             )
 
-        # Store generated sources in config. One generated source just restates the beam,
-        # and leaves it to Detector, which also knows about -beam_vector.
+        # Store generated sources in config. One source with no divergence just restates the
+        # beam, and leaves it to Detector, which also knows about -beam_vector.
         n_sources = len(source_directions)
-        if n_sources > 1:
+        if n_sources > 1 or hdiv_params.range > 0.0 or vdiv_params.range > 0.0:
             config['source_directions'] = source_directions
             config['source_weights'] = source_weights
             config['source_wavelengths'] = source_wavelengths
@@ -1709,10 +1844,10 @@ def build_simulation(
     beam_config = BeamConfig(**beam_kwargs)
 
     # Polarization
+    if 'polarization_factor' in config:
+        beam_config.polarization_factor = config['polarization_factor']
     if config.get('nopolar'):
         beam_config.nopolar = True
-    elif 'polarization_factor' in config:
-        beam_config.polarization_factor = config['polarization_factor']
 
     # Set generated sources if available
     if 'source_directions' in config:
@@ -1724,8 +1859,8 @@ def build_simulation(
         config_hook(crystal_config, detector_config, beam_config)
 
     # Create models
-    detector = Detector(detector_config)
-    crystal = Crystal(crystal_config, beam_config=beam_config)
+    detector = Detector(detector_config, device=device, dtype=dtype)
+    crystal = Crystal(crystal_config, beam_config=beam_config, device=device, dtype=dtype)
 
     # Set HKL data if available
     hkl_entry = config.get('hkl_data')
@@ -1770,6 +1905,25 @@ def build_simulation(
         dtype=dtype,
         device=device,
     )
+
+
+def smv_header_geometry(config: Dict[str, Any], detector_config: DetectorConfig) -> Dict[str, Any]:
+    """Header values for write_smv, with Xbeam and Ybeam as nanoBragg.c:1190-1250 leaves them."""
+    # C's detsize_s, which stays what was asked for when that isn't a whole number of pixels
+    size_s = config.get('detsize_s_mm', detector_config.spixels * detector_config.pixel_size_mm)
+    convention = detector_config.detector_convention
+    if convention in (DetectorConvention.MOSFLM, DetectorConvention.DENZO):
+        xbeam, ybeam = detector_config.beam_center_s, detector_config.beam_center_f
+    elif convention == DetectorConvention.ADXV:
+        xbeam, ybeam = detector_config.beam_center_f, size_s - detector_config.beam_center_s
+    else:  # Xbeam = Xclose and Ybeam = Yclose unless the flags gave them
+        fclose = config.get('close_center_f_mm', detector_config.beam_center_f)
+        sclose = config.get('close_center_s_mm', detector_config.beam_center_s)
+        xbeam = config.get('beam_center_x_mm', config.get('xclose_mm', fclose))
+        ybeam = config.get('beam_center_y_mm', config.get('yclose_mm', sclose))
+    # In double, as in C, whatever the run's dtype. Rendering keeps its own Detector.
+    return smv_geometry(Detector(detector_config, dtype=torch.float64), float(xbeam), float(ybeam), size_s,
+                        detector_config.pixel_size_mm)
 
 
 class _PrintHandler(logging.Handler):
@@ -1829,8 +1983,12 @@ def main():
 
         intensity = simulator.run(pixel_batch_size=args.pixel_batch_size)
 
+        # Every output comes from C's float image: float32 pixels, then used as doubles
+        with np.errstate(over='ignore'):
+            float_image = intensity.detach().cpu().numpy().astype(np.float32)
+
         # Compute statistics
-        stats = simulator.compute_statistics(intensity)
+        stats = simulator.compute_statistics(torch.from_numpy(float_image).to(intensity.device))
         print(f"\nStatistics:")
         print(f"  Max intensity: {stats['max_I']:.3e} at pixel ({stats['max_I_slow']}, {stats['max_I_fast']})")
         print(f"  Mean: {stats['mean']:.3e}")
@@ -1840,8 +1998,7 @@ def main():
         # Write outputs
         if config.get('floatfile'):
             # Write raw float image
-            data = intensity.cpu().numpy().astype(np.float32)
-            data.tofile(config['floatfile'])
+            float_image.tofile(config['floatfile'])
             print(f"Wrote float image to {config['floatfile']}")
 
         # Resolve the integer-image scale once, before either the int or the PGM
@@ -1856,33 +2013,22 @@ def main():
             # it into the scale made every pixel disagree with C. Measured on a
             # default 32x32 run before this fix: 1024/1024 pixels differed,
             # max |delta| = 41 counts, C peak 55040 against torch 55000.
-            max_val = intensity.max().item()
+            # max_I only ever moves on `>`, so NaN pixels don't reach it.
+            max_val = float(np.nanmax(float_image, initial=0.0))
             intfile_scale = 55000.0 / max_val if max_val > 0 else 1.0
 
+        header_geometry = smv_header_geometry(config, detector_config)
+
         if config.get('intfile'):
-            # Scale and write SMV per AT-CLI-006
+            # nanoBragg.c:3152-3168: every pixel of the ROI, in double, to floorf(test + 0.5)
             scale = intfile_scale
-
-            # Apply scaling per spec: integer pixel = floor(min(65535, float*scale + adc))
-            # Only apply to non-zero pixels (AT-CLI-005)
-            # Pixels outside ROI should remain zero
-            threshold = 1e-10
-            roi_mask = intensity > threshold
-
-            # Calculate scaled values
-            scaled = intensity * scale + adc_offset
-            # Only apply scaling where intensity > 0 (inside ROI)
-            scaled = torch.where(roi_mask, scaled, torch.zeros_like(scaled))
-            # C rounds: intimage = (unsigned short)(floorf(test + 0.5))
-            # (nanoBragg.c:3167). This used to truncate, a systematic -0.5 ADU
-            # bias on every pixel. floor(x + 0.5) is round-half-UP, which is not
-            # torch.round's round-half-to-even, so spell it out.
-            scaled = scaled.clip(0, 65535)
-            # int32 then uint16: the old int16 cast relied on two's-complement
-            # wrapping for values above 32767 and happened to round-trip.
-            scaled_int = (
-                torch.floor(scaled + 0.5).to(torch.int32).cpu().numpy().astype(np.uint16)
-            )
+            test = np.clip(float_image.astype(np.float64) * scale + adc_offset, 0.0, 65535.0)
+            # floorf: its double argument is rounded to float first. That is the round-half-up
+            # C wants, which np.round isn't. A NaN pixel comes out as 0.
+            scaled_int = np.nan_to_num(np.floor((test + 0.5).astype(np.float32))).astype(np.uint16)
+            scaled_int = scaled_int * roi_pixels(float_image.shape, (
+                detector_config.roi_xmin, detector_config.roi_xmax,
+                detector_config.roi_ymin, detector_config.roi_ymax))
 
             write_smv(
                 filepath=config['intfile'],
@@ -1890,16 +2036,16 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=detector_config.beam_center_s,
-                beam_center_y_mm=detector_config.beam_center_f,
-                close_distance_mm=detector_config.close_distance_mm,
+                beam_center_x_mm=float(header_geometry['xbeam_m']) * 1000.0,
+                beam_center_y_mm=float(header_geometry['ybeam_m']) * 1000.0,
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
                 twotheta_deg=config.get('twotheta_deg', 0.0),
                 convention=detector_config.detector_convention.name,
                 scale=1.0,  # Already scaled
-                adc_offset=0.0  # Already applied ADC
+                adc_offset=0.0,  # Already applied ADC
+                geometry=header_geometry,
             )
             print(f"Wrote SMV image to {config['intfile']}")
 
@@ -1938,55 +2084,25 @@ def main():
                     # -roi 17 17 17 17 (one pixel, so rmsd is 0 in both): C wrote
                     # "# pixels scaled by 7570.47" where torch wrote 1.
                     pgmscale = intfile_scale
-            write_pgm(config['pgmfile'], intensity.cpu().numpy(), pgmscale)
+            write_pgm(config['pgmfile'], float_image, pgmscale)
             print(f"Wrote PGM image to {config['pgmfile']}")
 
         # CLI-FLAGS-003: Honor -nonoise flag
         if config.get('noisefile') and not config.get('suppress_noise', False):
             # Generate and write noise image
-            noise_config = NoiseConfig(
-                seed=config.get('seed'),
-                adc_offset=config.get('adc', 40.0)
-            )
-            # For noise generation, we need to handle ROI properly (AT-CLI-005)
-            # Only apply noise and ADC to pixels inside ROI
-            # First, create a mask for where intensity > 0 (inside ROI)
-            roi_mask = intensity > 0
-
-            # Generate noise for the entire image (but without readout noise)
-            noisy, overloads = generate_poisson_noise(
-                intensity,
-                seed=noise_config.seed,
-                adc_offset=0.0,  # Don't apply ADC globally
-                readout_noise=0.0,  # Don't apply readout noise globally
-                overload_value=noise_config.overload_value
-            )
-
-            # noisy is now an integer tensor, convert back to float for additional operations
-            noisy = noisy.float()
-
-            # Add ADC offset and readout noise only to pixels inside ROI
-            if roi_mask.any():
-                # Apply readout noise only inside ROI
-                if noise_config.readout_noise > 0:
-                    generator = torch.Generator(device=intensity.device)
-                    if noise_config.seed is not None:
-                        generator.manual_seed(noise_config.seed + 1)  # Different seed for readout
-                    readout = torch.normal(
-                        mean=torch.zeros_like(noisy),
-                        std=noise_config.readout_noise,
-                        generator=generator
-                    )
-                    noisy = torch.where(roi_mask, noisy + readout, noisy)
-
-                # Add ADC offset only inside ROI
-                if noise_config.adc_offset > 0:
-                    noisy = torch.where(roi_mask, noisy + noise_config.adc_offset, noisy)
-
-            # Ensure pixels outside ROI remain exactly zero
-            noisy = torch.where(roi_mask, noisy, torch.zeros_like(noisy))
-
-            noisy_int = noisy.to(torch.int16).cpu().numpy().astype(np.uint16)
+            adc = config.get('adc', 40.0)
+            roi = (detector_config.roi_xmin, detector_config.roi_xmax,
+                   detector_config.roi_ymin, detector_config.roi_ymax)
+            if config.get('fast_noise'):
+                noisy_int, photons, overloads = fast_noise_image(intensity, config['seed'], adc, roi)
+            else:
+                noisy_int, photons, overloads = c_noise_image(
+                    intensity.detach().cpu().numpy(), config['seed'], adc, roi,
+                    mosaic_seed=config.get('mosaic_seed', 12345678),
+                    mosaic_domains=config['mosaic_domains'],
+                    misset_seed=(config.get('misset_seed', config['seed']) if config.get('misset_random') else None),
+                )
+            print(f"{photons:.0f} photons on noise image ({overloads} overloads)")
 
             write_smv(
                 filepath=config['noisefile'],
@@ -1994,16 +2110,16 @@ def main():
                 pixel_size_mm=detector_config.pixel_size_mm,
                 distance_mm=detector_config.distance_mm,
                 wavelength_angstrom=beam_config.wavelength_A,
-                beam_center_x_mm=detector_config.beam_center_s,
-                beam_center_y_mm=detector_config.beam_center_f,
-                close_distance_mm=detector_config.close_distance_mm,
+                beam_center_x_mm=float(header_geometry['xbeam_m']) * 1000.0,
+                beam_center_y_mm=float(header_geometry['ybeam_m']) * 1000.0,
                 phi_deg=config.get('phi_deg', 0.0),
                 osc_start_deg=config.get('phi_deg', 0.0),
                 osc_range_deg=config.get('osc_deg', 0.0),
                 twotheta_deg=config.get('twotheta_deg', 0.0),
                 convention=detector_config.detector_convention.name,
                 scale=1.0,  # Already scaled
-                adc_offset=0.0  # Already applied ADC
+                adc_offset=0.0,  # Already applied ADC
+                geometry=header_geometry,
             )
             print(f"Wrote noise image to {config['noisefile']} ({overloads} overloads)")
 
@@ -2011,6 +2127,9 @@ def main():
 
     except Exception as e:
         import traceback
+        if isinstance(e, MemoryError) or (isinstance(e, RuntimeError) and "allocate" in str(e)):  # torch's
+            print(f"Error: out of memory, no image written: {e}", file=sys.stderr)
+            sys.exit(1)
         print(f"Error: {e}", file=sys.stderr)
         traceback.print_exc()
         sys.exit(1)

@@ -137,6 +137,7 @@ class CrystalConfig:
     # Random misset generation (for AT-PARALLEL-024)
     misset_random: bool = False  # If True, generate random misset angles using seed
     misset_seed: Optional[int] = None  # Seed for random misset generation (C-compatible LCG)
+    misset_seed_reloads: bool = True  # False for a negative -misset_seed, which ran1 does not reseed from
 
     # MOSFLM matrix orientation (Phase G - CLI-FLAGS-003)
     # When -mat file is provided, these store the MOSFLM A* orientation in Å⁻¹
@@ -144,6 +145,9 @@ class CrystalConfig:
     mosflm_a_star: Optional[np.ndarray] = None  # MOSFLM a* reciprocal vector (Å⁻¹)
     mosflm_b_star: Optional[np.ndarray] = None  # MOSFLM b* reciprocal vector (Å⁻¹)
     mosflm_c_star: Optional[np.ndarray] = None  # MOSFLM c* reciprocal vector (Å⁻¹)
+    # -cell given as well as -mat: C's user_cell is still set, so the matrix gives the orientation
+    # and cell_a..cell_gamma give the lengths and the volume (nanoBragg.c:1935-1942)
+    mosflm_with_user_cell: bool = False
 
     # Spindle rotation parameters
     phi_start_deg: float = 0.0
@@ -159,6 +163,7 @@ class CrystalConfig:
     mosaic_spread_deg: float = 0.0
     mosaic_domains: int = 1
     mosaic_seed: Optional[int] = None
+    mosaic_seed_reloads: bool = True  # False for a negative -mosaic_seed, which ran1 does not reseed from
 
     # Crystal size (number of unit cells in each direction)
     N_cells: Tuple[int, int, int] = (1, 1, 1)  # Matches C default
@@ -220,6 +225,8 @@ class DetectorConfig:
     # whose Fclose and Fbeam coincide does.
     close_center_f_mm: Optional[float] = None  # Fclose (fast axis)
     close_center_s_mm: Optional[float] = None  # Sclose (slow axis)
+    detsize_f_mm: Optional[float] = None  # Size behind the default beam centre, fpixels*pixel if None
+    detsize_s_mm: Optional[float] = None  # Same, slow axis
 
     # Beam center source tracking (DETECTOR-CONFIG-001 Phase C1)
     # Distinguishes auto-calculated defaults from explicit user-provided values
@@ -324,8 +331,8 @@ class DetectorConfig:
         # The offset is part of the MOSFLM beam-center MAPPING formula and should
         # be applied when converting beam centers to Fbeam/Sbeam in the Detector class.
         if self.beam_center_s is None or self.beam_center_f is None:
-            detsize_s = self.spixels * self.pixel_size_mm  # Total detector size in slow axis (mm)
-            detsize_f = self.fpixels * self.pixel_size_mm  # Total detector size in fast axis (mm)
+            detsize_s = self.detsize_s_mm or self.spixels * self.pixel_size_mm  # Total detector size in slow axis (mm)
+            detsize_f = self.detsize_f_mm or self.fpixels * self.pixel_size_mm  # Total detector size in fast axis (mm)
 
             # Per spec-a-core.md §71-72:
             # MOSFLM/DENZO: Default Xbeam = Ybeam = (detsize + pixel)/2

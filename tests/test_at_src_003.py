@@ -1,186 +1,59 @@
-"""AT-SRC-003: Sourcefile Lambda Override and Steps Reconciliation Tests
+"""AT-SRC-003: Sourcefile wavelengths and steps reconciliation.
 
-Tests for SOURCE-WEIGHT-001 Phase E implementation (Option B):
-- TC-E1: Sourcefile wavelengths overridden by CLI -lambda
-- TC-E2: Warning emission when sourcefile wavelengths differ from CLI
-- TC-E3: Steps normalization parity (counts all sources including zero-weight)
-
-Per lambda_semantics.md (2025-10-09T13:17:09Z):
-Both weight and wavelength columns in sourcefiles are read but IGNORED.
-CLI -lambda is the sole authoritative wavelength source.
+Each source keeps the wavelength in its file, and -lambda fills in a missing column.
+Steps normalization counts all sources, including zero-weight ones.
 """
 
-import pytest
-import torch
+import os
+import subprocess
+import sys
 import tempfile
 import warnings
 from pathlib import Path
 
+import numpy as np
+import pytest
+import torch
+
 from nanobrag_torch.io.source import read_sourcefile
 
 
-class TestSourcefileLambdaOverride:
-    """TC-E1: Sourcefile wavelengths must be overridden by CLI -lambda."""
+class TestSourcefileWavelengths:
+    """nanoBragg.c:2341-2343 and 2748: each source keeps the wavelength in its file."""
 
-    def test_lambda_override_single_source(self):
-        """Single source with different wavelength - CLI wins."""
-        cli_lambda = 0.9768e-10  # meters (CLI value from TC-D1 fixture)
-        file_lambda = 6.2e-10     # meters (sourcefile value from TC-D1 fixture)
+    def test_file_wavelength_is_kept(self, tmp_path):
+        sourcefile = tmp_path / "sources.txt"
+        sourcefile.write_text("0 0 -10 1 6.2e-10\n0 0 -10 1 7.0e-10\n")
+        _, _, wavelengths = read_sourcefile(sourcefile, default_wavelength_m=1e-10, dtype=torch.float64)
+        assert wavelengths.tolist() == pytest.approx([6.2e-10, 7.0e-10])
 
-        # Create temporary sourcefile with divergent wavelength
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            # Format: X Y Z weight wavelength(m)
-            f.write(f"0.0 0.0 -10.0 1.0 {file_lambda}\n")
-            sourcefile_path = Path(f.name)
+    def test_missing_column_takes_lambda(self, tmp_path):
+        sourcefile = tmp_path / "sources.txt"
+        sourcefile.write_text("0 0 -10 1\n0 0 -10 1 7.0e-10\n")
+        _, _, wavelengths = read_sourcefile(sourcefile, default_wavelength_m=1e-10, dtype=torch.float64)
+        assert wavelengths.tolist() == pytest.approx([1e-10, 7.0e-10])
 
-        try:
-            directions, weights, wavelengths = read_sourcefile(
-                sourcefile_path,
-                default_wavelength_m=cli_lambda,
-                dtype=torch.float64,
-                device=torch.device('cpu')
-            )
-
-            # Verify wavelength is CLI value, not file value
-            assert wavelengths.shape == (1,)
-            expected_cli = torch.tensor([cli_lambda], dtype=torch.float64)
-            assert torch.allclose(wavelengths, expected_cli), \
-                f"Expected CLI wavelength {cli_lambda}, got {wavelengths[0].item()}"
-
-            # Verify it's NOT the file value
-            file_value = torch.tensor([file_lambda], dtype=torch.float64)
-            assert abs(wavelengths[0].item() - file_lambda) > 1e-12, \
-                f"Wavelength should be CLI value {cli_lambda}, not file value {file_lambda}"
-
-        finally:
-            sourcefile_path.unlink()
-
-    def test_lambda_override_multiple_sources(self):
-        """Multiple sources with varying wavelengths - all overridden to CLI."""
-        cli_lambda = 1.0e-10  # 1.0 Å
-        file_lambdas = [6.2e-10, 0.9768e-10, 1.5e-10]  # Various values
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            for lam in file_lambdas:
-                f.write(f"0.0 0.0 -10.0 1.0 {lam}\n")
-            sourcefile_path = Path(f.name)
-
-        try:
-            directions, weights, wavelengths = read_sourcefile(
-                sourcefile_path,
-                default_wavelength_m=cli_lambda,
-                dtype=torch.float64
-            )
-
-            # All wavelengths must equal CLI value
-            assert wavelengths.shape == (len(file_lambdas),)
-            expected = torch.full((len(file_lambdas),), cli_lambda, dtype=torch.float64)
-            assert torch.allclose(wavelengths, expected)
-
-        finally:
-            sourcefile_path.unlink()
-
-
-class TestSourcefileWarningEmission:
-    """TC-E2: Warning must be emitted when sourcefile wavelength differs from CLI."""
-
-    def test_warning_emitted_on_mismatch(self):
-        """Warning emitted when file wavelength ≠ CLI wavelength."""
-        cli_lambda = 0.9768e-10
-        file_lambda = 6.2e-10  # Significantly different
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            f.write(f"0.0 0.0 -10.0 1.0 {file_lambda}\n")
-            sourcefile_path = Path(f.name)
-
-        try:
-            # Clear any previous warning state
-            if hasattr(read_sourcefile, '_wavelength_warned'):
-                delattr(read_sourcefile, '_wavelength_warned')
-
-            # Expect UserWarning with specific text
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-
-                directions, weights, wavelengths = read_sourcefile(
-                    sourcefile_path,
-                    default_wavelength_m=cli_lambda,
-                    dtype=torch.float64
-                )
-
-                # Verify warning was emitted
-                assert len(w) == 1
-                assert issubclass(w[0].category, UserWarning)
-                assert "sourcefile wavelength column differs" in str(w[0].message).lower()
-                assert "spec-a-core.md:150-151" in str(w[0].message)
-
-        finally:
-            sourcefile_path.unlink()
-
-    def test_no_warning_when_matching(self):
-        """No warning when file wavelength matches CLI wavelength."""
-        cli_lambda = 1.0e-10
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            # File wavelength matches CLI
-            f.write(f"0.0 0.0 -10.0 1.0 {cli_lambda}\n")
-            sourcefile_path = Path(f.name)
-
-        try:
-            # Clear any previous warning state
-            if hasattr(read_sourcefile, '_wavelength_warned'):
-                delattr(read_sourcefile, '_wavelength_warned')
-
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-
-                directions, weights, wavelengths = read_sourcefile(
-                    sourcefile_path,
-                    default_wavelength_m=cli_lambda,
-                    dtype=torch.float64
-                )
-
-                # No warning should be emitted
-                wavelength_warnings = [warning for warning in w
-                                      if "wavelength" in str(warning.message).lower()]
-                assert len(wavelength_warnings) == 0
-
-        finally:
-            sourcefile_path.unlink()
-
-    def test_no_warning_when_column_missing(self):
-        """No warning when wavelength column is absent (defaults to CLI)."""
-        cli_lambda = 1.0e-10
-
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            # Only X Y Z weight (no wavelength column)
-            f.write("0.0 0.0 -10.0 1.0\n")
-            sourcefile_path = Path(f.name)
-
-        try:
-            # Clear any previous warning state
-            if hasattr(read_sourcefile, '_wavelength_warned'):
-                delattr(read_sourcefile, '_wavelength_warned')
-
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-
-                directions, weights, wavelengths = read_sourcefile(
-                    sourcefile_path,
-                    default_wavelength_m=cli_lambda,
-                    dtype=torch.float64
-                )
-
-                # No warning for missing column
-                wavelength_warnings = [warning for warning in w
-                                      if "wavelength" in str(warning.message).lower()]
-                assert len(wavelength_warnings) == 0
-
-                # Wavelength should still be CLI value
-                assert torch.allclose(wavelengths, torch.tensor([cli_lambda], dtype=torch.float64))
-
-        finally:
-            sourcefile_path.unlink()
+    @pytest.mark.parametrize("lines", [
+        ["-1 0 0 1 1.0e-10", "-1 0 0 1 1.1e-10"],
+        ["-1 0 0 2 1.0e-10", "-1 0 0 1 1.1e-10"],
+        ["-1 0 0 1 1.05e-10"],
+        ["-1 0 0 1", "-1 0 0 1 1.1e-10"],
+    ], ids=["two-wavelengths", "weights-differ", "one-source", "missing-column"])
+    def test_image_matches_c(self, lines, tmp_path):
+        c_bin = os.environ.get("NB_C_BIN")
+        if not c_bin or not Path(c_bin).exists():
+            pytest.skip("set NB_C_BIN to the oracle binary")
+        (tmp_path / "sources.txt").write_text("\n".join(lines) + "\n")
+        args = ("-cell 70 80 90 75 85 95 -default_F 100 -N 5 -lambda 1 -distance 100 -pixel 0.1 -detpixels 64 "
+                "-oversample 1 -nonoise -nopgm -sourcefile sources.txt -floatfile").split()
+        env = dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1] / "src"))
+        for command, out in (([str(Path(c_bin).resolve())], "c.bin"),
+                             ([sys.executable, "-m", "nanobrag_torch"], "py.bin")):
+            subprocess.run(command + args + [out], cwd=tmp_path, env=env, check=True, capture_output=True)
+        c_image = np.fromfile(tmp_path / "c.bin", dtype=np.float32)
+        py_image = np.fromfile(tmp_path / "py.bin", dtype=np.float32)
+        assert np.corrcoef(c_image, py_image)[0, 1] > 0.99999
+        assert py_image.sum() / c_image.sum() == pytest.approx(1.0, abs=1e-4)
 
 
 class TestStepsNormalizationParity:

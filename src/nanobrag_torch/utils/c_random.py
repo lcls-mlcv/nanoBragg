@@ -42,7 +42,7 @@ Determinism validated by AT-PARALLEL-013 (same-seed runs, correlation ≥0.99999
 
 References:
 -----------
-- C Source: nanoBragg.c lines 4143-4185 (ran1), 3820-3868 (mosaic_rotation_umat)
+- C Source: nanoBragg.c lines 3785-3816 (ran1), 3451-3499 (mosaic_rotation_umat)
 - Spec: specs/spec-a-core.md §5.3 (RNG determinism)
 - Architecture: arch.md ADR-05 (Deterministic Sampling & Seeds)
 - Phase B3 Analysis: reports/determinism-callchain/phase_b3/20251011T051737Z/c_seed_flow.md
@@ -50,6 +50,7 @@ References:
 
 import math
 import torch
+import copy
 from typing import Optional, Tuple
 import numpy as np
 
@@ -60,7 +61,7 @@ class CLCG:
     This class implements the ran1() function from nanoBragg.c, which is based on
     the Park and Miller "Minimal Standard" generator with Bays-Durham shuffle.
 
-    C-Code Implementation Reference (from nanoBragg.c, lines ~49100-49150):
+    C-Code Implementation Reference (from nanoBragg.c, lines 3785-3816):
     ```c
     #define IA 16807
     #define IM 2147483647
@@ -129,6 +130,13 @@ class CLCG:
         self.iv = [0] * self.NTAB
         self._initialized = False
 
+    def reseeded_without_reload(self, seed: int) -> "CLCG":
+        """A generator as C has it after storing a positive seed: ran1 reloads its table only
+        for a seed <= 0, so this keeps the table and carries on with |seed|."""
+        rng = copy.deepcopy(self)
+        rng.idum = abs(seed)
+        return rng
+
     def ran1(self) -> float:
         """Generate a uniform random deviate between 0 and 1.
 
@@ -162,7 +170,7 @@ class CLCG:
         self.iy = self.iv[j]
         self.iv[j] = self.idum
 
-        temp = self.AM * self.iy
+        temp = float(np.float32(self.AM * self.iy))  # C keeps it in a float
         return min(temp, self.RNMX)
 
 
@@ -170,7 +178,8 @@ def mosaic_rotation_umat(
     mosaicity: float,
     seed: Optional[int] = None,
     dtype: Optional[torch.dtype] = None,
-    device: torch.device = torch.device('cpu')
+    device: torch.device = torch.device('cpu'),
+    rng: Optional[CLCG] = None,
 ) -> torch.Tensor:
     """Generate a random unitary rotation matrix within a spherical cap.
 
@@ -178,7 +187,7 @@ def mosaic_rotation_umat(
     which generates a random rotation matrix with maximum rotation angle
     limited by the mosaicity parameter.
 
-    C-Code Implementation Reference (from nanoBragg.c, lines ~48855-48905):
+    C-Code Implementation Reference (from nanoBragg.c, lines 3451-3499):
     ```c
     double *mosaic_rotation_umat(float mosaicity, double umat[9], long *seed)
     {
@@ -245,7 +254,7 @@ def mosaic_rotation_umat(
 
     C Equivalent:
     -------------
-    Replicates nanoBragg.c lines 3820-3868 (mosaic_rotation_umat).
+    Replicates nanoBragg.c lines 3451-3499 (mosaic_rotation_umat).
     C version uses pointer side effects: `ran1(&seed)` mutates seed in-place.
     PyTorch version uses stateful CLCG class for memory safety.
 
@@ -261,7 +270,7 @@ def mosaic_rotation_umat(
     if dtype is None:
         dtype = torch.get_default_dtype()
 
-    rng = CLCG(seed)
+    rng = rng if rng is not None else CLCG(seed)
 
     # Make three random uniform deviates on [-1:1]
     r1 = 2.0 * rng.ran1() - 1.0
@@ -269,7 +278,7 @@ def mosaic_rotation_umat(
     r3 = 2.0 * rng.ran1() - 1.0
 
     xyrad = math.sqrt(1.0 - r2 * r2)
-    rot = mosaicity * math.pow(1.0 - r3 * r3, 1.0/3.0)
+    rot = float(np.float32(mosaicity) * _rot_scale(r3))
 
     v1 = xyrad * math.sin(math.pi * r1)
     v2 = xyrad * math.cos(math.pi * r1)
@@ -305,12 +314,19 @@ def mosaic_rotation_umat(
     return umat
 
 
+def _rot_scale(r3: float) -> np.float32:
+    """powf((1.0-r3*r3),(1.0/3.0)) of nanoBragg.c:3466, which is single precision."""
+    return np.float32(1.0 - r3 * r3) ** np.float32(1.0 / 3.0)
+
+
 def mosaic_rotation_umats(
     mosaicity,
     n_domains: int,
     seed: Optional[int] = None,
     dtype: Optional[torch.dtype] = None,
     device: torch.device = torch.device('cpu'),
+    rng: Optional[CLCG] = None,
+    single_precision_rot: bool = True,
 ) -> torch.Tensor:
     """Every mosaic domain's rotation matrix, exactly as nanoBragg.c builds them.
 
@@ -330,11 +346,14 @@ def mosaic_rotation_umats(
     ``rot = mosaicity * (1 - r3^2)^(1/3)``, so gradients flow while the deviates stay
     frozen, exactly the reparameterisation the Gaussian sampler used to provide.
 
+    C rounds rot to single. ``single_precision_rot=False`` keeps it in dtype, for a mosaicity being
+    refined, where rounding would make the value a staircase under a gradient that is not zero.
+
     Returns (n_domains, 3, 3).
     """
     if dtype is None:
         dtype = torch.get_default_dtype()
-    rng = CLCG(seed)
+    rng = rng if rng is not None else CLCG(seed)
 
     mosaicity_t = mosaicity if isinstance(mosaicity, torch.Tensor) else torch.as_tensor(
         mosaicity, dtype=dtype, device=device
@@ -360,13 +379,18 @@ def mosaic_rotation_umats(
         v1_l.append(xyrad * math.sin(math.pi * r1))
         v2_l.append(xyrad * math.cos(math.pi * r1))
         v3_l.append(r2)
-        rot_scale_l.append(math.pow(1.0 - r3 * r3, 1.0 / 3.0))
+        rot_scale_l.append(float(_rot_scale(r3)))
 
     v1 = torch.tensor(v1_l, dtype=dtype, device=device)
     v2 = torch.tensor(v2_l, dtype=dtype, device=device)
     v3 = torch.tensor(v3_l, dtype=dtype, device=device)
     # mosaicity_t is the only tensor input, so the gradient path runs through rot alone
-    rot = mosaicity_t * torch.tensor(rot_scale_l, dtype=dtype, device=device)
+    rot_scale = torch.tensor(rot_scale_l, dtype=dtype, device=device)
+    rot = mosaicity_t * rot_scale
+    if single_precision_rot:
+        # 8e-6 rad at the 90 rad of a random orientation. A shift, so that d(rot)/d(mosaicity)
+        # stays rot_scale.
+        rot = rot + ((mosaicity_t.detach().to(torch.float32) * rot_scale.to(torch.float32)).to(dtype) - rot.detach())
 
     t1 = torch.cos(rot)
     t2 = 1.0 - t1
@@ -395,7 +419,7 @@ def umat2misset(umat: torch.Tensor) -> Tuple[float, float, float]:
     This function ports the umat2misset() function from nanoBragg.c,
     which decomposes a rotation matrix into XYZ Euler angles.
 
-    C-Code Implementation Reference (from nanoBragg.c, lines ~48910-48995):
+    C-Code Implementation Reference (from nanoBragg.c, lines 3503-3624):
     ```c
     double *umat2misset(double umat[9],double *missets)
     {

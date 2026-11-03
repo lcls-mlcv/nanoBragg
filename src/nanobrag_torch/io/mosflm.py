@@ -4,9 +4,33 @@ This module provides functions for reading MOSFLM-style orientation matrices,
 which contain reciprocal lattice vectors scaled by wavelength.
 """
 
+import re
+
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Union
+
+
+# One %lg. fscanf takes the longest number it can and leaves the rest, so tokens need no space
+# between them. glibc's %lg also consumes an exponent letter and sign with no digits after them
+# ("1e", "1e+", "1E-") and returns the mantissa; "1ex" reads 1 and stops at the x.
+# Hex floats (0x...) are not handled.
+_FSCANF_DOUBLE = re.compile(
+    r"\s*([+-]?(?:(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d*)?|inf(?:inity)?|nan))", re.IGNORECASE
+)
+
+
+def _read_doubles_as_fscanf(text: str, count: int) -> list:
+    """Up to count numbers from the start of text, stopping where %lg would."""
+    values = []
+    position = 0
+    while len(values) < count:
+        match = _FSCANF_DOUBLE.match(text, position)
+        if match is None:
+            break
+        values.append(float(match.group(1).rstrip("eE+-")))
+        position = match.end()
+    return values
 
 
 def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -46,38 +70,28 @@ def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple
 
     Raises:
         FileNotFoundError: If the matrix file doesn't exist
-        ValueError: If the file doesn't contain exactly 9 numeric values
+        ValueError: If the file doesn't start with 9 numeric values. C reads them with
+            fscanf("%lg%lg%lg") three times, and at a heading or a stray token it carries
+            on with uninitialized vectors and a NaN cell, so here that is an error.
     """
     filepath = Path(filepath)
 
     if not filepath.exists():
         raise FileNotFoundError(f"MOSFLM matrix file not found: {filepath}")
 
-    # Read all values from the file
-    values = []
-    with open(filepath, 'r') as f:
-        for line in f:
-            # Skip comments and empty lines
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
+    # A whole-line # comment is torch's own: C has no value to give for such a file (see Raises)
+    lines = filepath.read_text().splitlines(keepends=True)
+    values = _read_doubles_as_fscanf("".join(l for l in lines if not l.lstrip().startswith("#")), 9)
 
-            # Parse numeric values
-            parts = line.split()
-            for part in parts:
-                try:
-                    values.append(float(part))
-                except ValueError:
-                    continue
-
-    if len(values) != 9:
+    if len(values) < 9:
         raise ValueError(
-            f"MOSFLM matrix file must contain exactly 9 numeric values, "
+            f"MOSFLM matrix file must start with 9 numeric values, "
             f"found {len(values)} in {filepath}"
         )
 
-    # Reshape into 3x3 matrix (row-major order from file)
-    matrix = np.array(values).reshape(3, 3)
+    # Reshape into 3x3 matrix (row-major order from file). The rest of a real MOSFLM file, the
+    # missets, U matrix and cell, C never reads (nanoBragg.c:1885-1887), and nor does this.
+    matrix = np.array(values[:9]).reshape(3, 3)
 
     # C-code reads this matrix in column-major order (see lines 26-28 above):
     # First row  -> a_star[1], b_star[1], c_star[1]  (components of each vector)
@@ -94,8 +108,9 @@ def read_mosflm_matrix(filepath: Union[str, Path], wavelength_A: float) -> Tuple
 
     # Scale to remove wavelength and convert to Å^-1
     # The values in the file are in units of Å^-1·(1/λ_Å)
-    # We scale by (1e-10/lambda_m) where lambda_m = wavelength_A * 1e-10
-    lambda_m = wavelength_A * 1e-10
+    # We scale by (1e-10/lambda0) where C reads lambda0 = atof(arg)/1e10 (nanoBragg.c:874, 1892).
+    # wavelength_A*1e-10 is an ulp away for many wavelengths, which moves the auto-oversample ceil.
+    lambda_m = wavelength_A / 1e10
     scale_factor = 1e-10 / lambda_m  # This equals 1/wavelength_A
 
     a_star = a_star_raw * scale_factor

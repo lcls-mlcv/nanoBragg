@@ -19,7 +19,7 @@ from scitbx.matrix import sqr
 from nanobrag_torch.compat.cctbx import _axis_angle_matrix, asu_structure_factors, experiment_model_from_dxtbx
 from nanobrag_torch.models.experiment import SerialExperiment
 from nanobrag_torch.utils.losses import gaussian_nll
-from nanobrag_torch.utils.refinement import refine_lbfgsb
+from nanobrag_torch.utils.refinement import git_commit, refine_lbfgsb
 
 P = argparse.ArgumentParser()
 P.add_argument("--expt", required=True, help="scan-varying refined experiments, one per lattice")
@@ -40,7 +40,7 @@ P.add_argument("--sensor-layers", dest="layers", type=int, default=0)
 P.add_argument("--misset", action="store_true", help="refine each frame and lattice's orientation too")
 P.add_argument("--rmin", type=float, default=400.0, help="pixels from the beam; F_calc has no bulk solvent inside about 8.5 A")
 P.add_argument("--flash", type=float, default=20.0,
-               help="drop a box whose peak is this many times the same box on both neighbouring frames; 0 keeps all")
+               help="drop a box whose peak is this many times the same box on its neighbouring frames; 0 keeps all")
 P.add_argument("--maxiter", type=int, default=100)
 P.add_argument("--start-only", dest="start_only", action="store_true")
 P.add_argument("--out", default="rotation_refinement.json")
@@ -65,7 +65,7 @@ osc = scan.get_oscillation()[1]
 
 
 def lab_crystal(exp, i):
-    A_i = sqr(exp.crystal.get_A_at_scan_point(i))
+    A_i = sqr(exp.crystal.get_A_at_scan_point(i - scan.get_array_range()[0]))  # scan points count from the scan's start
     R = sqr(_axis_angle_matrix(datum, math.radians(scan.get_angle_from_array_index(i))).flatten().tolist())
     c = copy.deepcopy(exp.crystal)
     c.reset_scan_points()
@@ -77,29 +77,42 @@ def read(i):
     return load(A.images % (i + 1)).get_raw_data().as_numpy_array().astype(np.float64)
 
 
+def neighbours(i):
+    """Each pixel's brighter value on the frames either side, infinite where one is masked; None without any."""
+    first, last = scan.get_array_range()
+    side = [read(k) for k in (i - 1, i + 1) if first <= k < last]
+    if not side:
+        return None
+    side = np.maximum.reduce(side)
+    side[(side < 0) | (side >= 1e5)] = np.inf
+    return side
+
+
 def rois_of(i, img, good):
     """Strongest indexed spots of frame i, one tilted plane each; returns rois, tilt_abc.
 
-    Real spots here rock over three to five frames, so a box bright on one frame alone is a
-    cosmic ray that DIALS happened to index, and the model can never fit it.
+    A box bright on one frame alone is a cosmic ray that DIALS happened to index, and the
+    model can never fit it. Real spots leave at least 7% of their counts on a neighbour in
+    CYP119 at 0.2 degrees a frame; on sharper data a real spot can pass --flash, so check
+    what it dropped. A pixel masked on a neighbour says nothing, so such a box stays.
     """
     sel = np.where((zo >= i - 0.5) & (zo < i + 1.5) & (lattice >= 0) & (np.hypot(xo - bx, yo - by) > A.rmin))[0]
     sel = sel[np.argsort(-intensity[sel])]
     H, W = img.shape
     h, rois, tilts = A.half, [], []
     used = np.zeros(img.shape, bool)
-    side = np.maximum(read(i - 1), read(i + 1)) if A.flash else None
+    side = neighbours(i) if A.flash else None
     flashes = []
     for j in sel:
         x, y = int(xo[j]), int(yo[j])
         x1, x2, y1, y2 = x - h, x + h + 1, y - h, y + h + 1
         if x1 < 0 or y1 < 0 or x2 > W or y2 > H or used[y1:y2, x1:x2].any() or good[y1:y2, x1:x2].mean() < 0.9:
             continue
-        used[y1:y2, x1:x2] = True
         box = good[y1:y2, x1:x2]
-        if A.flash and img[y1:y2, x1:x2][box].max() > A.flash * max(1.0, side[y1:y2, x1:x2][box].max()):
-            flashes.append((x, y, img[y1:y2, x1:x2][box].max()))
+        if side is not None and img[y1:y2, x1:x2][box].max() > A.flash * max(1.0, side[y1:y2, x1:x2][box].max()):
+            flashes.append((i, x, y, img[y1:y2, x1:x2][box].max()))
             continue
+        used[y1:y2, x1:x2] = True
         yy, xx = np.mgrid[0:y2 - y1, 0:x2 - x1]
         keep = good[y1:y2, x1:x2].ravel().copy()
         M = np.stack((xx.ravel(), yy.ravel(), np.ones(xx.size)), 1).astype(float)
@@ -114,12 +127,14 @@ def rois_of(i, img, good):
         if len(rois) == A.spots:
             break
     if flashes:
-        print("frame", i, "dropped flashes (x, y, peak):", flashes, flush=True)
+        print("dropped flashes (frame, x, y, peak):", flashes, flush=True)
+    dropped.extend(flashes)
     return rois, tilts
 
 
 frames = {}
 models = []
+dropped = []
 sensor = dict(detector_thick_mm=0.0)
 if A.layers:
     sensor = dict(detector_thicksteps=A.layers, oversample_thick=True)
@@ -128,6 +143,9 @@ for i in fit + test:
     img = read(i)
     good = (img >= 0) & (img < 1e5) & ~hot
     rois, tilts = rois_of(i, img, good)
+    if not rois:
+        print("frame", i, "has no boxes, skipping it", flush=True)
+        continue
     start = len(models)
     for l, exp in enumerate(E):
         models.append(experiment_model_from_dxtbx(
@@ -137,6 +155,7 @@ for i in fit + test:
             phi_start_deg=A.sign * osc / A.phi_steps / 2, osc_range_deg=A.sign * osc, phi_steps=A.phi_steps,
             spindle_axis=axis, structure_factors=sf, device=device))
     frames[i] = dict(img=img, good=good, models=models[start:], rois=len(rois))
+fit, test = [i for i in fit if i in frames], [i for i in test if i in frames]
 print("built", len(models), "models in", round(time.time() - t0), "s; rois", {i: f["rois"] for i, f in frames.items()}, flush=True)
 serial = SerialExperiment(models, share_detector=True)
 serial.freeze()
@@ -194,17 +213,17 @@ start = {i: score(f) for i, f in frames.items()}
 print("start (cc, nll/px):", start, flush=True)
 print("start G:", {i: [float(f"{g:.3g}") for g in G_of(f)] for i, f in frames.items()}, flush=True)
 print("peak GiB", round(torch.cuda.max_memory_allocated() / 2**30, 2), flush=True)
-result = dict(args=vars(A), start=start)
+result = dict(commit=git_commit(), args=vars(A), start=start, dropped=[[int(v) for v in d] for d in dropped])
 if not A.start_only:
     for f in (frames[i] for i in fit):
         for m in f["models"]:
             m.refine("Ncells", "eta", "scale", *(["misset"] if A.misset else []))
 
-    def objective():
-        return sum(gaussian_nll(predict(frames[i]), frames[i]["data"], 1.0, trusted=frames[i]["trusted"]) for i in fit)
+    def term(f):
+        return lambda: gaussian_nll(predict(f), f["data"], 1.0, trusted=f["trusted"])
 
     t0 = time.time()
-    r = refine_lbfgsb(serial, objective, maxiter=A.maxiter, scales=dict(scale=0.1))
+    r = refine_lbfgsb(serial, [term(frames[i]) for i in fit], maxiter=A.maxiter, scales=dict(scale=0.1))
     seconds = time.time() - t0
     for i in test:  # Ncells and eta stay as the fitted frames left them
         f = frames[i]

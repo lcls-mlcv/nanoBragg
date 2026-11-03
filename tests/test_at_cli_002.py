@@ -21,6 +21,8 @@ import tempfile
 from pathlib import Path
 import struct
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 
 class TestAT_CLI_002:
     """Test minimal CLI render with outputs."""
@@ -80,7 +82,7 @@ class TestAT_CLI_002:
                     assert key in header, f"Missing required header key: {key}"
 
                 # Verify header ends with }\f and is padded to 512 bytes
-                assert header.rstrip('\x00').endswith('}\f'), "Header should end with }\\f"
+                assert header.rstrip(' ').endswith('}\f'), "Header should end with }\\f"
                 assert len(header_bytes) == 512, "Header should be exactly 512 bytes"
 
                 # Read data and verify fast-major ordering

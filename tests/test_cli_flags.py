@@ -7,6 +7,10 @@ Validates argument parsing, unit conversions, and detector override behavior.
 Evidence base: reports/2025-10-cli-flags/phase_a/README.md
 """
 import os
+import subprocess
+import sys
+
+import numpy as np
 import pytest
 import torch
 from pathlib import Path
@@ -91,16 +95,16 @@ class TestPix0VectorAlias:
 
         assert config_m['pix0_override_m'] == pytest.approx(config_mm['pix0_override_m'], rel=0, abs=1e-12)
 
-    def test_dual_pix0_flag_rejection(self):
-        """Using both -pix0_vector and -pix0_vector_mm should raise ValueError."""
-        with pytest.raises(ValueError, match="Cannot specify both -pix0_vector and -pix0_vector_mm"):
-            run_parse([
-                '-cell', '100', '100', '100', '90', '90', '90',
-                '-pixel', '0.1',
-                '-default_F', '100',
-                '-pix0_vector', '0', '0', '0',
-                '-pix0_vector_mm', '0', '0', '0'
-            ])
+    def test_both_pix0_flags_are_accepted(self):
+        """C reads both, and the image is the same as with either: PARITY-PIX0-001."""
+        config = run_parse([
+            '-cell', '100', '100', '100', '90', '90', '90',
+            '-pixel', '0.1',
+            '-default_F', '100',
+            '-pix0_vector', '0', '0', '0',
+            '-pix0_vector_mm', '0', '0', '0'
+        ])
+        assert config['convention'] == 'CUSTOM'
 
     @pytest.mark.parametrize("pix0_m,pix0_mm", [
         ((0.1, -0.2, 0.3), (100, -200, 300)),
@@ -1014,3 +1018,43 @@ class TestInterpolateParity:
 
         assert not np.allclose(on, off), \
             "-interpolate and -nointerpolate produced identical images"
+
+
+def test_seed_zero_is_a_seed():
+    args = create_parser().parse_args("-default_F 100 -cell 70 80 90 90 90 90 -seed 0 -misset_seed 0".split())
+    config = parse_and_validate_args(args)
+    assert config['seed'] == 0
+    assert config['misset_seed'] == 0
+
+
+@pytest.mark.parametrize("flags, expected", [
+    ("-interpolate -nointerpolate", False),
+    ("-nointerpolate -interpolate", True),
+    ("-interpolate -nointerpolate -interpolate", True),
+    ("-interpolate", True),
+    ("-nointerpolate", False),
+])
+def test_last_interpolate_flag_wins(flags, expected):
+    """nanoBragg.c:1060-1069 walks argv."""
+    from nanobrag_torch.__main__ import build_simulation, create_parser
+
+    argv = "-cell 70 80 90 90 90 90 -default_F 100 -N 5 -detpixels 8".split() + flags.split()
+    args = create_parser().parse_args(argv)
+    args._argv = argv
+    assert build_simulation(args).crystal.interpolate is expected
+
+
+@pytest.mark.skipif(C_BINARY is None, reason="C binary not found")
+@pytest.mark.parametrize("flags", ["-interpolate -nointerpolate", "-nointerpolate -interpolate"])
+def test_interpolate_order_gives_cs_image(flags, tmp_path):
+    (tmp_path / "x.hkl").write_text("".join(f"{h} {k} {l} {50 + 7 * ((h * 3 + k * 5 + l * 11) % 13)}\n"
+                                            for h in range(-6, 7) for k in range(-6, 7) for l in range(-6, 7)))
+    argv = ("-cell 70 80 90 90 90 90 -hkl x.hkl -default_F 0 -N 5 -detpixels 32 -oversample 1 -nopolar".split()
+            + flags.split() + ["-floatfile"])
+    subprocess.run([str(C_BINARY), *argv, "c.bin", "-nopgm", "-nonoise", "-nointfile"], cwd=tmp_path,
+                   capture_output=True, timeout=120, check=True)
+    subprocess.run([sys.executable, "-m", "nanobrag_torch", *argv, "t.bin", "-dtype", "float64"], cwd=tmp_path,
+                   capture_output=True, timeout=120, check=True)
+    theirs = np.fromfile(tmp_path / "c.bin", dtype=np.float32)
+    assert theirs.max() > 0
+    np.testing.assert_allclose(np.fromfile(tmp_path / "t.bin", dtype=np.float32), theirs, rtol=2e-6, atol=1e-6)

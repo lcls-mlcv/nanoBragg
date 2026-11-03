@@ -7,8 +7,10 @@ loop stalls: on a shot hopper refines to 0.0013 degrees in 112 iterations, Adam 
 torch.optim.LBFGS on the raw parameters stopped with G 34% off. Rescaling to comparable
 sensitivity, as hopper does, and using SciPy's L-BFGS-B gives hopper's answer.
 """
+import os
+import subprocess
 import warnings
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -33,6 +35,21 @@ DEFAULT_SCALES = {
 }
 
 
+def git_commit() -> str:
+    """The commit this package runs from, "+dirty" if tracked files differ, "unknown" outside git.
+
+    For result files, so that a number can be traced to the code that made it.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        head = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
+        status = subprocess.run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no"],
+                                capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown"
+    return head.stdout.strip() + ("+dirty" if status.stdout.strip() else "")
+
+
 def scaled_parameters(model, scales: Optional[dict] = None) -> list:
     """(parameter, scale) for each trainable parameter, each once, in a stable order."""
     scales = {**DEFAULT_SCALES, **(scales or {})}
@@ -52,7 +69,7 @@ def scaled_parameters(model, scales: Optional[dict] = None) -> list:
 
 def refine_lbfgsb(
     model,
-    objective: Callable[[], torch.Tensor],
+    objective: Union[Callable[[], torch.Tensor], Sequence[Callable[[], torch.Tensor]]],
     scales: Optional[dict] = None,
     ftol: float = 1e-10,
     gtol: float = 1e-8,
@@ -64,6 +81,13 @@ def refine_lbfgsb(
     of DEFAULT_SCALES by group name. The model is left at the last point evaluated, which
     is scipy's solution. Returns scipy's OptimizeResult, in the scaled variables.
 
+    ``objective`` can be a list of closures whose sum is minimised. Each backward runs and
+    frees its graph before the next closure starts, so graphs don't pile up across terms.
+    Each closure must build everything it differentiates through itself, as
+    ``serial([i], roi_only=True)`` does, which costs memory of its own: trainable Fhkl or a
+    trainable shared detector are rebuilt per term and kept alive by each model until its
+    next run, about 435 MB a shot for pixel coordinates on a 16M detector.
+
         model.freeze().refine("scale", "misset", "Ncells", "cell")
         data = model.roi_values(image)
         refine_lbfgsb(model, lambda: gaussian_nll(model(roi_only=True), data, sigma))
@@ -74,6 +98,9 @@ def refine_lbfgsb(
     if not chosen:
         raise ValueError("nothing to refine: every parameter is frozen")
     starts = [parameter.detach().clone() for parameter, _ in chosen]
+    terms = [objective] if callable(objective) else list(objective)
+    if not terms:
+        raise ValueError("nothing to minimise: the list of objective terms is empty")
 
     def load(x):
         at = 0
@@ -87,13 +114,17 @@ def refine_lbfgsb(
         load(x)
         for parameter, _ in chosen:
             parameter.grad = None
-        loss = objective()
-        loss.backward()
+        loss = 0.0
+        for term in terms:
+            value = term()
+            if value.requires_grad:  # a term can miss every trainable parameter, as in a sum
+                value.backward()
+            loss += value.item()
         gradient = [
             (torch.zeros_like(p) if p.grad is None else p.grad * scale).reshape(-1).detach().cpu().numpy()
             for p, scale in chosen
         ]
-        return loss.item(), np.concatenate(gradient).astype(np.float64)
+        return loss, np.concatenate(gradient).astype(np.float64)
 
     if any(p.dtype != torch.float64 for p, _ in chosen):
         warnings.warn("refine_lbfgsb needs float64: float32 losses can tie under ftol and stop it early")

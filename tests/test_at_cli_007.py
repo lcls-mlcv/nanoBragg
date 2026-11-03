@@ -13,6 +13,8 @@ import pytest
 
 from nanobrag_torch.io.smv import read_smv
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 
 class TestATCLI007NoiseDeterminism:
     """Test CLI noise determinism with seeds."""
@@ -46,7 +48,7 @@ class TestATCLI007NoiseDeterminism:
             "-distance", "100",
             "-lambda", "1.0",
             "-default_F", "100",  # Ensure we have some structure factor
-            "-fluence", "1e25",  # Higher fluence for non-zero counts
+            "-fluence", "1e33",  # Enough photons that the seed shows in this ROI
             "-seed", str(seed),
             "-noisefile", str(output_file)
         ]

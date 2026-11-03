@@ -15,6 +15,8 @@ import numpy as np
 import pytest
 from pathlib import Path
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 # Set environment variable for PyTorch
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 

@@ -16,7 +16,7 @@ import torch
 
 from ..config import CrystalConfig, BeamConfig
 from ..utils.geometry import angles_to_rotation_matrix
-from ..io.hkl import read_hkl_file, try_load_hkl_or_fdump
+from ..io.hkl import read_hkl_file, try_load_hkl_or_fdump, write_fdump
 
 logger = logging.getLogger(__name__)
 
@@ -218,12 +218,12 @@ class Crystal:
                 warnings.warn(f"Unit cell angle {angle_name} is very close to 0° or 180°, which may cause numerical instability")
 
 
-    def load_hkl(self, hkl_path: str, write_cache: bool = True):
+    def load_hkl(self, hkl_path: str, write_cache: bool = False):
         """Load HKL structure factor data from file.
 
         Args:
             hkl_path: Path to HKL text file
-            write_cache: Whether to write Fdump.bin cache after loading
+            write_cache: Whether to write Fdump.bin to the working directory after loading
         """
         self.hkl_data, self.hkl_metadata = read_hkl_file(
             hkl_path,
@@ -231,6 +231,8 @@ class Crystal:
             device=self.device,
             dtype=self.dtype
         )
+        if write_cache:
+            write_fdump(self.hkl_data, self.hkl_metadata, "Fdump.bin")
 
         # Note: Auto-enable interpolation is already handled in __init__
         # This should be overridden by explicit CLI flags when they're implemented
@@ -746,13 +748,15 @@ class Crystal:
         # This must happen BEFORE applying misset rotation
         if hasattr(self.config, "misset_random") and self.config.misset_random:
             # Generate random misset angles using C-compatible LCG
-            from ..utils.c_random import mosaic_rotation_umat, umat2misset
+            from ..utils.c_random import CLCG, mosaic_rotation_umat, umat2misset
 
             # Use 90.0 as the cap for random orientation to match C code behavior
             # NOTE: The C code passes 90.0 (degrees) but mosaic_rotation_umat treats it as radians!
             # This is a bug in the C code, but we replicate it for exact parity.
             # C code: mosaic_rotation_umat(90.0, umat, &misset_seed)
-            umat = mosaic_rotation_umat(90.0, seed=self.config.misset_seed, dtype=self.dtype, device=self.device)
+            # A negative -misset_seed is a positive idum in C, which reloads as 1 on a fresh table
+            self._ran1_after_misset = CLCG(self.config.misset_seed if self.config.misset_seed_reloads else 1)
+            umat = mosaic_rotation_umat(90.0, dtype=self.dtype, device=self.device, rng=self._ran1_after_misset)
 
             # Extract Euler angles from the rotation matrix
             rotx, roty, rotz = umat2misset(umat)
@@ -828,9 +832,9 @@ class Crystal:
         #
         # vector_rescale normalizes and scales: new_vec = (target_mag / |old_vec|) * old_vec
         #
-        # CRITICAL (CLI-FLAGS-003 Phase K3a): The C code sets user_cell=0 when MOSFLM matrices
-        # are provided via -mat, which SKIPS this rescale path. When MOSFLM reciprocal vectors
-        # are supplied, they already encode the exact orientation and should not be altered.
+        # C sets user_cell only from -cell (nanoBragg.c:533) and never clears it. With -mat alone
+        # user_cell is 0 and this rescale is skipped, so the matrix's vectors stand as given; with
+        # -cell as well the rescale runs on the matrix's vectors (mosflm_with_user_cell).
 
         # Check if MOSFLM orientation was provided - if so, skip rescale
         mosflm_provided = (
@@ -839,7 +843,8 @@ class Crystal:
             and hasattr(self.config, "mosflm_c_star") and self.config.mosflm_c_star is not None
         )
 
-        if mosflm_provided:
+        # With -cell as well, C's user_cell is still 1 and it rescales as below (nanoBragg.c:1935-1942)
+        if mosflm_provided and not getattr(self.config, "mosflm_with_user_cell", False):
             # MOSFLM matrix provided (CLI-FLAGS-003 Phase K3g1)
             # Recompute cell volume and real vectors from MOSFLM reciprocal vectors
             #
@@ -959,6 +964,9 @@ class Crystal:
         b_star = c_cross_a * V_star_actual
         c_star = a_cross_b * V_star_actual
 
+        # C keeps dividing by the volume it had; only the spot radius below reads C's vectors
+        c_reciprocal_scale = V_actual / V
+
         # Update V to the actual volume
         V = V_actual
 
@@ -970,6 +978,7 @@ class Crystal:
             "b_star": b_star,
             "c_star": c_star,
             "V": V,
+            "c_reciprocal_scale": c_reciprocal_scale,
         }
 
     def _compute_cell_tensors_cached(self):
@@ -998,6 +1007,17 @@ class Crystal:
     def c(self) -> torch.Tensor:
         """Real-space lattice vector c (Angstroms)."""
         return self._compute_cell_tensors_cached()["c"]
+
+    @property
+    def c_reciprocal_scale(self) -> torch.Tensor:
+        """C's a_star, b_star, c_star over these, 1.0005 for a skewed -cell.
+
+        A skewed cell's real vectors, of the lengths asked for, enclose a little more than the
+        formula's V_cell, and nanoBragg.c:1958 regenerates the reciprocal vectors with 1/V_cell,
+        so they are not quite the inverse of a, b, c. Torch's are, as the metric needs. C's show
+        only in the radius of -gauss_xtal and -tophat_spots, which uses them (nanoBragg.c:2852).
+        """
+        return self.compute_cell_tensors()["c_reciprocal_scale"]
 
     @property
     def a_star(self) -> torch.Tensor:
@@ -1370,7 +1390,7 @@ class Crystal:
         Returns:
             torch.Tensor: Rotation matrices with shape (N_mos, 3, 3).
         """
-        from ..utils.c_random import mosaic_rotation_umats
+        from ..utils.c_random import CLCG, mosaic_rotation_umats
 
         if isinstance(config.mosaic_spread_deg, torch.Tensor):
             mosaic_spread_rad = torch.deg2rad(config.mosaic_spread_deg)
@@ -1381,12 +1401,24 @@ class Crystal:
 
         # C: long mosaic_seed = -12345678, and "-mosaic_seed N" stores -N; CLCG takes |seed|
         seed = config.mosaic_seed if config.mosaic_seed is not None else -12345678
+        rng = None
+        if not config.mosaic_seed_reloads:
+            # A negative -mosaic_seed is a positive idum in C: ran1 keeps a table -misset random
+            # loaded, and on a fresh one reloads as seed 1
+            after_misset = getattr(self, "_ran1_after_misset", None)
+            rng = CLCG(1) if after_misset is None else after_misset.reseeded_without_reload(seed)
         return mosaic_rotation_umats(
             mosaic_spread_rad,
             config.mosaic_domains,
             seed=seed,
             dtype=self.dtype,
             device=self.device,
+            rng=rng,
+            # C has no refinement to keep smooth: a float spread, as the CLI and compat.cctbx give it,
+            # stays C's to the bit. A tensor keeps the dtype whether or not it requires grad, since a
+            # spread derived from a parameter (0.057*exp(p)) requires grad only in grad mode, and a
+            # line search under no_grad must get the same values.
+            single_precision_rot=not isinstance(config.mosaic_spread_deg, torch.Tensor),
         )
 
     def _apply_static_orientation(self, vectors: dict) -> dict:

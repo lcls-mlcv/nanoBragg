@@ -1,0 +1,179 @@
+"""C's auto oversample, and what torch says when that needs more memory than there is."""
+
+import os
+import re
+import subprocess
+import sys
+import warnings
+from pathlib import Path
+
+import pytest
+import torch
+
+import nanobrag_torch.simulator as simulator_module
+from nanobrag_torch.__main__ import build_simulation, create_parser
+
+REPO = Path(__file__).resolve().parents[1]
+ENV = dict(os.environ, PYTHONPATH=str(REPO / "src"), MKL_THREADING_LAYER="GNU", NANOBRAGG_DISABLE_COMPILE="1")
+BASE = "-cell 70 80 90 90 90 90 -default_F 100 -distance 100 -detpixels 16".split()
+HUGE = BASE + "-samplesize 0.04".split()
+
+
+def bundle(flags):
+    args = create_parser().parse_args(flags)
+    args._argv = flags
+    return build_simulation(args)
+
+
+@pytest.mark.parametrize("flags", ["-samplesize 0.04", "-samplesize 0.004", "-N 3", "-N 40", "-samplesize 0.0123",
+                                   "-samplesize 0.04 -lambda 2.3 -pixel 0.172", "-Na 100 -Nb 3 -Nc 7",
+                                   "-N 20 -twotheta -24.7 -lambda 1.71", "-N 20 -twotheta 24.7 -pivot sample",
+                                   "-N 20 -close_distance 80 -detector_rotx 20",
+                                   "-Na 6 -Nb 7 -Nc 9 -cell 77 72.4 54.4 90 90 90 -twotheta -24.7 -lambda 1.71 "
+                                   "-distance 81.8 -pixel 0.172"])
+def test_auto_oversample_is_cs(flags, tmp_path):
+    c_bin = os.environ.get("NB_C_BIN")
+    if not c_bin or not Path(c_bin).exists():
+        pytest.skip("set NB_C_BIN to the oracle binary")
+    argv = BASE + flags.split()
+    # One pixel of ROI, as the choice comes before the render and C loops over every sample
+    c = subprocess.run([str(Path(c_bin).resolve())] + argv + "-roi 0 0 0 0 -nopgm -nonoise -nointfile -floatfile f.bin".split(),
+                       cwd=tmp_path, capture_output=True, text=True, timeout=120, check=True)
+    expected = int(re.search(r"auto-selected (\d+)-fold oversampling", c.stdout).group(1))
+    assert bundle(argv).simulator._auto_oversample() == expected
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+@pytest.mark.parametrize("flags", [
+    # 3*xtalsize/rps is a whole number: float32 moved the first group, C's a[0] and lambda0 the rest
+    "-cell 50 50 50 90 90 90 -N 30 -lambda 2 -distance 90 -pixel 0.2",
+    "-cell 100 100 100 90 90 90 -N 20 -lambda 0.5 -distance 120 -pixel 0.05",
+    "-cell 70 70 70 90 90 90 -N 30 -lambda 1.5 -distance 70 -pixel 0.05",
+    "-cell 120 120 120 90 90 90 -N 20 -lambda 1.5 -distance 120 -pixel 0.1",
+    "-cell 120 120 120 90 90 90 -N 5 -lambda 1 -distance 120 -pixel 0.2",
+    "-cell 120 120 120 90 90 90 -N 10 -lambda 2 -distance 90 -pixel 0.05",
+    "-cell 120 120 120 90 90 90 -N 20 -lambda 0.5 -distance 90 -pixel 0.05",
+    "-cell 100 100 150 90 90 120 -N 10 -lambda 0.9 -distance 90 -pixel 0.2 -misset 10 20 30",
+    "-cell 80 80 80 60 60 60 -N 10 -energy 12398.42 -distance 100 -twotheta 30",
+])
+def test_auto_oversample_is_cs_on_whole_numbers(flags, dtype, tmp_path):
+    c_bin = os.environ.get("NB_C_BIN")
+    if not c_bin or not Path(c_bin).exists():
+        pytest.skip("set NB_C_BIN to the oracle binary")
+    argv = "-default_F 100 -detpixels 8".split() + flags.split() + ["-oversample", "0"]
+    c = subprocess.run([str(Path(c_bin).resolve())] + argv + "-roi 0 0 0 0 -nopgm -nonoise -nointfile -floatfile f.bin".split(),
+                       cwd=tmp_path, capture_output=True, text=True, timeout=120, check=True)
+    expected = int(re.search(r"auto-selected (\d+)-fold oversampling", c.stdout).group(1))
+    assert bundle(argv + ["-dtype", dtype]).simulator._auto_oversample() == expected
+
+
+def test_the_reported_case_gives_six():
+    argv = "-default_F 100 -detpixels 8 -cell 50 50 50 90 90 90 -N 30 -lambda 2 -distance 90 -pixel 0.2 -oversample 0".split()
+    assert bundle(argv + ["-dtype", "float32"]).simulator._auto_oversample() == 6
+
+
+@pytest.mark.parametrize("matrix, flags", [
+    ("0.01 0 0\n0 0.0125 0\n0 0 0.02\n", "-N 10 -lambda 1"),
+    # C divides the matrix by lambda0 = atof(arg)/1e10 (nanoBragg.c:874, 1892); lambda*1e-10 is an ulp
+    # away for these, and 3*N*p/(m*d) is a whole number whatever lambda is, so the ulp moves the ceil
+    ("0.015 0 0\n0 0.015 0\n0 0 0.015\n", "-N 15 -lambda 2.008 -distance 100 -pixel 0.1"),
+    ("0.0125 0 0\n0 0.0125 0\n0 0 0.0125\n", "-N 25 -energy 11203.05 -distance 100 -pixel 0.1"),
+])
+def test_cell_lengths_follow_a_matrix(matrix, flags, tmp_path):
+    """-mat: the lengths come from the reciprocal vectors, at the file's wavelength."""
+    c_bin = os.environ.get("NB_C_BIN")
+    if not c_bin or not Path(c_bin).exists():
+        pytest.skip("set NB_C_BIN to the oracle binary")
+    (tmp_path / "a.mat").write_text(matrix)
+    argv = f"-default_F 100 -detpixels 8 -mat {tmp_path / 'a.mat'} {flags} -oversample 0".split()
+    c = subprocess.run([str(Path(c_bin).resolve())] + argv + "-roi 0 0 0 0 -nopgm -nonoise -nointfile -floatfile f.bin".split(),
+                       cwd=tmp_path, capture_output=True, text=True, timeout=120, check=True)
+    expected = int(re.search(r"auto-selected (\d+)-fold oversampling", c.stdout).group(1))
+    assert bundle(argv).simulator._auto_oversample() == expected
+
+
+def test_warning_gives_the_memory_and_leaves_the_run_alone(monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 10 ** 9)
+    simulator = bundle(BASE + "-N 3".split()).simulator
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        quiet = simulator.run(oversample=2)
+    with pytest.warns(UserWarning, match=r"may need about 0\.000197 GB, an estimate good to a factor of 2, and 1e-06 GB is available") as caught:
+        monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1000)
+        warned = simulator.run(oversample=2)
+    assert "2-fold oversampling" in str(caught[0].message)
+    assert torch.equal(quiet, warned)
+
+
+@pytest.mark.parametrize("flags, gigabytes", [
+    ("-oversample 1000", 16 ** 2 * 1000 ** 2 * 4 * 48 / 1e9),
+    ("-oversample 1000 -phisteps 3 -osc 1", 16 ** 2 * 1000 ** 2 * 4 * 84 / 1e9),
+    ("-oversample 1000 -mosaic 1 -mosaic_dom 20", 16 ** 2 * 1000 ** 2 * 4 * 390 / 1e9),
+    ("-oversample 1000 -dtype float64", 16 ** 2 * 1000 ** 2 * 8 * 48 / 1e9),
+    ("-oversample 1000 -detector_thick 100 -detector_abs 300 -detector_thicksteps 4", 4 * 16 ** 2 * 1000 ** 2 * 4 * 48 / 1e9),
+])
+def test_expected_memory_counts_what_multiplies_it(flags, gigabytes, monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1000)
+    simulator = bundle(BASE + flags.split()).simulator
+    with pytest.warns(UserWarning) as caught:
+        simulator._warn_if_memory_runs_out(16, 16, 1000, 1, None)
+    assert float(re.search(r"may need about ([0-9.e+]+) GB", str(caught[0].message)).group(1)) == pytest.approx(gigabytes, rel=2e-2)
+
+
+@pytest.mark.parametrize("pixels, oversample, sources, flags, measured_gb", [
+    # Peak above the import, measured on exxa with mem.sh, rv5 report
+    (2463, 1, 1, "-mosaic 1 -mosaic_dom 20", 9.4),
+    (2048, 1, 1, "-mosaic 1 -mosaic_dom 20", 6.6),
+    (1024, 1, 1, "-mosaic 1 -mosaic_dom 20 -dtype float64", 3.23),
+    (1024, 2, 1, "-mosaic 1 -mosaic_dom 10", 3.37),
+    (1024, 2, 1, "", 0.82),
+    (1024, 1, 3, "-mosaic 1 -mosaic_dom 5", 1.19),
+])
+def test_estimate_is_near_what_was_measured(pixels, oversample, sources, flags, measured_gb, monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1000)
+    simulator = bundle(BASE + flags.split()).simulator
+    with pytest.warns(UserWarning) as caught:
+        simulator._warn_if_memory_runs_out(pixels, pixels, oversample, sources, None)
+    estimate = float(re.search(r"may need about ([0-9.e+]+) GB", str(caught[0].message)).group(1))
+    assert estimate == pytest.approx(measured_gb, rel=0.15)
+
+
+def test_warning_makes_no_prediction_and_stops_nothing(monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 1)
+    simulator = bundle(BASE + "-N 3 -oversample 1".split()).simulator
+    with pytest.warns(UserWarning) as caught:
+        image = simulator.run()
+    message = str(caught[0].message)
+    assert "probably fail" not in message and "goes ahead anyway" in message
+    assert image.max() > 0
+
+
+def test_pixel_batch_size_is_counted(monkeypatch):
+    monkeypatch.setattr(simulator_module, "_memory_available_bytes", lambda device: 10 ** 10)
+    simulator = bundle(BASE).simulator
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        simulator._warn_if_memory_runs_out(16000, 16000, 2, 1, 1)
+    with pytest.warns(UserWarning):
+        simulator._warn_if_memory_runs_out(16000, 16000, 2, 1, None)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS is not enforced elsewhere")
+def test_available_memory_sees_the_address_space_cap():
+    code = ("import torch; from nanobrag_torch.simulator import _memory_available_bytes as m; "
+            "print(m(torch.device('cpu')))")
+    run = subprocess.run(["bash", "-c", f'ulimit -v 9000000; exec "{sys.executable}" -c "{code}"'],
+                         env=ENV, capture_output=True, text=True, timeout=120, check=True)
+    assert 0 < int(run.stdout) < 9000000 * 1024
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="RLIMIT_AS is not enforced elsewhere")
+def test_oversized_run_under_a_cap_warns_and_fails_without_growing(tmp_path):
+    cmd = " ".join(f'"{token}"' for token in [sys.executable, "-m", "nanobrag_torch"] + HUGE + ["-floatfile", "f.bin"])
+    run = subprocess.run(["bash", "-c", f"ulimit -v 8000000; exec {cmd}"], cwd=tmp_path, env=ENV,
+                         capture_output=True, text=True, timeout=120)
+    assert run.returncode == 1
+    assert "This run may need about 70.9 GB" in run.stderr
+    assert "1201-fold oversampling" in run.stderr
+    assert "Traceback" not in run.stderr
+    assert not (tmp_path / "f.bin").exists()

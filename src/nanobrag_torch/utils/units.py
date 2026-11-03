@@ -6,8 +6,13 @@ and the internal unit system (Angstroms for length, radians for angles).
 All functions preserve tensor properties and gradients.
 """
 
+import math
+
 import torch
 from typing import Union
+
+# nanoBragg.c:349
+RTD = 180.0 * (1.0 / math.pi)
 
 
 def mm_to_angstroms(value: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
@@ -51,8 +56,8 @@ def degrees_to_radians(value: Union[float, torch.Tensor]) -> Union[float, torch.
     if isinstance(value, torch.Tensor):
         return torch.deg2rad(value)
     else:
-        # For scalar values, use torch's function but return scalar
-        return torch.deg2rad(torch.tensor(value)).item()
+        # As a double: a tensor built here would be float32, the default dtype
+        return value / RTD
 
 
 def angstroms_to_mm(value: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
@@ -96,8 +101,7 @@ def radians_to_degrees(value: Union[float, torch.Tensor]) -> Union[float, torch.
     if isinstance(value, torch.Tensor):
         return torch.rad2deg(value)
     else:
-        # For scalar values, use torch's function but return scalar
-        return torch.rad2deg(torch.tensor(value)).item()
+        return value * RTD
 
 
 def mm_to_meters(value: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
@@ -136,4 +140,4 @@ def mrad_to_radians(value: Union[float, torch.Tensor]) -> Union[float, torch.Ten
     Returns:
         Value in radians (1 mrad = 0.001 rad)
     """
-    return value * 0.001
+    return value / 1000.0  # as C divides, so a ceil(range/step) lands on the same integer

@@ -10,7 +10,8 @@ from nanobrag_torch.__main__ import warn_c_misset_seed_order
     "argv, warns",
     [
         (["-misset_seed", "12345", "-misset", "random"], False),
-        (["-misset", "random", "-misset_seed", "12345"], True),
+        (["-misset", "random", "-misset_seed", "12345"], False),  # argc > i+3 fails in C
+        (["-misset", "random", "-misset_seed", "12345", "-N", "3", "-seed", "1"], True),
         (["-misset", "10", "20", "30", "-misset_seed", "1"], False),
         (["-seed", "1", "-misset", "random"], False),
     ],

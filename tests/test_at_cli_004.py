@@ -28,6 +28,8 @@ import numpy as np
 from nanobrag_torch.io.smv import write_smv
 from nanobrag_torch.io.mask import create_circular_mask
 
+pytestmark = pytest.mark.usefixtures("in_tmp_cwd")
+
 
 def create_test_smv_file(filename: str, fpixels: int, spixels: int,
                         pixel_size: float, distance: float,

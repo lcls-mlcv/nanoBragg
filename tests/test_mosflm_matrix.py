@@ -153,7 +153,7 @@ class TestMOSFLMMatrixLoading:
             matrix_file = f.name
 
         try:
-            with pytest.raises(ValueError, match="must contain exactly 9"):
+            with pytest.raises(ValueError, match="must start with 9"):
                 read_mosflm_matrix(matrix_file, wavelength_A=1.0)
         finally:
             Path(matrix_file).unlink()

@@ -979,6 +979,33 @@ cases:
     runs:
       - name: default-fluence
         extra_args: >-
+      - name: weak-structure-factor
+        extra_args: >-
+          -default_F 1e-6
+      - name: weak-structure-factor-below-float32-underflow
+        extra_args: >-
+          -default_F 1e-8
+      # r_e^2*fluence alone leaves float32 in the rest of these, and the pixels don't:
+      # all zero at 1e-17, 1.76x too bright at 1e-16, inf at 1e45.
+      - name: low-fluence-below-float32-underflow
+        extra_args: >-
+          -default_F 1e5
+          -fluence 1e-17
+      - name: low-fluence-subnormal-product
+        extra_args: >-
+          -default_F 1e4
+          -fluence 1e-16
+      - name: low-fluence-weak-structure-factor
+        extra_args: >-
+          -default_F 100
+          -fluence 1e-16
+      - name: high-fluence-above-float32
+        extra_args: >-
+          -fluence 1e45
+      - name: high-fluence-water
+        extra_args: >-
+          -fluence 1e40
+          -water 100
       - name: flux-only
         extra_args: >-
           -flux 1e12
@@ -1571,3 +1598,574 @@ cases:
       - name: dmin-60
         extra_args: >-
           -dmin 60
+  - id: PARITY-DIVSTEPS-001
+    description: >-
+      -divsteps sets both divergence axes and nanoBragg.c reads argv in order, so the
+      last of -divsteps, -hdivsteps and -vdivsteps wins for its axis.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+      -divergence 2
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: divsteps
+        extra_args: >-
+          -divsteps 3
+      - name: divsteps-then-hdivsteps
+        extra_args: >-
+          -divsteps 3
+          -hdivsteps 5
+      - name: hdivsteps-then-divsteps
+        extra_args: >-
+          -hdivsteps 5
+          -divsteps 3
+  - id: PARITY-MISSETSEED-001
+    description: >-
+      -misset_seed 0 is a seed like any other. nanoBragg.c's ran1 reads it as idum = 1.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.1
+      -distance 100
+      -detpixels 128
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: misset-seed-zero
+        extra_args: >-
+          -misset_seed 0
+          -misset random
+      - name: misset-seed-negative
+        extra_args: >-
+          -misset_seed -3
+          -misset random
+      - name: mosaic-seed-negative
+        extra_args: >-
+          -mosaic 1 -mosaic_domains 5 -mosaic_seed -7
+      - name: mosaic-seed-negative-after-misset
+        extra_args: >-
+          -misset_seed 3 -misset random -mosaic 1 -mosaic_domains 5 -mosaic_seed -7
+      - name: both-seeds-negative
+        extra_args: >-
+          -misset_seed -3 -misset random -mosaic 1 -mosaic_domains 5 -mosaic_seed -7
+  - id: PARITY-CLIFLAGS-002
+    description: >-
+      Flags nanoBragg.c reads with strstr or advertises under a longer name, flags it
+      resolves by argv order (-lambda/-energy, -detsize/-detpixels per axis), a lone
+      -Xbeam or -Ybeam, and detector sizes from a default detsize of 102.4 mm with
+      fpixels = ceil(detsize/pixel - 0.5). The default beam centre follows detsize even
+      when that is not a whole number of pixels.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: energy-then-lambda
+        extra_args: >-
+          -energy 12398.42 -lambda 2
+      - name: lambda-then-energy
+        extra_args: >-
+          -lambda 2 -energy 12398.42
+      - name: wavelength-flag
+        extra_args: >-
+          -wavelength 2
+      - name: energy-zero
+        extra_args: >-
+          -detpixels 32 -energy 0
+      - name: energy-minus-zero
+        extra_args: >-
+          -detpixels 32 -energy -0
+      - name: energy-zero-then-lambda
+        extra_args: >-
+          -detpixels 32 -energy 0 -lambda 2
+      - name: lambda-then-energy-zero
+        extra_args: >-
+          -detpixels 32 -lambda 2 -energy 0
+      - name: xbeam-alone
+        extra_args: >-
+          -Xbeam 5 -detpixels 128
+      - name: ybeam-alone
+        extra_args: >-
+          -Ybeam 5 -detpixels 128
+      - name: xbeam-alone-denzo
+        extra_args: >-
+          -Xbeam 5 -detpixels 128 -denzo
+      - name: ybeam-alone-adxv
+        extra_args: >-
+          -Ybeam 5 -detpixels 128 -adxv
+      - name: mosaic-domains-flag
+        extra_args: >-
+          -mosaic 1 -mosaic_domains 3
+      - name: detector-absorb-flag
+        extra_args: >-
+          -detector_absorb 100 -detector_thick 100 -detector_thicksteps 3
+      - name: sample-size-flag
+        extra_args: >-
+          -sample_size 0.0005
+      - name: xtal-size-flag
+        extra_args: >-
+          -xtal_size 0.0005
+      - name: default-size-coarse-pixels
+        extra_args: >-
+      - name: detsize-f-alone
+        extra_args: >-
+          -detsize_f 32
+      - name: detsize-s-alone
+        extra_args: >-
+          -detsize_s 32
+      - name: detsize-not-whole-pixels
+        extra_args: >-
+          -detsize 64.3
+      - name: detsize-not-whole-pixels-xds
+        extra_args: >-
+          -detsize 64.3 -xds
+      - name: detsize-not-whole-pixels-adxv
+        extra_args: >-
+          -detsize 64.3 -adxv
+      - name: ybeam-adxv-not-whole-pixels
+        extra_args: >-
+          -detsize_f 20.3 -detsize_s 30.7 -Ybeam 5 -adxv
+      - name: detpixels-f-alone
+        extra_args: >-
+          -detpixels_f 80
+      - name: detsize-then-detsize-f
+        extra_args: >-
+          -detsize 40 -detsize_f 20
+      - name: detsize-f-then-detsize
+        extra_args: >-
+          -detsize_f 20 -detsize 40
+      - name: detpixels-then-detpixels-f
+        extra_args: >-
+          -detpixels 60 -detpixels_f 30
+      - name: detpixels-f-then-detpixels
+        extra_args: >-
+          -detpixels_f 30 -detpixels 60
+  - id: PARITY-CLIFLAGS-003
+    description: >-
+      A detsize of exactly n+0.5 pixels. nanoBragg.c:1126 divides metres by metres, so
+      the rounding of those two doubles decides ceil(detsize/pixel - 0.5).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -distance 100
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: half-pixel-rounds-up
+        extra_args: >-
+          -pixel 0.1 -detsize 9.55
+      - name: half-pixel-rounds-up-coarse
+        extra_args: >-
+          -pixel 0.172 -detsize 2.15
+      - name: half-pixel-per-axis
+        extra_args: >-
+          -pixel 0.1 -detsize_f 9.55 -detsize_s 1.05
+  - id: PARITY-DIVERGENCE-001
+    description: >-
+      Generated sources. nanoBragg.c:2354-2361 rounds the divergence grid with test*4 > 1.1
+      and a half-step correction for an even count; -divergence alone means 2x2 steps.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -detpixels 48
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: divergence-alone
+        extra_args: >-
+          -divergence 2
+      - name: even-steps-2
+        extra_args: >-
+          -divergence 2 -divsteps 2
+      - name: even-steps-4
+        extra_args: >-
+          -divergence 2 -divsteps 4
+      - name: even-steps-6
+        extra_args: >-
+          -divergence 2 -divsteps 6
+      - name: odd-steps-5
+        extra_args: >-
+          -divergence 2 -divsteps 5
+      - name: mixed-even-odd
+        extra_args: >-
+          -divergence 2 -hdivsteps 4 -vdivsteps 3
+      - name: unequal-ranges
+        extra_args: >-
+          -hdivrange 3 -vdivrange 1 -divsteps 4
+      - name: step-given
+        extra_args: >-
+          -divergence 2 -hdivstep 0.5
+      - name: steps-zero-means-two
+        extra_args: >-
+          -divergence 2 -divsteps 0
+      - name: round-div-after-square-div
+        extra_args: >-
+          -divergence 2 -divsteps 4 -square_div -round_div
+      - name: count-without-range
+        extra_args: >-
+          -hdivsteps 3 -vdivsteps 3 -nopolar
+      - name: hdivrange-and-divsteps
+        extra_args: >-
+          -hdivrange 2 -divsteps 3 -nopolar
+      - name: vdivrange-and-divsteps-square
+        extra_args: >-
+          -vdivrange 2 -divsteps 3 -square_div -nopolar
+      - name: one-hdivstep-is-off-axis
+        extra_args: >-
+          -hdivsteps 1
+      - name: one-vdivstep-is-off-axis
+        extra_args: >-
+          -vdivsteps 1
+      - name: one-divstep-square
+        extra_args: >-
+          -divsteps 1 -square_div
+      - name: range-and-one-step-means-two
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 1
+      - name: all-three-given-one-step
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 1 -hdivstep 0.5
+      - name: all-three-given-step-beyond-range
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -hdivstep 1.5
+      - name: steps-given-on-both-axes
+        extra_args: >-
+          -hdivstep 0.5 -vdivstep 0.3
+      - name: divergence-then-hdivrange
+        extra_args: >-
+          -divergence 2 -hdivrange 1 -divsteps 3
+      - name: hdivrange-then-divergence
+        extra_args: >-
+          -hdivrange 1 -divergence 2 -divsteps 3
+      - name: polar-axis-adxv
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -adxv -square_div
+      - name: polar-axis-xds
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -xds -square_div
+      - name: polar-axis-flag
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -polar_vector 0 1 0
+      - name: dispsteps-alone
+        extra_args: >-
+          -dispsteps 3
+      - name: dispersion-and-one-step-means-two
+        extra_args: >-
+          -dispersion 10 -dispsteps 1
+      - name: negative-dispersion-and-steps
+        extra_args: >-
+          -dispersion -5 -dispsteps 3
+      - name: dispersion-at-energy-zero
+        extra_args: >-
+          -dispersion 10 -energy 0
+      - name: step-count-rounds-as-in-c
+        extra_args: >-
+          -divergence 0.9 -hdivstep 0.3
+  - id: PARITY-PIX0-001
+    description: >-
+      nanoBragg.c:1719 and 1740 overwrite pix0_vector under either pivot, so -pix0_vector
+      only switches to CUSTOM, and like every vector flag it loses to a later convention
+      flag, whose block then overwrites all the vectors (nanoBragg.c:647-728, 1172-1248).
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -detpixels 48
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: pix0-default
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01
+      - name: pix0-mm
+        extra_args: >-
+          -pix0_vector_mm 100 10 10
+      - name: pix0-and-pix0-mm
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -pix0_vector_mm 100 10 10
+      - name: pix0-after-mosflm
+        extra_args: >-
+          -mosflm -pix0_vector -0.1 0.01 0.01
+      - name: pix0-after-adxv
+        extra_args: >-
+          -adxv -pix0_vector 0.1 0.01 0.01
+      - name: pix0-after-xds
+        extra_args: >-
+          -xds -pix0_vector 0.1 0.01 0.01
+      - name: pix0-with-xbeam
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -Xbeam 5 -Ybeam 7
+      - name: pix0-pivot-sample
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -pivot sample
+      - name: pix0-twotheta
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -twotheta 10
+      - name: pix0-then-mosflm
+        extra_args: >-
+          -pix0_vector -0.1 0.01 0.01 -mosflm
+      - name: pix0-then-adxv
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -adxv
+      - name: pix0-then-xds
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -xds
+      - name: pix0-then-denzo
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -denzo
+      - name: pix0-then-dials
+        extra_args: >-
+          -pix0_vector 0.1 0.01 0.01 -dials
+      - name: fdet-then-mosflm
+        extra_args: >-
+          -fdet_vector 0 0.1 1 -mosflm
+      - name: beam-then-adxv
+        extra_args: >-
+          -beam_vector 0 0 1 -adxv
+      - name: polar-then-mosflm
+        extra_args: >-
+          -polar_vector 0 1 0 -mosflm
+      - name: fdet-then-xds
+        extra_args: >-
+          -fdet_vector 0 0 1 -xds
+      - name: spindle-then-mosflm
+        extra_args: >-
+          -spindle_axis 0 1 0 -mosflm -osc 1 -phisteps 2
+      - name: twotheta-axis-then-mosflm
+        extra_args: >-
+          -twotheta_axis 0 1 0 -mosflm -twotheta 5
+  - id: PARITY-CUSTOMVEC-001
+    description: >-
+      nanoBragg.c:1260-1268 unitizes the vectors given on the command line, and replaces an
+      odet whose magnitude isn't exactly 1 with fdet x sdet.
+    base_args: >-
+      -default_F 100
+      -cell 70 80 90 75 85 95
+      -lambda 1.0
+      -N 5
+      -pixel 0.5
+      -distance 100
+      -detpixels 48
+      -oversample 1
+    thresholds:
+      corr_min: 0.9999
+      sum_ratio_min: 0.999
+      sum_ratio_max: 1.001
+    runs:
+      - name: beam-not-unit
+        extra_args: >-
+          -beam_vector 2 0 0
+      - name: beam-tilted-not-unit
+        extra_args: >-
+          -beam_vector 1 0.1 0
+      - name: fdet-not-unit
+        extra_args: >-
+          -fdet_vector 0 0 2
+      - name: sdet-not-unit
+        extra_args: >-
+          -sdet_vector 0 -2 0
+      - name: odet-not-unit
+        extra_args: >-
+          -odet_vector 2 0 0
+      - name: odet-replaced-by-f-cross-s
+        extra_args: >-
+          -beam_vector 0 0 1 -fdet_vector 1 0 0 -sdet_vector 0 1 0 -odet_vector 0 3 0
+      - name: divergence-about-tilted-beam
+        extra_args: >-
+          -hdivrange 2 -hdivsteps 3 -square_div -beam_vector 1 0.1 0 -nopolar
+
+  - id: PARITY-WATER-002
+    description: Water background and the -oversample_ flags, which take corrections away from it
+    base_args: >-
+      -dtype float64 -cell 90.6 105.4 62.2 96.1 105.6 106.4 -default_F 1000 -Na 10 -Nb 9 -Nc 6 -detpixels 32 -distance 125 -water 100 -seed 1
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: omega-oversample-1
+        extra_args: >-
+          -oversample 1 -oversample_omega
+      - name: polar-oversample-1
+        extra_args: >-
+          -oversample 1 -oversample_polar
+      - name: polar-oversample-2
+        extra_args: >-
+          -oversample 2 -oversample_polar
+      - name: omega-polar-oversample-2
+        extra_args: >-
+          -oversample 2 -oversample_omega -oversample_polar
+      - name: omega-polar-thick
+        extra_args: >-
+          -oversample 2 -oversample_omega -oversample_polar -detector_thick 100 -detector_abs 300 -detector_thicksteps 3 -oversample_thick
+      - name: polar-thick-last-layer
+        extra_args: >-
+          -oversample 2 -oversample_polar -detector_thick 100 -detector_abs 300 -detector_thicksteps 3
+      - name: omega-thin-sensor
+        extra_args: >-
+          -oversample 1 -oversample_omega -detector_thick 100 -detector_abs 300 -detector_thicksteps 1
+
+  - id: PARITY-ROUND-001
+    description: -round_xtal in the default dtype, where the sinc3 bracket cancels in float32
+    base_args: >-
+      -cell 50.5 87.8 54.2 90 90 90 -default_F 1000 -Na 7 -Nb 4 -Nc 4 -pixel 0.05 -detpixels 24
+      -distance 201.6 -adxv -round_xtal -seed 8190010
+    thresholds:
+      corr_min: 0.99999
+      sum_ratio_min: 0.99999
+      sum_ratio_max: 1.00001
+      max_rel_max: 1.0e-5
+    runs:
+      - name: peak-on-a-pixel
+        extra_args: >-
+          -adc 10 -dmin 2.72
+      - name: peak-on-a-pixel-double
+        thresholds:
+          sum_ratio_min: 0.999999
+          sum_ratio_max: 1.000001
+          max_rel_max: 2.0e-7
+        extra_args: >-
+          -adc 10 -dmin 2.72 -dtype float64
+
+  - id: PARITY-POLAR-001
+    description: -nopolar only stops the cached factor, and -polar and -nopolar go by argv order
+    base_args: >-
+      -dtype float64 -cell 70 80 90 90 90 90 -default_F 100 -N 5 -detpixels 32 -oversample 1 -seed 1
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: nopolar-oversample-polar
+        extra_args: >-
+          -nopolar -oversample_polar
+      - name: nopolar-oversample-polar-subpixels
+        extra_args: >-
+          -nopolar -oversample_polar -oversample 2
+      - name: polar-then-nopolar-oversample-polar
+        extra_args: >-
+          -polar 0.7 -nopolar -oversample_polar
+      - name: nopolar-then-polar-oversample-polar
+        extra_args: >-
+          -nopolar -polar 0.7 -oversample_polar
+      - name: nopolar-then-polar
+        extra_args: >-
+          -nopolar -polar 0.7
+      - name: polar-then-nopolar
+        extra_args: >-
+          -polar 0.7 -nopolar
+      - name: nopolar-oversample-polar-water
+        extra_args: >-
+          -nopolar -oversample_polar -water 100
+      - name: nopolar-oversample-polar-sources
+        extra_args: >-
+          -nopolar -oversample_polar -hdivrange 0.5 -hdivsteps 3
+
+  - id: PARITY-SPOTRADIUS-001
+    description: A skewed cell's spot radius reads C's reciprocal vectors, which are 1/V_cell, not the inverse of a, b, c
+    base_args: >-
+      -dtype float64 -cell 115.8 44.5 46.8 103.4 99.4 96.8 -default_F 30 -N 4 -pixel 0.2 -detpixels 43 -distance 209.6 -energy 12108.8 -dials -nopolar -oversample 2 -seed 8
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: gauss
+        extra_args: >-
+          -gauss_xtal
+      - name: tophat
+        extra_args: >-
+          -tophat_spots
+      - name: gauss-misset-phi
+        extra_args: >-
+          -gauss_xtal -misset 10 20 30 -phi 5 -osc 1 -phisteps 2
+
+  - id: PARITY-RANDOM-001
+    description: ran1 and the rotation in mosaic_rotation_umat are single precision in C
+    base_args: >-
+      -dtype float64 -cell 47.4 92.8 86.9 90 90 90 -default_F 30 -Na 10 -Nb 5 -Nc 5 -pixel 0.172 -detpixels 50 -distance 232.9 -oversample 1 -seed 9
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: random-misset
+        extra_args: >-
+          -misset_seed 80725 -misset random
+      - name: random-misset-curved
+        extra_args: >-
+          -misset_seed 80725 -misset random -curved_det
+      - name: mosaic-domains
+        extra_args: >-
+          -mosaic 1.34 -mosaic_dom 3 -mosaic_seed 87101
+      - name: random-misset-phi-mosaic
+        extra_args: >-
+          -misset_seed 80725 -misset random -phi 45.4 -osc 2.79 -phisteps 2 -mosaic 1.34 -mosaic_dom 2 -mosaic_seed 87101
+
+  - id: PARITY-WATER-003
+    description: Water's cached polarization is that of the first sample and source -dmin lets through, and nothing if there is none
+    base_args: >-
+      -dtype float64 -cell 76.5 97.5 98.8 78.6 73.1 94.1 -default_F 100 -Na 8 -Nb 6 -Nc 2 -pixel 1 -detpixels 53 -distance 57 -wave 0.95 -polar 0.25 -square_xtal -water 286 -seed 9450615
+    thresholds:
+      sum_ratio_min: 0.999999
+      sum_ratio_max: 1.000001
+      max_rel_max: 1.0e-6
+    runs:
+      - name: sources
+        extra_args: >-
+          -oversample 1 -hdivrange 4 -hdivsteps 3
+      - name: sources-curved
+        extra_args: >-
+          -oversample 1 -hdivrange 4 -hdivsteps 3 -curved_det -pixel 0.05 -distance 113.8
+      - name: two-wavelengths-curved-dmin
+        extra_args: >-
+          -oversample 1 -dispersion 1.17 -dispsteps 2 -curved_det -dmin 2.94
+      - name: sources-dmin-subpixels
+        extra_args: >-
+          -oversample 2 -hdivrange 4 -hdivsteps 3 -dmin 3
+      - name: single-beam-dmin
+        extra_args: >-
+          -oversample 1 -dmin 3
+      - name: dmin-sensor-layers
+        extra_args: >-
+          -oversample 2 -dmin 3 -hdivrange 4 -hdivsteps 3 -detector_thick 100 -detector_abs 300 -detector_thicksteps 2

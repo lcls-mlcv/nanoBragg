@@ -200,23 +200,40 @@ def sinc3(x: torch.Tensor) -> torch.Tensor:
     Returns:
         torch.Tensor: Shape factor values 3*(sin(x)/x - cos(x))/x^2
     """
-    # Handle the x=0 case
-    eps = 1e-10
-    is_zero = torch.abs(x) < eps
+    # The bracket is x^2/3 near 0, so in float32 it cancels to nothing at the centre of a peak
+    if x.dtype != torch.float64:
+        if x.device.type == "mps":  # no doubles
+            return _sinc3_series(x)
+        return sinc3(x.to(torch.float64)).to(x.dtype)
 
-    # For non-zero values, compute 3*(sin(x)/x - cos(x))/x^2
-    # Protect against division by zero
-    x_safe = torch.where(is_zero, torch.ones_like(x), x)
-    sin_x = torch.sin(x_safe)
-    cos_x = torch.cos(x_safe)
+    near_zero = torch.abs(x) < 1e-2
 
-    # Compute the sinc3 function
-    result = 3.0 * (sin_x / x_safe - cos_x) / (x_safe * x_safe)
+    def closed_form(x_part):
+        return 3.0 * (torch.sin(x_part) / x_part - torch.cos(x_part)) / (x_part * x_part)
 
-    # Return 1.0 for x=0 case
-    result = torch.where(is_zero, torch.ones_like(x), result)
+    result = closed_form(torch.where(near_zero, torch.ones_like(x), x))
 
-    return result
+    # The closed form's derivative cancels worse than its value, so the gradient here is the
+    # series'. The value stays C's down to 1e-6. Below that it has no digits left, and C
+    # gets 1 only from exact x == 0, and 0 from any x under 1e-8. That is the forward beam
+    # on a sample point, where what C gets turns on the last bit of its pixel position,
+    # which torch's arithmetic does not reproduce. See docs/bugs/verified_c_bugs.md.
+    x2 = x * x
+    series = 1.0 + x2 * (-1.0 / 10.0 + x2 / 280.0)
+    keep_series = torch.abs(x) < 1e-6
+    value = torch.where(keep_series, series, closed_form(torch.where(keep_series, torch.ones_like(x), x))).detach()
+    return torch.where(near_zero, series + (value - series.detach()), result)
+
+
+def _sinc3_series(x: torch.Tensor) -> torch.Tensor:
+    """sinc3 for a device with no doubles: Taylor through x^10 below 1.5, where it is good to 4e-9."""
+    small = torch.abs(x) < 1.5
+    x_safe = torch.where(small, torch.ones_like(x), x)
+    closed = 3.0 * (torch.sin(x_safe) / x_safe - torch.cos(x_safe)) / (x_safe * x_safe)
+    x2 = torch.where(small, x * x, torch.zeros_like(x))
+    series = 1.0 + x2 * (-1.0 / 10.0 + x2 * (1.0 / 280.0 + x2 * (-1.0 / 15120.0 + x2 * (
+        1.0 / 1330560.0 + x2 * (-1.0 / 86486400.0)))))
+    return torch.where(small, series, closed)
 
 
 @_get_compile_decorator()

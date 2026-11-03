@@ -83,10 +83,8 @@ def test_sourcefile_parsing():
         # Use dtype from parser output (defaults to torch.get_default_dtype())
         torch.testing.assert_close(norms, torch.ones(2, dtype=directions.dtype))
 
-        # Per spec-a-core.md:151-153, wavelength column is IGNORED.
-        # All sources use CLI -lambda value (default_wavelength_m).
-        assert wavelengths[0].item() == pytest.approx(default_wavelength_m)
-        assert wavelengths[1].item() == pytest.approx(default_wavelength_m)
+        assert wavelengths[0].item() == pytest.approx(1.0e-10)
+        assert wavelengths[1].item() == pytest.approx(1.5e-10)
 
         # Check weights are preserved from file (for parsing correctness)
         # Use dtype from parser output (defaults to torch.get_default_dtype())

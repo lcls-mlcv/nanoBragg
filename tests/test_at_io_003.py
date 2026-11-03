@@ -217,3 +217,13 @@ class TestAT_IO_003:
                 assert np.allclose(data_padded[3, :, :], 0.0, rtol=1e-6)  # Last h plane
                 assert np.allclose(data_padded[:, 4, :], 0.0, rtol=1e-6)  # Last k column
                 assert np.allclose(data_padded[:, :, 5], 0.0, rtol=1e-6)  # Last l row
+
+def test_load_hkl_writes_the_cache_only_when_asked(tmp_path, monkeypatch):
+    from nanobrag_torch.models.crystal import Crystal
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "x.hkl").write_text("0 0 1 10.0\n1 0 0 20.0\n")
+    Crystal().load_hkl("x.hkl")
+    assert not (tmp_path / "Fdump.bin").exists()
+    Crystal().load_hkl("x.hkl", write_cache=True)
+    assert (tmp_path / "Fdump.bin").exists()

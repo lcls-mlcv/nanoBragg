@@ -18,6 +18,7 @@ import torch
 from .config import BeamConfig, CrystalConfig, CrystalShape, SpotMetric
 from .models.crystal import Crystal
 from .models.detector import Detector
+from .utils.c_cell import c_ceil_to_int, c_cell_lengths_m
 from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sincg_miller, sinc3, polarization_factor
@@ -339,11 +340,10 @@ def compute_physics_for_position(
         hrad_sqr = (h_frac * h_frac * Na * Na +
                    k_frac * k_frac * Nb * Nb +
                    l_frac * l_frac * Nc * Nc)
-        # Use clamp_min to avoid creating fresh tensors in compiled graph (PERF-PYTORCH-004 P1.1)
-        hrad_sqr = hrad_sqr.clamp_min(1e-12)
-        F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(
-            torch.pi * torch.sqrt(hrad_sqr * fudge)
-        )
+        # The where keeps sqrt's gradient finite at exactly 0
+        at_centre = hrad_sqr == 0
+        x = torch.pi * torch.sqrt(torch.where(at_centre, torch.ones_like(hrad_sqr), hrad_sqr) * fudge)
+        F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(torch.where(at_centre, torch.zeros_like(x), x))
     elif shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT):
         h_frac = h - h0
         k_frac = k - k0
@@ -366,8 +366,9 @@ def compute_physics_for_position(
             F_latt = Na * Nb * Nc * torch.exp(-(rad_sqr / 0.63) * fudge)
         else:
             inside_cutoff = (rad_sqr * fudge) < 0.3969
+            # N may be a tensor with a graph, in ExperimentModel, which full_like will not take
             F_latt = torch.where(inside_cutoff,
-                                torch.full_like(rad_sqr, Na * Nb * Nc),
+                                Na * Nb * Nc * torch.ones_like(rad_sqr),
                                 torch.zeros_like(rad_sqr))
     else:
         raise ValueError(f"Unsupported crystal shape: {shape}")
@@ -488,6 +489,46 @@ def compute_physics_for_position(
 
     # CLI-FLAGS-003 Phase M1: Return both post-polar (intensity) and pre-polar for trace
     return intensity, intensity_pre_polar
+
+
+R_E_SQR = 7.94079248018965e-30  # classical electron radius squared (meters squared)
+
+
+def _memory_available_bytes(device: torch.device) -> Optional[int]:
+    """What this process can still allocate on device, or None if there is no telling."""
+    device = torch.device(device)
+    if device.type == "cuda":
+        return torch.cuda.mem_get_info(device)[0]
+    if device.type != "cpu":
+        return None
+    limits = []
+    try:
+        with open("/proc/meminfo") as meminfo:
+            limits += [int(line.split()[1]) * 1024 for line in meminfo if line.startswith("MemAvailable:")]
+    except OSError:
+        if hasattr(os, "sysconf_names") and "SC_PHYS_PAGES" in os.sysconf_names:
+            limits.append(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+    try:
+        import resource
+
+        address_space = resource.getrlimit(resource.RLIMIT_AS)[0]
+        if address_space != resource.RLIM_INFINITY:
+            with open("/proc/self/statm") as statm:
+                used = int(statm.read().split()[0]) * os.sysconf("SC_PAGE_SIZE")
+            limits.append(max(address_space - used, 0))
+    except (ImportError, OSError):
+        pass
+    return min(limits) if limits else None
+
+
+def _as_double(x) -> float:
+    """A config value or scalar tensor as a Python float."""
+    return float(x.detach()) if isinstance(x, torch.Tensor) else float(x)
+
+
+def _widest_float(device: torch.device) -> torch.dtype:
+    """float64, or float32 on a device that has no doubles (MPS)."""
+    return torch.float32 if torch.device(device).type == "mps" else torch.float64
 
 
 @dataclass
@@ -620,24 +661,22 @@ class Simulator:
 
         # Physical constants (from nanoBragg.c ~line 240)
         # PERF-PYTORCH-006: Store as tensors with correct dtype to avoid implicit float64 upcasting
-        self.r_e_sqr = torch.tensor(
-            7.94079248018965e-30, device=self.device, dtype=self.dtype  # classical electron radius squared (meters squared)
-        )
+        # Whatever was given, as digits the run's dtype may not hold: see _wavelength_in_double
+        self._wavelength_given = self.beam_config.wavelength_A
+        # The scale is computed in double, as in C, where the device has doubles
+        self._scale_dtype = _widest_float(self.device)
+        self.r_e_sqr = R_E_SQR
         # Use fluence from beam config (AT-FLU-001)
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad to maintain gradient graph
-        self.fluence = as_tensor_preserving_grad(
-            self.beam_config.fluence, device=self.device, dtype=self.dtype
-        )
+        self.fluence = self.beam_config.fluence
         # Polarization setup from beam config
         # PERF-PYTORCH-006: Store as tensor with correct dtype
         # DBEX-GRADIENT-001: Use as_tensor_preserving_grad when nopolar is False
         # to maintain gradient graph for differentiable polarization_factor
-        if self.beam_config.nopolar:
-            self.kahn_factor = torch.tensor(0.0, device=self.device, dtype=self.dtype)
-        else:
-            self.kahn_factor = as_tensor_preserving_grad(
-                self.beam_config.polarization_factor, device=self.device, dtype=self.dtype
-            )
+        # -nopolar keeps the factor: -oversample_polar puts polarization back regardless
+        self.kahn_factor = as_tensor_preserving_grad(
+            self.beam_config.polarization_factor, device=self.device, dtype=self.dtype
+        )
         self.polarization_axis = torch.tensor(
             self.beam_config.polarization_axis, device=self.device, dtype=self.dtype
         )
@@ -682,6 +721,9 @@ class Simulator:
         self._refresh_pixel_coords()
 
         self._frozen_auto_oversample = None  # see _auto_oversample
+        self._oversample_freeze_warning = None  # said when the frozen value is first used
+        if self.detector.config.oversample <= 0:
+            self._freeze_auto_oversample_if_differentiable()
         self._refresh_roi_mask()
 
         # Compile the physics computation function with appropriate mode
@@ -715,13 +757,10 @@ class Simulator:
 
     def _refresh_roi_mask(self) -> None:
         # Build ROI mask once and cache it (AT-ROI-001)
-        # Start with all pixels enabled
-        self._cached_roi_mask = torch.ones(
-            self.detector.config.spixels,
-            self.detector.config.fpixels,
-            device=self.device,
-            dtype=self.dtype
-        )
+        # Start with all pixels enabled. Expanded, so this costs no memory: many Simulators
+        # of a large detector otherwise hold one full image each.
+        spixels, fpixels = self.detector.config.spixels, self.detector.config.fpixels
+        self._cached_roi_mask = torch.ones((), device=self.device, dtype=self.dtype).expand(spixels, fpixels)
 
         # Apply ROI bounds if specified
         # Note: ROI is in pixel indices (xmin/xmax for fast axis, ymin/ymax for slow axis)
@@ -738,10 +777,12 @@ class Simulator:
             )
 
         # Set everything outside ROI to zero
-        self._cached_roi_mask[:roi_ymin, :] = 0  # Below ymin
-        self._cached_roi_mask[roi_ymax+1:, :] = 0  # Above ymax
-        self._cached_roi_mask[:, :roi_xmin] = 0  # Left of xmin
-        self._cached_roi_mask[:, roi_xmax+1:] = 0  # Right of xmax
+        if (roi_ymin, roi_ymax, roi_xmin, roi_xmax) != (0, spixels - 1, 0, fpixels - 1):
+            self._cached_roi_mask = self._cached_roi_mask.clone()
+            self._cached_roi_mask[:roi_ymin, :] = 0  # Below ymin
+            self._cached_roi_mask[roi_ymax+1:, :] = 0  # Above ymax
+            self._cached_roi_mask[:, :roi_xmin] = 0  # Left of xmin
+            self._cached_roi_mask[:, roi_xmax+1:] = 0  # Right of xmax
 
         # Apply external mask if provided and cache it
         if self.detector.config.mask_array is not None:
@@ -782,11 +823,51 @@ class Simulator:
     def set_spectrum(self, wavelength_A, source_wavelengths=None, source_weights=None) -> None:
         """Replace the wavelengths (A; sources in metres) and source weights of this Simulator."""
         self.wavelength = as_tensor_preserving_grad(wavelength_A, device=self.device, dtype=self.dtype)
+        self._wavelength_given = wavelength_A
         if self._source_directions is not None and source_wavelengths is not None:
             self._source_wavelengths = source_wavelengths.to(device=self.device, dtype=self.dtype)
             self._source_wavelengths_A = self._source_wavelengths * 1e10
         if self._source_directions is not None and source_weights is not None:
             self._source_weights = source_weights.to(device=self.device, dtype=self.dtype)
+
+    def _scale_source(self, value) -> torch.Tensor:
+        """The one tensor a scale factor is kept in: value itself if a tensor, else a double.
+
+        Nothing is copied from it, so there is no second value to fall behind: an in-place change,
+        through .data or by anyone who holds this tensor, is the change. A number takes the scale's
+        width, so a float32 run keeps its digits.
+        """
+        if isinstance(value, torch.Tensor):
+            return value
+        return torch.tensor(float(value), device=self.device, dtype=self._scale_dtype)
+
+    @property
+    def fluence(self) -> torch.Tensor:
+        """Photons per square metre: the tensor given, or a double. Assign, or change it in place."""
+        return self._fluence
+
+    @fluence.setter
+    def fluence(self, value) -> None:
+        self._fluence = self._scale_source(value)
+
+    @property
+    def r_e_sqr(self) -> torch.Tensor:
+        """Classical electron radius squared, kept and assignable as fluence is."""
+        return self._r_e_sqr
+
+    @r_e_sqr.setter
+    def r_e_sqr(self, value) -> None:
+        self._r_e_sqr = self._scale_source(value)
+
+    def _r_e_sqr_fluence(self) -> torch.Tensor:
+        """r_e^2*fluence at the scale's width, whatever the run's dtype, read afresh each time."""
+        return (self._r_e_sqr.to(device=self.device, dtype=self._scale_dtype)
+                * self._fluence.to(device=self.device, dtype=self._scale_dtype))
+
+    def _polarized(self, oversample_polar: bool) -> bool:
+        """-nopolar only stops polarization being cached: nanoBragg.c:2772 tests oversample_polar
+        alone, so with it each sample is polarized anyway."""
+        return oversample_polar or not self.beam_config.nopolar
 
     def _weights_for_kernel(self) -> Optional[torch.Tensor]:
         """Per-source multipliers, or None for C's equal weighting.
@@ -799,7 +880,7 @@ class Simulator:
         weights = self._source_weights
         return len(weights) * weights / weights.sum()
 
-    def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None):
+    def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None, oversample_polar=False):
         """Compatibility shim - calls the pure function compute_physics_for_position.
 
         REFACTORING NOTE (PERF-PYTORCH-004 Phase 0):
@@ -854,7 +935,7 @@ class Simulator:
             crystal_fudge=self.crystal.config.fudge,
             spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
             # PERF-PYTORCH-004 P3.0b: Pass polarization parameters
-            apply_polarization=not self.beam_config.nopolar,
+            apply_polarization=self._polarized(oversample_polar),
             kahn_factor=self.kahn_factor,
             polarization_axis=self.polarization_axis,
         )
@@ -874,6 +955,7 @@ class Simulator:
         source_weights: Optional[torch.Tensor],
         oversample: int,
         oversample_omega: bool,
+        oversample_polar: bool,
         oversample_thick: bool,
         panel_axes: Optional[tuple] = None,
     ):
@@ -985,7 +1067,8 @@ class Simulator:
                     coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     incident_beam_direction=incident_dirs_batched,
                     wavelength=wavelengths_batched,
-                    source_weights=source_weights
+                    source_weights=source_weights,
+                    oversample_polar=oversample_polar,
                 )
 
                 # Reshape back to (S, F, oversample*oversample)
@@ -1000,7 +1083,8 @@ class Simulator:
                 # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
                 physics_intensity_flat, physics_intensity_pre_polar_flat = self._compute_physics_for_position(
-                    coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star
+                    coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
+                    oversample_polar=oversample_polar,
                 )
 
                 # Reshape back to (S, F, oversample*oversample)
@@ -1072,11 +1156,10 @@ class Simulator:
 
             # Apply last-value semantics if omega flag is not set
             if self.beam_config.water_size_um > 0:
-                # C: I = I_bg before the sample loop, so omega/capture below also apply.
-                # Its polarization factor is the cached one, from the first subpixel of the
-                # front layer, which is sample 0 here.
+                # C: I = I_bg before the sample loop, so the corrections applied once per pixel
+                # below reach it, and the ones applied per sample above do not.
                 accumulated_intensity = accumulated_intensity + self._water_background_pre_scale(
-                    subpixel_coords_all[:, :, 0, :]
+                    subpixel_coords_all, oversample_polar, source_directions, source_wavelengths_A
                 )
 
             # nanoBragg.c computes omega once per pixel, at the FIRST subpixel of the front
@@ -1122,14 +1205,16 @@ class Simulator:
                     pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     incident_beam_direction=incident_dirs_batched,
                     wavelength=wavelengths_batched,
-                    source_weights=source_weights
+                    source_weights=source_weights,
+                    oversample_polar=oversample_polar,
                 )
                 # The weighted sum over sources is done inside _compute_physics_for_position
             else:
                 # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
                 intensity, I_before_normalization_pre_polar = self._compute_physics_for_position(
-                    pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star
+                    pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
+                    oversample_polar=oversample_polar,
                 )
 
             # CLI-FLAGS-003 Phase M1: Save both post-polar (current intensity) and pre-polar for trace
@@ -1167,11 +1252,15 @@ class Simulator:
                     / airpath_m
                 )
 
-            if self.beam_config.water_size_um > 0:
-                normalized_intensity = normalized_intensity + self._water_background_pre_scale(pixel_coords_meters)
-
             # Apply omega directly
             normalized_intensity = normalized_intensity * omega_pixel
+
+            if self.beam_config.water_size_um > 0:
+                # Under -oversample_omega the pixel's omega goes on each sample, so not on I_bg
+                water = self._water_background_pre_scale(
+                    pixel_coords_meters.unsqueeze(2), oversample_polar, source_directions, source_wavelengths_A
+                )
+                normalized_intensity = normalized_intensity + (water if oversample_omega else water * omega_pixel)
 
         return (
             normalized_intensity,
@@ -1181,46 +1270,136 @@ class Simulator:
             capture_fraction_for_trace,
         )
 
+    def _warn_if_memory_runs_out(self, S: int, F: int, oversample: int, n_sources: int,
+                                 pixel_batch_size: Optional[int]) -> None:
+        """Say what a run may need when that is more than there is. The run always goes ahead.
+
+        C holds one sample at a time, so its time grows with oversample^2 and torch's memory does.
+        Measured peak above the import, CPU, 21 runs: 30 words of the run's dtype per sample, plus 18
+        per sample, phi step, mosaic domain and source, a sample being one subpixel of one sensor
+        layer. That is within 20% from 10 such units up (2463^2, 20 domains: 9.5 GB here, 9.4 measured),
+        and otherwise reads from half (9 sources alone) to twice (a plain run) what was measured.
+        """
+        n_layers = self.detector.thickness_layers()[0]
+        n_phi = max(int(self.crystal.config.phi_steps), 1)
+        n_mosaic = max(int(self.crystal.config.mosaic_domains), 1)
+        rows = S if pixel_batch_size is None else min(pixel_batch_size, S)
+        samples = rows * F * oversample * oversample * max(n_layers, 1)
+        words = 30 + 18 * max(n_sources, 1) * n_phi * n_mosaic
+        needed = torch.finfo(self.dtype).bits // 8 * samples * words
+        available = _memory_available_bytes(self.device)
+        if available is not None and needed > available:
+            warnings.warn(
+                f"This run may need about {needed / 1e9:.3g} GB, an estimate good to a factor of 2, and "
+                f"{available / 1e9:.3g} GB is available: "
+                f"{F}x{S} pixels at {oversample}-fold oversampling, {n_layers} sensor layers, {n_sources} "
+                f"sources, {n_phi} phi steps, {n_mosaic} mosaic domains. Memory grows as oversample^2, "
+                f"and C picks the same oversample but holds one sample at a time. It goes ahead anyway; "
+                f"if memory does run out it stops there, with no image. "
+                f"A lower -oversample changes the image; pixel_batch_size in Simulator.run does not.",
+                stacklevel=3,
+            )
+
     def _auto_oversample(self) -> int:
         """nanoBragg.c's auto oversample, frozen once any of its inputs requires grad.
 
         C picks ceil(3 * xtalsize / reciprocal_pixel_size) per run. That is a step
-        function of the cell, wavelength, distance and pixel size: recomputing it while
-        one of them is being refined makes the loss jump wherever the argument crosses
-        an integer (cell_a = 200 A with the default geometry flips 3 -> 4 across 1e-6).
-        So when any input requires grad, the first value chosen is kept for the life of
-        this Simulator and a warning says so; pass oversample explicitly to choose it.
-        With no differentiable inputs it is recomputed every run, as C does.
+        function of everything in _auto_oversample_inputs: recomputing it while one of
+        them is being refined makes the loss jump wherever the argument crosses an
+        integer (cell_a = 200 A with the default geometry flips 3 -> 4 across 1e-6).
+        So when any input requires grad, the value is chosen at construction, or at the
+        run that first finds one, and kept for the life of this Simulator, and a warning
+        says so; pass oversample explicitly to choose it. With no differentiable inputs
+        it is recomputed every run, as C does.
         """
+        self._freeze_auto_oversample_if_differentiable()
         if self._frozen_auto_oversample is not None:
+            if self._oversample_freeze_warning is not None:
+                warnings.warn(self._oversample_freeze_warning, stacklevel=3)
+                self._oversample_freeze_warning = None
             return self._frozen_auto_oversample
+        return self._select_auto_oversample()
 
+    def _auto_oversample_inputs(self) -> dict:
+        """Everything _select_auto_oversample reads, by name.
+
+        That is C's a[0]*Na, b[0]*Nb, c[0]*Nc, its lambda0, its pixel size, and its
+        close_distance/ratio, which every field the detector's geometry is built from enters.
+        """
         cfg = self.crystal.config
-        cells = (cfg.cell_a, cfg.cell_b, cfg.cell_c)
-        geometry = (self.wavelength, self.detector.config.distance_mm,
-                    self.detector.config.pixel_size_mm)
+        inputs = {f"cell_{name}": getattr(cfg, f"cell_{name}") for name in ("a", "b", "c", "alpha", "beta", "gamma")}
+        inputs.update(N_cells=cfg.N_cells, misset_deg=cfg.misset_deg, mosflm_a_star=cfg.mosflm_a_star,
+                      mosflm_b_star=cfg.mosflm_b_star, mosflm_c_star=cfg.mosflm_c_star,
+                      wavelength=self.wavelength, wavelength_A=self._wavelength_given)
+        inputs.update((name, getattr(self.detector.config, name, None)) for name in Detector._GEOMETRY_FIELDS)
+        return inputs
 
-        def value(x):
-            return float(x.detach()) if isinstance(x, torch.Tensor) else float(x)
+    def _freeze_auto_oversample_if_differentiable(self) -> None:
+        if self._frozen_auto_oversample is not None:
+            return
 
-        # Maximum crystal dimension in meters (a*Na, b*Nb, c*Nc)
-        xtalsize_max = max(abs(value(c) * 1e-10 * n) for c, n in zip(cells, cfg.N_cells))
-        # reciprocal_pixel_size = lambda * distance / pixel_size (all in meters)
-        wavelength, distance_mm, pixel_size_mm = (value(x) for x in geometry)
-        reciprocal_pixel_size = (wavelength * 1e-10) * (distance_mm / 1000.0) / (pixel_size_mm / 1000.0)
-        oversample = max(1, math.ceil(3.0 * xtalsize_max / reciprocal_pixel_size))
+        def differentiable(x):
+            if isinstance(x, (tuple, list)):
+                return any(differentiable(item) for item in x)
+            return isinstance(x, torch.Tensor) and x.requires_grad
+
+        names = [name for name, x in self._auto_oversample_inputs().items() if differentiable(x)]
+        if names:
+            self._frozen_auto_oversample = self._select_auto_oversample()
+            # Said at first use, not here: a caller passing oversample to every run never uses it
+            self._oversample_freeze_warning = (
+                f"oversample=-1 (auto) with differentiable inputs ({', '.join(names)}): "
+                f"keeping the auto-selected {self._frozen_auto_oversample}-fold oversampling for this "
+                f"Simulator, since re-selecting it as the parameters move would make the loss "
+                f"discontinuous. Pass oversample explicitly to choose the value."
+            )
+
+    def _select_auto_oversample(self) -> int:
+        """C's ceil(3 * xtalsize / reciprocal_pixel_size) for the inputs as they stand."""
+        cfg = self.crystal.config
+
+        # All in double, as in C, whatever the run's dtype: where the argument is a whole number
+        # float32 rounding moves the ceil
+        with torch.no_grad():
+            detector = Detector(self.detector.config, device="cpu", dtype=torch.float64)
+            distance_m = (_as_double(torch.dot(detector.pix0_vector, detector.odet_vec))
+                          / _as_double(detector.r_factor))
+        # C's distance is close_distance/ratio by now (nanoBragg.c:1758), with the ratio from
+        # before -twotheta. Lengths are divided down as C reads them.
+        xtalsize_max = max(length * max(_as_double(n), 1.0)
+                           for length, n in zip(self._cell_lengths_m(), cfg.N_cells))
+        reciprocal_pixel_size = (self._wavelength_in_double() / 1.0e10) * distance_m / (
+            _as_double(self.detector.config.pixel_size_mm) / 1000.0)
+        # A beam along the detector plane has distance 0; C divides by it, gets inf and so 1
+        oversample = c_ceil_to_int(3.0 * xtalsize_max / reciprocal_pixel_size
+                                   if reciprocal_pixel_size != 0.0 else math.inf)
+        if oversample <= 0:
+            oversample = 1
         logger.info(f"auto-selected {oversample}-fold oversampling")
 
-        if any(isinstance(x, torch.Tensor) and x.requires_grad for x in cells + geometry):
-            self._frozen_auto_oversample = oversample
-            warnings.warn(
-                f"oversample=-1 (auto) with differentiable cell/wavelength/detector inputs: "
-                f"keeping the auto-selected {oversample}-fold oversampling for this Simulator, "
-                f"since re-selecting it as the parameters move would make the loss "
-                f"discontinuous. Pass oversample explicitly to choose the value.",
-                stacklevel=3,
-            )
         return oversample
+
+    def _cell_lengths_m(self) -> tuple:
+        """a[0], b[0], c[0] of C, in double."""
+        cfg = self.crystal.config
+        cell = [_as_double(getattr(cfg, f"cell_{name}")) for name in ("a", "b", "c", "alpha", "beta", "gamma")]
+        reciprocal = None
+        if cfg.mosflm_a_star is not None:
+            reciprocal = [tuple(float(x) for x in star)
+                          for star in (cfg.mosflm_a_star, cfg.mosflm_b_star, cfg.mosflm_c_star)]
+        misset = [_as_double(angle) for angle in cfg.misset_deg]
+        return c_cell_lengths_m(cell, misset, reciprocal,
+                                user_cell=reciprocal is None or getattr(cfg, "mosflm_with_user_cell", False))
+
+    def _wavelength_in_double(self) -> float:
+        """The run's wavelength, with the digits it was given if the run's dtype cut them off."""
+        live = self.wavelength
+        given = _as_double(self._wavelength_given)
+        if isinstance(live, torch.Tensor):
+            still_given = float(torch.tensor(given, dtype=live.dtype)) == float(live.detach())
+        else:
+            still_given = float(live) == given
+        return given if still_given else _as_double(live)
 
     def _warn_if_tophat_severs_cell_gradients(self) -> None:
         """Warn once when TOPHAT leaves differentiable cell parameters with no path.
@@ -1431,8 +1610,8 @@ class Simulator:
         if oversample_thick is None:
             oversample_thick = self.detector.config.oversample_thick
 
-        # Auto-select oversample if set to -1 (matches C behavior)
-        if oversample == -1:
+        # Auto-select oversample if it is not positive (nanoBragg.c:2081)
+        if oversample <= 0:
             oversample = self._auto_oversample()
 
         # For now, we'll implement the base case without oversampling for this test
@@ -1468,6 +1647,10 @@ class Simulator:
             rot_a = rot_a.to(device=self.device, dtype=self.dtype)
             rot_b = rot_b.to(device=self.device, dtype=self.dtype)
             rot_c = rot_c.to(device=self.device, dtype=self.dtype)
+            if (self.crystal.config.shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT)
+                    and getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL) is SpotMetric.RECIPROCAL):
+                scale = self.crystal.c_reciprocal_scale
+                rot_a_star, rot_b_star, rot_c_star = rot_a_star * scale, rot_b_star * scale, rot_c_star * scale
             rot_a_star = rot_a_star.to(device=self.device, dtype=self.dtype)
             rot_b_star = rot_b_star.to(device=self.device, dtype=self.dtype)
             rot_c_star = rot_c_star.to(device=self.device, dtype=self.dtype)
@@ -1540,12 +1723,14 @@ class Simulator:
         # bound peak memory; scaling, background, ROI and trace below are applied once to the
         # assembled image, so chunked and unchunked runs give the same result.
         S, F, _ = pixel_coords_meters.shape
+        self._warn_if_memory_runs_out(S, F, oversample, n_sources, pixel_batch_size)
         kernel_args = dict(
             rot_a=rot_a, rot_b=rot_b, rot_c=rot_c,
             rot_a_star=rot_a_star, rot_b_star=rot_b_star, rot_c_star=rot_c_star,
             n_sources=n_sources, source_directions=source_directions,
             source_wavelengths_A=source_wavelengths_A, source_weights=source_weights,
-            oversample=oversample, oversample_omega=oversample_omega, oversample_thick=oversample_thick,
+            oversample=oversample, oversample_omega=oversample_omega, oversample_polar=oversample_polar,
+            oversample_thick=oversample_thick,
         )
         if pixel_batch_size is not None and pixel_batch_size < S:
             chunks = [
@@ -1584,13 +1769,14 @@ class Simulator:
         # ```
         #
         # Units: [dimensionless] / [dimensionless] × [m²] × [photons/m²] = [photons·m²]
+        # In double, as in C: r_e^2*fluence, or either factor with the image, can leave float32
+        # at a weak F or a low or high fluence while the pixel itself fits.
         physical_intensity = (
-            normalized_intensity
+            normalized_intensity.to(self._scale_dtype)
             / steps
-            * self.r_e_sqr
-            * self.fluence
+            * self._r_e_sqr_fluence()
             * getattr(self.beam_config, "spot_scale", 1.0)
-        )
+        ).to(self.dtype)
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -1646,7 +1832,7 @@ class Simulator:
             polarization_value = None
             if not oversample or oversample == 1:
                 # Calculate polarization factor for the entire detector when needed for trace
-                if self.beam_config.nopolar:
+                if not self._polarized(oversample_polar):
                     polarization_value = torch.ones_like(omega_pixel)
                 elif self.trace_pixel:
                     # Recompute polarization for the trace pixel
@@ -1685,7 +1871,8 @@ class Simulator:
                 steps,
                 capture_fraction_for_trace,
                 I_before_normalization,  # Post-polar accumulated intensity
-                I_before_normalization_pre_polar  # Pre-polar accumulated intensity
+                I_before_normalization_pre_polar,  # Pre-polar accumulated intensity
+                oversample_polar,
             )
 
         # PERF-PYTORCH-006: Ensure output matches requested dtype
@@ -1706,7 +1893,8 @@ class Simulator:
                            steps=None,
                            capture_fraction=None,
                            I_total=None,
-                           I_total_pre_polar=None):
+                           I_total_pre_polar=None,
+                           oversample_polar=False):
         """Apply debug output for -printout and -trace_pixel options.
 
         Args:
@@ -1820,9 +2008,9 @@ class Simulator:
                     b_vec = rot_b[0, 0] if len(rot_b.shape) > 1 else rot_b
                     c_vec = rot_c[0, 0] if len(rot_c.shape) > 1 else rot_c
 
-                    print(f"TRACE_PY: rot_a_angstroms {a_vec[0].item():.15g} {a_vec[1].item():.15g} {a_vec[2].item():.15g}")
-                    print(f"TRACE_PY: rot_b_angstroms {b_vec[0].item():.15g} {b_vec[1].item():.15g} {b_vec[2].item():.15g}")
-                    print(f"TRACE_PY: rot_c_angstroms {c_vec[0].item():.15g} {c_vec[1].item():.15g} {c_vec[2].item():.15g}")
+                    print(f"TRACE_PY: rot_a_angstroms {a_vec[0].item() * 1e10:.15g} {a_vec[1].item() * 1e10:.15g} {a_vec[2].item() * 1e10:.15g}")
+                    print(f"TRACE_PY: rot_b_angstroms {b_vec[0].item() * 1e10:.15g} {b_vec[1].item() * 1e10:.15g} {b_vec[2].item() * 1e10:.15g}")
+                    print(f"TRACE_PY: rot_c_angstroms {c_vec[0].item() * 1e10:.15g} {c_vec[1].item() * 1e10:.15g} {c_vec[2].item() * 1e10:.15g}")
 
                     # Spindle-axis instrumentation (CLI-FLAGS-003 Phase L3g)
                     # Emit raw spindle axis from config and normalized axis used by rotate_axis
@@ -1849,7 +2037,8 @@ class Simulator:
                     pixel_mag = torch.sqrt(torch.sum(coords_ang * coords_ang))
                     diffracted_unit = coords_ang / pixel_mag
                     incident_unit = self.incident_beam_direction
-                    scattering_vec = (diffracted_unit - incident_unit) / self.wavelength
+                    # rot_a etc. are in metres here, as in C, so the scattering vector is in 1/m
+                    scattering_vec = (diffracted_unit - incident_unit) / self.wavelength * 1e10
 
                     from nanobrag_torch.utils.geometry import dot_product
                     h = dot_product(scattering_vec.unsqueeze(0), a_vec.unsqueeze(0)).item()
@@ -1977,7 +2166,7 @@ class Simulator:
 
                     # Oversample flags
                     print(f"TRACE_PY: oversample_thick {1 if self.detector.config.oversample_thick else 0}")
-                    print(f"TRACE_PY: oversample_polar {1 if self.detector.config.oversample_polar else 0}")
+                    print(f"TRACE_PY: oversample_polar {1 if oversample_polar else 0}")
                     print(f"TRACE_PY: oversample_omega {1 if self.detector.config.oversample_omega else 0}")
 
                     # Capture fraction from detector absorption (actual value, not placeholder)
@@ -2063,7 +2252,7 @@ class Simulator:
                                 crystal_shape=self.crystal.config.shape,
                                 crystal_fudge=self.crystal.config.fudge,
                                 spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
-                                apply_polarization=not self.beam_config.nopolar,
+                                apply_polarization=self._polarized(oversample_polar),
                                 kahn_factor=self.kahn_factor,
                                 polarization_axis=self.polarization_axis,
                             )
@@ -2074,7 +2263,7 @@ class Simulator:
 
                             # Compute per-source polarization factor (matches C-code calculation)
                             # The polarization is already applied in intensity_src, so we can derive it
-                            if I_pre_polar_src > 0 and not self.beam_config.nopolar:
+                            if I_pre_polar_src > 0 and self._polarized(oversample_polar):
                                 polar_src = I_post_polar_src / I_pre_polar_src
                             else:
                                 polar_src = 1.0
@@ -2203,35 +2392,69 @@ class Simulator:
                 print(f"  = {normalized_intensity[target_slow, target_fast].item():.12e} * {self.r_e_sqr:.12e} * {self.fluence:.12e}")
                 print(f"  = {physical_intensity[target_slow, target_fast].item():.12e}")
 
-    def _water_background_pre_scale(self, pixel_coords_meters: torch.Tensor) -> torch.Tensor:
+    def _water_background_pre_scale(
+        self,
+        sample_coords_meters: torch.Tensor,
+        oversample_polar: bool,
+        source_directions: Optional[torch.Tensor] = None,
+        source_wavelengths_A: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Water background as nanoBragg.c seeds it, before the r_e^2*fluence/steps scaling.
 
         C sets ``I = I_bg`` for each pixel and then adds the Bragg contributions, so the
         background goes through the same tail as everything else: it is multiplied by
-        r_e^2*fluence a second time, divided by steps, and picks up the polarization
-        factor, the solid angle and the capture fraction (nanoBragg.c:2515, 2665, 3344).
-        Torch applies polarization per sub-sample inside the kernel, so the factor is
-        computed here at the pixel centre, which is where C evaluates it for a pixel.
+        r_e^2*fluence a second time, divided by steps, and picks up whichever of the
+        polarization factor, solid angle and capture fraction C applies once per pixel
+        (nanoBragg.c:2515, 2665, 3048-3050). With -oversample_polar those go on each sample
+        instead, so I_bg gets none. Otherwise, torch applying polarization per sample inside
+        the kernel, the factor C cached for the pixel is computed here: the one from the first
+        sample and source that -dmin lets through (nanoBragg.c:2765, 2772), and none, so a zero
+        pixel, if -dmin stops them all.
 
-        Returns (S, F); the caller adds it to the accumulated intensity.
+        sample_coords_meters is (S, F, n_samples, 3), in the order of C's loops. Returns (S, F);
+        the caller adds it to the accumulated intensity.
         """
         I_bg = self._calculate_water_background_amplitude()
-        if self.beam_config.nopolar:
-            return I_bg.expand(pixel_coords_meters.shape[:2])
+        S, F, n_samples = sample_coords_meters.shape[:3]
+        if self.beam_config.nopolar or oversample_polar:
+            return I_bg.expand(S, F)
 
-        diffracted = pixel_coords_meters / torch.linalg.norm(
-            pixel_coords_meters, dim=-1, keepdim=True
+        if source_directions is None:
+            incident = self.incident_beam_direction.reshape(-1, 3)
+            wavelength_A = self.wavelength.reshape(-1)
+        else:
+            incident = -source_directions
+            wavelength_A = source_wavelengths_A
+        n_sources = incident.shape[0]
+
+        diffracted = sample_coords_meters / torch.linalg.norm(
+            sample_coords_meters, dim=-1, keepdim=True
         ).clamp_min(1e-30)
-        incident = self.incident_beam_direction
-        if incident.dim() == 2:  # multiple sources: C caches the factor from the first one
-            incident = incident[0]
+        dmin = self.beam_config.dmin
+        if dmin is not None and dmin > 0:
+            scattering = (diffracted.unsqueeze(3) - incident) / wavelength_A.unsqueeze(-1)
+            stol = 0.5 * torch.linalg.norm(scattering, dim=-1)
+            reached = ~((stol > 0) & (dmin > 0.5 / stol))  # (S, F, n_samples, n_sources)
+            reached = reached.flatten(2)
+            first = reached.int().argmax(dim=-1)
+            any_reached = reached.any(dim=-1)
+        else:
+            first = torch.zeros((S, F), dtype=torch.long, device=self.device)
+            any_reached = None
+
+        first_sample = torch.div(first, n_sources, rounding_mode="floor")
+        first_diffracted = diffracted.gather(
+            2, first_sample.view(S, F, 1, 1).expand(S, F, 1, 3)
+        ).squeeze(2)
         polar = polarization_factor(
             torch.as_tensor(self.beam_config.polarization_factor, device=self.device, dtype=self.dtype),
-            incident.expand_as(diffracted).reshape(-1, 3).contiguous(),
-            diffracted.reshape(-1, 3).contiguous(),
+            incident[first % n_sources].reshape(-1, 3).contiguous(),
+            first_diffracted.reshape(-1, 3).contiguous(),
             torch.as_tensor(self.beam_config.polarization_axis, device=self.device, dtype=self.dtype),
-        ).reshape(pixel_coords_meters.shape[:2])
+        ).reshape(S, F)
+        if any_reached is not None:
+            polar = polar * any_reached.to(polar.dtype)
         return I_bg * polar
 
     def _calculate_water_background_amplitude(self) -> torch.Tensor:
@@ -2248,11 +2471,13 @@ class Simulator:
         - r_e^2 = classical electron radius squared
         - fluence = photons per square meter
         - water_size = water thickness in micrometers converted to meters
+        - 1e6 = density of water, g/m^3
         - Avogadro = 6.02214179e23 mol^-1
         - water_MW = 18 g/mol
 
-        Note: The 1e6 factor is as specified in the C code; it creates a unit inconsistency
-        but we replicate it exactly for compatibility.
+        So the factors after r_e^2*fluence count the molecules in a cube of water_size on a side.
+        The pixel loop multiplies by r_e^2*fluence again, so the image is quadratic in fluence,
+        as in C: see docs/bugs/verified_c_bugs.md.
 
         Returns:
             I_bg as a scalar tensor, before any of the per-pixel corrections.
@@ -2265,12 +2490,10 @@ class Simulator:
         # Convert water size from micrometers to meters
         water_size_m = self.beam_config.water_size_um * 1e-6
 
-        # Calculate background intensity per spec formula
-        # Note: The 1e6 factor creates unit inconsistency but matches C code
+        # nanoBragg.c:2515; 1e6 is the density of water in g/m^3
         I_bg = (
             F_bg * F_bg
-            * self.r_e_sqr
-            * self.fluence
+            * self._r_e_sqr_fluence()
             * (water_size_m ** 3)
             * 1e6
             * Avogadro
@@ -2496,13 +2719,16 @@ class Simulator:
         if roi_ymax is not None:
             roi_mask[roi_ymax+1:, :] = False
 
+        # C's rmsd loop tests the ROI and not the mask (nanoBragg.c:3117-3128)
+        rmsd_pixels = float_image[roi_mask].cpu().to(torch.float64)
+
         # Apply external mask if provided
         if self.detector.config.mask_array is not None:
             if self.detector.config.mask_array.shape == float_image.shape:
-                roi_mask = roi_mask & (self.detector.config.mask_array > 0)
+                roi_mask = roi_mask & (self.detector.config.mask_array.to(float_image.device) > 0)
 
-        # Get masked pixels
-        masked_pixels = float_image[roi_mask]
+        # Get masked pixels, in double as C sums them: a float32 square underflows on a faint image
+        masked_pixels = float_image[roi_mask].cpu().to(torch.float64)
         N = masked_pixels.numel()
 
         if N == 0:
@@ -2520,7 +2746,9 @@ class Simulator:
             }
 
         # Find maximum value and its location
-        max_I = masked_pixels.max().item()
+        # C's max_I only moves on `>`, so a NaN pixel is passed over
+        comparable_pixels = masked_pixels[~torch.isnan(masked_pixels)]
+        max_I = comparable_pixels.max().item() if comparable_pixels.numel() else 0.0
 
         # Find the last occurrence of the maximum value in the full image
         # This matches C behavior of "last set" location
@@ -2545,25 +2773,14 @@ class Simulator:
         # Compute mean
         mean = masked_pixels.mean().item()
 
-        # Compute RMS = sqrt(sum(pixel^2)/(N - 1))
-        # Note: Using N-1 for unbiased estimate per spec
-        if N > 1:
-            # math.sqrt on the Python float rather than torch.sqrt(torch.tensor(x)):
-            # the latter builds a tensor in the default dtype, which is float32,
-            # so a float64 sum was rounded to ~7 significant digits on its way
-            # back out. RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the
-            # PGM is byte-compared against C, where a boundary pixel could flip on
-            # that rounding.
-            sum_sq = (masked_pixels ** 2).sum().item()
-            RMS = math.sqrt(sum_sq / (N - 1))
-
-            # Compute RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
-            sum_dev_sq = ((masked_pixels - mean) ** 2).sum().item()
-            RMSD = math.sqrt(sum_dev_sq / (N - 1))
-        else:
-            # N=1 case: avoid division by zero
-            RMS = masked_pixels[0].item()
-            RMSD = 0.0
+        # Compute RMS = sqrt(sum(pixel^2)/(N - 1)), and RMSD = sqrt(sum((pixel - mean)^2)/(N - 1))
+        # with C's `if(sumn<=1) sumn=2`. math.sqrt on the Python float rather than
+        # torch.sqrt(torch.tensor(x)): the latter builds a tensor in the default dtype, which is
+        # float32, so a float64 sum was rounded to ~7 significant digits on its way back out.
+        # RMSD feeds the PGM auto-exposure (250/(5*rmsd)) and the PGM is byte-compared against
+        # C, where a boundary pixel could flip on that rounding.
+        RMS = math.sqrt((masked_pixels ** 2).sum().item() / (max(N, 2) - 1))
+        RMSD = math.sqrt(((rmsd_pixels - mean) ** 2).sum().item() / (max(rmsd_pixels.numel(), 2) - 1))
 
         return {
             "max_I": max_I,
