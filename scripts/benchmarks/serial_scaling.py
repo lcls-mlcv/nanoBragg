@@ -200,7 +200,7 @@ def main():
         torch.cuda.synchronize()
     wall = time.perf_counter() - t0
     evaluations = int(result.nfev)
-    fitted_logG = np.array([float(s.beam_params.delta_log_spot_scale) for s in model.shots])
+    fitted_logG = np.array([s.beam_params.delta_log_spot_scale.item() for s in model.shots])
     report = {
         "commit": git_commit(), "args": {k: str(v) for k, v in vars(args).items()},
         "unique_reflections": len(hkl), "seen_reflections": int(seen.sum()),
