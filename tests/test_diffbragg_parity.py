@@ -789,3 +789,36 @@ def test_refine_lbfgsb_reaches_hoppers_solution(tmp_path):
     np.testing.assert_allclose(fitted["G_over_truth"], hopper["G_over_truth"], rtol=1e-3)
     np.testing.assert_allclose(fitted["Ncells"], hopper["Ncells"], atol=2e-3)
     np.testing.assert_allclose(fitted["ucell"], hopper["ucell"], atol=2e-3)
+
+
+# Restraints: hopper_restraints against simtbx's own restraint term and its derivative
+# (refiners/parameters.py, NormalParameter, whose value is its variable).
+def test_restraint_terms_match_simtbx():
+    from simtbx.diffBragg.refiners.parameters import NormalParameter
+
+    from nanobrag_torch.config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig
+    from nanobrag_torch.models.experiment import ExperimentModel
+    from nanobrag_torch.utils.restraints import hopper_restraints
+
+    crystal = CrystalConfig(cell_a=40.0, cell_b=50.0, cell_c=60.0, N_cells=(6, 5, 4), default_F=100.0,
+                            shape=CrystalShape.GAUSS)
+    model = ExperimentModel(crystal, DetectorConfig(distance_mm=60.0, spixels=8, fpixels=8),
+                            BeamConfig(wavelength_A=1.2, spot_scale=3.0), dtype=torch.float64)
+    model.freeze().refine("scale", "Ncells")
+    with torch.no_grad():
+        model.beam_params.delta_log_spot_scale.fill_(0.2)
+        model.crystal_params.delta_log_N_cells.copy_(torch.tensor([0.1, -0.2, 0.3], dtype=torch.float64))
+    centers, betas = {"G": 2.0, "Nabc": [5.0, 6.0, 7.0]}, {"G": 4.0, "Nabc": [2.0, 3.0, 0.5]}
+    value = hopper_restraints(model, centers, betas)
+    value.backward()
+
+    G = float(model.beam_params.build_config().spot_scale)
+    N = [float(v) for v in model.crystal_params.build_config().N_cells]
+    params = [NormalParameter(init=G, center=2.0, beta=4.0)] + [
+        NormalParameter(init=n, center=c, beta=b) for n, c, b in zip(N, centers["Nabc"], betas["Nabc"])]
+    ref = sum(p.get_restraint_val(p.init) for p in params)
+    assert float(value) == pytest.approx(ref, rel=1e-12)
+    # d/d(log G) = G·d/dG, and likewise for log Ncells
+    dG, dN = (p.get_restraint_deriv(p.init) for p in params[:1]), [p.get_restraint_deriv(p.init) for p in params[1:]]
+    assert float(model.beam_params.delta_log_spot_scale.grad) == pytest.approx(G * next(dG), rel=1e-12)
+    np.testing.assert_allclose(model.crystal_params.delta_log_N_cells.grad.numpy(), np.multiply(N, dN), rtol=1e-12)
