@@ -184,12 +184,18 @@ def main():
         return {"cc_logF": cc, "R": float(np.abs(k * fit - truth_f).sum() / truth_f.sum())}
 
     start = agreement()
+    trajectory = []
+
+    def record():
+        """A last term of nothing trainable: notes the loss and F error at each evaluation."""
+        trajectory.append({"evaluation": len(trajectory) + 1, **agreement()})
+        return torch.zeros((), dtype=DT, device=args.device)
     if args.device.type == "cuda":
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     scales = None if args.fhkl_scale is None else {"Fhkl": args.fhkl_scale}
-    result = refine_lbfgsb(model, [term(i) for i in range(args.shots)], scales=scales, maxiter=args.maxiter)
+    result = refine_lbfgsb(model, [term(i) for i in range(args.shots)] + [record], scales=scales, maxiter=args.maxiter)
     if args.device.type == "cuda":
         torch.cuda.synchronize()
     wall = time.perf_counter() - t0
@@ -205,8 +211,9 @@ def main():
         "peak_gpu_GB": torch.cuda.max_memory_allocated() / 1e9 if args.device.type == "cuda" else None,
         "start": start, "end": agreement(),
         "scale_rms_error": float(np.sqrt(np.mean((fitted_logG - true_logG) ** 2))),
+        "trajectory": trajectory,
     }
-    print(json.dumps(report, indent=1))
+    print(json.dumps({k: v for k, v in report.items() if k != "trajectory"}, indent=1))
     if args.out:
         with open(args.out, "w") as fh:
             json.dump(report, fh, indent=1)
