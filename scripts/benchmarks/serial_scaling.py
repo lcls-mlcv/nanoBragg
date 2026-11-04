@@ -1,10 +1,11 @@
 """How refinement of one shared Fhkl scales with the number of shots (SerialExperiment).
 
-Synthetic stills, nothing measured: a tetragonal crystal with lysozyme's cell (P4_3 2_1 2 point
-group 422), Wilson-distributed amplitudes, random orientations, ROIs around each shot's strongest
-spots and Poisson noise. The start has every log F off by --f-noise and every shot's scale off by
---scale-noise; refine_lbfgsb then fits Fhkl and the per-shot scales (shot 0's held: the overall
-scale is degenerate with F), one objective term per shot so each graph is freed before the next.
+Synthetic stills, nothing measured: a tetragonal crystal with lysozyme's cell (point group
+422, without P4_3 2_1 2's absences), Wilson-distributed amplitudes, random orientations, ROIs
+around each shot's strongest spots and Poisson noise. The start has every log F off by --f-noise
+and every shot's scale off by --scale-noise; refine_lbfgsb then fits Fhkl and the per-shot scales
+(shot 0's held: the overall scale is degenerate with F), one objective term per shot so each graph
+is freed before the next.
 
 Reports, per run: evaluations, seconds per evaluation, peak GPU memory, and the agreement of the
 fitted F with the truth on the reflections the ROIs see (CC of log F and an R factor, at the start
@@ -16,14 +17,18 @@ On one GPU, with the defaults (60 spots a shot, 9x9 ROIs), an evaluation costs a
 and at 3.0 324, all to the same F (R 1.34%). At 400 shots: 586 iterations at 0.3, 473 at 1.0, both
 to R 0.85%. Hence the default Fhkl scale of 1.0. R is within 1% of its final value after about 80
 evaluations at 100 shots and 200 at 400; L-BFGS-B's default stop spends the rest creeping, so a
-maxiter of a few hundred loses nothing here.
+maxiter of a few hundred loses nothing here. The quoted runs used --maxiter 1000 (100 shots) and
+800 (400 shots); the default of 200 stops sooner.
+
+Holding shot 0's scale fixes the overall scale only for shots linked to it through shared
+reflections, so a handful of shots can drift apart; read the agreement at tens of shots or more.
+"Seen" reflections are all those any ROI pixel touches, including ones barely constrained.
 
     NANOBRAGG_DISABLE_COMPILE=1 PYTHONPATH=src python scripts/benchmarks/serial_scaling.py \
         --shots 100 --device cuda --out serial_100.json
 """
 import argparse
 import json
-import math
 import time
 
 import numpy as np
@@ -167,15 +172,19 @@ def main():
         for shot, g in zip(model.shots[1:], true_logG[1:]):
             shot.beam_params.delta_log_spot_scale.fill_(float(g + rng.normal(0.0, args.scale_noise)))
 
-    calls = {"n": 0, "seconds": 0.0}
+    cuda = args.device.type == "cuda"
+    sync = torch.cuda.synchronize if cuda else (lambda: None)
+    forward_seconds = [0.0]
 
     def term(i):
-        def f():
+        def shot_nll():
+            sync()
             t0 = time.perf_counter()
             value = gaussian_nll(model([i], roi_only=True)[0], data[i], 1.0)
-            calls["seconds"] += time.perf_counter() - t0  # forward only; backward runs after
+            sync()
+            forward_seconds[0] += time.perf_counter() - t0  # forward only; backward runs after
             return value
-        return f
+        return shot_nll
 
     fhkl = model.shots[0].fhkl_params
     # the reflections the ROIs see: those the first gradient reaches
@@ -183,6 +192,7 @@ def main():
     loss.backward()
     seen = (fhkl.delta_log_F.grad.abs() > 0).cpu().numpy()
     fhkl.delta_log_F.grad = None
+    forward_seconds[0] = 0.0
 
     def agreement():
         fit = fhkl.amplitudes().detach().cpu().numpy()[: len(hkl)][seen]
@@ -195,30 +205,30 @@ def main():
     trajectory = []
 
     def record():
-        """A last term of nothing trainable: notes the loss and F error at each evaluation."""
+        """A last term of nothing trainable: notes the F error at each evaluation."""
         trajectory.append({"evaluation": len(trajectory) + 1, **agreement()})
         return torch.zeros((), dtype=DT, device=args.device)
-    if args.device.type == "cuda":
-        torch.cuda.synchronize()
+    sync()
+    if cuda:
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
     scales = None if args.fhkl_scale is None else {"Fhkl": args.fhkl_scale}
     result = refine_lbfgsb(model, [term(i) for i in range(args.shots)] + [record], scales=scales, maxiter=args.maxiter)
-    if args.device.type == "cuda":
-        torch.cuda.synchronize()
+    sync()
     wall = time.perf_counter() - t0
     evaluations = int(result.nfev)
     fitted_logG = np.array([s.beam_params.delta_log_spot_scale.item() for s in model.shots])
     report = {
-        "commit": git_commit(), "args": {k: str(v) for k, v in vars(args).items()},
+        "commit": git_commit(),
+        "args": {k: str(v) if isinstance(v, torch.device) else v for k, v in vars(args).items()},
         "unique_reflections": len(hkl), "seen_reflections": int(seen.sum()),
         "roi_pixels": int(sum(d.numel() for d in data)), "evaluations": evaluations, "iterations": int(result.nit),
         "converged": bool(result.success), "message": str(result.message),
         "wall_seconds": wall, "seconds_per_evaluation": wall / max(evaluations, 1),
-        "forward_seconds_per_evaluation": calls["seconds"] / max(evaluations, 1),
-        "peak_gpu_GB": torch.cuda.max_memory_allocated() / 1e9 if args.device.type == "cuda" else None,
+        "forward_seconds_per_evaluation": forward_seconds[0] / max(evaluations, 1),
+        "peak_gpu_GB": torch.cuda.max_memory_allocated() / 1e9 if cuda else None,
         "start": start, "end": agreement(),
-        "scale_rms_error": float(np.sqrt(np.mean((fitted_logG - true_logG) ** 2))),
+        "scale_rms_error": float(np.sqrt(np.mean((fitted_logG[1:] - true_logG[1:]) ** 2))),  # shot 0 is held
         "trajectory": trajectory,
     }
     print(json.dumps({k: v for k, v in report.items() if k != "trajectory"}, indent=1))
