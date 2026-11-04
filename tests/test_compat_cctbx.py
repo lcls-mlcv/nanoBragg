@@ -523,9 +523,10 @@ def _exported_setup():
         model.detector_params.delta_detz_shift_mm.fill_(0.4)
         model.beam_params.lambda_offset.fill_(0.003)
     centres = [((x1 + x2) / 2, (y1 + y2) / 2, 0.0) for x1, x2, y1, y2 in EXPORT_ROIS]
+    centres[2] = (10.5, 10.5, 0.0)  # observed outside its box: the model gets no centroid there
     refls = flex.reflection_table()
     refls["xyzobs.px.value"] = flex.vec3_double(centres)
-    refls["xyzcal.px"] = flex.vec3_double(centres)
+    refls["xyzcal.px"] = flex.vec3_double([((x1 + x2) / 2, (y1 + y2) / 2, 0.0) for x1, x2, y1, y2 in EXPORT_ROIS])
     refls["panel"] = flex.size_t([0] * len(centres))
     return model, experiment, refls
 
