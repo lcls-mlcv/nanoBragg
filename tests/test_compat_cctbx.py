@@ -580,6 +580,8 @@ def test_dials_predicts_the_exported_spots_where_the_model_puts_them():
             continue  # not a local maximum
         s1 = np.array(panel.get_pixel_lab_coord((x + 0.5, y + 0.5)))
         hkl = np.rint(np.linalg.solve(A, s1 / np.linalg.norm(s1) * np.linalg.norm(s0) - s0)).astype(int)
+        if not hkl.any():
+            continue  # the direct beam's F000, which DIALS does not predict
         table = flex.reflection_table()
         table["miller_index"] = flex.miller_index([tuple(int(v) for v in hkl)])
         table["entering"] = flex.bool([False])
