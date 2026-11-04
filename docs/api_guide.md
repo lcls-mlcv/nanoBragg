@@ -28,7 +28,7 @@ Pass structure factors with `F=`:
 
 ## From dxtbx
 
-`simulator_from_dxtbx` and `experiment_model_from_dxtbx` take dxtbx detector, beam and crystal objects, so they need a cctbx install. Install cctbx and dxtbx with conda; this package has no pip extra for them.
+`simulator_from_dxtbx` and `experiment_model_from_dxtbx` take dxtbx detector, beam and crystal objects, so they need a cctbx install. After refinement, `experiment_from_model(model, experiment)` gives the dxtbx experiment with the refined crystal, panels and wavelength, and `reflections_from_model(model, reflections, experiment)` a reflection table with the model's spot centroids as `xyzcal.px`, as hopper writes them; `ExperimentList([...]).as_file` and `reflections.as_file` save them as `.expt` and `.refl`. Install cctbx and dxtbx with conda; this package has no pip extra for them.
 
 ## Refine
 
