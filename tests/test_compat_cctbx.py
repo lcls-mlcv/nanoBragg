@@ -1,10 +1,10 @@
 """
 Tests for nanobrag_torch.compat.cctbx.
 
-The first group uses duck-typed stand-ins for dxtbx Panel / Beam / Crystal so
-the geometry and orientation ingestion can be verified without cctbx. The last
-test runs only when cctbx + dxtbx are importable and compares against
-simtbx.nanoBragg directly.
+Most tests use duck-typed stand-ins for dxtbx Panel / Beam / Crystal so the
+geometry and orientation ingestion can be verified without cctbx. Those against
+simtbx.nanoBragg and the .expt/.refl export ones at the end run only when cctbx,
+dxtbx and dials are importable.
 """
 import math
 import os
@@ -497,3 +497,134 @@ def test_panel_simulator_keeps_nanoBragg_layer_step():
 def test_model_rejects_a_single_sensor_layer():
     with pytest.raises(ValueError, match="at least 2"):
         _layered_model(steps=1)
+
+
+# --------------------------------------------------------------------------- #
+# export: refined model -> .expt / .refl, with real dxtbx and dials
+# --------------------------------------------------------------------------- #
+EXPORT_ROIS = [(20, 40, 20, 40), (60, 80, 90, 110), (0, 6, 0, 6)]
+
+
+def _exported_setup():
+    """A real dxtbx still, its model refined a little, and a table of four reflections, ROIs on rows 0, 1, 3."""
+    from dials.array_family import flex  # type: ignore
+    from dxtbx.model import BeamFactory, Crystal as DxtbxCrystal, DetectorFactory, Experiment  # type: ignore
+    from scitbx.matrix import col  # type: ignore
+
+    xtal = DxtbxCrystal((40, 0, 0), (0, 45, 0), (0, 0, 50), "P212121")
+    xtal.set_U(col((1, 2, 3)).normalize().axis_and_angle_as_r3_rotation_matrix(0.4))
+    detector = DetectorFactory.simple("PAD", 80.0, (6.3, 6.1), "+x", "-y", (0.1, 0.1), (128, 128))
+    experiment = Experiment(crystal=xtal, detector=detector, beam=BeamFactory.simple(1.1))
+    model = experiment_model_from_dxtbx(detector, experiment.beam, xtal, Ncells_abc=(8, 8, 8), default_F=100.0,
+                                        fluence=1e30, rois=EXPORT_ROIS, dtype=torch.float64)
+    with torch.no_grad():
+        model.crystal_params.delta_misset_raw.copy_(torch.tensor([0.01, -0.02, 0.015], dtype=torch.float64))
+        model.crystal_params.delta_log_a.fill_(0.01)
+        model.detector_params.delta_detz_shift_mm.fill_(0.4)
+        model.beam_params.lambda_offset.fill_(0.003)
+    box_centres = [((x1 + x2) / 2, (y1 + y2) / 2, 0.0) for x1, x2, y1, y2 in EXPORT_ROIS]
+    observed = [box_centres[0], box_centres[1], (50.5, 50.5, 0.0), (10.5, 10.5, 0.0)]  # the last outside its box
+    refls = flex.reflection_table()
+    refls["xyzobs.px.value"] = flex.vec3_double(observed)
+    refls["xyzcal.px"] = flex.vec3_double(observed)
+    refls["panel"] = flex.size_t([0] * len(observed))
+    return model, experiment, refls
+
+
+def test_exported_experiment_carries_the_refined_geometry(tmp_path):
+    pytest.importorskip("dxtbx", reason="cctbx/dxtbx not installed")
+    from dxtbx.model import ExperimentList  # type: ignore
+    from nanobrag_torch.compat.cctbx import experiment_from_model
+
+    model, experiment, _ = _exported_setup()
+    before = experiment.crystal.get_A()
+    as_hopper = experiment_from_model(model, experiment)
+    assert as_hopper.detector[0].get_origin() == experiment.detector[0].get_origin()
+    assert as_hopper.beam.get_wavelength() == experiment.beam.get_wavelength()
+    new = experiment_from_model(model, experiment, detector=True, wavelength=True)
+    assert experiment.crystal.get_A() == before  # the original is untouched
+    path = tmp_path / "refined.expt"
+    ExperimentList([new]).as_file(str(path))
+    (back,) = ExperimentList.from_file(str(path), check_format=False)
+    g = model.geometry()
+    np.testing.assert_allclose(np.array(back.crystal.get_real_space_vectors()),
+                               np.stack([g.real_space_a, g.real_space_b, g.real_space_c]), rtol=0, atol=1e-9)
+    assert back.crystal.get_space_group().info().type().lookup_symbol() == "P 21 21 21"
+    np.testing.assert_allclose(back.detector[0].get_origin(), g.panels[0].origin_mm, rtol=0, atol=1e-9)
+    assert back.beam.get_wavelength() == pytest.approx(g.wavelength_A, rel=1e-12)
+
+    # read back in, the exported experiment simulates what the refined model does
+    again = experiment_model_from_dxtbx(back.detector, back.beam, back.crystal, Ncells_abc=(8, 8, 8),
+                                        default_F=100.0, fluence=1e30, rois=EXPORT_ROIS, dtype=torch.float64)
+    with torch.no_grad():
+        image, image_again = model(), again()
+    torch.testing.assert_close(image_again, image, rtol=1e-8, atol=1e-8 * float(image.max()))
+
+
+def test_dials_predicts_the_exported_spots_where_the_model_puts_them():
+    """Independent of torch's frame: DIALS' stills predictor on the exported experiment."""
+    pytest.importorskip("dials.algorithms.spot_prediction", reason="dials not installed")
+    from dials.algorithms.spot_prediction import StillsReflectionPredictor  # type: ignore
+    from dials.array_family import flex  # type: ignore
+    from nanobrag_torch.compat.cctbx import experiment_from_model
+
+    model, experiment, _ = _exported_setup()
+    new = experiment_from_model(model, experiment, detector=True, wavelength=True)
+    with torch.no_grad():
+        image = model(bragg_only=True).numpy()
+    panel, A = new.detector[0], np.array(new.crystal.get_A()).reshape(3, 3)
+    s0 = np.array(new.beam.get_s0())
+    checked = 0
+    for y, x in np.argwhere(image > 0.2 * image.max()):
+        if image[y, x] < image[max(y - 3, 0):y + 4, max(x - 3, 0):x + 4].max():
+            continue  # not a local maximum
+        s1 = np.array(panel.get_pixel_lab_coord((x + 0.5, y + 0.5)))
+        hkl = np.rint(np.linalg.solve(A, s1 / np.linalg.norm(s1) * np.linalg.norm(s0) - s0)).astype(int)
+        if not hkl.any():
+            continue  # the direct beam's F000, which DIALS does not predict
+        table = flex.reflection_table()
+        table["miller_index"] = flex.miller_index([tuple(int(v) for v in hkl)])
+        table["entering"] = flex.bool([False])
+        table["panel"] = flex.size_t([0])
+        StillsReflectionPredictor(new).for_reflection_table(table, new.crystal.get_A())
+        px, py, _ = table["xyzcal.px"][0]
+        box = image[y - 4:y + 5, x - 4:x + 5]
+        Y, X = np.indices(box.shape)
+        cx, cy = (X * box).sum() / box.sum() + x - 4 + 0.5, (Y * box).sum() / box.sum() + y - 4 + 0.5
+        assert math.hypot(px - cx, py - cy) < 0.5, (tuple(hkl), (px, py), (cx, cy))
+        checked += 1
+    assert checked >= 3
+
+
+def test_exported_reflections_carry_the_model_centroids(tmp_path):
+    pytest.importorskip("dials.array_family", reason="dials not installed")
+    from dials.array_family import flex  # type: ignore
+    from nanobrag_torch.compat.cctbx import experiment_from_model, reflections_from_model
+
+    model, experiment, refls = _exported_setup()
+    new_experiment = experiment_from_model(model, experiment, detector=True)
+    with torch.no_grad():
+        image = model(bragg_only=True).numpy()
+    rows = [0, 1, 3]
+    kept = reflections_from_model(model, refls, new_experiment, rows=rows, filter_unpredicted=False)
+    assert len(kept) == len(refls)
+    np.testing.assert_array_equal(np.array(list(kept["dials.xyzcal.px"])), np.array(list(refls["xyzcal.px"])))
+    cal = np.array(list(kept["xyzcal.px"]))
+    for row in (0, 1):  # centroids over each box, computed here from the whole image
+        x1, x2, y1, y2 = EXPORT_ROIS[row]
+        box = image[y1:y2, x1:x2]
+        Y, X = np.indices(box.shape)
+        np.testing.assert_allclose(cal[row, :2], ((X * box).sum() / box.sum() + x1 + 0.5,
+                                                  (Y * box).sum() / box.sum() + y1 + 0.5), rtol=1e-12)
+    assert np.isnan(cal[2]).all()  # no ROI
+    assert np.isnan(cal[3]).all()  # observed outside its box
+    assert image[0:6, 0:6].sum() > 0  # so not for want of signal
+    panel = new_experiment.detector[0]
+    np.testing.assert_allclose(kept["xyzcal.mm"][0][:2], panel.pixel_to_millimeter(tuple(cal[0, :2])), atol=1e-12)
+
+    filtered = reflections_from_model(model, refls, new_experiment, rows=rows)
+    assert len(filtered) == 2
+    path = tmp_path / "refined.refl"
+    filtered.as_file(str(path))
+    back = flex.reflection_table.from_file(str(path))
+    np.testing.assert_allclose(np.array(list(back["xyzcal.px"])), cal[:2], rtol=0, atol=1e-12)

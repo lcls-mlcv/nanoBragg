@@ -32,7 +32,9 @@ _EXPORTS = {
     ".utils.losses": ["gaussian_nll", "poisson_nll"],
     ".utils.refinement": ["refine_lbfgsb"],
     ".compat.cctbx": [
+        "experiment_from_model",
         "experiment_model_from_dxtbx",
+        "reflections_from_model",
         "set_structure_factors",
         "simulator_from_dxtbx",
     ],

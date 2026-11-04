@@ -35,10 +35,13 @@ simulator_from_dxtbx(detector, beam, crystal, ...)
 simulator_from_sim_data(SIM, ...)
 MultiPanelSimulator
 to_raw_pixels(image)
+experiment_from_model(model, experiment, ...)    # refined model -> dxtbx still Experiment (.expt)
+reflections_from_model(model, reflections, ...)  # model spot centroids -> reflection table (.refl)
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from dataclasses import replace
@@ -757,6 +760,100 @@ def experiment_model_from_dxtbx(
         model_kwargs["structure_factors"] = asu_structure_factors(miller_array, anomalous=anomalous)
     return ExperimentModel(crystal_cfg, configs, beam_cfg, device=device, dtype=dtype, background_rois=rois,
                            tilt_abc=tilt_abc, background_panels=panels, **model_kwargs)
+
+
+def _check_exportable(model, experiment, geometry) -> None:
+    """Refuse an experiment the model's geometry does not describe in dxtbx's frame."""
+    if len(geometry.panels) != len(experiment.detector):
+        raise ValueError(f"the model has {len(geometry.panels)} panels and the experiment's detector "
+                         f"{len(experiment.detector)}; export to the experiment the model was built from")
+    s0 = _unit(_s0_of(experiment.beam))
+    if not np.allclose(geometry.beam_direction, s0, rtol=0, atol=1e-9):
+        raise ValueError(f"the model's beam runs along {tuple(geometry.beam_direction)} and the experiment's along "
+                         f"{tuple(s0)}: only a model in dxtbx's frame (experiment_model_from_dxtbx) can be exported")
+    if getattr(experiment, "goniometer", None) is not None or getattr(experiment, "scan", None) is not None:
+        raise ValueError("the experiment has a goniometer or scan; the model's crystal is the lab orientation it "
+                         "simulates, which would need S·R(phi)·F undone (and any scan-point A replaced). Only "
+                         "stills can be exported for now")
+
+
+def experiment_from_model(model, experiment, *, detector: bool = False, wavelength: bool = False):
+    """A copy of a dxtbx still Experiment carrying a model's refined crystal, and optionally panels and wavelength.
+
+    ``model`` is the ExperimentModel experiment_model_from_dxtbx built from ``experiment`` (its
+    panels in the detector's order). As hopper's save_to_pandas, the crystal takes the model's
+    orientation and cell (Crystal.set_A: the crystal's type, space group and any mosaicity it
+    was given are kept, the refined mosaicity is not written) and the detector and beam stay
+    as they were. ``detector`` writes each panel's refined frame (flat detectors only) and
+    ``wavelength`` the refined wavelength, both of which hopper leaves in its pandas table.
+    Ncells, eta and the scales have no place in an Experiment; read them off the model.
+    """
+    geometry = model.geometry()
+    _check_exportable(model, experiment, geometry)
+    new = copy.copy(experiment)
+    new.crystal = copy.deepcopy(experiment.crystal)
+    real_space = np.stack([geometry.real_space_a, geometry.real_space_b, geometry.real_space_c])
+    new.crystal.set_A(tuple(np.linalg.inv(real_space).ravel()))  # columns a*, b*, c*
+    if detector:
+        new.detector = copy.deepcopy(experiment.detector)
+        for panel, frame in zip(new.detector, geometry.panels):
+            if not np.allclose(panel.get_local_origin(), panel.get_origin(), rtol=0, atol=1e-12):
+                raise ValueError("the detector is hierarchical: a panel's frame is relative to its group's; "
+                                 "export a flat detector, or leave detector=False")
+            panel.set_frame(tuple(frame.fast_axis), tuple(frame.slow_axis), tuple(frame.origin_mm))
+    if wavelength:
+        new.beam = copy.deepcopy(experiment.beam)
+        new.beam.set_wavelength(geometry.wavelength_A)
+    return new
+
+
+def reflections_from_model(model, reflections, experiment, *, rows=None, filter_unpredicted: bool = True):
+    """A reflection table with the model's spot centroids as xyzcal, as hopper writes after refinement.
+
+    ROI i of ``model`` is row ``rows[i]`` of ``reflections`` (hopper's refls_idx; by default
+    ROI i is row i), on the same panel. As hopper's get_new_xycalcs: existing xyzcal.px,
+    xyzcal.mm and xyzobs.mm.value are kept as dials.*; xyzcal.px is the Bragg-only model
+    centroid over the ROI's box and xyzcal.mm its position on the panels of ``experiment``
+    (pass experiment_from_model's); xyzobs.mm.value is recomputed on those panels. A row gets
+    no centroid (NaN) if it has no ROI, or the model has no signal in its box or at its
+    observed centroid (see ExperimentModel.roi_centroids). The model's pixel mask applies, so
+    a masked observed pixel loses a centroid hopper, which reads the unmasked model, keeps.
+    ``filter_unpredicted`` drops the rows without one, hopper's default.
+    """
+    background = model.background_params
+    rows = np.arange(len(background.rois)) if rows is None else np.asarray(rows, dtype=np.int64)
+    if rows.shape != (len(background.rois),) or (len(rows) and not 0 <= rows.min() <= rows.max() < len(reflections)):
+        raise ValueError(f"rows must give a row of the {len(reflections)}-row table for each of the model's "
+                         f"{len(background.rois)} ROIs")
+    if "panel" in list(reflections.keys()):
+        panels = np.asarray(list(reflections["panel"]), dtype=np.int64)[rows]
+        if not np.array_equal(panels, np.asarray(background.roi_panels)):
+            raise ValueError("an ROI's panel differs from its reflection's")
+    observed = np.asarray(list(reflections["xyzobs.px.value"]), dtype=np.float64).reshape(-1, 3)[rows, :2]
+    centroids = model.roi_centroids(observed=observed)
+
+    from dials.array_family import flex
+
+    new = reflections.copy()
+    for key in ("xyzcal.px", "xyzcal.mm", "xyzobs.mm.value"):
+        if key in list(new.keys()):
+            new[f"dials.{key}"] = new[key].deep_copy()
+    nan3 = (np.nan, np.nan, np.nan)
+    cal_px, cal_mm, obs_mm = ([nan3] * len(new) for _ in range(3))
+    for row, (x, y), panel_id in zip(rows, centroids, background.roi_panels):
+        if np.isnan(x):
+            continue
+        panel = experiment.detector[int(panel_id)]
+        xobs, yobs = (float(v) for v in new["xyzobs.px.value"][int(row)][:2])
+        cal_px[row] = (float(x), float(y), 0.0)
+        cal_mm[row] = (*panel.pixel_to_millimeter((float(x), float(y))), 0.0)
+        obs_mm[row] = (*panel.pixel_to_millimeter((xobs, yobs)), 0.0)
+    new["xyzcal.px"] = flex.vec3_double(cal_px)
+    new["xyzcal.mm"] = flex.vec3_double(cal_mm)
+    new["xyzobs.mm.value"] = flex.vec3_double(obs_mm)
+    if filter_unpredicted:
+        new = new.select(flex.bool([not np.isnan(x) for x, _, _ in cal_px]))
+    return new
 
 
 def to_raw_pixels(image: torch.Tensor):
