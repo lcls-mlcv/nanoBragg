@@ -43,9 +43,10 @@ def _grads(model):
 def test_default_is_trainable_and_reproduces_the_config_image():
     model = ExperimentModel(*_configs(), dtype=DTYPE)
     # eta has nothing to refine without mosaic spread, detz_shift is for origin-defined
-    # (dxtbx) detectors; every other parameter trains
+    # (dxtbx) detectors, Ndef needs the hkl metric; every other parameter trains
     assert set(model.unrefinable) == {"crystal_params.delta_log_eta", "detector_params.delta_detz_shift_mm",
-                                       "fhkl_params.delta_log_F", "beam_params.delta_log_source_weights"}
+                                       "fhkl_params.delta_log_F", "beam_params.delta_log_source_weights",
+                                       "crystal_params.delta_N_cells_def"}
     assert all(p.requires_grad for n, p in model.named_parameters() if n not in model.unrefinable)
     torch.testing.assert_close(model(), _config_image(), rtol=1e-12, atol=0.0)
     assert all(g is not None for n, g in _grads(model).items() if n not in model.unrefinable)
@@ -145,5 +146,6 @@ def test_ncells_frozen_and_unrefinable_under_square():
     assert not ncells.requires_grad
     assert set(model.unrefinable) == {"crystal_params.delta_log_N_cells", "crystal_params.delta_log_eta",
                                       "detector_params.delta_detz_shift_mm",
-                                       "fhkl_params.delta_log_F", "beam_params.delta_log_source_weights"}
+                                       "fhkl_params.delta_log_F", "beam_params.delta_log_source_weights",
+                                       "crystal_params.delta_N_cells_def"}
     assert len(model.trainable_parameters()) == len(list(model.parameters())) - len(model.unrefinable)

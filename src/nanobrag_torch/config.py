@@ -168,6 +168,10 @@ class CrystalConfig:
 
     # Crystal size (number of unit cells in each direction)
     N_cells: Tuple[int, int, int] = (1, 1, 1)  # Matches C default
+    # diffBragg's off-diagonal Ncells (Nd, Ne, Nf): NABC = [[Na, Nd, Nf], [Nd, Nb, Ne], [Nf, Ne, Nc]]
+    # for the GAUSS/TOPHAT lattice factor with spot_metric=HKL. Not a nanoBragg.c input; zeros
+    # leave C's lattice factor untouched.
+    N_cells_def: Tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     # Structure factor parameters
     default_F: float = 0.0  # Default structure factor magnitude (matches C default)

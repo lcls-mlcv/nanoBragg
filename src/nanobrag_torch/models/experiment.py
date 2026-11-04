@@ -16,7 +16,7 @@ import torch
 from torch import nn
 
 from ..config import (
-    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
+    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot, SpotMetric,
 )
 from ..models.crystal import Crystal
 from ..models.detector import Detector
@@ -177,6 +177,15 @@ class CrystalStageAParams(nn.Module):
         self.delta_log_N_cells = param_cls(
             torch.zeros((3,), device=self.device, dtype=self.dtype)
         )
+        # diffBragg's off-diagonal Ncells (Nd, Ne, Nf), additive about the config's values
+        self.register_buffer(
+            "base_N_cells_def",
+            torch.as_tensor([float(n) for n in getattr(base_config, "N_cells_def", (0.0, 0.0, 0.0))],
+                            device=self.device, dtype=self.dtype),
+        )
+        self.delta_N_cells_def = param_cls(
+            torch.zeros((3,), device=self.device, dtype=self.dtype)
+        )
         # Parameters that must not move, with the reason; refine() refuses them.
         self.unrefinable = {}
 
@@ -199,6 +208,15 @@ class CrystalStageAParams(nn.Module):
                 "Ncells is not refinable with shape=TOPHAT: the spot's edge is a hard cutoff that "
                 "moves with N, which a gradient cannot see, so it follows the N^6 inside the spot "
                 "and misses the spot shrinking. Use CrystalShape.GAUSS (as diffBragg does) or ROUND."
+            )
+
+        if base_config.shape != CrystalShape.GAUSS or base_config.spot_metric is not SpotMetric.HKL:
+            if any(float(v) != 0.0 for v in getattr(base_config, "N_cells_def", (0.0, 0.0, 0.0))):
+                raise ValueError("N_cells_def (diffBragg's off-diagonal Ncells) needs shape=CrystalShape.GAUSS "
+                                 "and spot_metric=SpotMetric.HKL; this crystal would ignore or refuse it")
+            self.unrefinable["delta_N_cells_def"] = (
+                "Ndef (diffBragg's off-diagonal Ncells) is refinable only with shape=CrystalShape.GAUSS "
+                "and spot_metric=SpotMetric.HKL, the lattice factor diffBragg defines it for"
             )
 
         self.crystal_system = normalize_crystal_system(crystal_system)
@@ -314,7 +332,17 @@ class CrystalStageAParams(nn.Module):
             cfg.mosflm_a_star, cfg.mosflm_b_star, cfg.mosflm_c_star = A[:, 0], A[:, 1], A[:, 2]
         n_cells = self.base_N_cells * torch.exp(self.delta_log_N_cells)
         cfg.N_cells = (n_cells[0], n_cells[1], n_cells[2])
+        if "delta_N_cells_def" in self.unrefinable:
+            # Plain numbers: no gradient can reach a lattice factor that has no off-diagonals
+            cfg.N_cells_def = tuple(float(v) for v in self.base_N_cells_def)
+        else:
+            n_def = self.N_cells_def()
+            cfg.N_cells_def = (n_def[0], n_def[1], n_def[2])
         return cfg
+
+    def N_cells_def(self) -> torch.Tensor:
+        """(Nd, Ne, Nf), diffBragg's off-diagonal Ncells."""
+        return self.base_N_cells_def + self.delta_N_cells_def
 
 
 class DetectorStageAParams(nn.Module):
@@ -817,6 +845,7 @@ class ExperimentModel(nn.Module):
         "fluence": ("beam_params.delta_log_fluence",),
         "scale": ("beam_params.delta_log_spot_scale",),
         "Ncells": ("crystal_params.delta_log_N_cells",),
+        "Ndef": ("crystal_params.delta_N_cells_def",),
         "eta": ("crystal_params.delta_log_eta",),
         "Fhkl": ("fhkl_params.delta_log_F",),
         "background": ("background_params.delta_tilt_abc",),
@@ -1079,6 +1108,7 @@ class ExperimentModel(nn.Module):
         )
         # Simulator's auto-oversample choice reads the config copy.
         crystal.config.N_cells = crystal_cfg.N_cells
+        crystal.config.N_cells_def = crystal_cfg.N_cells_def
         self._apply_mosaicity(crystal)
         # A fixed grid in another dtype or device is a copy, so it is made again from the caller's
         # tensor at each forward; in the model's own dtype and device .to() returns the tensor itself

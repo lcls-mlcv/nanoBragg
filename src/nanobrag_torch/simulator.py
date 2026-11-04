@@ -47,6 +47,7 @@ def compute_physics_for_position(
     N_cells_a: int = 0,
     N_cells_b: int = 0,
     N_cells_c: int = 0,
+    N_cells_def: Optional[torch.Tensor] = None,
     crystal_shape: CrystalShape = CrystalShape.SQUARE,
     crystal_fudge: float = 1.0,
     spot_metric: SpotMetric = SpotMetric.RECIPROCAL,
@@ -347,7 +348,18 @@ def compute_physics_for_position(
         h_frac = h - h0
         k_frac = k - k0
         l_frac = l - l0
-        if spot_metric is SpotMetric.HKL:
+        n_scale = Na * Nb * Nc
+        if spot_metric is SpotMetric.HKL and N_cells_def is not None and shape == CrystalShape.GAUSS:
+            # diffBragg (diffBragg_cpu_kernel.cpp:521-536): V = NABC (h - h0) with the symmetric
+            # NABC = [[Na, Nd, Nf], [Nd, Nb, Ne], [Nf, Ne, Nc]], scale det(NABC). The determinant is
+            # written so that at Nd = Ne = Nf = 0 it is Na*Nb*Nc to the bit.
+            Nd, Ne, Nf = N_cells_def[0], N_cells_def[1], N_cells_def[2]
+            v1 = Na * h_frac + Nd * k_frac + Nf * l_frac
+            v2 = Nd * h_frac + Nb * k_frac + Ne * l_frac
+            v3 = Nf * h_frac + Ne * k_frac + Nc * l_frac
+            rad_sqr = v1 * v1 + v2 * v2 + v3 * v3
+            n_scale = n_scale - Na * Ne * Ne - Nb * Nf * Nf - Nc * Nd * Nd + 2 * Nd * Ne * Nf
+        elif spot_metric is SpotMetric.HKL:
             # cctbx nanoBragg.cpp / diffBragg: radius measured in hkl space, as ROUND does
             rad_sqr = (h_frac * h_frac * Na * Na +
                        k_frac * k_frac * Nb * Nb +
@@ -362,12 +374,12 @@ def compute_physics_for_position(
             rad_sqr = rad_sqr * Na * Na * Nb * Nb * Nc * Nc
 
         if shape == CrystalShape.GAUSS:
-            F_latt = Na * Nb * Nc * torch.exp(-(rad_sqr / 0.63) * fudge)
+            F_latt = n_scale * torch.exp(-(rad_sqr / 0.63) * fudge)
         else:
             inside_cutoff = (rad_sqr * fudge) < 0.3969
             # N may be a tensor with a graph, in ExperimentModel, which full_like will not take
             F_latt = torch.where(inside_cutoff,
-                                Na * Nb * Nc * torch.ones_like(rad_sqr),
+                                n_scale * torch.ones_like(rad_sqr),
                                 torch.zeros_like(rad_sqr))
     else:
         raise ValueError(f"Unsupported crystal shape: {shape}")
@@ -958,6 +970,28 @@ class Simulator:
         weights = self._source_weights
         return len(weights) * weights / weights.sum()
 
+    def _n_cells_def(self) -> Optional[torch.Tensor]:
+        """diffBragg's (Nd, Ne, Nf) in the run's dtype, or None when they are zero numbers.
+
+        None keeps the diagonal lattice factor's arithmetic, so nanoBragg.c's images are unchanged.
+        A tensor always takes the matrix path (testing its value would cost a device sync each run);
+        at zeros that path agrees with the diagonal one to the last bit or so (1e-14 in float64,
+        1e-5 in float32 tails), so a model's image can differ by that between grad and no_grad.
+        diffBragg defines the off-diagonals for its Gaussian lattice factor in hkl only: any other
+        shape or the reciprocal-space metric (nanoBragg.c's) refuses them. Nothing bounds them:
+        like diffBragg, det(NABC) can reach 0 (no image; diffBragg's derivatives are NaN there).
+        """
+        values = getattr(self.crystal.config, "N_cells_def", None)
+        if values is None:
+            return None
+        if not any(isinstance(v, torch.Tensor) or float(v) != 0.0 for v in values):
+            return None
+        cfg = self.crystal.config
+        if cfg.shape != CrystalShape.GAUSS or getattr(cfg, "spot_metric", SpotMetric.RECIPROCAL) is not SpotMetric.HKL:
+            raise ValueError("N_cells_def (diffBragg's off-diagonal Ncells) needs shape=CrystalShape.GAUSS and "
+                             "spot_metric=SpotMetric.HKL, the lattice factor diffBragg defines it for")
+        return torch.stack([torch.as_tensor(v, device=self.device, dtype=self.dtype) for v in values])
+
     def _compute_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star, incident_beam_direction=None, wavelength=None, source_weights=None, oversample_polar=False):
         """Compatibility shim - calls the pure function compute_physics_for_position.
 
@@ -1009,6 +1043,7 @@ class Simulator:
             N_cells_a=self.crystal.N_cells_a,
             N_cells_b=self.crystal.N_cells_b,
             N_cells_c=self.crystal.N_cells_c,
+            N_cells_def=self._n_cells_def(),
             crystal_shape=self.crystal.config.shape,
             crystal_fudge=self.crystal.config.fudge,
             spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
@@ -2331,6 +2366,7 @@ class Simulator:
                                 N_cells_a=self.crystal.N_cells_a,
                                 N_cells_b=self.crystal.N_cells_b,
                                 N_cells_c=self.crystal.N_cells_c,
+                                N_cells_def=self._n_cells_def(),
                                 crystal_shape=self.crystal.config.shape,
                                 crystal_fudge=self.crystal.config.fudge,
                                 spot_metric=getattr(self.crystal.config, "spot_metric", SpotMetric.RECIPROCAL),
