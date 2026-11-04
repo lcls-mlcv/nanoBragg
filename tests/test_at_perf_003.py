@@ -126,7 +126,9 @@ class TestATPERF003MemoryBandwidth:
         memory_32, time_32, _ = self.measure_memory_and_time(torch.float32)
 
         time_ratio = time_64 / time_32
-        memory_ratio = memory_64 / memory_32
+        # RSS growth of the second run can be 0 MB when the allocator reuses what the first
+        # freed; the ratio is reported, not asserted
+        memory_ratio = memory_64 / memory_32 if memory_32 > 0 else float("nan")
 
         print(f"\nPerformance comparison (2048×2048):")
         print(f"  Float64: {time_64:.3f}s, {memory_64:.1f} MB")
