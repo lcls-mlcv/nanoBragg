@@ -16,19 +16,24 @@ so values carry over from a hopper run:
     ucell_alpha/beta/gamma
                  cell angles: centers in degrees, betas and values in radians, as hopper
                  converts them. Only the crystal system's free variables are restrained.
-    RotXYZ       the misset offsets from the start (radians), restrained to 0: hopper takes
-                 betas.RotXYZ and no center. Here they are offsets of the misset angles, which
-                 equal hopper's rotations to first order.
+    RotXYZ       the misset (radians), restrained to 0; hopper ignores centers.RotXYZ and so
+                 does this. hopper rotates about the lab axes on top of the orientation; the
+                 misset equals that to first order only from a zero base misset (a crystal
+                 given by its orientation matrix, as from dxtbx), so anything else is refused.
     detz_shift   the origin shift along z (metres)
     spec         (lambda_offset in Angstrom, lambda_scale)
     Nvol         det NABC: ½ (c - det)²/b, without the log term, and whether or not Ncells
                  refines, as hopper does
 
-A SerialExperiment restrains each shot, and a parameter its shots share once. hopper's Fhkl,
-B-factor and diffuse restraints are not here.
+A SerialExperiment restrains each shot, and a parameter its shots share once.
+
+Differences from hopper: calling this is hopper's use_restraints=True (hopper ignores centers
+and betas without it). hopper's has_isotropic_ncells restrains Na only; Ncells here are always
+three. Not here, and refused by name: Fhkl, Finit, Friedel, B, diffuse_gamma, diffuse_sigma,
+the deprecated betas.ucell, and hopper's per-ROI scale restraint (center 1, beta 1e12).
 """
 import math
-from typing import Callable, Dict, List, Sequence, Tuple, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 
@@ -37,50 +42,53 @@ from .unit_cell import FREE_VARIABLES
 Number = Union[float, Sequence[float]]
 
 _ANGLES = ("alpha", "beta", "gamma")
-
-
-def _terms(shot) -> Dict[str, List[Tuple[torch.Tensor, Callable[[], torch.Tensor]]]]:
-    """name -> [(parameter, value in hopper's units)] for one ExperimentModel."""
-    crystal, beam, detector = shot.crystal_params, shot.beam_params, shot.detector_params
-
-    def cell(var):
-        def value():
-            v = getattr(crystal.build_config(), f"cell_{var}")
-            v = torch.as_tensor(v, dtype=crystal.dtype, device=crystal.device).reshape(1)
-            return torch.deg2rad(v) if var in _ANGLES else v
-        return value
-
-    def detz():
-        base = detector._base_config.origin_shift_z_mm
-        return ((0.0 if base is None else base) + detector.delta_detz_shift_mm).reshape(1) * 1e-3
-
-    terms = {
-        "G": [(beam.delta_log_spot_scale, lambda: (beam.base_spot_scale * torch.exp(beam.delta_log_spot_scale)).reshape(1))],
-        "Nabc": [(crystal.delta_log_N_cells, lambda: crystal.base_N_cells * torch.exp(crystal.delta_log_N_cells))],
-        "Ndef": [(crystal.delta_N_cells_def, crystal.N_cells_def)],
-        "eta_abc": [(crystal.delta_log_eta, crystal.eta)],
-        "RotXYZ": [(crystal.delta_misset_raw,
-                    lambda: torch.deg2rad(crystal.max_misset_delta_deg * torch.tanh(crystal.delta_misset_raw)))],
-        "detz_shift": [(detector.delta_detz_shift_mm, detz)],
-        "spec": [(beam.lambda_offset, lambda: beam.lambda_offset.reshape(1)),
-                 (beam.delta_log_lambda_scale, lambda: torch.exp(beam.delta_log_lambda_scale).reshape(1))],
-    }
-    free = FREE_VARIABLES[crystal.crystal_system]
-    for var, pname in crystal._CELL_PARAMS.items():
-        terms[f"ucell_{var}"] = [(getattr(crystal, pname), cell(var))] if var in free else []
-    return terms
-
-
 _NAMES = ("G", "Nabc", "Ndef", "eta_abc", "RotXYZ", "detz_shift", "spec", "Nvol") + tuple(
     f"ucell_{v}" for v in ("a", "b", "c") + _ANGLES)
+_DEGREE_CENTERS = tuple(f"ucell_{a}" for a in _ANGLES)
 
 
-def _nvol(shot) -> torch.Tensor:
-    crystal = shot.crystal_params
-    n = crystal.base_N_cells * torch.exp(crystal.delta_log_N_cells)
-    # the off-diagonals the lattice factor uses: none where Ndef is unrefinable (CrystalStageAParams)
-    d = crystal.base_N_cells_def if "delta_N_cells_def" in crystal.unrefinable else crystal.N_cells_def()
-    return n[0] * n[1] * n[2] - n[0] * d[1] ** 2 - n[1] * d[2] ** 2 - n[2] * d[0] ** 2 + 2 * d[0] * d[1] * d[2]
+def _vector(values, like: torch.Tensor) -> torch.Tensor:
+    return torch.stack([torch.as_tensor(v, dtype=like.dtype, device=like.device).reshape(()) for v in values])
+
+
+def _values(shot, names) -> Dict[str, List[Tuple[Optional[torch.Tensor], torch.Tensor]]]:
+    """name -> [(parameter, its value in hopper's units)] for one ExperimentModel.
+
+    Values come from the blocks' build_config, the configs the simulation runs on. Nvol has
+    no parameter of its own.
+    """
+    crystal, beam, detector = shot.crystal_params, shot.beam_params, shot.detector_params
+    c, b = crystal.build_config(), beam.build_config()
+    like = crystal.delta_log_N_cells
+    n, nd = _vector(c.N_cells, like), _vector(c.N_cells_def, like)
+    values = {
+        "G": [(beam.delta_log_spot_scale, _vector([b.spot_scale], like))],
+        "Nabc": [(crystal.delta_log_N_cells, n)],
+        "Ndef": [(crystal.delta_N_cells_def, nd)],
+        "eta_abc": [(crystal.delta_log_eta, crystal.eta())],
+        "spec": [(beam.lambda_offset, beam.lambda_offset.reshape(1)),
+                 (beam.delta_log_lambda_scale, torch.exp(beam.delta_log_lambda_scale).reshape(1))],
+        "Nvol": [(None, torch.linalg.det(torch.stack([torch.stack([n[0], nd[0], nd[2]]),
+                                                      torch.stack([nd[0], n[1], nd[1]]),
+                                                      torch.stack([nd[2], nd[1], n[2]])])).reshape(1))],
+    }
+    if "RotXYZ" in names and crystal.delta_misset_raw.requires_grad:
+        base = _vector([crystal.base_misset_x, crystal.base_misset_y, crystal.base_misset_z], like)
+        if bool((base != 0).any()):
+            raise ValueError(
+                "RotXYZ restrains rotations about the lab axes on top of the orientation, as hopper's are; "
+                "the misset equals those only from a zero base misset (a crystal given by its orientation "
+                "matrix, as from dxtbx). Leave betas.RotXYZ out for this crystal.")
+        values["RotXYZ"] = [(crystal.delta_misset_raw, torch.deg2rad(_vector(c.misset_deg, like)))]
+    if "detz_shift" in names and detector.origin_defined:
+        shift = detector.build_config().origin_shift_z_mm
+        values["detz_shift"] = [(detector.delta_detz_shift_mm, _vector([shift], like) * 1e-3)]
+    free = FREE_VARIABLES[crystal.crystal_system]
+    for var, pname in crystal._CELL_PARAMS.items():
+        if var in free:
+            value = _vector([getattr(c, f"cell_{var}")], like)
+            values[f"ucell_{var}"] = [(getattr(crystal, pname), torch.deg2rad(value) if var in _ANGLES else value)]
+    return values
 
 
 def _entries(x: Number, count: int, what: str) -> torch.Tensor:
@@ -93,7 +101,12 @@ def _entries(x: Number, count: int, what: str) -> torch.Tensor:
 
 
 def hopper_restraints(model, centers: Dict[str, Number], betas: Dict[str, Number]) -> torch.Tensor:
-    """Sum of hopper's restraint terms on ``model`` (ExperimentModel or SerialExperiment).
+    """Sum of hopper's restraint terms on ``model``, in the model's dtype.
+
+    Args:
+        model: ExperimentModel or SerialExperiment.
+        centers: Restraint targets by hopper's ``centers`` names (module docstring).
+        betas: Restraint variances by hopper's ``betas`` names; RotXYZ needs no center.
 
     Add it to the likelihood inside the objective:
 
@@ -104,8 +117,7 @@ def hopper_restraints(model, centers: Dict[str, Number], betas: Dict[str, Number
     unknown = sorted((set(centers) | set(betas)) - set(_NAMES))
     if unknown:
         raise ValueError(f"no hopper restraint named {', '.join(unknown)}; known: {', '.join(_NAMES)}")
-    if "RotXYZ" in centers:
-        raise ValueError("RotXYZ is restrained to 0, as in hopper: give betas.RotXYZ and no center")
+    centers.pop("RotXYZ", None)  # hopper restrains RotXYZ to 0 and ignores its center
     unpaired = sorted(set(centers) ^ (set(betas) - {"RotXYZ"}))
     if unpaired:
         raise ValueError(f"restraining {', '.join(unpaired)} needs both a center and a beta, as hopper requires")
@@ -115,30 +127,30 @@ def hopper_restraints(model, centers: Dict[str, Number], betas: Dict[str, Number
     total = torch.zeros((), dtype=first.dtype, device=first.device)
     seen = set()
     for shot in shots:
-        terms = _terms(shot)
+        if not betas:
+            break
+        values = _values(shot, betas)
         for name in betas:
-            if name == "Nvol":
+            if name == "Nvol":  # hopper: whether or not Ncells refines, and no log term
                 key = (name, id(shot.crystal_params))
                 if key not in seen:
                     seen.add(key)
-                    total = total + 0.5 * (float(centers[name]) - _nvol(shot)) ** 2 / float(betas[name])
+                    total = total + 0.5 * (float(centers[name]) - values[name][0][1][0]) ** 2 / float(betas[name])
                 continue
             # spec's two entries are two parameters; every other name is one parameter
-            at = 0
-            for parameter, value in terms[name]:
-                v = value()
-                count = v.numel()
-                start, at = at, at + count
+            end = 0
+            for parameter, value in values.get(name, []):
+                start, end = end, end + value.numel()
                 key = (name, id(parameter))
                 if not parameter.requires_grad or key in seen:
                     continue
                 seen.add(key)
-                beta = _entries(betas[name], at, f"betas.{name}")[start:].to(v)
+                beta = _entries(betas[name], end, f"betas.{name}")[start:].to(value)
                 if name == "RotXYZ":
-                    center = torch.zeros_like(v)
+                    center = torch.zeros_like(value)
                 else:
-                    center = _entries(centers[name], at, f"centers.{name}")[start:].to(v)
-                    if name in tuple(f"ucell_{a}" for a in _ANGLES):
+                    center = _entries(centers[name], end, f"centers.{name}")[start:].to(value)
+                    if name in _DEGREE_CENTERS:
                         center = torch.deg2rad(center)
-                total = total + (0.5 * (torch.log(2 * math.pi * beta) + (center - v) ** 2 / beta)).sum()
+                total = total + (0.5 * (torch.log(2 * math.pi * beta) + (center - value) ** 2 / beta)).sum()
     return total

@@ -39,8 +39,9 @@ def configs(**crystal):
     return crystal, detector, BeamConfig(wavelength_A=1.2, fluence=1e24, spot_scale=3.0)
 
 
-def model(**kwargs):
-    m = ExperimentModel(*configs(), dtype=DT, **kwargs)
+def model(misset_deg=(0.0, 0.0, 0.0), **kwargs):
+    """A zero base misset, as for a crystal given by its orientation matrix: RotXYZ needs one."""
+    m = ExperimentModel(*configs(misset_deg=misset_deg), dtype=DT, **kwargs)
     with torch.no_grad():  # away from the configs, so values and centers differ
         for p in m.parameters():
             p.add_(0.01 * torch.arange(1, p.numel() + 1, dtype=DT).reshape(p.shape))
@@ -98,6 +99,17 @@ def test_each_restraint_is_hoppers_term_at_the_models_value(name):
     centers = {name: CENTERS[name]} if name in CENTERS else {}
     got = hopper_restraints(m, centers, {name: BETAS[name]})
     assert float(got) == pytest.approx(expected(m, [name]), rel=1e-12)
+
+
+def test_rotxyz_from_a_nonzero_base_misset_is_refused():
+    with pytest.raises(ValueError, match="RotXYZ"):
+        hopper_restraints(model(misset_deg=(5.0, -3.0, 2.0)), {}, {"RotXYZ": 1e-5})
+
+
+def test_rotxyz_ignores_a_center_as_hopper_does():
+    m = model()
+    torch.testing.assert_close(hopper_restraints(m, {"RotXYZ": 0.3}, {"RotXYZ": 1e-5}),
+                               hopper_restraints(m, {}, {"RotXYZ": 1e-5}), rtol=0, atol=0)
 
 
 def test_anisotropic_eta_restrains_each_axis():
