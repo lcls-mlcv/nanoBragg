@@ -41,20 +41,26 @@ class PanelFrame:
 
 
 @dataclass(frozen=True)
-class Geometry:
-    """The crystal, panels and wavelength a model simulates, in the lab frame of its configs.
+class SimulatedGeometry:
+    """The crystal, panels, beam and wavelength a model simulates, in the lab frame of its configs.
 
-    The real-space vectors are in Angstrom, at phi = 0 and without the mosaic domains. For a
-    model from experiment_model_from_dxtbx the frame is dxtbx's, so these are what a dxtbx
-    Crystal(real_space_a, real_space_b, real_space_c), Panel.set_frame and Beam.set_wavelength
-    take.
+    The real-space vectors are in Angstrom, at phi = 0 and without the mosaic domains;
+    beam_direction is the unit vector the beam travels along. For a model from
+    experiment_model_from_dxtbx the frame is dxtbx's (beam_direction is the unit s0), so these
+    are what a dxtbx Crystal(real_space_a, real_space_b, real_space_c), Panel.set_frame and
+    Beam.set_wavelength take. Other detector conventions have frames of their own.
     """
 
     real_space_a: np.ndarray
     real_space_b: np.ndarray
     real_space_c: np.ndarray
     panels: Tuple[PanelFrame, ...]
+    beam_direction: np.ndarray
     wavelength_A: float
+
+
+def _numpy(tensor: torch.Tensor) -> np.ndarray:
+    return tensor.detach().cpu().double().numpy().copy()
 
 
 def _param_factory(param_init: str):
@@ -1469,18 +1475,18 @@ class ExperimentModel(nn.Module):
         return images if bragg_only else images + background.image() * masks
 
     @torch.no_grad()
-    def geometry(self) -> Geometry:
-        """The crystal, panels and wavelength this model simulates with its current parameters."""
+    def geometry(self) -> SimulatedGeometry:
+        """The crystal, panels, beam and wavelength this model simulates with its current parameters."""
         self._sync()
         cell = self._crystal.compute_cell_tensors()
         panels = []
         for detector in self._detectors:
             detector._ensure_geometry_current()
-            panels.append(PanelFrame(*(v.detach().cpu().double().numpy().copy() for v in (
-                detector.pix0_vector * 1000.0, detector.fdet_vec, detector.sdet_vec))))
-        a, b, c = (cell[x].detach().cpu().double().numpy().copy() for x in "abc")
+            pix0_mm = detector.pix0_vector * 1000.0  # metres
+            panels.append(PanelFrame(_numpy(pix0_mm), _numpy(detector.fdet_vec), _numpy(detector.sdet_vec)))
         wavelength = float(self.beam_params.build_config().wavelength_A)
-        return Geometry(a, b, c, tuple(panels), wavelength)
+        return SimulatedGeometry(*(_numpy(cell[x]) for x in "abc"), tuple(panels),
+                                 _numpy(self._detectors[0].beam_vector), wavelength)
 
     @torch.no_grad()
     def roi_centroids(self, observed=None) -> np.ndarray:

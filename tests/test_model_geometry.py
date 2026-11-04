@@ -1,4 +1,5 @@
-"""What an ExperimentModel simulates, read back out for export: geometry(), bragg_only, roi_centroids()."""
+"""What an ExperimentModel simulates, read back out for export: geometry(), bragg_only, roi_centroids(), and
+the checks of experiment_from_model / reflections_from_model that need no cctbx."""
 from types import SimpleNamespace
 
 import numpy as np
@@ -68,6 +69,7 @@ def test_geometry_gives_back_what_was_imported():
     np.testing.assert_allclose(panel.fast_axis, (1.0, 0.0, 0.0), rtol=0, atol=1e-15)
     np.testing.assert_allclose(panel.slow_axis, (0.0, -1.0, 0.0), rtol=0, atol=1e-15)
     assert g.wavelength_A == pytest.approx(1.2, rel=1e-15)
+    np.testing.assert_allclose(g.beam_direction, (0.0, 0.0, -1.0), rtol=0, atol=1e-15)
 
 
 def test_geometry_follows_refined_parameters():
@@ -137,3 +139,116 @@ def test_an_observed_centroid_without_model_signal_gets_no_centroid():
     np.testing.assert_array_equal(on, free)
     assert np.isnan(m.roi_centroids(observed=[(empty_x + 0.5, empty_y + 0.5)])[0]).all()
     assert np.isnan(m.roi_centroids(observed=[(20.0, 3.0)])[0]).all()  # outside its box
+
+
+def _tophat_edge():
+    """A tophat model over the whole image and a lit pixel whose left neighbour is dark."""
+    m = model_of(dxtbx_objects(), shape="tophat", rois=[(0, 16, 0, 16)])
+    m.freeze()
+    with torch.no_grad():
+        image = m(bragg_only=True).numpy()
+    lit = np.argwhere((image[:, 1:] > 0) & (image[:, :-1] == 0))
+    y, x = lit[0]
+    return m, int(y), int(x) + 1
+
+
+def test_the_observed_pixel_is_hoppers_int_of_x_minus_half():
+    m, y, x = _tophat_edge()
+    # hopper checks pixel int(x_obs - x1 - 0.5): a centroid at x + 0.9 checks pixel x, at x + 0.4 pixel x - 1
+    assert np.isfinite(m.roi_centroids(observed=[(x + 0.9, y + 0.5)])[0]).all()
+    assert np.isnan(m.roi_centroids(observed=[(x + 0.4, y + 0.5)])[0]).all()
+    # and int() truncates toward zero: just left of the box still checks its first column
+    np.testing.assert_array_equal(m.roi_centroids(observed=[(-0.3, y + 0.5)]),
+                                  m.roi_centroids(observed=[(0.5, y + 0.5)]))
+
+
+class _Panel:
+    def __init__(self, origin, local_origin=None):
+        self.origin, self.local_origin = tuple(origin), tuple(local_origin or origin)
+
+    def get_origin(self):
+        return self.origin
+
+    def get_local_origin(self):
+        return self.local_origin
+
+    def set_frame(self, fast, slow, origin):
+        self.fast, self.slow, self.origin = fast, slow, tuple(origin)
+
+
+class _Crystal:
+    def set_A(self, A):
+        self.A = np.asarray(A).reshape(3, 3)
+
+
+class _Beam:
+    def __init__(self, s0=(0.0, 0.0, -1 / 1.2)):
+        self.s0, self.wavelength = s0, 1.2
+
+    def get_s0(self):
+        return self.s0
+
+    def set_wavelength(self, wavelength):
+        self.wavelength = wavelength
+
+
+def _experiment(**kwargs):
+    from types import SimpleNamespace
+    fields = dict(crystal=_Crystal(), detector=[_Panel((-1.6, 1.9, -60.0))], beam=_Beam(), goniometer=None, scan=None)
+    fields.update(kwargs)
+    return SimpleNamespace(**fields)
+
+
+def test_experiment_from_model_writes_what_geometry_gives():
+    from nanobrag_torch import experiment_from_model
+
+    m = refined()
+    g = m.geometry()
+    experiment = _experiment()
+    crystal_only = experiment_from_model(m, experiment)
+    assert crystal_only.detector is experiment.detector and crystal_only.beam is experiment.beam
+    new = experiment_from_model(m, experiment, detector=True, wavelength=True)
+    np.testing.assert_allclose(np.linalg.inv(new.crystal.A), np.stack([g.real_space_a, g.real_space_b, g.real_space_c]),
+                               rtol=1e-12)
+    np.testing.assert_allclose(new.detector[0].origin, g.panels[0].origin_mm, rtol=0, atol=1e-12)
+    assert new.beam.wavelength == g.wavelength_A
+    assert experiment.detector[0].origin == (-1.6, 1.9, -60.0) and experiment.beam.wavelength == 1.2
+
+
+@pytest.mark.parametrize("change, message", [
+    (dict(detector=[_Panel((0, 0, -60.0)), _Panel((0, 0, -60.0))]), "panels"),
+    (dict(beam=_Beam((1 / 1.2, 0.0, 0.0))), "dxtbx's frame"),
+    (dict(goniometer=object()), "goniometer"),
+])
+def test_experiment_from_model_refuses_an_experiment_it_does_not_describe(change, message):
+    from nanobrag_torch import experiment_from_model
+
+    with pytest.raises(ValueError, match=message):
+        experiment_from_model(refined(), _experiment(**change))
+
+
+def test_experiment_from_model_refuses_a_hierarchical_detector_for_its_panels():
+    from nanobrag_torch import experiment_from_model
+
+    experiment = _experiment(detector=[_Panel((-1.6, 1.9, -60.0), local_origin=(0.0, 0.0, 0.0))])
+    experiment_from_model(refined(), experiment)  # the crystal alone is fine
+    with pytest.raises(ValueError, match="hierarchical"):
+        experiment_from_model(refined(), experiment, detector=True)
+
+
+class _Table(dict):
+    def __len__(self):
+        return len(self["xyzobs.px.value"])
+
+
+@pytest.mark.parametrize("rows, panels, message", [
+    (None, [0, 0], "rows must give"),
+    ([0, 1, 5], [0, 0, 0], "rows must give"),
+    ([0, 1, 2], [0, 0, 1], "panel differs"),
+])
+def test_reflections_from_model_refuses_rows_that_do_not_match(rows, panels, message):
+    from nanobrag_torch import reflections_from_model
+
+    table = _Table({"xyzobs.px.value": [(0.5, 0.5, 0.0)] * len(panels), "panel": panels})
+    with pytest.raises(ValueError, match=message):
+        reflections_from_model(refined(), table, _experiment(), rows=rows)
