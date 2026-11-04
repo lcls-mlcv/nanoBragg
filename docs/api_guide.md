@@ -34,7 +34,7 @@ Pass structure factors with `F=`:
 
 `ExperimentModel` is a `torch.nn.Module` whose parameters are the diffBragg refinables. All of them train by default; `freeze()` and `refine()` choose the subset. Refine in `torch.float64`; `refine_lbfgsb` warns on anything else.
 
-`gaussian_nll` is hopper's target and `poisson_nll` is the counting likelihood. `SerialExperiment` holds many shots that share structure factors. `scripts/refinement_demo.py` is a worked example on synthetic and real stills.
+`gaussian_nll` is hopper's target and `poisson_nll` is the counting likelihood. `hopper_restraints(model, centers, betas)` adds hopper's restraints, with hopper's `centers` and `betas` names and units; add it to the likelihood in the objective. `SerialExperiment` holds many shots that share structure factors. `scripts/refinement_demo.py` is a worked example on synthetic and real stills.
 
 ## Output
 
