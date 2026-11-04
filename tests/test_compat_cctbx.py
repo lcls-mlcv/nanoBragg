@@ -497,3 +497,99 @@ def test_panel_simulator_keeps_nanoBragg_layer_step():
 def test_model_rejects_a_single_sensor_layer():
     with pytest.raises(ValueError, match="at least 2"):
         _layered_model(steps=1)
+
+
+# --------------------------------------------------------------------------- #
+# export: refined model -> .expt / .refl
+# --------------------------------------------------------------------------- #
+EXPORT_ROIS = [(20, 40, 20, 40), (60, 80, 90, 110), (0, 6, 0, 6)]
+
+
+def _exported_setup():
+    """A real dxtbx experiment, its model refined a little, and a reflection per ROI."""
+    from dials.array_family import flex  # type: ignore
+    from dxtbx.model import BeamFactory, Crystal as DxtbxCrystal, DetectorFactory, Experiment  # type: ignore
+    from scitbx.matrix import col  # type: ignore
+
+    xtal = DxtbxCrystal((40, 0, 0), (0, 45, 0), (0, 0, 50), "P212121")
+    xtal.set_U(col((1, 2, 3)).normalize().axis_and_angle_as_r3_rotation_matrix(0.4))
+    detector = DetectorFactory.simple("PAD", 80.0, (6.3, 6.1), "+x", "-y", (0.1, 0.1), (128, 128))
+    experiment = Experiment(crystal=xtal, detector=detector, beam=BeamFactory.simple(1.1))
+    model = experiment_model_from_dxtbx(detector, experiment.beam, xtal, Ncells_abc=(8, 8, 8), default_F=100.0,
+                                        fluence=1e30, rois=EXPORT_ROIS, dtype=torch.float64)
+    with torch.no_grad():
+        model.crystal_params.delta_misset_raw.copy_(torch.tensor([0.01, -0.02, 0.015], dtype=torch.float64))
+        model.crystal_params.delta_log_a.fill_(0.01)
+        model.detector_params.delta_detz_shift_mm.fill_(0.4)
+        model.beam_params.lambda_offset.fill_(0.003)
+    centres = [((x1 + x2) / 2, (y1 + y2) / 2, 0.0) for x1, x2, y1, y2 in EXPORT_ROIS]
+    refls = flex.reflection_table()
+    refls["xyzobs.px.value"] = flex.vec3_double(centres)
+    refls["xyzcal.px"] = flex.vec3_double(centres)
+    refls["panel"] = flex.size_t([0] * len(centres))
+    return model, experiment, refls
+
+
+def test_exported_experiment_carries_the_refined_geometry(tmp_path):
+    pytest.importorskip("dxtbx", reason="cctbx/dxtbx not installed")
+    from dxtbx.model import ExperimentList  # type: ignore
+    from nanobrag_torch.compat.cctbx import experiment_from_model
+
+    model, experiment, _ = _exported_setup()
+    before = experiment.crystal.get_A()
+    new = experiment_from_model(model, experiment)
+    assert experiment.crystal.get_A() == before  # the original is untouched
+    path = tmp_path / "refined.expt"
+    ExperimentList([new]).as_file(str(path))
+    (back,) = ExperimentList.from_file(str(path), check_format=False)
+    g = model.geometry()
+    np.testing.assert_allclose(np.array(back.crystal.get_real_space_vectors()),
+                               np.stack([g.real_space_a, g.real_space_b, g.real_space_c]), rtol=0, atol=1e-9)
+    assert back.crystal.get_space_group().info().type().lookup_symbol() == "P 21 21 21"
+    np.testing.assert_allclose(back.detector[0].get_origin(), g.panels[0].origin_mm, rtol=0, atol=1e-9)
+    assert back.beam.get_wavelength() == pytest.approx(g.wavelength_A, rel=1e-12)
+
+    # read back in, the exported experiment simulates what the refined model does
+    again = experiment_model_from_dxtbx(back.detector, back.beam, back.crystal, Ncells_abc=(8, 8, 8),
+                                        default_F=100.0, fluence=1e30, rois=EXPORT_ROIS, dtype=torch.float64)
+    with torch.no_grad():
+        image, image_again = model(), again()
+    torch.testing.assert_close(image_again, image, rtol=1e-8, atol=1e-8 * float(image.max()))
+
+
+def test_exported_reflections_carry_the_model_centroids(tmp_path):
+    pytest.importorskip("dials.array_family", reason="dials not installed")
+    from dials.array_family import flex  # type: ignore
+    from nanobrag_torch.compat.cctbx import experiment_from_model, reflections_from_model
+
+    model, experiment, refls = _exported_setup()
+    new_experiment = experiment_from_model(model, experiment)
+    expected = model.roi_centroids(observed=np.array(list(refls["xyzobs.px.value"]))[:, :2])
+    predicted = np.isfinite(expected).all(axis=1)
+    assert predicted.any() and not predicted.all()
+
+    kept = reflections_from_model(model, refls, new_experiment, filter_unpredicted=False)
+    assert len(kept) == len(refls)
+    np.testing.assert_array_equal(np.array(list(kept["dials.xyzcal.px"])), np.array(list(refls["xyzcal.px"])))
+    cal = np.array(list(kept["xyzcal.px"]))
+    np.testing.assert_allclose(cal[predicted, :2], expected[predicted], rtol=0, atol=1e-12)
+    assert np.isnan(cal[~predicted]).all()
+    panel = new_experiment.detector[0]
+    i = int(np.flatnonzero(predicted)[0])
+    np.testing.assert_allclose(kept["xyzcal.mm"][i][:2], panel.pixel_to_millimeter(tuple(cal[i, :2])), atol=1e-12)
+
+    filtered = reflections_from_model(model, refls, new_experiment)
+    assert len(filtered) == int(predicted.sum())
+    path = tmp_path / "refined.refl"
+    filtered.as_file(str(path))
+    back = flex.reflection_table.from_file(str(path))
+    np.testing.assert_allclose(np.array(list(back["xyzcal.px"]))[:, :2], expected[predicted], rtol=0, atol=1e-12)
+
+
+def test_export_refuses_a_mismatched_experiment_or_table():
+    pytest.importorskip("dials.array_family", reason="dials not installed")
+    from nanobrag_torch.compat.cctbx import reflections_from_model
+
+    model, experiment, refls = _exported_setup()
+    with pytest.raises(ValueError, match="ROI i must be reflection i"):
+        reflections_from_model(model, refls[:2], experiment)

@@ -8,8 +8,8 @@ parameters while delegating all physics and geometry to the core components.
 
 from __future__ import annotations
 
-from dataclasses import fields, replace
-from typing import Optional
+from dataclasses import dataclass, fields, replace
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -29,6 +29,32 @@ from ..utils.unit_cell import (
 
 
 _PARAM_INIT_MODES = ("trainable", "stage_a", "frozen")
+
+
+@dataclass(frozen=True)
+class PanelFrame:
+    """A panel as dxtbx describes it: the corner of its first pixel (mm) and its unit axes."""
+
+    origin_mm: np.ndarray
+    fast_axis: np.ndarray
+    slow_axis: np.ndarray
+
+
+@dataclass(frozen=True)
+class Geometry:
+    """The crystal, panels and wavelength a model simulates, in the lab frame of its configs.
+
+    The real-space vectors are in Angstrom, at phi = 0 and without the mosaic domains. For a
+    model from experiment_model_from_dxtbx the frame is dxtbx's, so these are what a dxtbx
+    Crystal(real_space_a, real_space_b, real_space_c), Panel.set_frame and Beam.set_wavelength
+    take.
+    """
+
+    real_space_a: np.ndarray
+    real_space_b: np.ndarray
+    real_space_c: np.ndarray
+    panels: Tuple[PanelFrame, ...]
+    wavelength_A: float
 
 
 def _param_factory(param_init: str):
@@ -742,6 +768,7 @@ class BackgroundStageAParams(nn.Module):
             raise ValueError(f"tilt_abc must be finite: ROIs {sorted(set(np.flatnonzero(~np.isfinite(abc)) // 3))}")
 
         self.spixels, self.fpixels, self.n_panels = spixels, fpixels, n_panels
+        self.rois, self.roi_panels = rois, panels  # each box, as given, for roi_centroids
         # Only the covered pixels are kept, so a detector of shoeboxes stays small.
         kept = {key: [] for key in ("panel", "slow", "fast", "region", "x", "y")}
         for panel in np.unique(panels) if R else [0]:
@@ -1402,11 +1429,13 @@ class ExperimentModel(nn.Module):
         oversample_polar: Optional[bool] = None,
         oversample_thick: Optional[bool] = None,
         roi_only: bool = False,
+        bragg_only: bool = False,
     ) -> torch.Tensor:
         """
         Run the diffraction simulation for the current parameter values.
 
-        With ``roi_only`` only the pixels of the background regions are evaluated.
+        With ``roi_only`` only the pixels of the background regions are evaluated; with
+        ``bragg_only`` the background planes are left out.
 
         Returns:
             Float image tensor with shape (spixels, fpixels), or (panels, spixels, fpixels)
@@ -1426,16 +1455,61 @@ class ExperimentModel(nn.Module):
         if roi_only and len(self._detectors) > 1:
             panel_pixels = self._roi_panel_pixels()
             image = self._simulator.run(panel_pixels=panel_pixels, **options)
-            return image + background.values() * panel_pixels.mask
+            return image if bragg_only else image + background.values() * panel_pixels.mask
         if roi_only:
             image = self._simulator.run(pixels=background.pixels, **options)
+            if bragg_only:
+                return image
             return image + background.values() * self._simulator._cached_roi_mask[tuple(background.pixels.T)]
         simulators = self._whole_panel_simulators()
         images = torch.stack([simulator.run(**options) for simulator in simulators])
         masks = torch.stack([simulator._cached_roi_mask for simulator in simulators])
         if len(simulators) == 1:
             images, masks = images[0], masks[0]
-        return images + background.image() * masks
+        return images if bragg_only else images + background.image() * masks
+
+    @torch.no_grad()
+    def geometry(self) -> Geometry:
+        """The crystal, panels and wavelength this model simulates with its current parameters."""
+        self._sync()
+        cell = self._crystal.compute_cell_tensors()
+        panels = []
+        for detector in self._detectors:
+            detector._ensure_geometry_current()
+            panels.append(PanelFrame(*(v.detach().cpu().double().numpy().copy() for v in (
+                detector.pix0_vector * 1000.0, detector.fdet_vec, detector.sdet_vec))))
+        a, b, c = (cell[x].detach().cpu().double().numpy().copy() for x in "abc")
+        wavelength = float(self.beam_params.build_config().wavelength_A)
+        return Geometry(a, b, c, tuple(panels), wavelength)
+
+    @torch.no_grad()
+    def roi_centroids(self, observed=None) -> np.ndarray:
+        """Each ROI's Bragg-only model centroid (x, y), in dxtbx pixels: NaN where it has no signal.
+
+        As hopper's get_new_xycalcs, over the ROI's whole box (one ROI's pixels painted over by a
+        later one count for both), at pixel centres (fast + 0.5, slow + 0.5). With ``observed``,
+        each ROI's observed centroid (x, y) in the same pixels, an ROI whose model has no signal
+        at that pixel gets none either: hopper's test that the model peak is this spot and not
+        a neighbour. An observed centroid outside its box gets none (hopper's indexing wraps
+        around there).
+        """
+        background = self.background_params
+        values = self(roi_only=True, bragg_only=True).detach().cpu().double().numpy()
+        slow, fast = background.pixels.cpu().numpy().T
+        on_panel = background.panel.cpu().numpy()
+        centroids = np.full((len(background.rois), 2), np.nan)
+        for i, ((x1, x2, y1, y2), panel) in enumerate(zip(background.rois, background.roi_panels)):
+            inside = (on_panel == panel) & (fast >= x1) & (fast < x2) & (slow >= y1) & (slow < y2)
+            weight = values[inside]
+            total = weight.sum()
+            if observed is not None:
+                column, row = int(observed[i][0] - x1 - 0.5), int(observed[i][1] - y1 - 0.5)  # hopper's
+                at = inside & (fast == x1 + column) & (slow == y1 + row)
+                if not (0 <= column < x2 - x1 and 0 <= row < y2 - y1) or not (values[at] > 0).any():
+                    continue
+            if total > 0:
+                centroids[i] = ((fast[inside] + 0.5) * weight).sum() / total, ((slow[inside] + 0.5) * weight).sum() / total
+        return centroids
 
 
 def _as_numbers(value):
