@@ -26,6 +26,8 @@ DEFAULT_SCALES = {
     "cell": 0.002,  # log a, b, c; raw angles
     "distance": 0.002,  # log distance
     "detz_shift": 0.1,  # mm
+    "panel_rotation": 0.001,  # radians, about each panel's own axes
+    "panel_shift": 0.05,  # mm, lab x, y, z
     "detector_rotation": 0.002,
     "twotheta": 0.002,
     "beam_center": 0.01,

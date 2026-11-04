@@ -786,6 +786,97 @@ class BackgroundStageAParams(nn.Module):
         return image if self.n_panels > 1 else image[0]
 
 
+def _rodrigues(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+    """I + sin(a) K + (1 - cos(a)) K^2 for the unit axis's cross-product matrix K."""
+    x, y, z = axis[0], axis[1], axis[2]
+    zero = torch.zeros_like(x)
+    K = torch.stack([torch.stack([zero, -z, y]), torch.stack([z, zero, -x]), torch.stack([-y, x, zero])])
+    eye = torch.eye(3, dtype=axis.dtype, device=axis.device)
+    return eye + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
+
+
+class PanelGroupStageAParams(nn.Module):
+    """diffBragg's per-panel-group geometry: three rotations and a shift for each group of panels.
+
+    diffBragg (diffBragg.cpp, rotate_fs_ss_vecs_3D and update_dxtbx_geoms) moves a panel by
+    R = R_O(rot_O) R_F(rot_F) R_S(rot_S), Rodrigues rotations about the panel's own odet, fdet and
+    sdet, as f' = R f, s' = R s and origin' = pivot + R (origin - pivot) + shift, where the pivot of a
+    group is the origin of its first panel (ensemble_refine_launcher.py). Rotations are in radians and
+    shifts in mm, along lab x, y and z. Only for panels given by their origin (dxtbx panels: CUSTOM
+    convention, SAMPLE pivot, close distance); the moved panel is written back as its axes, beam
+    centre and close distance, from which Detector rebuilds exactly that origin.
+    """
+
+    def __init__(self, panel_configs, panel_groups=None, device=None, dtype=torch.float32,
+                 param_init: str = "trainable") -> None:
+        super().__init__()
+        self.active = panel_groups is not None
+        if panel_groups is not None and (isinstance(panel_groups, (str, bytes)) or not all(
+                isinstance(g, (int, np.integer)) and not isinstance(g, (bool, np.bool_)) for g in panel_groups)):
+            raise ValueError(f"panel_groups must be a sequence of integer group ids, got {panel_groups!r}")
+        groups = [0] * len(panel_configs) if panel_groups is None else [int(g) for g in panel_groups]
+        if len(groups) != len(panel_configs):
+            raise ValueError(f"panel_groups has {len(groups)} entries for {len(panel_configs)} panels")
+        n_groups = max(groups) + 1
+        if sorted(set(groups)) != list(range(n_groups)):
+            raise ValueError(f"panel_groups must number the groups 0..{n_groups - 1}, got {sorted(set(groups))}")
+        self.group_of_panel = groups
+        origins = []
+        for cfg in panel_configs:
+            given_by_origin = (cfg.detector_convention == DetectorConvention.CUSTOM
+                               and cfg.detector_pivot == DetectorPivot.SAMPLE and cfg.close_distance_mm is not None
+                               and all(getattr(cfg, f"custom_{n}_vector") is not None for n in ("fdet", "sdet", "odet")))
+            if self.active and not given_by_origin:
+                raise ValueError("panel_groups needs every panel given by its origin (dxtbx panels: CUSTOM "
+                                 "convention, SAMPLE pivot, close distance)")
+            origins.append(self._origin_mm(cfg, dtype, device) if given_by_origin else torch.zeros(3, dtype=dtype, device=device))
+        first_of_group = [groups.index(g) for g in range(n_groups)]
+        # Derived from the panels, not a parameter: not saved, so a state_dict cannot move it
+        self.register_buffer("pivot_mm", torch.stack([origins[i] for i in first_of_group]).detach(), persistent=False)
+        param_cls = _param_factory(param_init)
+        self.delta_panel_rot_rad = param_cls(torch.zeros((n_groups, 3), device=device, dtype=dtype))
+        self.delta_panel_shift_mm = param_cls(torch.zeros((n_groups, 3), device=device, dtype=dtype))
+        self.unrefinable = {}
+        if not self.active:
+            why = ("per-panel geometry needs panel_groups= (a group id per panel, as diffBragg's "
+                   "panel_group_file)")
+            self.unrefinable = {"delta_panel_rot_rad": why, "delta_panel_shift_mm": why}
+        for pname in self.unrefinable:
+            getattr(self, pname).requires_grad_(False)
+
+    @staticmethod
+    def _vector(value, dtype, device):
+        if isinstance(value, torch.Tensor):
+            return value.to(device=device, dtype=dtype)
+        return torch.stack([torch.as_tensor(v, device=device, dtype=dtype) for v in value])
+
+    @classmethod
+    def _origin_mm(cls, cfg, dtype, device):
+        f, s, o = (cls._vector(getattr(cfg, f"custom_{n}_vector"), dtype, device) for n in ("fdet", "sdet", "odet"))
+        as_t = lambda v: torch.as_tensor(v, device=device, dtype=dtype)  # noqa: E731
+        return -as_t(cfg.beam_center_f) * f - as_t(cfg.beam_center_s) * s + as_t(cfg.close_distance_mm) * o
+
+    def apply(self, cfg, panel_index: int):
+        """cfg with its panel moved by its group's rotations and shift (unchanged when not active)."""
+        if not self.active:
+            return cfg
+        g = self.group_of_panel[panel_index]
+        dtype, device = self.delta_panel_rot_rad.dtype, self.delta_panel_rot_rad.device
+        f, s, o = (self._vector(getattr(cfg, f"custom_{n}_vector"), dtype, device) for n in ("fdet", "sdet", "odet"))
+        origin = self._origin_mm(cfg, dtype, device)
+        rot = self.delta_panel_rot_rad[g]
+        R = _rodrigues(o, rot[0]) @ _rodrigues(f, rot[1]) @ _rodrigues(s, rot[2])
+        f2, s2, o2 = R @ f, R @ s, R @ o
+        origin2 = self.pivot_mm[g] + R @ (origin - self.pivot_mm[g]) + self.delta_panel_shift_mm[g]
+        cfg.custom_fdet_vector = (f2[0], f2[1], f2[2])
+        cfg.custom_sdet_vector = (s2[0], s2[1], s2[2])
+        cfg.custom_odet_vector = (o2[0], o2[1], o2[2])
+        cfg.beam_center_f = -torch.dot(origin2, f2)
+        cfg.beam_center_s = -torch.dot(origin2, s2)
+        cfg.close_distance_mm = torch.dot(origin2, o2)
+        return cfg
+
+
 class ExperimentModel(nn.Module):
     """
     High-level experiment composition model for Stage-A optimization.
@@ -846,6 +937,8 @@ class ExperimentModel(nn.Module):
         "scale": ("beam_params.delta_log_spot_scale",),
         "Ncells": ("crystal_params.delta_log_N_cells",),
         "Ndef": ("crystal_params.delta_N_cells_def",),
+        "panel_rotation": ("panel_group_params.delta_panel_rot_rad",),
+        "panel_shift": ("panel_group_params.delta_panel_shift_mm",),
         "eta": ("crystal_params.delta_log_eta",),
         "Fhkl": ("fhkl_params.delta_log_F",),
         "background": ("background_params.delta_tilt_abc",),
@@ -869,6 +962,7 @@ class ExperimentModel(nn.Module):
         background_rois=None,
         tilt_abc=None,
         background_panels=None,
+        panel_groups=None,
     ) -> None:
         super().__init__()
         if structure_factors is not None and hkl_data is not None:
@@ -906,6 +1000,16 @@ class ExperimentModel(nn.Module):
         for block in self.panel_params:
             for name, _ in list(block.named_parameters(recurse=False)):
                 setattr(block, name, getattr(self.detector_params, name))
+        self.panel_group_params = PanelGroupStageAParams(panel_configs, panel_groups, device=self.device,
+                                                         dtype=self.dtype, param_init=param_init)
+        if self.panel_group_params.active:
+            # The groups' rotations and shifts are the panels' geometry; the shared offsets would
+            # repeat their common motion
+            why = "with panel_groups the panels move by their groups' rotations and shifts (panel_rotation, panel_shift)"
+            for name in ("delta_rotx_raw", "delta_roty_raw", "delta_rotz_raw", "delta_twotheta_raw",
+                         "delta_beam_s_raw", "delta_beam_f_raw", "delta_detz_shift_mm", "delta_log_distance_mm"):
+                self.detector_params.unrefinable.setdefault(name, why)
+                getattr(self.detector_params, name).requires_grad_(False)
         self.beam_params = BeamStageAParams(
             base_config=beam_config,
             device=self.device,
@@ -976,7 +1080,7 @@ class ExperimentModel(nn.Module):
         """Parameter name -> why it cannot be refined (crystal shape, crystal system, detector kind,
         no structure factors, a single source)."""
         blocked = {}
-        for block in ("crystal_params", "detector_params", "beam_params", "fhkl_params"):
+        for block in ("crystal_params", "detector_params", "beam_params", "fhkl_params", "panel_group_params"):
             blocked.update({f"{block}.{n}": why for n, why in getattr(self, block).unrefinable.items()})
         return blocked
 
@@ -1073,6 +1177,7 @@ class ExperimentModel(nn.Module):
     _DETECTOR_FIELDS = (
         "distance_mm", "close_distance_mm", "detector_rotx_deg", "detector_roty_deg", "detector_rotz_deg",
         "detector_twotheta_deg", "beam_center_s", "beam_center_f", "origin_shift_z_mm",
+        "custom_fdet_vector", "custom_sdet_vector", "custom_odet_vector",
     )
 
     def _sync(self):
@@ -1087,7 +1192,8 @@ class ExperimentModel(nn.Module):
         beam_cfg = self.beam_params.build_config()
 
         if self._simulator is None:
-            self._construct(crystal_cfg, [block.build_config() for block in self._panel_blocks], beam_cfg)
+            self._construct(crystal_cfg, [self.panel_group_params.apply(block.build_config(), index)
+                                          for index, block in enumerate(self._panel_blocks)], beam_cfg)
             self._detector_state = self._detector_parameter_state()
             return self._simulator
 
@@ -1151,7 +1257,7 @@ class ExperimentModel(nn.Module):
     )
 
     def _detector_parameter_state(self) -> tuple:
-        params = list(self.detector_params.parameters())
+        params = [*self.detector_params.parameters(), *self.panel_group_params.parameters()]
         return tuple(p.requires_grad for p in params), torch.cat([p.detach().reshape(-1) for p in params])
 
     def _sync_detectors(self) -> None:
@@ -1167,8 +1273,8 @@ class ExperimentModel(nn.Module):
         if last is not None and not any(state[0]) and state[0] == last[0] and torch.equal(state[1], last[1]):
             return
         self._detector_state = state
-        for detector, block in zip(self._detectors, self._panel_blocks):
-            detector_cfg = block.build_config()
+        for index, (detector, block) in enumerate(zip(self._detectors, self._panel_blocks)):
+            detector_cfg = self.panel_group_params.apply(block.build_config(), index)
             for name in self._DETECTOR_FIELDS:
                 setattr(detector.config, name, getattr(detector_cfg, name))
 
@@ -1384,7 +1490,9 @@ class SerialExperiment(nn.Module):
     Every shot keeps its own crystal and beam parameters, as hopper's per-shot refinement
     does, and all shots share the first shot's Fhkl, as its ensemble stage does. With
     ``share_detector`` (identical panels on every shot) they also share one Detector, so
-    the panels' pixel coordinates exist once, and one set of detector offsets.
+    the panels' pixel coordinates exist once, and one set of detector offsets and panel-group
+    rotations and shifts, which is how diffBragg refines panel geometry (one global set). Without
+    it each shot has its own.
 
         serial = SerialExperiment(models)
         serial.freeze().refine("Fhkl", "scale")
@@ -1412,8 +1520,12 @@ class SerialExperiment(nn.Module):
                 raise ValueError("all shots must be built with the same StructureFactors object")
             shot.fhkl_params = first.fhkl_params
             if share_detector:
+                if shot.panel_group_params.group_of_panel != first.panel_group_params.group_of_panel or (
+                        shot.panel_group_params.active != first.panel_group_params.active):
+                    raise ValueError("share_detector=True needs the same panel_groups on every shot")
                 shot.detector_params = first.detector_params
                 shot.panel_params = first.panel_params
+                shot.panel_group_params = first.panel_group_params
                 shot._shared_detectors_from = first
                 shot._detectors_synced_by_serial = True
         first._detectors_synced_by_serial = share_detector
