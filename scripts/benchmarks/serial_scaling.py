@@ -8,7 +8,15 @@ scale is degenerate with F), one objective term per shot so each graph is freed 
 
 Reports, per run: evaluations, seconds per evaluation, peak GPU memory, and the agreement of the
 fitted F with the truth on the reflections the ROIs see (CC of log F and an R factor, at the start
-and at the end).
+and at the end), and the trajectory of that agreement at every evaluation.
+
+On one GPU, with the defaults (60 spots a shot, 9x9 ROIs), an evaluation costs about 9 ms a shot
+(0.9 s at 100 shots, 3.6 s at 400) and peak memory stays under 0.6 GB at 400 shots. With
+--fhkl-scale 0.1, 100 shots had not converged after 1000 iterations; at 0.3 it took 594, at 1.0 346
+and at 3.0 324, all to the same F (R 1.34%). At 400 shots: 586 iterations at 0.3, 473 at 1.0, both
+to R 0.85%. Hence the default Fhkl scale of 1.0. R is within 1% of its final value after about 80
+evaluations at 100 shots and 200 at 400; L-BFGS-B's default stop spends the rest creeping, so a
+maxiter of a few hundred loses nothing here.
 
     NANOBRAGG_DISABLE_COMPILE=1 PYTHONPATH=src python scripts/benchmarks/serial_scaling.py \
         --shots 100 --device cuda --out serial_100.json

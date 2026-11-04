@@ -31,7 +31,8 @@ DEFAULT_SCALES = {
     "detector_rotation": 0.002,
     "twotheta": 0.002,
     "beam_center": 0.01,
-    "Fhkl": 0.1,  # log F
+    # log F; scripts/benchmarks/serial_scaling.py converges sooner at 1.0 than at 0.1 or 0.3
+    "Fhkl": 1.0,
     "background": 1.0,  # photons across the region
     "wavelength": 0.001,  # Angstrom, log scale
     "source_weights": 0.1,  # log weight
