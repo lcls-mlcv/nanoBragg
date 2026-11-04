@@ -112,6 +112,7 @@ def main():
     P.add_argument("--f-noise", dest="f_noise", type=float, default=0.3, help="start log F error (sd)")
     P.add_argument("--scale-noise", dest="scale_noise", type=float, default=0.3, help="start log G error (sd)")
     P.add_argument("--maxiter", type=int, default=200)
+    P.add_argument("--fhkl-scale", dest="fhkl_scale", type=float, help="refine_lbfgsb scale for Fhkl (default its own)")
     P.add_argument("--seed", type=int, default=0)
     P.add_argument("--out")
     args = P.parse_args()
@@ -187,7 +188,8 @@ def main():
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
     t0 = time.perf_counter()
-    result = refine_lbfgsb(model, [term(i) for i in range(args.shots)], maxiter=args.maxiter)
+    scales = None if args.fhkl_scale is None else {"Fhkl": args.fhkl_scale}
+    result = refine_lbfgsb(model, [term(i) for i in range(args.shots)], scales=scales, maxiter=args.maxiter)
     if args.device.type == "cuda":
         torch.cuda.synchronize()
     wall = time.perf_counter() - t0
