@@ -14,7 +14,7 @@ from torch.autograd.function import once_differentiable
 from torch.func import functional_call
 
 from nanobrag_torch.config import (
-    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
+    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot, SpotMetric,
 )
 from nanobrag_torch.diffuse import GaussianHalo
 from nanobrag_torch.models.experiment import ExperimentModel
@@ -33,14 +33,14 @@ GEOMETRY = [  # (parameter, component), through the diffuse term
 DIFFUSE = [(f"{HALO}.log_amplitude", None), (f"{HALO}.log_sigma", None), (K_D, None)]
 
 
-def _model(dtype=torch.float64, halo=None):
-    crystal = CrystalConfig(cell_a=30.0, cell_b=35.0, cell_c=40.0, misset_deg=(5.0, -3.0, 2.0), N_cells=(5, 5, 5),
-                            default_F=0.0, shape=CrystalShape.GAUSS)
+def _model(dtype=torch.float64, halo=None, device=None, **crystal_kwargs):
+    crystal = CrystalConfig(**{**dict(cell_a=30.0, cell_b=35.0, cell_c=40.0, misset_deg=(5.0, -3.0, 2.0),
+                                      N_cells=(5, 5, 5), default_F=0.0, shape=CrystalShape.GAUSS), **crystal_kwargs})
     detector = DetectorConfig(distance_mm=60.0, pixel_size_mm=0.8, spixels=P, fpixels=P, oversample=1,
                               detector_convention=DetectorConvention.MOSFLM, detector_pivot=DetectorPivot.BEAM)
     beam = BeamConfig(wavelength_A=1.2, fluence=1e33)  # a few photons a pixel
-    model = ExperimentModel(crystal, detector, beam, dtype=dtype,
-                            diffuse=halo if halo is not None else GaussianHalo(40.0, 0.15, dtype=dtype))
+    model = ExperimentModel(crystal, detector, beam, dtype=dtype, device=device,
+                            diffuse=halo if halo is not None else GaussianHalo(40.0, 0.15, dtype=dtype).to(device or "cpu"))
     with torch.no_grad():  # off the starting point, where the parameters are all exactly zero
         model.crystal_params.delta_misset_raw.copy_(torch.tensor([0.01, -0.02, 0.015]))
         model.diffuse_params.delta_log_scale.fill_(0.1)
@@ -74,7 +74,7 @@ def _central_difference(model, name, component, step=1e-6):
 
 def _autograd(model):
     model.zero_grad(set_to_none=True)
-    _loss(model).backward()
+    (model() * _weights(model.dtype).to(model.device)).sum().backward()
     return {n: p.grad for n, p in model.named_parameters() if p.grad is not None}
 
 
@@ -86,6 +86,31 @@ def test_gradient_matches_central_differences(name, component):
     fd = _central_difference(model, name, component)
     assert float(grad) != 0.0
     assert float(grad) == pytest.approx(fd, rel=1e-6)
+
+
+# The shape factor's own derivatives, through the model (audit 2026-11-05): ROUND in N, TOPHAT in
+# the cell (inside the cell, and cut by it) and GAUSS-HKL in Ndef
+SHAPE_CASES = {
+    "round-N": (dict(shape=CrystalShape.ROUND), [("crystal_params.delta_log_N_cells", i) for i in range(3)]),
+    "tophat-cell": (dict(shape=CrystalShape.TOPHAT), [("crystal_params.delta_log_a", None),
+                                                       ("crystal_params.delta_gamma_raw", None)]),
+    "tophat-cell-cut": (dict(shape=CrystalShape.TOPHAT, cell_a=120.0, cell_b=125.0, cell_c=115.0),
+                        [("crystal_params.delta_log_a", None), ("crystal_params.delta_log_b", None)]),
+    "gauss-ndef": (dict(shape=CrystalShape.GAUSS, spot_metric=SpotMetric.HKL, N_cells_def=(0.3, -0.2, 0.1)),
+                   [("crystal_params.delta_N_cells_def", i) for i in range(3)]),
+}
+
+
+@pytest.mark.parametrize("case", sorted(SHAPE_CASES))
+def test_shape_factor_gradients_match_central_differences(case):
+    crystal, names = SHAPE_CASES[case]
+    model = _model(**crystal)
+    grads = _autograd(model)
+    for name, component in names:
+        grad = grads[name] if component is None else grads[name][component]
+        fd = _central_difference(model, name, component)
+        assert float(grad) != 0.0
+        assert float(grad) == pytest.approx(fd, rel=1e-5), (name, component)
 
 
 def test_bragg_is_zero_so_the_geometry_gradient_is_the_diffuse_terms():
@@ -121,6 +146,21 @@ def test_float32_gradients_follow_float64():
     for name, _ in DIFFUSE + GEOMETRY:
         assert single[name].dtype == torch.float32
         torch.testing.assert_close(single[name].double(), double[name], rtol=2e-3, atol=1e-3 * double[name].abs().max())
+
+
+@pytest.mark.parametrize("device", [
+    pytest.param("mps", marks=pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")),
+    pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_float32_gradients_on_a_gpu_follow_the_cpu(device):
+    """The whole model on the GPU in float32: the gradient values, not just their device, against CPU float64."""
+    double = _autograd(_model())
+    model = _model(torch.float32, device=torch.device(device))
+    single = _autograd(model)
+    for name, _ in DIFFUSE + GEOMETRY:
+        assert single[name].device.type == device
+        torch.testing.assert_close(single[name].cpu().double(), double[name], rtol=2e-3,
+                                   atol=1e-3 * double[name].abs().max())
 
 
 class _FirstOrderOnly(torch.autograd.Function):
