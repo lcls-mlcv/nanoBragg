@@ -160,9 +160,22 @@ class DiffuseModel(Protocol):          # in practice an nn.Module
   | ROUND | 0.8972 (N = 5), 0.9496 (10), 0.9748 (20): 1 untruncated (0.7236² = π/6), but the sinc3² tail is cut at the cell, about 1 − 0.5/N |
   | GAUSS or TOPHAT, `RECIPROCAL` (the default, bl831 C) | the HKL factor × V/N_cells², V in Å³: 2.65 for 30×35×40 Å and 5³ cells, 0.23 for 237,000 Å³ and 10³ |
 
-  The C path is unchanged, and so is the tie (N_cells·I_d for every shape). Whether the tie
-  divides by the factor is open: for GAUSS-HKL it is a 1.6% shift, for the RECIPROCAL metric
-  it depends on cell and crystal size, because that radius is not dimensionless.
+  The C path and the Simulator are unchanged (N_cells·I_d for every shape).
+- **Decided 2026-11-05: the tie is corrected for the shape in `ExperimentModel`.** The
+  diffuse term is multiplied by the factor, `nanobrag_torch.diffuse.bragg_peak_factor`, so
+  integrated Bragg over diffuse is |F|²/I_d for every shape. SQUARE is 1 exactly, so it
+  behaves as before.
+  - Closed forms: GAUSS (0.315π/fudge)^(3/2), TOPHAT (4/3)π(0.3969/fudge)^(3/2), GAUSS with
+    Ndef times |det NABC|/(Na·Nb·Nc), RECIPROCAL metric times V/N_cells². ROUND has no
+    closed form for the truncated tail, so Gauss-Legendre quadrature over the cell, cached by
+    (N, fudge), with no gradient in N.
+  - It is recomputed at every forward from the current N_cells and cell, with their
+    gradients. It is not folded into k_d's starting value because under the RECIPROCAL metric
+    it moves as N_cells and the cell refine. It shows as `model.diffuse_shape_factor()` and
+    `diffuse_params.shape_factor`. `diffuse_shape_factor=False` sets it to 1.
+  - Against the kernel's measured integral: SQUARE 1e-15, ROUND 5e-6, GAUSS-HKL 1e-9 (2e-4
+    at N = 3, where the cell cuts the tail), RECIPROCAL 9e-5, TOPHAT 1e-4 to 2e-3 (the grid's
+    ball).
 - **Relative scale `k_d`** (group `diffuse_scale`, log, default frozen at 1):
   - Frozen, the absolute tie is a physical constraint.
   - Freed, the halves separate: a diffuse fit that does not lean on the Bragg scale.
@@ -245,6 +258,9 @@ Gauges:
   (`ExperimentModel.OPTIONAL_GROUPS` names them). A parameter the module froze itself is
   unrefinable. Shots share the whole block, k_d included: one diffuse-to-Bragg ratio.
   `model.components` gives bragg, diffuse, background and total, on the ROI path too.
+  `bragg_only=True` leaves out the diffuse term as well as the background (decided
+  2026-11-05), so `roi_centroids` and the export see the Bragg term alone.
+  `param_init="frozen"` freezes the given module's parameters in place.
 
 Gradient checks (/tdd, CPU float64, central finite differences plus gradcheck on a 16² case):
 - each eryx parameter (log γ per class, solvent log k and log B, log share, extra_U, LLM σ)
@@ -347,8 +363,10 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    evaluation as the reference. The fineness of the grid near integer hkl is set by the
    measured grid-vs-exact error.
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
-   `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The GAUSS/ROUND
-   peak-integral factor is measured (D2-T1) before the tie is trusted for those shapes.
+   `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
+   factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse
+   term by it, recomputed from the current crystal, with an opt-out (section 2.1). k_d
+   stays one value shared by all shots.
 4. **Isotropic part.** A radial background b(|q|) owns everything radial. The diffuse model's
    shell mean is projected out by default, and the projection can be switched off for a
    future absolute model.

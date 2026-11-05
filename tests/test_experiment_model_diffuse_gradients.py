@@ -28,6 +28,7 @@ GEOMETRY = [  # (parameter, component), through the diffuse term
     ("detector_params.delta_log_distance_mm", None),
     ("detector_params.delta_beam_s_raw", None), ("detector_params.delta_beam_f_raw", None),
     ("beam_params.delta_log_lambda_scale", None),
+    ("crystal_params.delta_log_N_cells", 0), ("crystal_params.delta_log_N_cells", 2),  # through the diffuse term and its shape factor
 ]
 DIFFUSE = [(f"{HALO}.log_amplitude", None), (f"{HALO}.log_sigma", None), (K_D, None)]
 

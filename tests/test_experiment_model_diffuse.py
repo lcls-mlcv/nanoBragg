@@ -12,9 +12,9 @@ import pytest
 import torch
 
 from nanobrag_torch.config import (
-    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
+    BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot, SpotMetric,
 )
-from nanobrag_torch.diffuse import GaussianHalo
+from nanobrag_torch.diffuse import GaussianHalo, bragg_peak_factor
 from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.models.detector import Detector
 from nanobrag_torch.models.experiment import ExperimentModel, SerialExperiment
@@ -122,15 +122,79 @@ def test_k_d_is_frozen_by_default_and_refinable():
     assert k_d.requires_grad
 
 
-def test_the_image_is_bragg_plus_the_simulators_diffuse_term():
+SHAPES = {
+    "square": dict(shape=CrystalShape.SQUARE),
+    "gauss-reciprocal": dict(shape=CrystalShape.GAUSS),
+    "gauss-hkl": dict(shape=CrystalShape.GAUSS, spot_metric=SpotMetric.HKL),
+    "tophat": dict(shape=CrystalShape.TOPHAT, spot_metric=SpotMetric.HKL),
+    "round": dict(shape=CrystalShape.ROUND),
+}
+
+
+def _expected_factor(crystal):
+    config = _crystal(**crystal)
+    cell = Crystal(config, dtype=DTYPE)
+    return float(bragg_peak_factor(config.shape, torch.tensor(config.N_cells, dtype=DTYPE), config.spot_metric,
+                                   volume=cell.V / cell.c_reciprocal_scale ** 3))
+
+
+@pytest.mark.parametrize("shape", sorted(SHAPES))
+def test_the_diffuse_part_is_the_simulators_times_the_shape_factor(shape):
+    """The tie corrected for the shape: integrated Bragg / diffuse is |F|^2 / I_d (tests/test_diffuse_shape_integral.py)."""
     halo = _halo()
-    model = _model(halo)
-    image = model(bragg_only=True)
-    reference = _simulator(halo).run()
-    assert torch.equal(image, reference)  # k_d frozen at 1 is the absolute tie of the Simulator
-    components = model.components
-    assert torch.equal(components["bragg"] + components["diffuse"], image)
-    assert components["diffuse"].abs().max() > 0 and components["bragg"].abs().max() > 0
+    model = _model(halo, crystal=SHAPES[shape])
+    with torch.no_grad():
+        image = model()
+        sim = _simulator(halo, crystal=SHAPES[shape])
+        sim.run()
+    factor = _expected_factor(SHAPES[shape])
+    assert float(model.diffuse_params.shape_factor) == pytest.approx(factor, rel=1e-14)
+    # (not bit for bit under GAUSS-HKL, where the model's zero Ndef takes the matrix path: Simulator._n_cells_def)
+    torch.testing.assert_close(model.components["bragg"], sim.components["bragg"], rtol=1e-12, atol=0.0)
+    torch.testing.assert_close(model.components["diffuse"], factor * sim.components["diffuse"], rtol=1e-14, atol=0.0)
+    assert torch.equal(model.components["bragg"] + model.components["diffuse"] + model.components["background"], image)
+    if shape == "square":  # factor 1: the Simulator's tie, bit for bit
+        assert torch.equal(model.components["diffuse"], sim.components["diffuse"])
+    else:
+        assert abs(factor - 1) > 1e-3
+
+
+def test_the_shape_factor_can_be_turned_off():
+    halo = _halo()
+    model = _model(halo, diffuse_shape_factor=False)
+    with torch.no_grad():
+        model()
+        sim = _simulator(halo)
+        sim.run()
+    assert float(model.diffuse_params.shape_factor) == 1.0
+    assert torch.equal(model.components["diffuse"], sim.components["diffuse"])
+
+
+def test_the_shape_factor_follows_the_crystal_size_and_cell():
+    model = _model(_halo())
+    with torch.no_grad():
+        model.crystal_params.delta_log_N_cells.fill_(math.log(6.0 / 5.0))
+        model.crystal_params.delta_log_a.fill_(math.log(32.0 / 30.0))
+        model()
+    expected = _expected_factor(dict(N_cells=(6, 6, 6), cell_a=32.0))
+    assert float(model.diffuse_params.shape_factor) == pytest.approx(expected, rel=1e-12)
+    assert expected != pytest.approx(_expected_factor({}), rel=1e-3)
+
+
+def test_bragg_only_is_the_bragg_part_alone():
+    for kwargs, run in [({}, {}), (dict(background_rois=ROIS), dict(roi_only=True))]:
+        with torch.no_grad():
+            with_halo = _model(_halo(), **kwargs)
+            image = with_halo(bragg_only=True, **run)
+            assert with_halo.components is None
+            assert torch.equal(image, _model(**kwargs)(bragg_only=True, **run))
+            full = with_halo(**run)
+            assert torch.equal(with_halo.components["bragg"], image) and not torch.equal(full, image)
+    panels = _panels(_halo(), background_rois=ROIS, background_panels=ROI_PANELS)
+    plain = _panels(None, background_rois=ROIS, background_panels=ROI_PANELS)
+    with torch.no_grad():
+        for run in ({}, dict(roi_only=True)):
+            assert torch.equal(panels(bragg_only=True, **run), plain(bragg_only=True, **run))
 
 
 def test_k_d_scales_only_the_diffuse_component():
@@ -196,12 +260,14 @@ def test_panels_are_the_single_panel_simulators():
     halo = _halo()
     model = _panels(halo)
     with torch.no_grad():
-        model(bragg_only=True)
+        model()
+        factor = _expected_factor({})
         for panel, (f, s) in enumerate(PANELS):
             sim = _simulator(halo, detector=dict(beam_center_f=f, beam_center_s=s))
             sim.run()
-            for key in ("bragg", "diffuse"):
-                torch.testing.assert_close(model.components[key][panel], sim.components[key], rtol=1e-12, atol=0.0)
+            torch.testing.assert_close(model.components["bragg"][panel], sim.components["bragg"], rtol=1e-12, atol=0.0)
+            torch.testing.assert_close(model.components["diffuse"][panel], factor * sim.components["diffuse"],
+                                       rtol=1e-12, atol=0.0)
 
 
 def test_roi_centroids_follow_the_bragg_part():

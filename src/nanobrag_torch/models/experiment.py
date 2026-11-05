@@ -820,23 +820,36 @@ class BackgroundStageAParams(nn.Module):
 
 
 class DiffuseStageAParams(nn.Module):
-    """A diffuse model (nanobrag_torch.diffuse.DiffuseModel) and its relative scale k_d.
+    """A diffuse model (nanobrag_torch.diffuse.DiffuseModel), its relative scale k_d and the shape factor.
 
     An extension, not in nanoBragg.c. The block is what the Simulator calls: k_d times the
-    model's scattering per cell, so k_d multiplies the diffuse component of the image and
-    nothing else. k_d = exp(delta_log_scale) starts at 1 and frozen, whatever param_init says:
-    frozen, the diffuse term keeps the Simulator's absolute tie to the Bragg term (one G,
-    fluence and N_cells for both); refined (group diffuse_scale), the two halves separate.
+    shape factor times the model's scattering per cell, so both multiply the diffuse component
+    of the image and nothing else.
+
+    k_d = exp(delta_log_scale) starts at 1 and frozen, whatever param_init says: frozen, the
+    diffuse term keeps its absolute tie to the Bragg term (one G, fluence and N_cells for both);
+    refined (group diffuse_scale), the two halves separate.
+
+    ``shape_factor`` is nanobrag_torch.diffuse.bragg_peak_factor of the crystal as it is at each
+    forward (ExperimentModel.diffuse_shape_factor): the integral of the lattice factor over a
+    Bragg peak over N_cells, 1 for SQUARE. With it, integrated Bragg over diffuse is |F|^2 / I_d
+    whatever the shape. It is derived, not a parameter or a buffer: GAUSS and TOPHAT under the
+    RECIPROCAL metric make it follow N_cells and the cell (with their gradients), which a
+    stored value would not. ``use_shape_factor=False`` keeps it at 1.
 
     The model's own parameters are its trainable ones (group diffuse); one the model froze
-    itself is listed in ``unrefinable`` and stays frozen. param_init="frozen" freezes the rest.
+    itself is listed in ``unrefinable`` and stays frozen. param_init="frozen" freezes the rest,
+    in place: the module given is the one that is frozen, and stays so outside this model.
     A model that is not an nn.Module (a plain function) has no parameters to refine.
     """
 
-    def __init__(self, model, device=None, dtype: torch.dtype = torch.float32, param_init: str = "trainable") -> None:
+    def __init__(self, model, device=None, dtype: torch.dtype = torch.float32, param_init: str = "trainable",
+                 use_shape_factor: bool = True) -> None:
         super().__init__()
         param_cls = _param_factory(param_init)
         self.model = model
+        self.use_shape_factor = use_shape_factor
+        self.shape_factor = torch.ones((), device=device, dtype=dtype)  # ExperimentModel sets it at each forward
         self.delta_log_scale = param_cls(torch.zeros((), device=device, dtype=dtype))
         self.delta_log_scale.requires_grad_(False)
         own = list(model.named_parameters()) if isinstance(model, nn.Module) else []
@@ -854,7 +867,8 @@ class DiffuseStageAParams(nn.Module):
 
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
         per_cell = self.model(hkl)
-        return per_cell * torch.exp(self.delta_log_scale).to(device=per_cell.device)
+        scale = torch.exp(self.delta_log_scale) * self.shape_factor
+        return per_cell * scale.to(device=per_cell.device)
 
 
 def _rodrigues(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
@@ -989,9 +1003,13 @@ class ExperimentModel(nn.Module):
     nanobrag_torch.diffuse.DiffuseModel, to the image through Simulator(diffuse=...). The model
     becomes the submodule diffuse_params.model, and the model gains the groups diffuse (its
     parameters) and diffuse_scale (a relative scale k_d, frozen at 1; see DiffuseStageAParams),
-    listed in the instance's PARAMETER_GROUPS. After each forward, ``components`` holds the
-    image's parts "bragg", "diffuse", "background" and "total", shaped as the result; it is
-    None without a diffuse model, which leaves everything else as it was.
+    listed in the instance's PARAMETER_GROUPS. param_init="frozen" freezes the module's own
+    parameters in place. The term is multiplied by the shape factor diffuse_shape_factor(), so
+    that integrated Bragg over diffuse is |F|^2 / I_d for every crystal shape (1 for SQUARE;
+    ``diffuse_shape_factor=False`` turns it off). After each forward, ``components`` holds
+    the image's parts "bragg", "diffuse", "background" and "total", shaped as the result; it
+    is None without a diffuse model, which leaves everything else as it was, and after a
+    bragg_only forward.
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -1045,6 +1063,7 @@ class ExperimentModel(nn.Module):
         background_panels=None,
         panel_groups=None,
         diffuse=None,
+        diffuse_shape_factor: bool = True,
     ) -> None:
         super().__init__()
         if structure_factors is not None and hkl_data is not None:
@@ -1120,7 +1139,7 @@ class ExperimentModel(nn.Module):
         self.components = None
         if diffuse is not None:
             self.diffuse_params = DiffuseStageAParams(diffuse, device=self.device, dtype=self.dtype,
-                                                      param_init=param_init)
+                                                      param_init=param_init, use_shape_factor=diffuse_shape_factor)
             self.PARAMETER_GROUPS = {**type(self).PARAMETER_GROUPS,
                                      **self.diffuse_params.parameter_groups("diffuse_params")}
 
@@ -1508,8 +1527,8 @@ class ExperimentModel(nn.Module):
         Run the diffraction simulation for the current parameter values.
 
         With ``roi_only`` only the pixels of the background regions are evaluated; with
-        ``bragg_only`` the background planes are left out (a diffuse term stays in; it is
-        components["bragg"] that holds the Bragg term alone).
+        ``bragg_only`` the background planes and any diffuse term are left out, so the result
+        is the Bragg term alone (and the diffuse term is not computed).
 
         Returns:
             Float image tensor with shape (spixels, fpixels), or (panels, spixels, fpixels)
@@ -1525,9 +1544,24 @@ class ExperimentModel(nn.Module):
             oversample_polar=oversample_polar,
             oversample_thick=oversample_thick,
         )
+        if self.diffuse is None:
+            return self._forward_images(background, roi_only, bragg_only, options)
+        if not bragg_only:
+            return self._forward_with_components(background, roi_only, options)
+        # The Bragg term alone: the Simulators run without their diffuse model
+        simulators = [self._simulator] if roi_only else self._whole_panel_simulators()
+        self.components = None
+        try:
+            for simulator in simulators:
+                simulator.diffuse = None
+            return self._forward_images(background, roi_only, bragg_only, options)
+        finally:
+            for simulator in simulators:
+                simulator.diffuse = self.diffuse
+
+    def _forward_images(self, background, roi_only, bragg_only, options) -> torch.Tensor:
+        """forward() of the Simulators as they are: whole images or ROI pixels, with or without the planes."""
         # As diffBragg: Bragg model + background. run() has just refreshed each mask.
-        if self.diffuse is not None:
-            return self._forward_with_components(background, roi_only, bragg_only, options)
         if roi_only and len(self._detectors) > 1:
             panel_pixels = self._roi_panel_pixels()
             image = self._simulator.run(panel_pixels=panel_pixels, **options)
@@ -1544,11 +1578,35 @@ class ExperimentModel(nn.Module):
             images, masks = images[0], masks[0]
         return images if bragg_only else images + background.image() * masks
 
-    def _forward_with_components(self, background, roi_only, bragg_only, options) -> torch.Tensor:
+    def diffuse_shape_factor(self) -> torch.Tensor:
+        """The diffuse term's shape factor at the current parameters (see DiffuseStageAParams).
+
+        nanobrag_torch.diffuse.bragg_peak_factor of this crystal's shape, spot metric, fudge,
+        N_cells and Ndef, and for the RECIPROCAL metric the volume of the reciprocal vectors
+        the kernel measures the spot radius with. 1 with diffuse_shape_factor=False.
+        """
+        from ..diffuse import bragg_peak_factor
+
+        if self.diffuse is None:
+            raise ValueError("this model has no diffuse model")
+        if not self.diffuse.use_shape_factor:
+            return torch.ones((), device=self.device, dtype=self.dtype)
+        if self._crystal is None:
+            self._sync()
+        cfg = self.crystal_params.build_config()
+        N = torch.stack([torch.as_tensor(n, device=self.device, dtype=self.dtype) for n in cfg.N_cells])
+        volume = None
+        if cfg.shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT) and cfg.spot_metric is SpotMetric.RECIPROCAL:
+            cell = self._crystal.compute_cell_tensors()
+            volume = cell["V"] / cell["c_reciprocal_scale"] ** 3
+        return bragg_peak_factor(cfg.shape, N, cfg.spot_metric, cfg.fudge, volume, cfg.N_cells_def)
+
+    def _forward_with_components(self, background, roi_only, options) -> torch.Tensor:
         """forward() with a diffuse model: the same images, with each Simulator's components kept.
 
         A separate path so that the one without a diffuse model stays as it was, bit for bit.
         """
+        self.diffuse.shape_factor = self.diffuse_shape_factor()
         if roi_only and len(self._detectors) > 1:
             panel_pixels = self._roi_panel_pixels()
             self._simulator.run(panel_pixels=panel_pixels, **options)
@@ -1569,11 +1627,7 @@ class ExperimentModel(nn.Module):
             if len(simulators) == 1:
                 parts, masks = {key: value[0] for key, value in parts.items()}, masks[0]
             planes = background.image() * masks
-        image = parts["total"]
-        if bragg_only:
-            planes = torch.zeros_like(image)
-        else:
-            image = image + planes
+        image = parts["total"] + planes
         self.components = {"bragg": parts["bragg"], "diffuse": parts["diffuse"], "background": planes, "total": image}
         return image
 
@@ -1603,10 +1657,7 @@ class ExperimentModel(nn.Module):
         around there).
         """
         background = self.background_params
-        values = self(roi_only=True, bragg_only=True)
-        if self.components is not None:
-            values = self.components["bragg"]  # the spot, not the diffuse term under it
-        values = values.detach().cpu().double().numpy()
+        values = self(roi_only=True, bragg_only=True).detach().cpu().double().numpy()
         slow, fast = background.pixels.cpu().numpy().T
         on_panel = background.panel.cpu().numpy()
         centroids = np.full((len(background.rois), 2), np.nan)
