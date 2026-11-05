@@ -36,6 +36,7 @@ import pytest
 import torch
 
 from nanobrag_torch.config import CrystalConfig, CrystalShape, SpotMetric
+from nanobrag_torch.diffuse import bragg_peak_factor
 from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.simulator import compute_physics_for_position
 
@@ -45,11 +46,12 @@ TOPHAT = 4.0 / 3.0 * math.pi * 0.63 ** 3
 ORTHORHOMBIC = (30.0, 35.0, 40.0, 90.0, 90.0, 90.0)
 
 
-def peak_integral(shape, N, metric=SpotMetric.HKL, points=96, cell=ORTHORHOMBIC, chunk=1 << 17):
+def peak_integral(shape, N, metric=SpotMetric.HKL, points=96, cell=ORTHORHOMBIC, chunk=1 << 17, fudge=1.0,
+                  N_cells_def=None):
     """The integral of F_latt^2 over the cell of hkl about one lattice point, over N_cells; and the crystal."""
     crystal = Crystal(CrystalConfig(cell_a=cell[0], cell_b=cell[1], cell_c=cell[2], cell_alpha=cell[3],
                                     cell_beta=cell[4], cell_gamma=cell[5], N_cells=N, shape=shape,
-                                    spot_metric=metric), dtype=DTYPE)
+                                    spot_metric=metric, fudge=fudge), dtype=DTYPE)
     # The reciprocal vectors as Simulator.run hands them to the kernel for the RECIPROCAL metric
     stars = [v * crystal.c_reciprocal_scale for v in (crystal.a_star, crystal.b_star, crystal.c_star)]
     pixel = torch.tensor([[0.1, 0.02, 0.01]], dtype=DTYPE)
@@ -69,7 +71,8 @@ def peak_integral(shape, N, metric=SpotMetric.HKL, points=96, cell=ORTHORHOMBIC,
             pixel, *rot, *rot_star, incident_beam_direction=incident, wavelength=wavelength,
             crystal_get_structure_factor=lambda h, k, l: torch.ones_like(h),  # noqa: E741
             N_cells_a=Na, N_cells_b=Nb, N_cells_c=Nc, crystal_shape=shape, spot_metric=metric,
-            apply_polarization=False)
+            crystal_fudge=fudge, apply_polarization=False,
+            N_cells_def=None if N_cells_def is None else torch.tensor(N_cells_def, dtype=DTYPE))
         total = total + intensity.sum()
     return float(total / points ** 3 / (N[0] * N[1] * N[2])), crystal
 
@@ -134,3 +137,52 @@ def test_reciprocal_metric_factor_scales_as_volume_over_n_cells_squared(shape, c
     assert factor == pytest.approx(constant * volume / n_cells ** 2, rel=tolerance)
     if cell == ORTHORHOMBIC:
         assert factor == pytest.approx(2.6459, rel=1e-4)  # not 1: the tie is not N_cells here
+
+
+# The shape correction of the tie (decided 2026-11-05): ExperimentModel multiplies the diffuse term by
+# bragg_peak_factor, so that integrated Bragg over diffuse is |F|^2 / I_d whatever the shape. The
+# factor must be the kernel's own peak integral, measured here as above.
+FACTOR_CASES = {
+    "square": (CrystalShape.SQUARE, (5, 5, 5), {}, 1e-12),
+    "square-uneven": (CrystalShape.SQUARE, (3, 4, 6), dict(points=32), 1e-12),
+    "gauss-hkl": (CrystalShape.GAUSS, (5, 5, 5), {}, 1e-7),
+    "gauss-hkl-uneven": (CrystalShape.GAUSS, (3, 4, 6), {}, 3e-4),  # Na = 3 cuts the tail at 1.5 sigma*3.8
+    "gauss-hkl-fudge": (CrystalShape.GAUSS, (5, 5, 5), dict(fudge=1.7), 1e-7),
+    "gauss-hkl-ndef": (CrystalShape.GAUSS, (6, 6, 6), dict(N_cells_def=(0.8, -0.5, 0.4)), 1e-6),
+    "tophat-hkl": (CrystalShape.TOPHAT, (3, 3, 3), dict(points=192), 5e-4),
+    "round-5": (CrystalShape.ROUND, (5, 5, 5), dict(points=128), 1e-5),
+    "round-20": (CrystalShape.ROUND, (20, 20, 20), dict(points=128), 1e-5),
+    "round-uneven": (CrystalShape.ROUND, (4, 6, 9), dict(points=128), 1e-5),
+    "round-fudge": (CrystalShape.ROUND, (6, 6, 6), dict(points=128, fudge=0.6), 1e-5),
+    "gauss-reciprocal": (CrystalShape.GAUSS, (5, 5, 5), dict(metric=SpotMetric.RECIPROCAL), 1e-4),
+    "gauss-reciprocal-triclinic": (CrystalShape.GAUSS, (5, 5, 5), dict(
+        metric=SpotMetric.RECIPROCAL, cell=(30.0, 35.0, 40.0, 85.0, 95.0, 100.0)), 1e-3),
+    "tophat-reciprocal": (CrystalShape.TOPHAT, (5, 5, 5), dict(
+        metric=SpotMetric.RECIPROCAL, points=192, cell=(30.0, 30.0, 30.0, 90.0, 90.0, 90.0)), 5e-3),
+}
+
+
+@pytest.mark.parametrize("case", sorted(FACTOR_CASES))
+def test_the_tie_factor_is_the_kernels_peak_integral(case):
+    """Integrated Bragg / (factor * diffuse) is |F|^2 / I_d for every shape: the kernel's integral over the factor is 1."""
+    shape, N, options, tolerance = FACTOR_CASES[case]
+    measured, crystal = peak_integral(shape, N, **options)
+    metric = options.get("metric", SpotMetric.HKL)
+    volume = crystal.V / crystal.c_reciprocal_scale ** 3
+    factor = bragg_peak_factor(shape, torch.tensor(N, dtype=DTYPE), spot_metric=metric, fudge=options.get("fudge", 1.0),
+                               volume=volume, N_cells_def=options.get("N_cells_def"))
+    assert measured / float(factor) == pytest.approx(1.0, abs=tolerance)
+
+
+def test_square_factor_is_exactly_one():
+    factor = bragg_peak_factor(CrystalShape.SQUARE, torch.tensor([5.0, 7.0, 3.0], dtype=DTYPE))
+    assert factor.item() == 1.0
+
+
+def test_closed_form_factors_carry_the_gradient_of_cell_and_size():
+    N = torch.tensor([5.0, 6.0, 7.0], dtype=DTYPE, requires_grad=True)
+    volume = torch.tensor(42000.0, dtype=DTYPE, requires_grad=True)
+    factor = bragg_peak_factor(CrystalShape.GAUSS, N, spot_metric=SpotMetric.RECIPROCAL, volume=volume)
+    factor.backward()
+    torch.testing.assert_close(volume.grad, factor.detach() / volume.detach(), rtol=1e-14, atol=0.0)
+    torch.testing.assert_close(N.grad, -2 * factor.detach() / N.detach(), rtol=1e-14, atol=0.0)
