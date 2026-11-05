@@ -68,7 +68,7 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
     configurations.
   - It fills `Simulator.components`, and a ROI mask applies to both parts.
   - `ExperimentModel` does not use it: it builds its own Simulators, has no diffuse group,
-    and the ROI path ignores it.
+    and the ROI path ignores it. (Done in D2, section 4.)
 
 ### eryx (`mdx2-compare` 4ab7329)
 - **Detector-facing model:** `total_scattering.TotalScattering(crystal, network, share,
@@ -240,6 +240,11 @@ Gauges:
 - **Group `radial_background`** holds the spline knots.
 - `SerialExperiment` shares one diffuse module across shots, as it shares Fhkl. The radial
   background stays per shot.
+- **Done in D2:** the module is `diffuse_params.model` and k_d is
+  `diffuse_params.delta_log_scale`; the groups are in the instance's `PARAMETER_GROUPS`
+  (`ExperimentModel.OPTIONAL_GROUPS` names them). A parameter the module froze itself is
+  unrefinable. Shots share the whole block, k_d included: one diffuse-to-Bragg ratio.
+  `model.components` gives bragg, diffuse, background and total, on the ROI path too.
 
 Gradient checks (/tdd, CPU float64, central finite differences plus gradcheck on a 16² case):
 - each eryx parameter (log γ per class, solvent log k and log B, log share, extra_U, LLM σ)
