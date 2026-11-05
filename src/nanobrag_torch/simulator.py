@@ -249,7 +249,13 @@ def compute_physics_for_position(
     # does the rounding itself for the nearest-neighbour path.
     if diffuse is not None:
         hkl = torch.stack((h, k, l), dim=-1)
-        per_cell = diffuse(hkl.reshape(-1, 3)).to(device=h.device, dtype=h.dtype).reshape(h.shape)
+        per_cell = diffuse(hkl.reshape(-1, 3))
+        # MPS holds no float64, so the cast happens on the other device: off MPS first, onto it last
+        if per_cell.device.type == "mps":
+            per_cell = per_cell.to(device=h.device).to(dtype=h.dtype)
+        else:
+            per_cell = per_cell.to(dtype=h.dtype).to(device=h.device)
+        per_cell = per_cell.reshape(h.shape)
         intensity = (N_cells_a * N_cells_b * N_cells_c) * per_cell
     else:
         F_cell = crystal_get_structure_factor(h, k, l)

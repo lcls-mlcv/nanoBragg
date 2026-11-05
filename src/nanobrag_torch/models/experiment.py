@@ -868,7 +868,11 @@ class DiffuseStageAParams(nn.Module):
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
         per_cell = self.model(hkl)
         scale = torch.exp(self.delta_log_scale) * self.shape_factor
-        return per_cell * scale.to(device=per_cell.device)
+        if per_cell.device != scale.device:
+            # onto this model's device; MPS holds no float64, so a cast happens off MPS
+            per_cell = (per_cell.to(device=scale.device) if per_cell.device.type == "mps"
+                        else per_cell.to(dtype=scale.dtype).to(device=scale.device))
+        return per_cell * scale
 
 
 def _rodrigues(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:

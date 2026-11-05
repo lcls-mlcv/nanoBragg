@@ -319,3 +319,22 @@ def test_shots_must_share_the_diffuse_model_or_all_have_none():
         SerialExperiment([_shot(_halo(), MISSETS[0]), _model(crystal=dict(misset_deg=MISSETS[1]))])
     with pytest.raises(ValueError, match="same diffuse model"):
         SerialExperiment([_model(crystal=dict(misset_deg=MISSETS[0])), _shot(_halo(), MISSETS[1])])
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_a_model_on_mps_in_float32_runs_in_a_cpu_float64_model():
+    class OnMps(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.halo = GaussianHalo(40.0, 0.15, dtype=torch.float32).to("mps")
+
+        def forward(self, hkl):
+            # cast on the CPU, then move: the backward of a combined .to(mps, float32) would make float64 on MPS
+            return self.halo(hkl.to(dtype=torch.float32).to(device="mps"))
+
+    model = _model(OnMps())
+    image = model()
+    image.sum().backward()
+    reference = _model(GaussianHalo(40.0, 0.15, dtype=torch.float32))
+    assert image.dtype == DTYPE and model.diffuse_params.model.halo.log_sigma.grad.device.type == "mps"
+    torch.testing.assert_close(image, reference(), rtol=1e-5, atol=0.0)
