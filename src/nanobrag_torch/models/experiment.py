@@ -1674,7 +1674,8 @@ class SerialExperiment(nn.Module):
     """Several shots refined together, each an ExperimentModel, sharing structure factors.
 
     Every shot keeps its own crystal and beam parameters, as hopper's per-shot refinement
-    does, and all shots share the first shot's Fhkl, as its ensemble stage does. With
+    does, and all shots share the first shot's Fhkl, as its ensemble stage does, and its diffuse
+    model and k_d, if they have one (each shot built with the same model object). With
     ``share_detector`` (identical panels on every shot) they also share one Detector, so
     the panels' pixel coordinates exist once, and one set of detector offsets and panel-group
     rotations and shifts, which is how diffBragg refines panel geometry (one global set). Without
@@ -1705,6 +1706,11 @@ class SerialExperiment(nn.Module):
             if shot.fhkl_params.structure_factors is not first.fhkl_params.structure_factors:
                 raise ValueError("all shots must be built with the same StructureFactors object")
             shot.fhkl_params = first.fhkl_params
+            if (shot.diffuse is None) != (first.diffuse is None) or (
+                    first.diffuse is not None and shot.diffuse.model is not first.diffuse.model):
+                raise ValueError("all shots must be built with the same diffuse model, or all without one")
+            if first.diffuse is not None:
+                shot.diffuse_params = first.diffuse_params  # with its k_d: one diffuse-to-Bragg ratio
             if share_detector:
                 if shot.panel_group_params.group_of_panel != first.panel_group_params.group_of_panel or (
                         shot.panel_group_params.active != first.panel_group_params.active):

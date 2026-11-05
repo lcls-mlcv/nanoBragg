@@ -151,3 +151,105 @@ def test_components_are_none_without_a_model():
     model = _model()
     model()
     assert model.components is None
+
+
+# 3. The ROI path and panels carry the term; components come through the model.
+
+PANELS = [(4.8, 4.8), (-5.0, 4.8)]
+ROI_PANELS = [1, 0]
+
+
+def _panels(diffuse, **kwargs):
+    return _model(diffuse, detector=[_detector(beam_center_f=f, beam_center_s=s) for f, s in PANELS], **kwargs)
+
+
+@pytest.mark.parametrize("detector", [{}, dict(oversample=2), dict(detector_thick_um=300.0, detector_abs_um=200.0,
+                                                                  detector_thicksteps=3)])
+def test_roi_pixels_are_the_whole_image_pixels_part_by_part(detector):
+    model = _model(_halo(), detector=detector, background_rois=ROIS, tilt_abc=[(0.5, -0.25, 3.0), (1.0, 2.0, 7.0)])
+    with torch.no_grad():
+        whole = model()
+        whole_parts = {k: v.clone() for k, v in model.components.items()}
+        values = model(roi_only=True)
+    index = tuple(model.background_params.pixels.T)
+    torch.testing.assert_close(values, whole[index], rtol=1e-12, atol=0.0)
+    for key, part in model.components.items():
+        assert part.shape == values.shape
+        torch.testing.assert_close(part, whole_parts[key][index], rtol=1e-12, atol=0.0)
+    assert model.components["diffuse"].abs().min() > 0
+
+
+def test_roi_across_panels_are_the_whole_images_at_their_pixels():
+    model = _panels(_halo(), background_rois=ROIS, background_panels=ROI_PANELS)
+    with torch.no_grad():
+        whole = model()
+        assert whole.shape == (2, P, P) and model.components["diffuse"].shape == (2, P, P)
+        whole_diffuse = model.components["diffuse"].clone()
+        values = model(roi_only=True)
+    background = model.background_params
+    index = (background.panel, *background.pixels.T)
+    torch.testing.assert_close(values, whole[index], rtol=1e-12, atol=0.0)
+    torch.testing.assert_close(model.components["diffuse"], whole_diffuse[index], rtol=1e-12, atol=0.0)
+
+
+def test_panels_are_the_single_panel_simulators():
+    halo = _halo()
+    model = _panels(halo)
+    with torch.no_grad():
+        model(bragg_only=True)
+        for panel, (f, s) in enumerate(PANELS):
+            sim = _simulator(halo, detector=dict(beam_center_f=f, beam_center_s=s))
+            sim.run()
+            for key in ("bragg", "diffuse"):
+                torch.testing.assert_close(model.components[key][panel], sim.components[key], rtol=1e-12, atol=0.0)
+
+
+def test_roi_centroids_follow_the_bragg_part():
+    rois = [(0, P, 0, P)]
+    with torch.no_grad():
+        plain = _model(background_rois=rois).roi_centroids()
+        with_halo = _model(GaussianHalo(amplitude=1e6, sigma=0.3), background_rois=rois).roi_centroids()
+    torch.testing.assert_close(torch.as_tensor(with_halo), torch.as_tensor(plain), rtol=1e-12, atol=0.0)
+
+
+# 4. SerialExperiment holds one diffuse model.
+
+def _shot(halo, misset):
+    return _model(halo, crystal=dict(misset_deg=misset))
+
+
+MISSETS = [(5.0, -3.0, 2.0), (20.0, 10.0, -5.0)]
+
+
+def test_shots_share_one_diffuse_block():
+    halo = _halo()
+    serial = SerialExperiment([_shot(halo, m) for m in MISSETS])
+    block = serial.shots[0].diffuse_params
+    assert all(shot.diffuse_params is block for shot in serial.shots)
+    names = [n for n, _ in serial.named_parameters()]
+    assert sum(n.endswith("log_sigma") for n in names) == 1
+    assert sum(n.endswith("delta_log_scale") for n in names) == 1
+    serial.refine("diffuse_scale")
+    w = torch.rand(P, P, dtype=DTYPE, generator=torch.Generator().manual_seed(2))
+    images = serial()
+    sum((image * w).sum() for image in images).backward()
+    expected = {"log_sigma": 0.0, "delta_log_scale": 0.0}
+    for image, misset in zip(images, MISSETS):
+        alone = _shot(_halo(), misset)
+        alone.refine("diffuse_scale")
+        reference = alone()
+        torch.testing.assert_close(image, reference, rtol=1e-12, atol=0.0)
+        (reference * w).sum().backward()
+        expected["log_sigma"] += alone.diffuse_params.model.log_sigma.grad
+        expected["delta_log_scale"] += alone.diffuse_params.delta_log_scale.grad
+    torch.testing.assert_close(halo.log_sigma.grad, expected["log_sigma"], rtol=1e-11, atol=0.0)
+    torch.testing.assert_close(block.delta_log_scale.grad, expected["delta_log_scale"], rtol=1e-11, atol=0.0)
+
+
+def test_shots_must_share_the_diffuse_model_or_all_have_none():
+    with pytest.raises(ValueError, match="same diffuse model"):
+        SerialExperiment([_shot(_halo(), MISSETS[0]), _shot(_halo(), MISSETS[1])])
+    with pytest.raises(ValueError, match="same diffuse model"):
+        SerialExperiment([_shot(_halo(), MISSETS[0]), _model(crystal=dict(misset_deg=MISSETS[1]))])
+    with pytest.raises(ValueError, match="same diffuse model"):
+        SerialExperiment([_model(crystal=dict(misset_deg=MISSETS[0])), _shot(_halo(), MISSETS[1])])
