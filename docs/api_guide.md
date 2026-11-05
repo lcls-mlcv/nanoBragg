@@ -36,6 +36,10 @@ Pass structure factors with `F=`:
 
 `gaussian_nll` is hopper's target and `poisson_nll` is the counting likelihood. `hopper_restraints(model, centers, betas)` adds hopper's restraints, with hopper's `centers` and `betas` names and units; add it to the likelihood in the objective. `SerialExperiment` holds many shots that share structure factors. `scripts/refinement_demo.py` is a worked example on synthetic and real stills.
 
+## Diffuse scattering
+
+`Simulator(diffuse=model)` adds a diffuse term to the image, an extension that nanoBragg.c does not have. `model` maps fractional Miller indices `(n, 3)` to scattering per unit cell in electrons squared, `(n,)`; it is any callable, usually a `torch.nn.Module` (see `nanobrag_torch.diffuse.DiffuseModel`). The term takes the Bragg term's r_e², fluence, scale, solid angle, polarization and sensor capture, times the number of cells, without the lattice factor, so the two share one absolute scale. After `run()`, `simulator.components` holds `bragg`, `diffuse` and `total`. Without a model the image is unchanged, bit for bit. `ConstantDiffuse` and `GaussianHalo` are small reference models; physical models live in their own packages and implement the same call. `docs/diffuse_joint_plan.md` describes the plan for refining Bragg and diffuse together.
+
 ## Output
 
 The library prints nothing. It logs to the `nanobrag_torch` logger: oversampling choices at INFO, reflection ranges at DEBUG. To see them:

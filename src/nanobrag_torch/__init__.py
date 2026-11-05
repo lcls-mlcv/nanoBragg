@@ -25,6 +25,7 @@ _EXPORTS = {
         "NoiseConfig",
         "SpotMetric",
     ],
+    ".diffuse": ["ConstantDiffuse", "DiffuseModel", "GaussianHalo"],
     ".models.crystal": ["Crystal"],
     ".models.detector": ["Detector"],
     ".models.experiment": ["ExperimentModel", "SerialExperiment"],

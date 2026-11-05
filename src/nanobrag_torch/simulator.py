@@ -600,9 +600,10 @@ class Simulator:
             device: PyTorch device (cpu/cuda)
             dtype: PyTorch data type
             debug_config: Debug configuration with printout, printout_pixel, trace_pixel options
-            diffuse: Optional extension, not in nanoBragg.c. Maps Miller indices (n, 3), float64
-                (float32 on MPS), to scattering per unit cell (n,) in electrons squared, finite everywhere. run()
-                adds it to the image and fills self.components. None leaves the image untouched.
+            diffuse: Optional extension, not in nanoBragg.c: a nanobrag_torch.diffuse.DiffuseModel,
+                mapping Miller indices (n, 3), float64 (float32 on MPS), to scattering per unit cell
+                (n,) in electrons squared, finite everywhere. run() adds it to the image and fills
+                self.components. None leaves the image untouched.
             diffuse_orientations: "all" averages the term over every phi step and mosaic domain,
                 "first" uses the first, which is cheaper and exact for one orientation.
         """
