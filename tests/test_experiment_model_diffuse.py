@@ -149,7 +149,7 @@ def test_the_diffuse_part_is_the_simulators_times_the_shape_factor(shape):
         sim = _simulator(halo, crystal=SHAPES[shape])
         sim.run()
     factor = _expected_factor(SHAPES[shape])
-    assert float(model.diffuse_params.shape_factor) == pytest.approx(factor, rel=1e-14)
+    assert float(model.diffuse_shape_factor()) == pytest.approx(factor, rel=1e-14)
     # (not bit for bit under GAUSS-HKL, where the model's zero Ndef takes the matrix path: Simulator._n_cells_def)
     torch.testing.assert_close(model.components["bragg"], sim.components["bragg"], rtol=1e-12, atol=0.0)
     torch.testing.assert_close(model.components["diffuse"], factor * sim.components["diffuse"], rtol=1e-14, atol=0.0)
@@ -167,7 +167,7 @@ def test_the_shape_factor_can_be_turned_off():
         model()
         sim = _simulator(halo)
         sim.run()
-    assert float(model.diffuse_params.shape_factor) == 1.0
+    assert float(model.diffuse_shape_factor()) == 1.0
     assert torch.equal(model.components["diffuse"], sim.components["diffuse"])
 
 
@@ -178,7 +178,7 @@ def test_the_shape_factor_follows_the_crystal_size_and_cell():
         model.crystal_params.delta_log_a.fill_(math.log(32.0 / 30.0))
         model()
     expected = _expected_factor(dict(N_cells=(6, 6, 6), cell_a=32.0))
-    assert float(model.diffuse_params.shape_factor) == pytest.approx(expected, rel=1e-12)
+    assert float(model.diffuse_shape_factor()) == pytest.approx(expected, rel=1e-12)
     assert expected != pytest.approx(_expected_factor({}), rel=1e-3)
 
 
@@ -339,3 +339,88 @@ def test_a_model_on_mps_in_float32_runs_in_a_cpu_float64_model():
     reference = _model(GaussianHalo(40.0, 0.15, dtype=torch.float32))
     assert image.dtype == DTYPE and model.diffuse_params.model.halo.log_sigma.grad.device.type == "mps"
     torch.testing.assert_close(image, reference(), rtol=1e-5, atol=0.0)
+
+
+# Review and audit follow-ups (2026-11-05)
+
+def test_model_diffuse_is_the_module_given():
+    halo = _halo()
+    model = _model(halo)
+    assert model.diffuse is halo and model.diffuse_params.model is halo
+    assert _model().diffuse is None
+
+
+def test_refine_all_leaves_k_d_frozen_unless_named():
+    model = _model(_halo()).freeze()
+    model.refine()
+    k_d = model.diffuse_params.delta_log_scale
+    assert not k_d.requires_grad and model.diffuse_params.model.log_sigma.requires_grad
+    model.refine("diffuse_scale")
+    assert k_d.requires_grad
+    model.freeze().refine(K_D)
+    assert k_d.requires_grad
+
+
+def _plain_diffuse(halo, crystal=None):
+    sim = _simulator(halo, crystal=crystal)
+    with torch.no_grad():
+        sim.run()
+    return sim.components["diffuse"]
+
+
+def test_each_shot_scales_by_its_own_factor_and_setting():
+    halo = _halo()
+    shots = [_model(halo, crystal=dict(N_cells=(5, 5, 5))), _model(halo, crystal=dict(N_cells=(6, 6, 6))),
+             _model(halo, crystal=dict(N_cells=(7, 7, 7)), diffuse_shape_factor=False)]
+    serial = SerialExperiment(shots)
+    with torch.no_grad():
+        serial(keep_components=True)
+        for shot, n, use in zip(serial.shots, (5, 6, 7), (True, True, False)):
+            factor = _expected_factor(dict(N_cells=(n, n, n))) if use else 1.0
+            torch.testing.assert_close(shot.components["diffuse"],
+                                       factor * _plain_diffuse(halo, dict(N_cells=(n, n, n))), rtol=1e-13, atol=0.0)
+        # and a shot's own Simulator, run directly after the pass, uses that shot's factor
+        sim = serial.shots[0]._build_simulator()[0]
+        sim.run()
+        torch.testing.assert_close(sim.components["diffuse"], _expected_factor({}) * _plain_diffuse(halo),
+                                   rtol=1e-13, atol=0.0)
+
+
+def test_a_direct_simulator_run_uses_the_current_factor():
+    halo = _halo()
+    model = _model(halo)
+    with torch.no_grad():
+        model()
+        model.crystal_params.delta_log_N_cells.fill_(math.log(6.0 / 5.0))
+        sim = model._build_simulator()[0]
+        sim.run()
+    n6 = dict(N_cells=(6, 6, 6))
+    torch.testing.assert_close(sim.components["diffuse"], _expected_factor(n6) * _plain_diffuse(halo, n6),
+                               rtol=1e-12, atol=0.0)
+
+
+def _graphs_held(model):
+    """Tensors with an autograd graph that the model and its Simulators keep after a forward."""
+    held = []
+    objects = [model, model.diffuse_params, *[s.diffuse for s in model._simulators]]
+    for obj in objects:
+        for value in vars(obj).values():
+            values = value.values() if isinstance(value, dict) else [value]
+            held += [v for v in values if torch.is_tensor(v) and v.grad_fn is not None]
+    return held
+
+
+def test_no_graph_is_kept_between_forwards():
+    model = _model(_halo())
+    model().sum().backward()
+    assert _graphs_held(model) == []
+    assert all(part.grad_fn is None for part in model.components.values())
+
+
+def test_serial_experiments_drop_components_unless_asked():
+    halo = _halo()
+    serial = SerialExperiment([_shot(halo, m) for m in MISSETS])
+    serial()
+    assert all(shot.components is None for shot in serial.shots)
+    serial(keep_components=True)
+    assert all(shot.components is not None and shot.components["total"].grad_fn is None for shot in serial.shots)
