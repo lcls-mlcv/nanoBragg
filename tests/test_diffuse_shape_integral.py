@@ -142,24 +142,48 @@ def test_reciprocal_metric_factor_scales_as_volume_over_n_cells_squared(shape, c
 # The shape correction of the tie (decided 2026-11-05): ExperimentModel multiplies the diffuse term by
 # bragg_peak_factor, so that integrated Bragg over diffuse is |F|^2 / I_d whatever the shape. The
 # factor must be the kernel's own peak integral, measured here as above.
+CUBIC_100 = (100.0, 100.0, 100.0, 90.0, 90.0, 90.0)
+TRICLINIC_BIG = (110.0, 120.0, 100.0, 80.0, 95.0, 105.0)
+RECIPROCAL = SpotMetric.RECIPROCAL
+# shape, N, peak_integral options, tolerance on kernel / factor. The kernel's midpoint grid is the
+# limit where the cell cuts the peak (the integrand is not small at the boundary): 1e-4 there.
 FACTOR_CASES = {
     "square": (CrystalShape.SQUARE, (5, 5, 5), {}, 1e-12),
     "square-uneven": (CrystalShape.SQUARE, (3, 4, 6), dict(points=32), 1e-12),
     "gauss-hkl": (CrystalShape.GAUSS, (5, 5, 5), {}, 1e-7),
-    "gauss-hkl-uneven": (CrystalShape.GAUSS, (3, 4, 6), {}, 3e-4),  # Na = 3 cuts the tail at 1.5 sigma*3.8
+    "gauss-hkl-uneven": (CrystalShape.GAUSS, (3, 4, 6), {}, 1e-6),
+    "gauss-hkl-small": (CrystalShape.GAUSS, (1, 2, 2), {}, 1e-4),
     "gauss-hkl-fudge": (CrystalShape.GAUSS, (5, 5, 5), dict(fudge=1.7), 1e-7),
     "gauss-hkl-ndef": (CrystalShape.GAUSS, (6, 6, 6), dict(N_cells_def=(0.8, -0.5, 0.4)), 1e-6),
+    "gauss-hkl-ndef-small": (CrystalShape.GAUSS, (2, 3, 2), dict(N_cells_def=(0.5, -0.3, 0.2)), 1e-4),
     "tophat-hkl": (CrystalShape.TOPHAT, (3, 3, 3), dict(points=192), 5e-4),
+    "tophat-hkl-small": (CrystalShape.TOPHAT, (1, 1, 2), dict(points=192), 5e-3),
     "round-5": (CrystalShape.ROUND, (5, 5, 5), dict(points=128), 1e-5),
     "round-20": (CrystalShape.ROUND, (20, 20, 20), dict(points=128), 1e-5),
     "round-uneven": (CrystalShape.ROUND, (4, 6, 9), dict(points=128), 1e-5),
+    "round-fractional": (CrystalShape.ROUND, (5.5, 6.2, 4.7), dict(points=128), 1e-5),
     "round-fudge": (CrystalShape.ROUND, (6, 6, 6), dict(points=128, fudge=0.6), 1e-5),
-    "gauss-reciprocal": (CrystalShape.GAUSS, (5, 5, 5), dict(metric=SpotMetric.RECIPROCAL), 1e-4),
+    "gauss-reciprocal": (CrystalShape.GAUSS, (5, 5, 5), dict(metric=RECIPROCAL), 1e-4),
     "gauss-reciprocal-triclinic": (CrystalShape.GAUSS, (5, 5, 5), dict(
-        metric=SpotMetric.RECIPROCAL, cell=(30.0, 35.0, 40.0, 85.0, 95.0, 100.0)), 1e-3),
+        metric=RECIPROCAL, cell=(30.0, 35.0, 40.0, 85.0, 95.0, 100.0)), 1e-4),
     "tophat-reciprocal": (CrystalShape.TOPHAT, (5, 5, 5), dict(
-        metric=SpotMetric.RECIPROCAL, points=192, cell=(30.0, 30.0, 30.0, 90.0, 90.0, 90.0)), 5e-3),
+        metric=RECIPROCAL, points=192, cell=(30.0, 30.0, 30.0, 90.0, 90.0, 90.0)), 5e-3),
+    # The audit's cases (2026-11-05): the cell cuts the peak, which the untruncated forms ignored
+    # (kernel / untruncated was 0.910, 0.019, 0.019)
+    "gauss-reciprocal-79x79x38": (CrystalShape.GAUSS, (5, 5, 5), dict(metric=RECIPROCAL, cell=(79.0, 79.0, 38.0, 90.0, 90.0, 90.0)), 1e-4),
+    "gauss-reciprocal-100-N3": (CrystalShape.GAUSS, (3, 3, 3), dict(metric=RECIPROCAL, cell=CUBIC_100), 1e-4),
+    "tophat-reciprocal-100-N3": (CrystalShape.TOPHAT, (3, 3, 3), dict(metric=RECIPROCAL, cell=CUBIC_100), 1e-12),
+    "tophat-reciprocal-120-N5": (CrystalShape.TOPHAT, (5, 5, 5), dict(
+        metric=RECIPROCAL, points=192, cell=(120.0, 120.0, 120.0, 90.0, 90.0, 90.0)), 5e-3),
+    "tophat-reciprocal-triclinic-big": (CrystalShape.TOPHAT, (5, 5, 5), dict(metric=RECIPROCAL, points=192, cell=TRICLINIC_BIG), 5e-3),
+    "gauss-reciprocal-triclinic-big": (CrystalShape.GAUSS, (4, 6, 5), dict(metric=RECIPROCAL, cell=TRICLINIC_BIG), 1e-4),
 }
+
+
+def _factor(shape, N, crystal, metric=SpotMetric.HKL, fudge=1.0, N_cells_def=None, **_):
+    stars = torch.stack([crystal.a_star, crystal.b_star, crystal.c_star]) * crystal.c_reciprocal_scale
+    return bragg_peak_factor(shape, torch.tensor(N, dtype=DTYPE), spot_metric=metric, fudge=fudge,
+                             reciprocal_vectors=stars, N_cells_def=N_cells_def)
 
 
 @pytest.mark.parametrize("case", sorted(FACTOR_CASES))
@@ -167,11 +191,23 @@ def test_the_tie_factor_is_the_kernels_peak_integral(case):
     """Integrated Bragg / (factor * diffuse) is |F|^2 / I_d for every shape: the kernel's integral over the factor is 1."""
     shape, N, options, tolerance = FACTOR_CASES[case]
     measured, crystal = peak_integral(shape, N, **options)
-    metric = options.get("metric", SpotMetric.HKL)
-    volume = crystal.V / crystal.c_reciprocal_scale ** 3
-    factor = bragg_peak_factor(shape, torch.tensor(N, dtype=DTYPE), spot_metric=metric, fudge=options.get("fudge", 1.0),
-                               volume=volume, N_cells_def=options.get("N_cells_def"))
+    factor = _factor(shape, N, crystal, **options)
     assert measured / float(factor) == pytest.approx(1.0, abs=tolerance)
+
+
+@pytest.mark.parametrize("shape", [CrystalShape.GAUSS, CrystalShape.TOPHAT])
+@pytest.mark.parametrize("edge", [30.0, 60.0, 100.0, 150.0])
+@pytest.mark.parametrize("n", [3, 5, 10])
+def test_reciprocal_metric_factor_over_a_sweep_of_cells_and_sizes(shape, edge, n):
+    """From peaks far inside the cell (fast path) to a cell inside the peak (factor = N_cells)."""
+    cell = (edge, 1.1 * edge, 0.9 * edge, 90.0, 90.0, 90.0)
+    points = 192 if shape is CrystalShape.TOPHAT else 96
+    if shape is CrystalShape.TOPHAT and 0.63 * min(cell[:3]) / n ** 3 < 10 / points:
+        pytest.skip("a ball under 10 steps of the kernel's grid in radius: its grid volume is no reference")
+    measured, crystal = peak_integral(shape, (n, n, n), RECIPROCAL, points=points, cell=cell)
+    factor = float(_factor(shape, (n, n, n), crystal, RECIPROCAL))
+    assert factor <= n ** 3 * (1 + 1e-12)  # F_latt^2 <= N_cells^2 everywhere
+    assert measured / factor == pytest.approx(1.0, abs=1e-4 if shape is CrystalShape.GAUSS else 1e-2)
 
 
 def test_square_factor_is_exactly_one():
@@ -179,10 +215,51 @@ def test_square_factor_is_exactly_one():
     assert factor.item() == 1.0
 
 
-def test_closed_form_factors_carry_the_gradient_of_cell_and_size():
-    N = torch.tensor([5.0, 6.0, 7.0], dtype=DTYPE, requires_grad=True)
-    volume = torch.tensor(42000.0, dtype=DTYPE, requires_grad=True)
-    factor = bragg_peak_factor(CrystalShape.GAUSS, N, spot_metric=SpotMetric.RECIPROCAL, volume=volume)
-    factor.backward()
-    torch.testing.assert_close(volume.grad, factor.detach() / volume.detach(), rtol=1e-14, atol=0.0)
-    torch.testing.assert_close(N.grad, -2 * factor.detach() / N.detach(), rtol=1e-14, atol=0.0)
+def _numeric_gradient(fn, x, step=1e-6):
+    grads = []
+    for i in range(len(x)):
+        e = torch.zeros_like(x)
+        e[i] = step
+        grads.append((float(fn(x + e)) - float(fn(x - e))) / (2 * step))
+    return torch.tensor(grads, dtype=DTYPE)
+
+
+CRYSTAL_STARS = torch.tensor([[1 / 30.0, 0.001, 0.0], [0.0, 1 / 35.0, 0.002], [0.0, 0.0, 1 / 40.0]], dtype=DTYPE)
+BIG_STARS = CRYSTAL_STARS * 0.3  # a cell about 3x as large: the peak is cut by the cell
+
+
+@pytest.mark.parametrize("shape,metric,N,stars", [
+    (CrystalShape.GAUSS, RECIPROCAL, (5.0, 6.0, 7.0), CRYSTAL_STARS),  # fast path
+    (CrystalShape.GAUSS, RECIPROCAL, (5.0, 6.0, 7.0), BIG_STARS),  # truncated quadrature
+    (CrystalShape.TOPHAT, RECIPROCAL, (5.0, 6.0, 7.0), BIG_STARS),
+    (CrystalShape.GAUSS, SpotMetric.HKL, (1.5, 2.0, 2.5), None),
+    (CrystalShape.ROUND, SpotMetric.HKL, (5.0, 5.0, 5.0), None),
+    (CrystalShape.ROUND, SpotMetric.HKL, (4.3, 6.1, 9.2), None),
+    (CrystalShape.ROUND, SpotMetric.HKL, (20.0, 20.0, 20.0), None),
+])
+def test_the_factor_is_differentiable_in_size_and_cell(shape, metric, N, stars):
+    N = torch.tensor(N, dtype=DTYPE, requires_grad=True)
+    factor = bragg_peak_factor(shape, N, spot_metric=metric, reciprocal_vectors=stars)
+    (grad,) = torch.autograd.grad(factor, N)
+    fd = _numeric_gradient(lambda n: bragg_peak_factor(shape, n, spot_metric=metric, reciprocal_vectors=stars),
+                           N.detach())
+    assert fd.abs().max() > 0
+    torch.testing.assert_close(grad, fd, rtol=1e-5, atol=1e-7 * float(factor))
+    if stars is not None:
+        stars = stars.clone().requires_grad_(True)
+        (grad,) = torch.autograd.grad(bragg_peak_factor(shape, N.detach(), metric, reciprocal_vectors=stars), stars)
+        flat = _numeric_gradient(lambda v: bragg_peak_factor(shape, N.detach(), metric, reciprocal_vectors=v.reshape(3, 3)),
+                                 stars.detach().reshape(-1), step=1e-9)
+        torch.testing.assert_close(grad.reshape(-1), flat, rtol=1e-4, atol=1e-6 * flat.abs().max())
+
+
+def test_round_cost_is_about_linear_in_n():
+    """N^3 cubature took 2.2 s at N = 100 and minutes at 500; the radial form is linear in N."""
+    import time
+    times = {}
+    for n in (5, 20, 100, 500):
+        start = time.perf_counter()
+        factor = bragg_peak_factor(CrystalShape.ROUND, torch.tensor([n, n, n], dtype=DTYPE))
+        times[n] = time.perf_counter() - start
+        assert 1 - 0.6 / n < float(factor) < 1
+    assert times[500] < 2.0, times

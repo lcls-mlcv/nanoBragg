@@ -165,17 +165,33 @@ class DiffuseModel(Protocol):          # in practice an nn.Module
   diffuse term is multiplied by the factor, `nanobrag_torch.diffuse.bragg_peak_factor`, so
   integrated Bragg over diffuse is |F|²/I_d for every shape. SQUARE is 1 exactly, so it
   behaves as before.
-  - Closed forms: GAUSS (0.315π/fudge)^(3/2), TOPHAT (4/3)π(0.3969/fudge)^(3/2), GAUSS with
-    Ndef times |det NABC|/(Na·Nb·Nc), RECIPROCAL metric times V/N_cells². ROUND has no
-    closed form for the truncated tail, so Gauss-Legendre quadrature over the cell, cached by
-    (N, fudge), with no gradient in N.
-  - It is recomputed at every forward from the current N_cells and cell, with their
-    gradients. It is not folded into k_d's starting value because under the RECIPROCAL metric
-    it moves as N_cells and the cell refine. It shows as `model.diffuse_shape_factor()` and
-    `diffuse_params.shape_factor`. `diffuse_shape_factor=False` sets it to 1.
-  - Against the kernel's measured integral: SQUARE 1e-15, ROUND 5e-6, GAUSS-HKL 1e-9 (2e-4
-    at N = 3, where the cell cuts the tail), RECIPROCAL 9e-5, TOPHAT 1e-4 to 2e-3 (the grid's
-    ball).
+  - The factor is the integral over the peak's own cell of hkl, |h − h0| < 1/2, as the
+    kernel assigns points to their nearest lattice point.
+    - GAUSS and TOPHAT: the closed forms (0.315π/fudge)^(3/2) and (4/3)π(0.3969/fudge)^(3/2),
+      over √det M, apply where the cell cuts under 1e-10 of the Gaussian or none of the ball.
+      Elsewhere it computes the cut integral (Gauss–Legendre in 3D, or the ball's chord
+      integrated over h, k).
+    - ROUND has no closed form. It is a radial integral of sinc3² times the area of the sphere
+      inside the cell, with work linear in N: 12 ms at N = 500.
+    - All of these are differentiable in N, the cell and Ndef.
+    - Audit, 2026-11-05: the first version ignored the cut. Under RECIPROCAL that was 9% off
+      for 79×79×38 Å with N = 5, and a factor of 50 off for a 100 Å cell with N = 3.
+  - It is recomputed at every forward from the current N_cells and cell, with their gradients.
+    It is not folded into k_d's starting value because it moves as they refine. It shows as
+    `model.diffuse_shape_factor()`, and `diffuse_shape_factor=False` sets it to 1.
+  - Against the kernel's measured integral (`tests/test_diffuse_shape_integral.py`):
+    - SQUARE 1e-15, GAUSS-HKL 1e-9 (4e-5 at N = 1–2);
+    - ROUND 5e-6;
+    - RECIPROCAL GAUSS 5e-5 where the cell cuts the peak; there the kernel's midpoint grid is
+      the limit, converging as h² towards the factor;
+    - TOPHAT 1e-5 to 2e-3, the grid's ball.
+- **The RECIPROCAL metric and joint fits.** Under bl831's metric the factor is about
+  V/N_cells² while the peak sits inside the cell, so with k_d frozen the integrated diffuse
+  term scales as V/N_cells, against N_cells for the Bragg term. That is faithful to C's
+  metric, whose radius is not dimensionless, but unphysical when N_cells or the cell refines:
+  the fit moves Bragg and diffuse pixels together in a way no crystal does.
+  **Recommendation: use `spot_metric=SpotMetric.HKL` (diffBragg's) for joint fits.** There the
+  factor is a constant: 0.9844 for GAUSS, 1 for SQUARE.
 - **Relative scale `k_d`** (group `diffuse_scale`, log, default frozen at 1):
   - Frozen, the absolute tie is a physical constraint.
   - Freed, the halves separate: a diffuse fit that does not lean on the Bragg scale.

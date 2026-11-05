@@ -134,8 +134,9 @@ SHAPES = {
 def _expected_factor(crystal):
     config = _crystal(**crystal)
     cell = Crystal(config, dtype=DTYPE)
+    stars = torch.stack([cell.a_star, cell.b_star, cell.c_star]) * cell.c_reciprocal_scale
     return float(bragg_peak_factor(config.shape, torch.tensor(config.N_cells, dtype=DTYPE), config.spot_metric,
-                                   volume=cell.V / cell.c_reciprocal_scale ** 3))
+                                   reciprocal_vectors=stars))
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))

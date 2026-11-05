@@ -1586,8 +1586,8 @@ class ExperimentModel(nn.Module):
         """The diffuse term's shape factor at the current parameters (see DiffuseStageAParams).
 
         nanobrag_torch.diffuse.bragg_peak_factor of this crystal's shape, spot metric, fudge,
-        N_cells and Ndef, and for the RECIPROCAL metric the volume of the reciprocal vectors
-        the kernel measures the spot radius with. 1 with diffuse_shape_factor=False.
+        N_cells and Ndef, and for the RECIPROCAL metric the reciprocal vectors the kernel
+        measures the spot radius with. 1 with diffuse_shape_factor=False.
         """
         from ..diffuse import bragg_peak_factor
 
@@ -1599,11 +1599,11 @@ class ExperimentModel(nn.Module):
             self._sync()
         cfg = self.crystal_params.build_config()
         N = torch.stack([torch.as_tensor(n, device=self.device, dtype=self.dtype) for n in cfg.N_cells])
-        volume = None
+        stars = None
         if cfg.shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT) and cfg.spot_metric is SpotMetric.RECIPROCAL:
-            cell = self._crystal.compute_cell_tensors()
-            volume = cell["V"] / cell["c_reciprocal_scale"] ** 3
-        return bragg_peak_factor(cfg.shape, N, cfg.spot_metric, cfg.fudge, volume, cfg.N_cells_def)
+            cell = self._crystal.compute_cell_tensors()  # as Simulator.run scales them for this metric
+            stars = torch.stack([cell["a_star"], cell["b_star"], cell["c_star"]]) * cell["c_reciprocal_scale"]
+        return bragg_peak_factor(cfg.shape, N, cfg.spot_metric, cfg.fudge, stars, cfg.N_cells_def)
 
     def _forward_with_components(self, background, roi_only, options) -> torch.Tensor:
         """forward() with a diffuse model: the same images, with each Simulator's components kept.
