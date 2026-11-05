@@ -8,10 +8,12 @@ Run the same script against two trees and compare:
     PYTHONPATH=<either>/src      python scripts/diffuse/off_is_identical.py compare base.npz branch.npz
 
 "write" stores, for a fixed set of Simulator, ExperimentModel and SerialExperiment cases, the
-image, the gradient of a weighted image sum with respect to every trainable parameter (and the
-Simulator's geometry leaves) and the state_dict keys. "compare" demands np.array_equal on every
+image and the gradient of a weighted image sum: for the models with respect to every trainable
+parameter, plus their state_dict keys; for a bare Simulator (not an nn.Module) with respect to
+leaves for the distance, cell length a and wavelength. "compare" demands np.array_equal on every
 array and identical key lists. It uses only API that exists without the extension, so the base
-tree can run it. Pass --device cuda to repeat on a GPU.
+tree can run it. Pass --device cuda to repeat on a GPU. Compilation is off by default; set
+NANOBRAGG_DISABLE_COMPILE=0 to gate the compiled kernel instead.
 """
 import argparse
 import os
@@ -61,6 +63,7 @@ SIMULATOR_CASES = {
     "sources": dict(beam=dict(sources=3)),
     "sensor": dict(detector=dict(detector_thick_um=300.0, detector_abs_um=200.0, detector_thicksteps=3)),
     "oversample": dict(detector=dict(oversample=3)),
+    "pixels": dict(run=dict(pixels=torch.tensor([[3, 4], [12, 11], [20, 7], [23, 23]]))),
 }
 
 MODEL_CASES = {
@@ -85,15 +88,21 @@ def _store(out, prefix, image, named):
 
 def simulator_cases(out, device, dtype):
     for name, case in SIMULATOR_CASES.items():
-        distance = torch.tensor(60.0, dtype=dtype, device=device, requires_grad=True)
+        leaves = {name: torch.tensor(value, dtype=dtype, device=device, requires_grad=True)
+                  for name, value in [("distance_mm", 60.0), ("cell_a", 30.0), ("wavelength_A", 1.2)]}
         detector = _detector(**case.get("detector", {}))
-        detector.distance_mm = distance
-        crystal = Crystal(_crystal(**case.get("crystal", {})), device=device, dtype=dtype)
+        detector.distance_mm = leaves["distance_mm"]
+        crystal_config = _crystal(**case.get("crystal", {}))
+        crystal_config.cell_a = leaves["cell_a"]
+        crystal = Crystal(crystal_config, device=device, dtype=dtype)
         sim = Simulator(crystal, Detector(detector, device=device, dtype=dtype),
                         beam_config=_beam(**case.get("beam", {})), device=device, dtype=dtype)
-        image = sim.run()
+        if "sources" not in case.get("beam", {}):
+            sim.wavelength = leaves["wavelength_A"]
+        run = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in case.get("run", {}).items()}
+        image = sim.run(**run)
         (image * _weights(image.shape, device, dtype)).sum().backward()
-        _store(out, f"sim/{name}/{dtype}", image, [("distance_mm", distance)])
+        _store(out, f"sim/{name}/{dtype}", image, leaves.items())
 
 
 def model_cases(out, device, dtype):

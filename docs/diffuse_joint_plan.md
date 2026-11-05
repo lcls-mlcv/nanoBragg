@@ -1,6 +1,7 @@
 # Plan: Bragg and diffuse in one differentiable model
 
-Status: draft for review, no code yet. Branch `feat/diffuse-joint` off `torch` 3d863fc.
+Status: plan settled 2026-11-04; PR D1 implements section 7's first row. Branch
+`feat/diffuse-joint` off `torch` 3d863fc.
 
 Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 (`nanobrag_torch`), eryx = the diffuse-scattering library (PyTorch, GPLv2).
@@ -45,7 +46,8 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
   (hopper's centers and betas), `utils/refinement.refine_lbfgsb` (scaled L-BFGS-B over
   closures), and the .expt/.refl export (#71).
 - **The diffuse hook is not in `torch`.** Branch `diffuse-on-tail` (31d0b2c and 3f653f1)
-  adds it, plus the MPS fix 7b344a4 from a local branch. All three cherry-pick onto 3d863fc
+  adds it, plus the MPS fix 7b344a4 from a local branch (rebased in D1 as 4defbe5, 6995bd8,
+  0805f4e). All three cherry-pick onto 3d863fc
   with no conflict, and `tests/test_diffuse_term.py` passes there (20 tests). What it does:
   - `Simulator(diffuse=fn, diffuse_orientations="all"|"first")`, where
     `fn(hkl (n,3) float64) -> (n,)` is scattering per unit cell in electrons².
@@ -110,9 +112,9 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 ```python
 # nanobrag_torch/diffuse.py (MIT)
 class DiffuseModel(Protocol):          # in practice an nn.Module
-    def forward(self, hkl: Tensor) -> Tensor: ...        # (n,3) fractional -> (n,) e^2 per cell
-    # optional
-    def grid(self) -> "DiffuseGrid": ...                 # values on a reciprocal grid, see 2.3
+    def __call__(self, hkl: Tensor) -> Tensor: ...       # (n,3) fractional -> (n,) e^2 per cell
+    # added in D3, optional:
+    # def grid(self) -> "DiffuseGrid": ...               # values on a reciprocal grid, see 2.2
 ```
 
 - torchBragg ships only the protocol, reference toy models and a grid interpolator:
@@ -229,14 +231,19 @@ Each rung uses the result of the one before; real data only after synthetic reco
 
 - **V0 Off is off.**
   - Parity matrix (306 cases) unchanged.
-  - `scripts/diffuse/off_is_identical.py`: images, gradients of a weighted image sum with
-    respect to every trainable parameter, and `state_dict` keys of Simulator (6 cases),
-    ExperimentModel (whole image, ROI, multi-panel, GAUSS with mosaic) and SerialExperiment,
-    in float32 and float64. They are written on the base tree and on the branch and compared
-    with `np.array_equal`.
+  - `scripts/diffuse/off_is_identical.py` covers:
+    - 7 Simulator cases, among them `pixels=`, with gradients for distance, cell a and
+      wavelength;
+    - 4 ExperimentModel cases (whole image, ROI, multi-panel, GAUSS with mosaic) and a
+      SerialExperiment, with gradients for every trainable parameter and their `state_dict`
+      keys.
+  - It runs in float32 and float64, eager and compiled, writes on the base tree and on the
+    branch, and compares with `np.array_equal`.
+  - The .expt/.refl export reads only model state, which this gate already covers; its own
+    tests run in the cctbx gate.
   - The bytes are specific to the machine (BLAS, CPU), so this runs on both gate machines for
     every PR, rather than as a stored golden file in CI. A 1-ulp change to the scale makes
-    119 of the 262 arrays differ.
+    119 of the 262 arrays in the first version differ.
 - **V1 Toy recovery** (analytic halo, in torchBragg tests):
   - noise-free and Poisson images, Bragg+diffuse from known G, misset, cell and halo width;
   - recover each half alone and jointly;
