@@ -603,7 +603,8 @@ class Simulator:
             diffuse: Optional extension, not in nanoBragg.c: a nanobrag_torch.diffuse.DiffuseModel,
                 mapping Miller indices (n, 3), float64 (float32 on MPS), to scattering per unit cell
                 (n,) in electrons squared, finite everywhere. run() adds it to the image and fills
-                self.components. None leaves the image untouched.
+                self.components: "diffuse", "total", and "bragg", which is everything nanoBragg.c
+                computes, the water background included. None leaves the image untouched.
             diffuse_orientations: "all" averages the term over every phi step and mosaic domain,
                 "first" uses the first, which is cheaper and exact for one orientation.
         """
@@ -1718,6 +1719,7 @@ class Simulator:
             torch.Tensor: Final diffraction image with shape (spixels, fpixels), or the
             (N,) values of ``pixels`` or ``panel_pixels``.
         """
+        self.components = None  # a run without a diffuse model leaves none from an earlier run
         selected = pixels is not None or panel_pixels is not None
         if selected and (self.printout or self.trace_pixel):
             raise ValueError("printout and trace_pixel need the whole image; run without pixels=")
@@ -1906,7 +1908,7 @@ class Simulator:
         diffuse_intensity = None
         if self.diffuse is not None:
             diffuse_intensity = self._diffuse_intensity(pixel_coords_meters, rot_a, rot_b, rot_c, panel_axes,
-                                                        source_directions, source_wavelengths_A)
+                                                        source_directions, source_wavelengths_A, oversample_polar)
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -2611,12 +2613,18 @@ class Simulator:
         ).reshape(pixel_coords_meters.shape[:2])
 
     def _diffuse_intensity(self, pixel_coords_meters, rot_a, rot_b, rot_c, panel_axes,
-                           source_directions, source_wavelengths_A) -> torch.Tensor:
+                           source_directions, source_wavelengths_A, oversample_polar=False) -> torch.Tensor:
         """
-        Photons per pixel from self.diffuse, evaluated at pixel centres in float64, or float32 on
-        MPS, which has no doubles.
+        Photons per pixel from self.diffuse at pixel centers. The arithmetic is float64 (float32
+        on MPS, which has no doubles); the pixel coordinates arrive in the run's dtype.
 
         photons = N_cells * mean(I_cell * polar) * omega * capture * r_e^2 * fluence.
+
+        The mean is over orientations (phi steps and mosaic domains) and sources. Sources are
+        weighted as the Bragg term weights them: equally as in C, or by f_s = w/sum(w) with
+        use_source_weights. Polarization follows Bragg's rule too: -nopolar turns it off unless
+        oversample_polar is set (nanoBragg.c:2772). The model is called once per source and
+        orientation on all pixels, which bounds the memory of one call to that of one image.
 
         This is the Bragg tail without F_latt^2, because diffuse scattering adds incoherently from
         each cell. It is written out, not added to the accumulator as the water term is: that
@@ -2638,15 +2646,21 @@ class Simulator:
             rot_a, rot_b, rot_c = rot_a[:1, :1], rot_b[:1, :1], rot_c[:1, :1]
         cell = torch.stack([rot_a, rot_b, rot_c], dim=-2).to(wide).reshape(-1, 3, 3)
 
+        kernel_weights = self._weights_for_kernel() if source_directions is not None else None
+        if kernel_weights is None:
+            fractions = [1.0 / len(beams)] * len(beams)
+        else:  # n*w/sum(w) per source, so the fraction of each is that over n
+            fractions = list(kernel_weights.to(device=self.device, dtype=wide) / len(beams))
+
         total = 0.0
-        for incident, wavelength in beams:
+        for (incident, wavelength), fraction in zip(beams, fractions):
             incident = incident.to(wide)
             q = (diffracted - incident) / (wavelength.to(wide) * 1e-10)
-            polar = 1.0 if self.beam_config.nopolar else self._pixel_polarization(coords, incident)
+            polar = self._pixel_polarization(coords, incident) if self._polarized(oversample_polar) else 1.0
             for vectors in cell:
                 hkl = q.reshape(-1, 3) @ vectors.T
-                total = total + polar * self.diffuse(hkl).to(device=self.device, dtype=wide).reshape(q.shape[:2])
-        mean = total / (len(beams) * len(cell))
+                total = total + fraction * polar * self.diffuse(hkl).to(device=self.device, dtype=wide).reshape(q.shape[:2])
+        mean = total / len(cell)
 
         pixel_size = torch.as_tensor(self.detector.pixel_size, device=self.device, dtype=wide)
         if self.detector.config.point_pixel:

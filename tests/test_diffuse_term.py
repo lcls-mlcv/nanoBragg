@@ -200,3 +200,33 @@ def test_mps_runs_the_term_in_float32_and_matches_the_cpu():
 def test_unknown_orientation_mode_is_refused():
     with pytest.raises(ValueError, match="diffuse_orientations"):
         simulator(diffuse=constant(1.0), diffuse_orientations="some")
+
+
+def test_one_cell_weighted_sources_match_bragg_with_its_weights():
+    """With use_source_weights the Bragg image is sum f_s I_s (f_s = w/sum w); the diffuse term must weight the same."""
+    directions = torch.tensor([[-1.0, 0, 0], [-0.9992, 0.04, 0], [-0.9992, -0.03, 0.02]], dtype=torch.float64)
+    directions = directions / directions.norm(dim=1, keepdim=True)
+    beam = dict(source_directions=directions, source_wavelengths=torch.tensor([1.0e-10, 1.1e-10, 0.95e-10], dtype=torch.float64),
+                source_weights=torch.tensor([1.0, 3.0, 0.5], dtype=torch.float64), use_source_weights=True)
+    bragg = simulator(beam=beam).run(oversample=1)
+    sim = simulator(crystal=dict(default_F=0.0), beam=beam, diffuse=constant(F0 ** 2))
+    sim.run(oversample=1)
+    assert torch.abs(sim.components["diffuse"] / bragg - 1).max() < 1e-12
+
+
+def test_one_cell_nopolar_with_oversample_polar_still_polarizes_as_bragg_does():
+    """nanoBragg.c:2772 polarizes every sample under -oversample_polar even with -nopolar."""
+    beam = dict(nopolar=True, polarization_factor=0.5)
+    bragg = simulator(beam=beam).run(oversample=1, oversample_polar=True)
+    sim = simulator(crystal=dict(default_F=0.0), beam=beam, diffuse=constant(F0 ** 2))
+    sim.run(oversample=1, oversample_polar=True)
+    assert torch.abs(sim.components["diffuse"] / bragg - 1).max() < 1e-12
+
+
+def test_components_are_cleared_when_the_term_is_removed():
+    sim = simulator(diffuse=constant(1.0))
+    sim.run(oversample=1)
+    assert sim.components is not None
+    sim.diffuse = None
+    sim.run(oversample=1)
+    assert sim.components is None
