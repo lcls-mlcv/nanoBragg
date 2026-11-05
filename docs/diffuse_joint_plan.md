@@ -149,6 +149,20 @@ class DiffuseModel(Protocol):          # in practice an nn.Module
   own integrals, so the tie may be off by a constant there. Test D2-T1 integrates F_latt² per
   shape and records the factor. If it is not 1, the tie divides by it, recorded as an
   extension rather than a change to the C path.
+- **Measured in D2** (`tests/test_diffuse_shape_integral.py`, through the kernel function, one
+  peak in its cell of hkl, factor = ∫F_latt² / N_cells):
+
+  | Shape | Factor |
+  |---|---|
+  | SQUARE | 1 (to 1e-15) |
+  | GAUSS, `spot_metric=HKL` (diffBragg, cctbx) | (0.315π)^(3/2) = 0.9844 |
+  | TOPHAT, HKL | (4/3)π·0.63³ = 1.0474 |
+  | ROUND | 0.8972 (N = 5), 0.9496 (10), 0.9748 (20): 1 untruncated (0.7236² = π/6), but the sinc3² tail is cut at the cell, about 1 − 0.5/N |
+  | GAUSS or TOPHAT, `RECIPROCAL` (the default, bl831 C) | the HKL factor × V/N_cells², V in Å³: 2.65 for 30×35×40 Å and 5³ cells, 0.23 for 237,000 Å³ and 10³ |
+
+  The C path is unchanged, and so is the tie (N_cells·I_d for every shape). Whether the tie
+  divides by the factor is open: for GAUSS-HKL it is a 1.6% shift, for the RECIPROCAL metric
+  it depends on cell and crystal size, because that radius is not dimensionless.
 - **Relative scale `k_d`** (group `diffuse_scale`, log, default frozen at 1):
   - Frozen, the absolute tie is a physical constraint.
   - Freed, the halves separate: a diffuse fit that does not lean on the Bragg scale.
