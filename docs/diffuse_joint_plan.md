@@ -1,7 +1,10 @@
 # Plan: Bragg and diffuse in one differentiable model
 
-Status: plan settled 2026-11-04; PR D1 implements section 7's first row. Branch
-`feat/diffuse-joint` off `torch` 3d863fc.
+Status: plan settled 2026-11-04. D1 (the hook, branch `feat/diffuse-joint` off `torch`
+3d863fc) is open as PR #72. D2 (ExperimentModel, `feat/diffuse-experiment`, stacked on D1)
+is implemented and has been through the audit and review of 2026-11-05. Its V1 gate,
+`scripts/diffuse/v1_toy_recovery.py`, runs at small size in the tests; the full size runs on
+the GPU gate machine.
 
 Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 (`nanobrag_torch`), eryx = the diffuse-scattering library (PyTorch, GPLv2).
@@ -295,11 +298,12 @@ Each rung uses the result of the one before; real data only after synthetic reco
 - **V0 Off is off.**
   - Parity matrix (306 cases) unchanged.
   - `scripts/diffuse/off_is_identical.py` covers:
-    - 7 Simulator cases, among them `pixels=`, with gradients for distance, cell a and
-      wavelength;
-    - 5 ExperimentModel cases (whole image, ROI, multi-panel, ROI across panels, GAUSS with
-      mosaic) and a SerialExperiment, with gradients for every trainable parameter and their
-      `state_dict` keys.
+    - 9 Simulator cases, among them `pixels=`, ROUND and TOPHAT, with gradients for distance,
+      cell a and wavelength;
+    - 9 ExperimentModel cases and a SerialExperiment, with gradients for every trainable
+      parameter and their `state_dict` keys. The model cases are whole image, ROI,
+      multi-panel, ROI across panels, GAUSS with mosaic, ROUND, TOPHAT, and `bragg_only` on
+      the whole image and on the ROI.
   - It runs in float32 and float64, eager and compiled, writes on the base tree and on the
     branch, and compares with `np.array_equal`.
   - The .expt/.refl export reads only model state, which this gate already covers; its own
