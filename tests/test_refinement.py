@@ -6,6 +6,7 @@ import torch
 from nanobrag_torch.config import (
     BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
 )
+from nanobrag_torch.diffuse import GaussianHalo
 from nanobrag_torch.models.experiment import ExperimentModel, SerialExperiment
 from nanobrag_torch.utils.losses import gaussian_nll
 from nanobrag_torch.utils.refinement import DEFAULT_SCALES, refine_lbfgsb, scaled_parameters
@@ -25,7 +26,18 @@ def _model(misset=(5.0, -3.0, 2.0), **kwargs):
 
 
 def test_every_group_has_a_scale():
-    assert set(DEFAULT_SCALES) == set(ExperimentModel.PARAMETER_GROUPS)
+    assert set(DEFAULT_SCALES) == set(ExperimentModel.PARAMETER_GROUPS) | set(ExperimentModel.OPTIONAL_GROUPS)
+
+
+def test_a_diffuse_model_is_scaled_on_its_own_and_in_a_serial_experiment():
+    halo = GaussianHalo(10.0, 0.1)
+    model = _model(diffuse=halo)
+    model.freeze().refine("diffuse", "diffuse_scale")
+    assert sorted(scale for _, scale in scaled_parameters(model)) == [DEFAULT_SCALES["diffuse"]] * 2 + [
+        DEFAULT_SCALES["diffuse_scale"]]
+    serial = SerialExperiment([model, _model(misset=(1.0, 2.0, 3.0), diffuse=halo)])
+    serial.freeze().refine("diffuse")
+    assert len(scaled_parameters(serial)) == 2
 
 
 def test_scaled_parameters_are_the_trainable_ones_each_once():

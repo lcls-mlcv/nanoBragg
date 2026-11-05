@@ -819,6 +819,44 @@ class BackgroundStageAParams(nn.Module):
         return image if self.n_panels > 1 else image[0]
 
 
+class DiffuseStageAParams(nn.Module):
+    """A diffuse model (nanobrag_torch.diffuse.DiffuseModel) and its relative scale k_d.
+
+    An extension, not in nanoBragg.c. The block is what the Simulator calls: k_d times the
+    model's scattering per cell, so k_d multiplies the diffuse component of the image and
+    nothing else. k_d = exp(delta_log_scale) starts at 1 and frozen, whatever param_init says:
+    frozen, the diffuse term keeps the Simulator's absolute tie to the Bragg term (one G,
+    fluence and N_cells for both); refined (group diffuse_scale), the two halves separate.
+
+    The model's own parameters are its trainable ones (group diffuse); one the model froze
+    itself is listed in ``unrefinable`` and stays frozen. param_init="frozen" freezes the rest.
+    A model that is not an nn.Module (a plain function) has no parameters to refine.
+    """
+
+    def __init__(self, model, device=None, dtype: torch.dtype = torch.float32, param_init: str = "trainable") -> None:
+        super().__init__()
+        param_cls = _param_factory(param_init)
+        self.model = model
+        self.delta_log_scale = param_cls(torch.zeros((), device=device, dtype=dtype))
+        self.delta_log_scale.requires_grad_(False)
+        own = list(model.named_parameters()) if isinstance(model, nn.Module) else []
+        self.unrefinable = {f"model.{name}": "frozen in the diffuse model as it was given"
+                            for name, p in own if not p.requires_grad}
+        if param_init == "frozen":
+            for _, p in own:
+                p.requires_grad_(False)
+
+    def parameter_groups(self, prefix: str) -> dict:
+        """The groups diffuse (the model's parameters) and diffuse_scale (k_d), named under ``prefix``."""
+        own = self.model.named_parameters() if isinstance(self.model, nn.Module) else []
+        return {"diffuse": tuple(f"{prefix}.model.{name}" for name, _ in own),
+                "diffuse_scale": (f"{prefix}.delta_log_scale",)}
+
+    def forward(self, hkl: torch.Tensor) -> torch.Tensor:
+        per_cell = self.model(hkl)
+        return per_cell * torch.exp(self.delta_log_scale).to(device=per_cell.device)
+
+
 def _rodrigues(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     """I + sin(a) K + (1 - cos(a)) K^2 for the unit axis's cross-product matrix K."""
     x, y, z = axis[0], axis[1], axis[2]
@@ -946,6 +984,14 @@ class ExperimentModel(nn.Module):
     A beam with several sources is a spectrum, weighted as
     diffBragg weights it even though a plain Simulator ignores the weights as C does
     (see BeamStageAParams).
+
+    ``diffuse`` (an extension, not in nanoBragg.c) adds a diffuse model, a
+    nanobrag_torch.diffuse.DiffuseModel, to the image through Simulator(diffuse=...). The model
+    becomes the submodule diffuse_params.model, and the model gains the groups diffuse (its
+    parameters) and diffuse_scale (a relative scale k_d, frozen at 1; see DiffuseStageAParams),
+    listed in the instance's PARAMETER_GROUPS. After each forward, ``components`` holds the
+    image's parts "bragg", "diffuse", "background" and "total", shaped as the result; it is
+    None without a diffuse model, which leaves everything else as it was.
     """
 
     # Group name -> parameter names, for refine()/freeze().
@@ -978,6 +1024,8 @@ class ExperimentModel(nn.Module):
         "wavelength": ("beam_params.lambda_offset", "beam_params.delta_log_lambda_scale"),
         "source_weights": ("beam_params.delta_log_source_weights",),
     }
+    # Groups a model has only when built with them: with diffuse=, in its own PARAMETER_GROUPS
+    OPTIONAL_GROUPS = ("diffuse", "diffuse_scale")
 
     def __init__(
         self,
@@ -996,6 +1044,7 @@ class ExperimentModel(nn.Module):
         tilt_abc=None,
         background_panels=None,
         panel_groups=None,
+        diffuse=None,
     ) -> None:
         super().__init__()
         if structure_factors is not None and hkl_data is not None:
@@ -1067,6 +1116,13 @@ class ExperimentModel(nn.Module):
             dtype=self.dtype,
             param_init=param_init,
         )
+        # Without a diffuse model nothing is added: no submodule, parameter, buffer or group
+        self.components = None
+        if diffuse is not None:
+            self.diffuse_params = DiffuseStageAParams(diffuse, device=self.device, dtype=self.dtype,
+                                                      param_init=param_init)
+            self.PARAMETER_GROUPS = {**type(self).PARAMETER_GROUPS,
+                                     **self.diffuse_params.parameter_groups("diffuse_params")}
 
         # Optional externally-provided structure factors (dense HKL grid).
         # Downstream projects (e.g. dbex) can populate these either via the
@@ -1090,6 +1146,11 @@ class ExperimentModel(nn.Module):
         self._detectors_synced_by_serial = False  # once per pass, not once per shot
         self._detector_state: Optional[tuple] = None
 
+    @property
+    def diffuse(self) -> Optional[DiffuseStageAParams]:
+        """The diffuse block the Simulators call (k_d times the model), or None."""
+        return self._modules.get("diffuse_params")
+
     def _resolve(self, names) -> list:
         """Parameter names for these groups/parameters (all of them if none given)."""
         params = dict(self.named_parameters())
@@ -1111,9 +1172,12 @@ class ExperimentModel(nn.Module):
     @property
     def unrefinable(self) -> dict:
         """Parameter name -> why it cannot be refined (crystal shape, crystal system, detector kind,
-        no structure factors, a single source)."""
+        no structure factors, a single source, frozen in the diffuse model)."""
         blocked = {}
-        for block in ("crystal_params", "detector_params", "beam_params", "fhkl_params", "panel_group_params"):
+        blocks = ["crystal_params", "detector_params", "beam_params", "fhkl_params", "panel_group_params"]
+        if self.diffuse is not None:
+            blocks.append("diffuse_params")
+        for block in blocks:
             blocked.update({f"{block}.{n}": why for n, why in getattr(self, block).unrefinable.items()})
         return blocked
 
@@ -1129,6 +1193,8 @@ class ExperimentModel(nn.Module):
         blocked = self.unrefinable
         for name in names:
             members = self.PARAMETER_GROUPS.get(name, (name,))
+            if not members:
+                raise ValueError(f"group {name!r} has no parameters (a diffuse model that is not an nn.Module)")
             if all(m in blocked for m in members):
                 raise ValueError(blocked[members[0]])
         for name in self._resolve(names):
@@ -1343,6 +1409,7 @@ class ExperimentModel(nn.Module):
             beam_config=self._beam_config,
             device=self.device,
             dtype=self.dtype,
+            diffuse=self.diffuse,
         )
         # _sync writes fresh parameter tensors into the detector config each forward, which
         # rebuilds the geometry once per pass; per-run rebuilds would split a shared Detector
@@ -1441,7 +1508,8 @@ class ExperimentModel(nn.Module):
         Run the diffraction simulation for the current parameter values.
 
         With ``roi_only`` only the pixels of the background regions are evaluated; with
-        ``bragg_only`` the background planes are left out.
+        ``bragg_only`` the background planes are left out (a diffuse term stays in; it is
+        components["bragg"] that holds the Bragg term alone).
 
         Returns:
             Float image tensor with shape (spixels, fpixels), or (panels, spixels, fpixels)
@@ -1458,6 +1526,8 @@ class ExperimentModel(nn.Module):
             oversample_thick=oversample_thick,
         )
         # As diffBragg: Bragg model + background. run() has just refreshed each mask.
+        if self.diffuse is not None:
+            return self._forward_with_components(background, roi_only, bragg_only, options)
         if roi_only and len(self._detectors) > 1:
             panel_pixels = self._roi_panel_pixels()
             image = self._simulator.run(panel_pixels=panel_pixels, **options)
@@ -1473,6 +1543,39 @@ class ExperimentModel(nn.Module):
         if len(simulators) == 1:
             images, masks = images[0], masks[0]
         return images if bragg_only else images + background.image() * masks
+
+    def _forward_with_components(self, background, roi_only, bragg_only, options) -> torch.Tensor:
+        """forward() with a diffuse model: the same images, with each Simulator's components kept.
+
+        A separate path so that the one without a diffuse model stays as it was, bit for bit.
+        """
+        if roi_only and len(self._detectors) > 1:
+            panel_pixels = self._roi_panel_pixels()
+            self._simulator.run(panel_pixels=panel_pixels, **options)
+            parts = self._simulator.components
+            planes = background.values() * panel_pixels.mask
+        elif roi_only:
+            self._simulator.run(pixels=background.pixels, **options)
+            parts = self._simulator.components
+            planes = background.values() * self._simulator._cached_roi_mask[tuple(background.pixels.T)]
+        else:
+            simulators = self._whole_panel_simulators()
+            runs = []
+            for simulator in simulators:
+                simulator.run(**options)
+                runs.append(simulator.components)
+            parts = {key: torch.stack([run[key] for run in runs]) for key in ("bragg", "diffuse", "total")}
+            masks = torch.stack([simulator._cached_roi_mask for simulator in simulators])
+            if len(simulators) == 1:
+                parts, masks = {key: value[0] for key, value in parts.items()}, masks[0]
+            planes = background.image() * masks
+        image = parts["total"]
+        if bragg_only:
+            planes = torch.zeros_like(image)
+        else:
+            image = image + planes
+        self.components = {"bragg": parts["bragg"], "diffuse": parts["diffuse"], "background": planes, "total": image}
+        return image
 
     @torch.no_grad()
     def geometry(self) -> SimulatedGeometry:
@@ -1500,7 +1603,10 @@ class ExperimentModel(nn.Module):
         around there).
         """
         background = self.background_params
-        values = self(roi_only=True, bragg_only=True).detach().cpu().double().numpy()
+        values = self(roi_only=True, bragg_only=True)
+        if self.components is not None:
+            values = self.components["bragg"]  # the spot, not the diffuse term under it
+        values = values.detach().cpu().double().numpy()
         slow, fast = background.pixels.cpu().numpy().T
         on_panel = background.panel.cpu().numpy()
         centroids = np.full((len(background.rois), 2), np.nan)

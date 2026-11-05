@@ -36,6 +36,9 @@ DEFAULT_SCALES = {
     "background": 1.0,  # photons across the region
     "wavelength": 0.001,  # Angstrom, log scale
     "source_weights": 0.1,  # log weight
+    # Optional groups (ExperimentModel.OPTIONAL_GROUPS)
+    "diffuse": 0.1,  # the diffuse model's own parameters, logs in the reference models
+    "diffuse_scale": 1.0,  # log k_d, as log G
 }
 
 
