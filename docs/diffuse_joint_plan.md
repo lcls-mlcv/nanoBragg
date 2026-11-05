@@ -316,6 +316,28 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - recover each half alone and jointly;
   - report the Fisher-matrix condition number and the correlations between shared
     parameters.
+  - **Gate design (2026-11-05)**, `scripts/diffuse/v1_toy_recovery.py`:
+    - **Fits:** bragg (G, misset, cell), diffuse (misset, cell, halo amplitude and σ, with G
+      known, since with k_d frozen G and the amplitude are one number there), and joint (all).
+      They run on the Poisson deviance, GAUSS with the HKL metric.
+    - **Separability:** for each joint parameter, its Fisher sd in the joint fit over its sd
+      in the fit of its own half (G: bragg; halo: diffuse; misset and cell: the better of the
+      two). Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and seed (noise-free: errors
+      < 1e-5).
+    - **Exit code:** 0 only if the separable toy passes and the negative toy is flagged
+      (ratio > 1.5), so the metric is shown to tell them apart.
+    - **What sets the ratio:** halo σ over the spot's sd in h, 0.397/N (Fisher at the truth,
+      the same at 24² and 64²).
+      - N = 5 (spot sd 0.079): σ = 0.05, 0.12, 0.3, 0.5 give 22, 14, 2.6, 2.3.
+      - N = 10 (spot sd 0.040): 40, 2.2, 1.28, 1.23.
+      - corr(amplitude, σ) is about −0.9 in every joint fit.
+    - **The gate toy:** N = 10, σ = 0.3 (7.5 spot sds). Peak 128 e² per cell under F = 100.
+      At 24² that is 8.4 diffuse photons a pixel under spots of 9e5; the fluence keeps photons
+      per solid angle fixed, so 0.17 a pixel at 64². Ratios are 1.28 (amplitude), 1.11 (σ) and
+      1.00 for G, misset and cell. Poisson |z| ≤ 2.3 over seeds 1–3 at 64².
+    - **Negative case:** the first toy, N = 5 and σ = 0.12 (1.5 spot sds). The halo hides under
+      the spots: ratios 14 (amplitude) and 4.5 (σ). At 128² with seed 1 the joint fit
+      collapsed σ to 0.025 (z = −4.9, at 128²). The report flags it as weakly identified.
 - **V2 eryx synthetic recovery:**
   - lysozyme from a public PDB in the SBGrid 747 cell, stills and a rotation wedge, with
     known springs, solvent, G and misset;
