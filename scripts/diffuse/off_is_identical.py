@@ -70,6 +70,8 @@ MODEL_CASES = {
     "whole": dict(),
     "roi": dict(model=dict(background_rois=[(2, 12, 3, 9), (14, 22, 10, 20)]), run=dict(roi_only=True)),
     "panels": dict(panels=[(4.8, 4.8), (-5.0, 4.8)]),
+    "roi-panels": dict(panels=[(4.8, 4.8), (-5.0, 4.8)], run=dict(roi_only=True),
+                       model=dict(background_rois=[(2, 12, 3, 9), (14, 22, 10, 20)], background_panels=[1, 0])),
     "gauss-eta": dict(crystal=dict(shape=CrystalShape.GAUSS, mosaic_spread_deg=0.2, mosaic_domains=4)),
 }
 

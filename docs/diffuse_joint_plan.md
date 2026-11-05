@@ -260,9 +260,9 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - `scripts/diffuse/off_is_identical.py` covers:
     - 7 Simulator cases, among them `pixels=`, with gradients for distance, cell a and
       wavelength;
-    - 4 ExperimentModel cases (whole image, ROI, multi-panel, GAUSS with mosaic) and a
-      SerialExperiment, with gradients for every trainable parameter and their `state_dict`
-      keys.
+    - 5 ExperimentModel cases (whole image, ROI, multi-panel, ROI across panels, GAUSS with
+      mosaic) and a SerialExperiment, with gradients for every trainable parameter and their
+      `state_dict` keys.
   - It runs in float32 and float64, eager and compiled, writes on the base tree and on the
     branch, and compares with `np.array_equal`.
   - The .expt/.refl export reads only model state, which this gate already covers; its own
