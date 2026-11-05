@@ -2,13 +2,12 @@
 Diffuse scattering models for ``Simulator(diffuse=...)``: the protocol and reference models.
 
 This is an extension, not part of nanoBragg.c. A diffuse model maps fractional Miller
-indices to scattering per unit cell; the Simulator turns that into photons per pixel with
-the same r_e^2, fluence, scale, solid angle, polarization and sensor capture as the Bragg
-term, but without the lattice factor, since diffuse scattering adds incoherently from the
-cells (see Simulator._diffuse_intensity):
-
-    photons = N_cells * mean_over_sources_and_orientations(I_cell(hkl) * polar)
-              * omega * capture * r_e^2 * fluence * spot_scale
+indices to scattering per unit cell. The Simulator renders it through the Bragg term's own
+path with N_cells * I_cell(hkl) in place of (F_cell * F_latt)^2 at every sample (subpixel,
+sensor layer, source, phi step, mosaic domain), since diffuse scattering adds incoherently
+from the cells. Solid angle, polarization, capture, dmin, source weights and the division
+by steps then follow the Bragg rules exactly, and the two terms share one absolute scale
+(see Simulator._diffuse_physics_for_position).
 
 torchBragg never imports a diffuse library. Physical models (for example eryx's lattice
 dynamics) implement DiffuseModel themselves; the reference models here are small, closed
@@ -29,7 +28,8 @@ class DiffuseModel(Protocol):
     Anything callable as ``model(hkl) -> intensity``.
 
     hkl: (n, 3) fractional Miller indices in the lattice of the crystal's real-space vectors,
-        on the simulator's device, float64 (float32 on MPS, which has no doubles). It carries
+        on the simulator's device and in its dtype; n counts every sample, source and
+        orientation of the pixels being rendered (pixel_batch_size bounds it). It carries
         the autograd graph of the geometry (orientation, cell, detector, wavelength); a model
         that wants those gradients keeps it in its graph.
     returns: (n,) scattering per unit cell in electrons squared, real and finite everywhere,

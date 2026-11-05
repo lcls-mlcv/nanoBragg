@@ -54,6 +54,18 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
   - It evaluates at pixel centers, outside the kernel, in float64 (float32 on MPS).
   - photons = N_cells · mean over sources and orientations(I_cell · polar) · Ω · capture ·
     r_e² · fluence · spot_scale. This is the Bragg tail without F_latt².
+  - **Changed in D1 after review:** that pixel-center tail departed from Bragg's per-sample
+    rules. Measured gaps:
+    - sensor without `oversample_thick`: up to 1.6–1.9×;
+    - dmin ignored;
+    - `oversample` ignored: 19% for a σ = 0.05 halo;
+    - static `kahn_factor`;
+    - a shape bug with `panel_pixels` and a sensor.
+
+    The term now goes through Bragg's own path. The uncompiled kernel takes
+    N_cells·I(hkl) in place of (F_cell·F_latt)² at every sample, and hkl arrives in the
+    run's dtype. A one-cell Bragg image with F = √I(hkl) is the test oracle, to 1e-12, in 10
+    configurations.
   - It fills `Simulator.components`, and a ROI mask applies to both parts.
   - `ExperimentModel` does not use it: it builds its own Simulators, has no diffuse group,
     and the ROI path ignores it.

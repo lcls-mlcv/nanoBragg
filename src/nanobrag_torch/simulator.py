@@ -55,8 +55,14 @@ def compute_physics_for_position(
     apply_polarization: bool = True,
     kahn_factor: float = 1.0,
     polarization_axis: Optional[torch.Tensor] = None,
+    diffuse: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Compute physics (Miller indices, structure factors, intensity) for given positions.
+
+    With ``diffuse`` (an extension, not in nanoBragg.c; see nanobrag_torch.diffuse) the term
+    summed over orientations is N_cells * diffuse(hkl) in place of (F_cell * F_latt)^2, and
+    everything else (dmin, polarization, source weights) is applied as for Bragg. The Bragg
+    path is untouched when it is None; it is only ever given to the uncompiled function.
 
     This is a pure function with no instance state dependencies, enabling safe cross-instance
     kernel caching for torch.compile optimization (PERF-PYTORCH-004 Phase 0).
@@ -241,152 +247,157 @@ def compute_physics_for_position(
     # of its own nodes returns that node's value exactly, so -interpolate and
     # -nointerpolate produced bit-identical images. Crystal.get_structure_factor
     # does the rounding itself for the nearest-neighbour path.
-    F_cell = crystal_get_structure_factor(h, k, l)
+    if diffuse is not None:
+        hkl = torch.stack((h, k, l), dim=-1)
+        per_cell = diffuse(hkl.reshape(-1, 3)).to(device=h.device, dtype=h.dtype).reshape(h.shape)
+        intensity = (N_cells_a * N_cells_b * N_cells_c) * per_cell
+    else:
+        F_cell = crystal_get_structure_factor(h, k, l)
 
-    # Ensure F_cell is on the same device as h (device-neutral implementation per Core Rule #16)
-    # The crystal.get_structure_factor may return CPU tensors even when h0/k0/l0 are on CUDA
-    if F_cell.device != h.device:
-        F_cell = F_cell.to(device=h.device)
+        # Ensure F_cell is on the same device as h (device-neutral implementation per Core Rule #16)
+        # The crystal.get_structure_factor may return CPU tensors even when h0/k0/l0 are on CUDA
+        if F_cell.device != h.device:
+            F_cell = F_cell.to(device=h.device)
 
-    # NANOBRAG-GOLDEN-001 (A3): Bounded HKL diagnostics per panel (input.md:15, input.md:36)
-    # Emit HKL min/max + hit-rate to explain first divergence when torch output is zero.
-    # Only log once per panel to avoid log bloat (<100 lines per input.md:34).
-    # Per docs/development/testing_strategy.md:112, trace requirements capture Miller index stats.
-    #
-    # DYNAMO-SAFETY NOTE:
-    # The debug print below is intended for eager/debug runs only. Under torch.compile/Dynamo,
-    # string formatting can interact badly with graph tracing, so we explicitly skip this block
-    # when a Dynamo trace is in progress.
-    log_hkl_stats = os.environ.get("NANOBRAGG_DEBUG_HKL", "0") == "1"  # debug only; was tied to apply_polarization
-    if log_hkl_stats:
-        is_compiling = False
-        try:
-            import torch._dynamo as _dynamo  # type: ignore[attr-defined]
-
-            is_compiling = _dynamo.is_compiling()
-        except Exception:
-            # If Dynamo is unavailable or any error occurs, assume we are not compiling
-            # and proceed with eager-mode logging.
+        # NANOBRAG-GOLDEN-001 (A3): Bounded HKL diagnostics per panel (input.md:15, input.md:36)
+        # Emit HKL min/max + hit-rate to explain first divergence when torch output is zero.
+        # Only log once per panel to avoid log bloat (<100 lines per input.md:34).
+        # Per docs/development/testing_strategy.md:112, trace requirements capture Miller index stats.
+        #
+        # DYNAMO-SAFETY NOTE:
+        # The debug print below is intended for eager/debug runs only. Under torch.compile/Dynamo,
+        # string formatting can interact badly with graph tracing, so we explicitly skip this block
+        # when a Dynamo trace is in progress.
+        log_hkl_stats = os.environ.get("NANOBRAGG_DEBUG_HKL", "0") == "1"  # debug only; was tied to apply_polarization
+        if log_hkl_stats:
             is_compiling = False
+            try:
+                import torch._dynamo as _dynamo  # type: ignore[attr-defined]
 
-        if not is_compiling and logger.isEnabledFor(logging.DEBUG):
-            # Compute HKL bounds (keep tensors on device per input.md:37)
-            h0_min = h0.min().item()
-            h0_max = h0.max().item()
-            k0_min = k0.min().item()
-            k0_max = k0.max().item()
-            l0_min = l0.min().item()
-            l0_max = l0.max().item()
+                is_compiling = _dynamo.is_compiling()
+            except Exception:
+                # If Dynamo is unavailable or any error occurs, assume we are not compiling
+                # and proceed with eager-mode logging.
+                is_compiling = False
 
-            nonzero_F = (F_cell != 0).sum().item()
-            total_pixels = F_cell.numel()
-            hit_rate = (nonzero_F / total_pixels * 100) if total_pixels > 0 else 0.0
+            if not is_compiling and logger.isEnabledFor(logging.DEBUG):
+                # Compute HKL bounds (keep tensors on device per input.md:37)
+                h0_min = h0.min().item()
+                h0_max = h0.max().item()
+                k0_min = k0.min().item()
+                k0_max = k0.max().item()
+                l0_min = l0.min().item()
+                l0_max = l0.max().item()
 
-            # Single-line structured log per panel (bounded)
-            logger.debug(
-                f"[HKL stats] h=[{h0_min:.0f},{h0_max:.0f}] "
-                f"k=[{k0_min:.0f},{k0_max:.0f}] "
-                f"l=[{l0_min:.0f},{l0_max:.0f}] "
-                f"hit_rate={nonzero_F}/{total_pixels} ({hit_rate:.2f}%)"
-            )
+                nonzero_F = (F_cell != 0).sum().item()
+                total_pixels = F_cell.numel()
+                hit_rate = (nonzero_F / total_pixels * 100) if total_pixels > 0 else 0.0
 
-    # Calculate lattice structure factor
-    #
-    # C-Code Implementation Reference (from nanoBragg.c, lines 3062-3081):
-    # ```c
-    # /* structure factor of the lattice (paralelpiped crystal)
-    #     F_latt = sin(M_PI*Na*h)*sin(M_PI*Nb*k)*sin(M_PI*Nc*l)/sin(M_PI*h)/sin(M_PI*k)/sin(M_PI*l);
-    # */
-    # F_latt = 1.0;
-    # if(xtal_shape == SQUARE)
-    # {
-    #     /* xtal is a paralelpiped */
-    #     double F_latt_a = 1.0, F_latt_b = 1.0, F_latt_c = 1.0;
-    #     if(Na>1){
-    #         F_latt_a = sincg(M_PI*h,Na);
-    #         F_latt *= F_latt_a;
-    #     }
-    #     if(Nb>1){
-    #         F_latt_b = sincg(M_PI*k,Nb);
-    #         F_latt *= F_latt_b;
-    #     }
-    #     if(Nc>1){
-    #         F_latt_c = sincg(M_PI*l,Nc);
-    #         F_latt *= F_latt_c;
-    #     }
-    # }
-    # ```
-    #
-    # Per specs/spec-a-core.md §4.3:
-    # "SQUARE (grating): F_latt = sincg(π·h, Na) · sincg(π·k, Nb) · sincg(π·l, Nc)"
-    #
-    # CRITICAL: Use fractional h,k,l directly (NOT h-h0), unlike ROUND/GAUSS/TOPHAT shapes.
-    Na = N_cells_a
-    Nb = N_cells_b
-    Nc = N_cells_c
-    shape = crystal_shape
-    fudge = crystal_fudge
+                # Single-line structured log per panel (bounded)
+                logger.debug(
+                    f"[HKL stats] h=[{h0_min:.0f},{h0_max:.0f}] "
+                    f"k=[{k0_min:.0f},{k0_max:.0f}] "
+                    f"l=[{l0_min:.0f},{l0_max:.0f}] "
+                    f"hit_rate={nonzero_F}/{total_pixels} ({hit_rate:.2f}%)"
+                )
 
-    if shape == CrystalShape.SQUARE:
-        # Note: sincg internally handles Na/Nb/Nc > 1 guards per C implementation
-        F_latt_a = sincg_miller(h, Na)
-        F_latt_b = sincg_miller(k, Nb)
-        F_latt_c = sincg_miller(l, Nc)
-        F_latt = F_latt_a * F_latt_b * F_latt_c
-    elif shape == CrystalShape.ROUND:
-        h_frac = h - h0
-        k_frac = k - k0
-        l_frac = l - l0
-        hrad_sqr = (h_frac * h_frac * Na * Na +
-                   k_frac * k_frac * Nb * Nb +
-                   l_frac * l_frac * Nc * Nc)
-        # The where keeps sqrt's gradient finite at exactly 0
-        at_centre = hrad_sqr == 0
-        x = torch.pi * torch.sqrt(torch.where(at_centre, torch.ones_like(hrad_sqr), hrad_sqr) * fudge)
-        F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(torch.where(at_centre, torch.zeros_like(x), x))
-    elif shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT):
-        h_frac = h - h0
-        k_frac = k - k0
-        l_frac = l - l0
-        n_scale = Na * Nb * Nc
-        if spot_metric is SpotMetric.HKL and N_cells_def is not None and shape == CrystalShape.GAUSS:
-            # diffBragg (diffBragg_cpu_kernel.cpp:521-536): V = NABC (h - h0) with the symmetric
-            # NABC = [[Na, Nd, Nf], [Nd, Nb, Ne], [Nf, Ne, Nc]], scale det(NABC). The determinant is
-            # written so that at Nd = Ne = Nf = 0 it is Na*Nb*Nc to the bit.
-            Nd, Ne, Nf = N_cells_def[0], N_cells_def[1], N_cells_def[2]
-            v1 = Na * h_frac + Nd * k_frac + Nf * l_frac
-            v2 = Nd * h_frac + Nb * k_frac + Ne * l_frac
-            v3 = Nf * h_frac + Ne * k_frac + Nc * l_frac
-            rad_sqr = v1 * v1 + v2 * v2 + v3 * v3
-            n_scale = n_scale - Na * Ne * Ne - Nb * Nf * Nf - Nc * Nd * Nd + 2 * Nd * Ne * Nf
-        elif spot_metric is SpotMetric.HKL:
-            # cctbx nanoBragg.cpp / diffBragg: radius measured in hkl space, as ROUND does
-            rad_sqr = (h_frac * h_frac * Na * Na +
+        # Calculate lattice structure factor
+        #
+        # C-Code Implementation Reference (from nanoBragg.c, lines 3062-3081):
+        # ```c
+        # /* structure factor of the lattice (paralelpiped crystal)
+        #     F_latt = sin(M_PI*Na*h)*sin(M_PI*Nb*k)*sin(M_PI*Nc*l)/sin(M_PI*h)/sin(M_PI*k)/sin(M_PI*l);
+        # */
+        # F_latt = 1.0;
+        # if(xtal_shape == SQUARE)
+        # {
+        #     /* xtal is a paralelpiped */
+        #     double F_latt_a = 1.0, F_latt_b = 1.0, F_latt_c = 1.0;
+        #     if(Na>1){
+        #         F_latt_a = sincg(M_PI*h,Na);
+        #         F_latt *= F_latt_a;
+        #     }
+        #     if(Nb>1){
+        #         F_latt_b = sincg(M_PI*k,Nb);
+        #         F_latt *= F_latt_b;
+        #     }
+        #     if(Nc>1){
+        #         F_latt_c = sincg(M_PI*l,Nc);
+        #         F_latt *= F_latt_c;
+        #     }
+        # }
+        # ```
+        #
+        # Per specs/spec-a-core.md §4.3:
+        # "SQUARE (grating): F_latt = sincg(π·h, Na) · sincg(π·k, Nb) · sincg(π·l, Nc)"
+        #
+        # CRITICAL: Use fractional h,k,l directly (NOT h-h0), unlike ROUND/GAUSS/TOPHAT shapes.
+        Na = N_cells_a
+        Nb = N_cells_b
+        Nc = N_cells_c
+        shape = crystal_shape
+        fudge = crystal_fudge
+
+        if shape == CrystalShape.SQUARE:
+            # Note: sincg internally handles Na/Nb/Nc > 1 guards per C implementation
+            F_latt_a = sincg_miller(h, Na)
+            F_latt_b = sincg_miller(k, Nb)
+            F_latt_c = sincg_miller(l, Nc)
+            F_latt = F_latt_a * F_latt_b * F_latt_c
+        elif shape == CrystalShape.ROUND:
+            h_frac = h - h0
+            k_frac = k - k0
+            l_frac = l - l0
+            hrad_sqr = (h_frac * h_frac * Na * Na +
                        k_frac * k_frac * Nb * Nb +
                        l_frac * l_frac * Nc * Nc)
-        else:
-            # bl831 nanoBragg.c since 2023: "round in reciprocal space"
-            # rot_*_star (N_phi, N_mos, 3) broadcasts against any leading (sources, pixels) shape
-            delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star +
-                            k_frac.unsqueeze(-1) * rot_b_star +
-                            l_frac.unsqueeze(-1) * rot_c_star)
-            rad_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
-            rad_sqr = rad_sqr * Na * Na * Nb * Nb * Nc * Nc
+            # The where keeps sqrt's gradient finite at exactly 0
+            at_centre = hrad_sqr == 0
+            x = torch.pi * torch.sqrt(torch.where(at_centre, torch.ones_like(hrad_sqr), hrad_sqr) * fudge)
+            F_latt = Na * Nb * Nc * 0.723601254558268 * sinc3(torch.where(at_centre, torch.zeros_like(x), x))
+        elif shape in (CrystalShape.GAUSS, CrystalShape.TOPHAT):
+            h_frac = h - h0
+            k_frac = k - k0
+            l_frac = l - l0
+            n_scale = Na * Nb * Nc
+            if spot_metric is SpotMetric.HKL and N_cells_def is not None and shape == CrystalShape.GAUSS:
+                # diffBragg (diffBragg_cpu_kernel.cpp:521-536): V = NABC (h - h0) with the symmetric
+                # NABC = [[Na, Nd, Nf], [Nd, Nb, Ne], [Nf, Ne, Nc]], scale det(NABC). The determinant is
+                # written so that at Nd = Ne = Nf = 0 it is Na*Nb*Nc to the bit.
+                Nd, Ne, Nf = N_cells_def[0], N_cells_def[1], N_cells_def[2]
+                v1 = Na * h_frac + Nd * k_frac + Nf * l_frac
+                v2 = Nd * h_frac + Nb * k_frac + Ne * l_frac
+                v3 = Nf * h_frac + Ne * k_frac + Nc * l_frac
+                rad_sqr = v1 * v1 + v2 * v2 + v3 * v3
+                n_scale = n_scale - Na * Ne * Ne - Nb * Nf * Nf - Nc * Nd * Nd + 2 * Nd * Ne * Nf
+            elif spot_metric is SpotMetric.HKL:
+                # cctbx nanoBragg.cpp / diffBragg: radius measured in hkl space, as ROUND does
+                rad_sqr = (h_frac * h_frac * Na * Na +
+                           k_frac * k_frac * Nb * Nb +
+                           l_frac * l_frac * Nc * Nc)
+            else:
+                # bl831 nanoBragg.c since 2023: "round in reciprocal space"
+                # rot_*_star (N_phi, N_mos, 3) broadcasts against any leading (sources, pixels) shape
+                delta_r_star = (h_frac.unsqueeze(-1) * rot_a_star +
+                                k_frac.unsqueeze(-1) * rot_b_star +
+                                l_frac.unsqueeze(-1) * rot_c_star)
+                rad_sqr = torch.sum(delta_r_star * delta_r_star, dim=-1)
+                rad_sqr = rad_sqr * Na * Na * Nb * Nb * Nc * Nc
 
-        if shape == CrystalShape.GAUSS:
-            F_latt = n_scale * torch.exp(-(rad_sqr / 0.63) * fudge)
+            if shape == CrystalShape.GAUSS:
+                F_latt = n_scale * torch.exp(-(rad_sqr / 0.63) * fudge)
+            else:
+                inside_cutoff = (rad_sqr * fudge) < 0.3969
+                # N may be a tensor with a graph, in ExperimentModel, which full_like will not take
+                F_latt = torch.where(inside_cutoff,
+                                    n_scale * torch.ones_like(rad_sqr),
+                                    torch.zeros_like(rad_sqr))
         else:
-            inside_cutoff = (rad_sqr * fudge) < 0.3969
-            # N may be a tensor with a graph, in ExperimentModel, which full_like will not take
-            F_latt = torch.where(inside_cutoff,
-                                n_scale * torch.ones_like(rad_sqr),
-                                torch.zeros_like(rad_sqr))
-    else:
-        raise ValueError(f"Unsupported crystal shape: {shape}")
+            raise ValueError(f"Unsupported crystal shape: {shape}")
 
-    # Calculate intensity
-    F_total = F_cell * F_latt
-    intensity = F_total * F_total  # |F|^2
+        # Calculate intensity
+        F_total = F_cell * F_latt
+        intensity = F_total * F_total  # |F|^2
 
     # Apply dmin culling
     if dmin_mask is not None:
@@ -601,8 +612,9 @@ class Simulator:
             dtype: PyTorch data type
             debug_config: Debug configuration with printout, printout_pixel, trace_pixel options
             diffuse: Optional extension, not in nanoBragg.c: a nanobrag_torch.diffuse.DiffuseModel,
-                mapping Miller indices (n, 3), float64 (float32 on MPS), to scattering per unit cell
-                (n,) in electrons squared, finite everywhere. run() adds it to the image and fills
+                mapping Miller indices (n, 3), in the simulator's dtype, to scattering per unit
+                cell (n,) in electrons squared, finite everywhere. It is rendered through the Bragg
+                path (subpixels, layers, sources, orientations) with N_cells * I in place of F^2. run() adds it to the image and fills
                 self.components: "diffuse", "total", and "bragg", which is everything nanoBragg.c
                 computes, the water background included. None leaves the image untouched.
             diffuse_orientations: "all" averages the term over every phi step and mosaic domain,
@@ -1067,6 +1079,42 @@ class Simulator:
             polarization_axis=self.polarization_axis,
         )
 
+    def _diffuse_physics_for_position(self, pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star,
+                                      rot_c_star, incident_beam_direction=None, wavelength=None,
+                                      source_weights=None, oversample_polar=False):
+        """_compute_physics_for_position with N_cells * self.diffuse(hkl) for (F_cell * F_latt)^2.
+
+        Uncompiled, so the model can be any Python callable. With diffuse_orientations="first"
+        only the first phi step and mosaic domain is evaluated, weighted by the number of
+        orientations, so that run()'s division by steps leaves that one orientation's term.
+        """
+        n_orientations = rot_a.shape[0] * rot_a.shape[1]
+        if self.diffuse_orientations == "first":
+            rot_a, rot_b, rot_c = rot_a[:1, :1], rot_b[:1, :1], rot_c[:1, :1]
+            rot_a_star, rot_b_star, rot_c_star = rot_a_star[:1, :1], rot_b_star[:1, :1], rot_c_star[:1, :1]
+        intensity, intensity_pre_polar = compute_physics_for_position(
+            pixel_coords_angstroms=pixel_coords_angstroms,
+            rot_a=rot_a, rot_b=rot_b, rot_c=rot_c,
+            rot_a_star=rot_a_star, rot_b_star=rot_b_star, rot_c_star=rot_c_star,
+            incident_beam_direction=(self.incident_beam_direction if incident_beam_direction is None
+                                     else incident_beam_direction).clone(),
+            wavelength=self.wavelength if wavelength is None else wavelength,
+            source_weights=source_weights,
+            dmin=self.beam_config.dmin,
+            N_cells_a=self.crystal.N_cells_a,
+            N_cells_b=self.crystal.N_cells_b,
+            N_cells_c=self.crystal.N_cells_c,
+            apply_polarization=self._polarized(oversample_polar),
+            kahn_factor=self.kahn_factor,
+            polarization_axis=self.polarization_axis,
+            diffuse=self.diffuse,
+        )
+        if self.diffuse_orientations == "first" and n_orientations > 1:
+            intensity = intensity * n_orientations
+            if intensity_pre_polar is not None:
+                intensity_pre_polar = intensity_pre_polar * n_orientations
+        return intensity, intensity_pre_polar
+
     def _pixel_intensity(
         self,
         pixel_coords_meters: torch.Tensor,
@@ -1085,6 +1133,8 @@ class Simulator:
         oversample_polar: bool,
         oversample_thick: bool,
         panel_axes: Optional[tuple] = None,
+        physics: Optional[Callable] = None,
+        water: bool = True,
     ):
         """
         Accumulated per-pixel intensity for a block of pixels, before the
@@ -1095,7 +1145,13 @@ class Simulator:
         Returns (normalized_intensity, omega_pixel, I_before_normalization,
         I_before_normalization_pre_polar, capture_fraction_for_trace), each
         (S, F) or None; the last four feed the pixel trace.
+
+        ``physics`` replaces the per-sample kernel (default _compute_physics_for_position), and
+        ``water=False`` leaves out the water background: the diffuse term goes through this same
+        function, so every per-sample and per-pixel rule of the Bragg term applies to it too.
         """
+        if physics is None:
+            physics = self._compute_physics_for_position
         # Apply physical scaling factors (from nanoBragg.c ~line 3050)
         # Solid angle correction, converting all units to meters for calculation
 
@@ -1190,7 +1246,7 @@ class Simulator:
                 # Single batched call for all sources
                 # This replaces the Python loop and enables torch.compile optimization
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
-                physics_intensity_flat, physics_intensity_pre_polar_flat = self._compute_physics_for_position(
+                physics_intensity_flat, physics_intensity_pre_polar_flat = physics(
                     coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     incident_beam_direction=incident_dirs_batched,
                     wavelength=wavelengths_batched,
@@ -1209,7 +1265,7 @@ class Simulator:
             else:
                 # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
-                physics_intensity_flat, physics_intensity_pre_polar_flat = self._compute_physics_for_position(
+                physics_intensity_flat, physics_intensity_pre_polar_flat = physics(
                     coords_reshaped, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     oversample_polar=oversample_polar,
                 )
@@ -1282,7 +1338,7 @@ class Simulator:
                 I_before_normalization_pre_polar = None
 
             # Apply last-value semantics if omega flag is not set
-            if self.beam_config.water_size_um > 0:
+            if water and self.beam_config.water_size_um > 0:
                 # C: I = I_bg before the sample loop, so the corrections applied once per pixel
                 # below reach it, and the ones applied per sample above do not.
                 accumulated_intensity = accumulated_intensity + self._water_background_pre_scale(
@@ -1328,7 +1384,7 @@ class Simulator:
                 # Single batched call for all sources
                 # This replaces the Python loop and enables torch.compile optimization
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
-                intensity, I_before_normalization_pre_polar = self._compute_physics_for_position(
+                intensity, I_before_normalization_pre_polar = physics(
                     pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     incident_beam_direction=incident_dirs_batched,
                     wavelength=wavelengths_batched,
@@ -1339,7 +1395,7 @@ class Simulator:
             else:
                 # No explicit sources: use default beam parameters
                 # CLI-FLAGS-003 Phase M1: Unpack both post-polar and pre-polar intensities
-                intensity, I_before_normalization_pre_polar = self._compute_physics_for_position(
+                intensity, I_before_normalization_pre_polar = physics(
                     pixel_coords_angstroms, rot_a, rot_b, rot_c, rot_a_star, rot_b_star, rot_c_star,
                     oversample_polar=oversample_polar,
                 )
@@ -1382,7 +1438,7 @@ class Simulator:
             # Apply omega directly
             normalized_intensity = normalized_intensity * omega_pixel
 
-            if self.beam_config.water_size_um > 0:
+            if water and self.beam_config.water_size_um > 0:
                 # Under -oversample_omega the pixel's omega goes on each sample, so not on I_bg
                 water = self._water_background_pre_scale(
                     pixel_coords_meters.unsqueeze(2), oversample_polar, source_directions, source_wavelengths_A
@@ -1860,24 +1916,22 @@ class Simulator:
             oversample=oversample, oversample_omega=oversample_omega, oversample_polar=oversample_polar,
             oversample_thick=oversample_thick,
         )
-        if pixel_batch_size is not None and pixel_batch_size < S:
-            chunks = [
-                self._pixel_intensity(
-                    pixel_coords_meters[s_start:s_start + pixel_batch_size],
-                    panel_axes=None if panel_axes is None else tuple(a[s_start:s_start + pixel_batch_size] for a in panel_axes),
-                    **kernel_args,
-                )
-                for s_start in range(0, S, pixel_batch_size)
-            ]
-            (normalized_intensity, omega_pixel, I_before_normalization,
-             I_before_normalization_pre_polar, capture_fraction_for_trace) = (
-                None if part[0] is None else torch.cat(part, dim=0) for part in zip(*chunks)
-            )
-        else:
-            (normalized_intensity, omega_pixel, I_before_normalization,
-             I_before_normalization_pre_polar, capture_fraction_for_trace) = self._pixel_intensity(
-                pixel_coords_meters, panel_axes=panel_axes, **kernel_args
-            )
+
+        def accumulate(**term):
+            if pixel_batch_size is not None and pixel_batch_size < S:
+                chunks = [
+                    self._pixel_intensity(
+                        pixel_coords_meters[s_start:s_start + pixel_batch_size],
+                        panel_axes=None if panel_axes is None else tuple(a[s_start:s_start + pixel_batch_size] for a in panel_axes),
+                        **kernel_args, **term,
+                    )
+                    for s_start in range(0, S, pixel_batch_size)
+                ]
+                return tuple(None if part[0] is None else torch.cat(part, dim=0) for part in zip(*chunks))
+            return self._pixel_intensity(pixel_coords_meters, panel_axes=panel_axes, **kernel_args, **term)
+
+        (normalized_intensity, omega_pixel, I_before_normalization,
+         I_before_normalization_pre_polar, capture_fraction_for_trace) = accumulate()
 
         # Final intensity with all physical constants in meters
         # Per spec AT-SAM-001 and nanoBragg.c:3358, divide by steps for normalization
@@ -1907,8 +1961,16 @@ class Simulator:
         ).to(self.dtype)
         diffuse_intensity = None
         if self.diffuse is not None:
-            diffuse_intensity = self._diffuse_intensity(pixel_coords_meters, rot_a, rot_b, rot_c, panel_axes,
-                                                        source_directions, source_wavelengths_A, oversample_polar)
+            # The Bragg term's whole path with N_cells * I_cell(hkl) per orientation for
+            # (F_cell * F_latt)^2: subpixels, sensor layers, omega, capture, polarization, dmin,
+            # sources and steps follow the same rules, so the two share one absolute scale.
+            diffuse_accumulated = accumulate(physics=self._diffuse_physics_for_position, water=False)[0]
+            diffuse_intensity = (
+                diffuse_accumulated.to(self._scale_dtype)
+                / steps
+                * self._r_e_sqr_fluence()
+                * getattr(self.beam_config, "spot_scale", 1.0)
+            ).to(self.dtype)
 
         # Apply ROI/mask filter (AT-ROI-001)
         # Zero out pixels outside ROI or masked pixels
@@ -2598,89 +2660,6 @@ class Simulator:
         if any_reached is not None:
             polar = polar * any_reached.to(polar.dtype)
         return I_bg * polar
-
-    def _pixel_polarization(self, pixel_coords_meters: torch.Tensor, incident: torch.Tensor) -> torch.Tensor:
-        """Polarization factor per pixel for one incident direction, in the precision of the coordinates."""
-        dtype = pixel_coords_meters.dtype
-        diffracted = pixel_coords_meters / torch.linalg.norm(
-            pixel_coords_meters, dim=-1, keepdim=True
-        ).clamp_min(1e-30)
-        return polarization_factor(
-            torch.as_tensor(self.beam_config.polarization_factor, device=self.device, dtype=dtype),
-            incident.to(dtype).expand_as(diffracted).reshape(-1, 3).contiguous(),
-            diffracted.reshape(-1, 3).contiguous(),
-            torch.as_tensor(self.beam_config.polarization_axis, device=self.device, dtype=dtype),
-        ).reshape(pixel_coords_meters.shape[:2])
-
-    def _diffuse_intensity(self, pixel_coords_meters, rot_a, rot_b, rot_c, panel_axes,
-                           source_directions, source_wavelengths_A, oversample_polar=False) -> torch.Tensor:
-        """
-        Photons per pixel from self.diffuse at pixel centers. The arithmetic is float64 (float32
-        on MPS, which has no doubles); the pixel coordinates arrive in the run's dtype.
-
-        photons = N_cells * mean(I_cell * polar) * omega * capture * r_e^2 * fluence.
-
-        The mean is over orientations (phi steps and mosaic domains) and sources. Sources are
-        weighted as the Bragg term weights them: equally as in C, or by f_s = w/sum(w) with
-        use_source_weights. Polarization follows Bragg's rule too: -nopolar turns it off unless
-        oversample_polar is set (nanoBragg.c:2772). The model is called once per source and
-        orientation on all pixels, which bounds the memory of one call to that of one image.
-
-        This is the Bragg tail without F_latt^2, because diffuse scattering adds incoherently from
-        each cell. It is written out, not added to the accumulator as the water term is: that
-        term is divided by steps and takes r_e^2*fluence twice to match C. Capture is the true
-        absorbed fraction of the sensor, which equals the Bragg result with oversample_thick.
-        """
-        coords = pixel_coords_meters
-        wide = _widest_float(self.device)
-        if self._curved_detector:
-            coords = self.detector.apply_curved_mapping(coords)
-        coords = coords.to(wide)
-        distance = torch.linalg.norm(coords, dim=-1, keepdim=True).clamp_min(1e-30)
-        diffracted = coords / distance
-        if source_directions is None:
-            beams = [(self.incident_beam_direction, self.wavelength)]
-        else:
-            beams = list(zip(-source_directions, source_wavelengths_A))
-        if self.diffuse_orientations == "first":
-            rot_a, rot_b, rot_c = rot_a[:1, :1], rot_b[:1, :1], rot_c[:1, :1]
-        cell = torch.stack([rot_a, rot_b, rot_c], dim=-2).to(wide).reshape(-1, 3, 3)
-
-        kernel_weights = self._weights_for_kernel() if source_directions is not None else None
-        if kernel_weights is None:
-            fractions = [1.0 / len(beams)] * len(beams)
-        else:  # n*w/sum(w) per source, so the fraction of each is that over n
-            fractions = list(kernel_weights.to(device=self.device, dtype=wide) / len(beams))
-
-        total = 0.0
-        for (incident, wavelength), fraction in zip(beams, fractions):
-            incident = incident.to(wide)
-            q = (diffracted - incident) / (wavelength.to(wide) * 1e-10)
-            polar = self._pixel_polarization(coords, incident) if self._polarized(oversample_polar) else 1.0
-            for vectors in cell:
-                hkl = q.reshape(-1, 3) @ vectors.T
-                total = total + fraction * polar * self.diffuse(hkl).to(device=self.device, dtype=wide).reshape(q.shape[:2])
-        mean = total / len(cell)
-
-        pixel_size = torch.as_tensor(self.detector.pixel_size, device=self.device, dtype=wide)
-        if self.detector.config.point_pixel:
-            omega = 1.0 / distance[..., 0] ** 2
-        else:
-            close = self.detector.close_distance if panel_axes is None else panel_axes[3]
-            omega = pixel_size ** 2 / distance[..., 0] ** 2 * close.to(wide) / distance[..., 0]
-
-        capture = 1.0
-        n_layers, layer_step_m, mu = self.detector.thickness_layers()
-        if n_layers > 1:
-            normal = self.detector.odet_vec if panel_axes is None else panel_axes[2].squeeze(1).squeeze(1)
-            parallax = torch.sum(diffracted * normal.to(wide), dim=-1)
-            parallax = torch.where(parallax.abs() < 1e-10, torch.sign(parallax) * 1e-10, parallax)
-            capture = 1 - torch.exp(-n_layers * layer_step_m * mu / parallax)
-
-        n_cells = self.crystal.N_cells_a * self.crystal.N_cells_b * self.crystal.N_cells_c
-        scale = getattr(self.beam_config, "spot_scale", 1.0)
-        return (n_cells.to(wide) * mean * omega * capture
-                * self._r_e_sqr_fluence().to(wide) * scale).to(self.dtype)
 
     def _calculate_water_background_amplitude(self) -> torch.Tensor:
         """Calculate water background contribution (AT-BKG-001).

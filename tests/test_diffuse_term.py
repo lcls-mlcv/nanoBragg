@@ -39,7 +39,8 @@ def simulator(crystal=None, detector=None, beam=None, dtype=torch.float64, **kw)
     (dict(point_pixel=True), {}, {}, 1e-12),
     (dict(detector_twotheta_deg=25.0), {}, {}, 1e-12),
     (dict(detector_rotx_deg=7.0, detector_roty_deg=-5.0), {}, {}, 1e-12),
-    (dict(detector_thick_um=500.0, detector_abs_um=300.0, detector_thicksteps=40), {}, dict(oversample_thick=True), 3e-3),
+    (dict(detector_thick_um=500.0, detector_abs_um=300.0, detector_thicksteps=40), {}, dict(oversample_thick=True), 1e-12),
+    (dict(detector_thick_um=500.0, detector_abs_um=300.0, detector_thicksteps=40), {}, {}, 1e-12),
 ])
 def test_one_cell_bragg_and_diffuse_are_the_same_image(detector, beam, run, tolerance):
     bragg = simulator(detector=detector, beam=beam).run(oversample=1, **run)
@@ -159,7 +160,7 @@ def test_chunks_subsets_and_masks_agree_with_the_whole_image():
     assert masked.components["diffuse"][:, :8].abs().max() == 0 and image[:, 21:].abs().max() == 0
 
 
-def test_gradient_reaches_term_parameters_and_geometry():
+def test_gradient_reaches_the_term_parameters():
     scale = torch.tensor(3.0, dtype=torch.float64, requires_grad=True)
     sim = simulator(crystal=dict(default_F=0.0), diffuse=lambda hkl: scale * (1.0 + hkl[:, 0] ** 2))
     sim.run(oversample=1)
@@ -230,3 +231,86 @@ def test_components_are_cleared_when_the_term_is_removed():
     sim.diffuse = None
     sim.run(oversample=1)
     assert sim.components is None
+
+
+# The oracle below sees hkl: a one-cell Bragg image (F_latt = 1 for SQUARE, N = 1) whose structure
+# factor is sqrt(I(hkl)) at the fractional Miller indices is, sample for sample, the diffuse image
+# of I. The constant-F identity above cannot see per-source wavelengths, rotations or subpixels.
+
+HALO = lambda hkl: 1.0 + 40.0 * torch.exp(-((hkl - torch.round(hkl)) ** 2).sum(-1) / (2 * 0.08 ** 2))  # noqa: E731
+
+
+def oracle(model, crystal=None, detector=None, beam=None):
+    sim = simulator(crystal={**(crystal or {}), "N_cells": (1, 1, 1), "default_F": 1.0}, detector=detector, beam=beam)
+
+    def structure_factor(h, k, l):  # noqa: E741
+        hkl = torch.stack(torch.broadcast_tensors(h, k, l), -1)
+        return torch.sqrt(model(hkl.reshape(-1, 3)).reshape(hkl.shape[:-1]))
+    sim.crystal.get_structure_factor = structure_factor
+    return sim
+
+
+SENSOR = dict(detector_thick_um=500.0, detector_abs_um=300.0, detector_thicksteps=4)
+DIVERGENT = dict(source_directions=torch.nn.functional.normalize(torch.tensor(
+    [[-1.0, 0, 0], [-0.9992, 0.04, 0], [-0.9992, -0.03, 0.02]], dtype=torch.float64), dim=1),
+    source_wavelengths=torch.tensor([1.0e-10, 1.1e-10, 0.95e-10], dtype=torch.float64),
+    source_weights=torch.tensor([1.0, 3.0, 0.5], dtype=torch.float64))
+
+
+@pytest.mark.parametrize("crystal,detector,beam,run", [
+    ({}, {}, {}, dict(oversample=3)),
+    ({}, SENSOR, {}, dict(oversample=1)),
+    ({}, SENSOR, {}, dict(oversample=2, oversample_thick=True)),
+    ({}, {}, {}, dict(oversample=2, oversample_omega=True, oversample_polar=True)),
+    ({}, {}, dict(dmin=12.0), dict(oversample=1)),
+    ({}, {}, DIVERGENT, dict(oversample=2)),
+    ({}, {}, {**DIVERGENT, "use_source_weights": True}, dict(oversample=1)),
+    (dict(mosaic_spread_deg=2.0, mosaic_domains=3, phi_start_deg=1.0, osc_range_deg=3.0, phi_steps=2), {}, {}, dict(oversample=1)),
+    ({}, dict(curved_detector=True, detector_twotheta_deg=20.0), {}, dict(oversample=2)),
+    ({}, dict(point_pixel=True), dict(polarization_factor=0.7), dict(oversample=1)),
+], ids=["oversample", "sensor", "sensor-thick", "per-sample", "dmin", "sources", "weighted", "phi-mosaic", "curved",
+        "point-pixel"])
+def test_diffuse_is_the_one_cell_bragg_image_of_sqrt_intensity(crystal, detector, beam, run):
+    expected = oracle(HALO, crystal, detector, beam).run(**run)
+    sim = simulator(crystal={**crystal, "N_cells": (1, 1, 1), "default_F": 0.0}, detector=detector, beam=beam, diffuse=HALO)
+    sim.run(**run)
+    assert expected.max() > 0 and torch.equal(sim.components["diffuse"] > 0, expected > 0)
+    assert torch.allclose(sim.components["diffuse"], expected, rtol=1e-12, atol=0)
+
+
+def test_live_polarization_factor_reaches_the_diffuse_term():
+    expected = oracle(HALO)
+    sim = simulator(crystal=dict(N_cells=(1, 1, 1), default_F=0.0), diffuse=HALO)
+    for s in (expected, sim):
+        s.kahn_factor = torch.tensor(0.5, dtype=torch.float64)
+    sim.run(oversample=1)
+    assert torch.allclose(sim.components["diffuse"], expected.run(oversample=1), rtol=1e-12, atol=0)
+
+
+def test_n_cells_scales_the_diffuse_term_as_the_integral_of_the_lattice_factor():
+    """Summed over a finely sampled image, Bragg with N cells and constant F equals diffuse with F^2 (Parseval)."""
+    detector = dict(spixels=32, fpixels=32)
+    for n_cells, tolerance in [((2, 1, 1), 1e-3), ((3, 2, 1), 5e-3)]:
+        bragg = simulator(crystal=dict(N_cells=n_cells), detector=detector).run(
+            oversample=7, oversample_omega=True, oversample_polar=True)
+        sim = simulator(crystal=dict(N_cells=n_cells, default_F=0.0), detector=detector, diffuse=constant(F0 ** 2))
+        sim.run(oversample=7, oversample_omega=True, oversample_polar=True)
+        assert float(bragg.sum() / sim.components["diffuse"].sum()) == pytest.approx(1.0, abs=tolerance)
+
+
+def test_panel_pixels_with_a_thick_sensor_give_the_whole_image_at_those_pixels():
+    from src.nanobrag_torch.simulator import PanelPixels
+    sim = simulator(crystal=dict(N_cells=(1, 1, 1), default_F=0.0), detector=SENSOR, diffuse=HALO)
+    sim.run(oversample=1)
+    whole = sim.components["diffuse"].clone()
+    chosen = torch.tensor([[3, 4], [20, 11], [31, 31], [7, 25]])
+    detector = sim.detector
+    coords = detector.get_pixel_coords()[chosen[:, 0], chosen[:, 1]]
+    n = len(chosen)
+    pixels = PanelPixels(coords_m=coords, fdet=detector.fdet_vec.expand(n, 3), sdet=detector.sdet_vec.expand(n, 3),
+                         odet=detector.odet_vec.expand(n, 3),
+                         close_distance_m=torch.as_tensor(detector.close_distance, dtype=torch.float64).expand(n),
+                         mask=torch.ones(n, dtype=torch.float64))
+    values = sim.run(oversample=1, panel_pixels=pixels)
+    assert values.shape == (n,) and sim.components["diffuse"].shape == (n,)
+    assert torch.allclose(sim.components["diffuse"], whole[chosen[:, 0], chosen[:, 1]], rtol=1e-12, atol=0)
