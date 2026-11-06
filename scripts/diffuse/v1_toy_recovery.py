@@ -406,6 +406,73 @@ def separability(toy, size, device="cpu", grid=None):
     return ratios
 
 
+# Where a parameter's Fisher sd at the truth exceeds PROFILE_SD (log units) the likelihood is not
+# quadratic over the range a fit can wander, and the Fisher z misdescribes it (measured: the 128^2
+# sharp_wide fits before the fluence fix, log kappa sd 1.18, ran to z 223 along a valley). For such a
+# parameter the gate uses the profile-likelihood z at the truth, and the report gives the 1-sd profile
+# interval (2 dNLL = 1) beside the Fisher z.
+PROFILE_SD = 0.5
+
+
+def get_truth(toy, wanted):
+    """The true raw value of the parameter labelled ``wanted``."""
+    for key, value in toy.truth().items():
+        if label(key) == wanted:
+            return value
+    raise KeyError(wanted)
+
+
+def _refit(toy, size, name, device, grid, data, start, fixed=None):
+    """The deviance minimum with every parameter of the fit refined from ``start`` except ``fixed``
+    (key, value), held at its value: one point of a profile."""
+    fit = fits(grid, toy)[name]
+    values = toy.truth()
+    model = build(toy, size, fit["diffuse"], fit["bragg"], device, grid)
+    for key in fit.get("known", []):
+        put(model, key, values[key])
+    for key in fit["refine"]:
+        put(model, key, start[key])
+    if fixed is not None:
+        put(model, fixed[0], fixed[1])
+    for key in fit["refine"]:
+        if fixed is None or key != fixed[0]:
+            model.refine(key[0])
+    refine_lbfgsb(model, lambda: deviance(image(model), data), ftol=1e-15, gtol=1e-10, maxiter=1000)
+    with torch.no_grad():
+        return float(deviance(image(model), data))
+
+
+def profile(toy, size, name, device, grid, data, fitted, key, sd, nll_min):
+    """The profile z at the truth and the 1-sd interval of one parameter (deviance is the NLL up to a
+    constant, so 2 dNLL = 1 marks one sd). The interval is bracketed from the estimate in steps of the
+    Fisher sd, doubling up to 16 sds, then bisected five times; an end not reached is +-inf."""
+    estimate, truth = fitted[key], toy.truth()[key]
+    at_truth = _refit(toy, size, name, device, grid, data, fitted, (key, truth))
+    best = min(nll_min, at_truth)
+    delta = max(at_truth - best, 0.0)
+    z = math.copysign(math.sqrt(2 * delta), estimate - truth)
+    interval = []
+    for direction in (-1, 1):
+        inside, width = 0.0, sd
+        outside = None
+        while width <= 16 * sd:
+            if 2 * (_refit(toy, size, name, device, grid, data, fitted, (key, estimate + direction * width)) - best) >= 1:
+                outside = width
+                break
+            inside, width = width, 2 * width
+        if outside is None:
+            interval.append(direction * math.inf)
+            continue
+        for _ in range(5):
+            mid = 0.5 * (inside + outside)
+            if 2 * (_refit(toy, size, name, device, grid, data, fitted, (key, estimate + direction * mid)) - best) >= 1:
+                outside = mid
+            else:
+                inside = mid
+        interval.append(estimate + direction * 0.5 * (inside + outside))
+    return {"z": z, "delta_nll": delta, "interval": interval}
+
+
 def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid=None):
     """One fit. The data come from the exact halo; with a GridSpec the model fitted (and its Fisher
     information) uses the halo's grid."""
@@ -437,6 +504,15 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
     scaled = information / np.sqrt(np.outer(np.diag(information), np.diag(information)))
     labels = list(map(label, keys))
     errors = {lab: get(model, key) - values[key] for lab, key in zip(labels, keys)}
+    z = {lab: float(errors[lab] / s) for lab, s in zip(labels, sd)}
+    profiles = {}
+    if any(s > PROFILE_SD for s in sd):
+        fitted = {key: get(model, key) for key in keys}
+        with torch.no_grad():
+            nll_min = float(deviance(image(model), data))
+        for lab, key, s in zip(labels, keys, sd):
+            if s > PROFILE_SD:
+                profiles[lab] = profile(toy, size, name, device, grid, data, fitted, key, float(s), nll_min)
     return {
         "fit": name, "size": size, "poisson": poisson, "seed": seed, "grid": None if grid is None else asdict(grid),
         "converged": bool(result.success),
@@ -444,7 +520,9 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
         # the cored grid's drift at the fit's end (data for the V2 drift tolerance)
         "core_drift": model.diffuse.core_drift() if fit["diffuse"] and grid is not None and grid.core else None, "message": str(result.message), "photons": photons,
         "errors": errors,
-        "z": {lab: float(errors[lab] / s) for lab, s in zip(labels, sd)},
+        "z": z,
+        "profile": profiles,  # the parameters whose Fisher sd exceeds PROFILE_SD: z, delta_nll, interval
+        "z_gate": {lab: profiles[lab]["z"] if lab in profiles else value for lab, value in z.items()},
         "fisher_sd": dict(zip(labels, sd.tolist())),
         "fisher_condition": float(np.linalg.cond(information)),
         "fisher_condition_scaled": float(np.linalg.cond(scaled)),
@@ -461,10 +539,10 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
             for seed in (seeds if poisson else [0]) for name in FITS]
     worst_ratio = float(max(ratios.values()))
     if poisson:
-        worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
+        worst_recovery = float(max(abs(z) for r in fits for z in r["z_gate"].values()))
         recovered = bool(worst_recovery < Z_LIMIT)
     elif grid is not None and (not grid.core or toy.smooth > 0):  # the grid's bias (a nonzero residual), in sds
-        worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
+        worst_recovery = float(max(abs(z) for r in fits for z in r["z_gate"].values()))
         recovered = bool(worst_recovery < GRID_BIAS_LIMIT)
     else:
         worst_recovery = float(max(abs(e) for r in fits for e in r["errors"].values()))

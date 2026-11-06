@@ -215,3 +215,32 @@ def test_photons_per_solid_angle_do_not_change_with_size():
     toy = v1.TOYS["separable"]
     assert _photons(toy, 48)[0] == pytest.approx(_photons(toy, 24)[0], rel=0.05)
     assert _photons(toy, 96, oversample=2)[1] == pytest.approx(_photons(toy, 48, oversample=4)[1], rel=0.05)
+
+
+# Profile likelihood (2026-11-06): where a parameter's Fisher sd exceeds PROFILE_SD (log units) the
+# quadratic Fisher z does not describe the likelihood; the gate uses the profile-likelihood z at the
+# truth, z_p = sign(p_hat - p_true) sqrt(2 (NLL(p_true, rest refit) - NLL_min)), and reports the
+# 1-sd profile interval (2 dNLL = 1) beside the Fisher z.
+
+def test_a_well_identified_fit_gets_no_profile():
+    result = v1.run_fit("joint", size=24, poisson=True, seed=1)
+    assert result["profile"] == {}
+    assert result["z_gate"] == result["z"]
+
+
+def test_a_poorly_identified_parameter_gets_a_profile_z_and_interval():
+    import dataclasses
+    base = v1.EXTRA_TOYS["sharp_wide"]
+    toy = dataclasses.replace(base, fluence=base.fluence / 28.4)  # about 100 diffuse photons: kappa's sd > 0.5
+    grid = v1.GridSpec(1 / 4, core=True)
+    result = v1.run_fit("diffuse", size=24, poisson=True, seed=2, toy=toy, grid=grid)
+    flagged = {k for k, sd in result["fisher_sd"].items() if sd > v1.PROFILE_SD}
+    assert flagged and set(result["profile"]) == flagged
+    for label in flagged:
+        profile = result["profile"][label]
+        assert profile["delta_nll"] >= -1e-6
+        assert result["z_gate"][label] == pytest.approx(profile["z"])
+        lo, hi = profile["interval"]
+        assert lo <= result["errors"][label] + v1.get_truth(toy, label) <= hi  # the estimate is inside
+    for label in set(result["z"]) - flagged:
+        assert result["z_gate"][label] == result["z"][label]
