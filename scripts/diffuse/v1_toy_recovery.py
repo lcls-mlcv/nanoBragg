@@ -116,10 +116,13 @@ class GridSpec:
 
     step: float
     kd: str = "frozen"
+    core: bool = False  # D3b: the halo is the grid's core (refinable), the grid holds the residual
 
     def __post_init__(self):
         if self.kd not in ("frozen", "free"):
             raise ValueError(f"kd must be 'frozen' or 'free', got {self.kd!r}")
+        if self.core and self.kd == "free":
+            raise ValueError("with the halo as the core its amplitude is refined, so k_d stays frozen")
 
 
 def diffuse_photons(toy, size, device="cpu"):
@@ -142,9 +145,16 @@ def grid_step_for(toy, size, kd="frozen", device="cpu"):
     return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
 
 
+CORE_HALO = [("diffuse_params.model.core.log_amplitude", None), ("diffuse_params.model.core.log_sigma", None)]
+GRID_CORE_FITS = {name: {**spec, "refine": [CORE_HALO[HALO.index(k)] if k in HALO else k for k in spec["refine"]]}
+                  for name, spec in FITS.items()}
+
+
 def fits(grid=None):
     if grid is None:
         return FITS
+    if grid.core:
+        return GRID_CORE_FITS
     return GRID_FITS if grid.kd == "free" else GRID_FITS_KD_FROZEN
 
 
@@ -164,7 +174,8 @@ class Toy:
         return math.sqrt(0.63 / 4) / self.n_cells
 
     def truth(self) -> dict:
-        return {**GEOMETRY_TRUTH, HALO[0]: math.log(self.amplitude), HALO[1]: math.log(self.sigma), K_D: 0.0}
+        return {**GEOMETRY_TRUTH, HALO[0]: math.log(self.amplitude), HALO[1]: math.log(self.sigma), K_D: 0.0,
+                CORE_HALO[0]: math.log(self.amplitude), CORE_HALO[1]: math.log(self.sigma)}
 
     def start_halo(self) -> tuple:
         return 0.7 * self.amplitude, 1.3 * self.sigma
@@ -195,6 +206,20 @@ def toy_grid(toy, step, device="cpu"):
     return _GRIDS[key]
 
 
+def cored_grid(toy, step, device="cpu"):
+    """A grid whose core is a refinable GaussianHalo at the start values; the residual, the true halo
+    less the core at the truth, is zero for this toy (the machinery's check: it fits as the exact halo)."""
+    core = GaussianHalo(toy.amplitude, toy.sigma).to(device)
+    grid = DiffuseGrid.from_model(GaussianHalo(toy.amplitude, toy.sigma), step=step, d_min=GRID_D_MIN,
+                                  cell=(30.0, 35.0, 40.0), point_group=MMM, refinable=False,
+                                  device=torch.device(device), core=core)
+    amplitude, sigma = toy.start_halo()
+    with torch.no_grad():
+        core.log_amplitude.fill_(math.log(amplitude))
+        core.log_sigma.fill_(math.log(sigma))
+    return grid
+
+
 def build(toy, size, diffuse, bragg, device="cpu", grid=None, oversample=1):
     n = toy.n_cells
     crystal = CrystalConfig(cell_a=30.0, cell_b=35.0, cell_c=40.0, misset_deg=(5.0, -3.0, 2.0), N_cells=(n, n, n),
@@ -207,7 +232,7 @@ def build(toy, size, diffuse, bragg, device="cpu", grid=None, oversample=1):
     elif grid is None:
         halo = GaussianHalo(*toy.start_halo())
     else:
-        halo = toy_grid(toy, grid.step, device)
+        halo = toy_grid(toy, grid.step, device) if not grid.core else cored_grid(toy, grid.step, device)
     model = ExperimentModel(crystal, detector, beam, dtype=DTYPE, device=torch.device(device), diffuse=halo,
                             crystal_system="orthorhombic")
     if diffuse and grid is not None and grid.kd == "free":
@@ -274,7 +299,11 @@ def truth_model(toy, fit, size, device="cpu", grid=None, oversample=1):
     spec = fits(grid)[fit]
     model = build(toy, size, spec["diffuse"], spec["bragg"], device, grid, oversample=oversample)
     truth = toy.truth()
-    diffuse_keys = (HALO if grid is None else [K_D] if grid.kd == "free" else []) if spec["diffuse"] else []
+    if grid is None:
+        diffuse_keys = HALO
+    else:
+        diffuse_keys = CORE_HALO if grid.core else [K_D] if grid.kd == "free" else []
+    diffuse_keys = diffuse_keys if spec["diffuse"] else []
     for key in [SCALE, *MISSET, *CELL] + diffuse_keys:
         put(model, key, truth[key])
     return model
@@ -355,7 +384,7 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
     if poisson:
         worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
         recovered = bool(worst_recovery < Z_LIMIT)
-    elif grid is not None:  # the grid's bias, in Fisher sds at this size's photons
+    elif grid is not None and not grid.core:  # the grid's bias, in Fisher sds at this size's photons
         worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
         recovered = bool(worst_recovery < GRID_BIAS_LIMIT)
     else:
@@ -379,12 +408,14 @@ def main(argv=None):
                         help="fit with the halo's DiffuseGrid, nodes STEP apart (default: grid_step_for)")
     parser.add_argument("--grid-kd", choices=["frozen", "free"], default="frozen",
                         help="with --grid: k_d frozen at 1 (plan decision 3, the default) or refined")
+    parser.add_argument("--grid-core", action="store_true",
+                        help="with --grid: the halo as the grid's refinable core (D3b), the grid its residual")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     grid = None
     if args.grid is not None:  # one step for both toys, the separable one's: the hidden toy is judged on separability
         step = args.grid or grid_step_for(TOYS["separable"], args.size, args.grid_kd, args.device)
-        grid = GridSpec(step, args.grid_kd)
+        grid = GridSpec(step, args.grid_kd, core=args.grid_core)
     reports = {name: evaluate(name, args.size, args.poisson, args.seeds, args.device, grid=grid)
                for name in TOYS}
     for name, report in reports.items():
@@ -400,7 +431,7 @@ def main(argv=None):
     flagged = not reports["hidden"]["separable"]
     # With the grid's shape and k_d both frozen the diffuse term has no parameter of its own, so
     # nothing can trade off with the spots: the hidden toy cannot be flagged and is not required to be.
-    needs_flag = grid is None or grid.kd == "free"
+    needs_flag = grid is None or grid.kd == "free" or grid.core
     if needs_flag:
         verdict = 'flagged as weakly identified (expected)' if flagged else 'NOT flagged: the metric does not discriminate'
     else:

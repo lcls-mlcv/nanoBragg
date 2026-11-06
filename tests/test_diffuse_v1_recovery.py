@@ -122,6 +122,22 @@ def test_the_grid_gate_passes_with_its_exit_code():
     assert v1.main(["--size", "24", "--grid"]) == 0
 
 
+# --grid-core (D3b): the halo is the grid's core, refinable; the residual (zero for this toy) on the grid
+
+@pytest.mark.parametrize("fit", sorted(v1.FITS))
+def test_noise_free_recovery_with_the_halo_as_the_grids_core(fit):
+    grid = v1.GridSpec(1 / 8, kd="frozen", core=True)
+    result = v1.run_fit(fit, size=24, poisson=False, seed=0, grid=grid)
+    if fit != "bragg":
+        assert "diffuse_params.model.core.log_sigma" in result["errors"]
+    for label, error in result["errors"].items():
+        assert abs(error) < 1e-5, (label, error)
+
+
+def test_the_core_gate_passes_and_flags_the_hidden_toy():
+    assert v1.main(["--size", "24", "--grid", "0.125", "--grid-core"]) == 0
+
+
 def _photons(toy, size, oversample=1):
     """(diffuse, Bragg) photons of the joint truth image at a size."""
     import torch
