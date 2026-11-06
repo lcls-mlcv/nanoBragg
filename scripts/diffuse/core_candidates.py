@@ -23,6 +23,12 @@ Candidates, prototypes on one nonuniform tensor-product trilinear interpolator:
   per-lattice-point table, plus a uniform grid of the residual I - core. M' = M is the core the model
   knows; M' = 1 (isotropic) a core of the wrong shape, whose residual is still sharp.
 
+The supplied core's accuracy (audit 2026-11-05): same-sign errors in M and errors in kappa, and three
+departures of the truth from A(h0) / (d^T M d + kappa^2) that a real one-phonon term has: an amplitude
+that varies within the halo (variant "q": form_factor, q^2 and a Debye-Waller factor at hkl, not h0),
+a non-quadratic directional shape (variant "christoffel"), and an off-diagonal metric ("offdiag",
+supplied with its diagonal or in full).
+
 For each, at the V1 toy's geometry (128^2, GAUSS-HKL, k_d frozen): the linearised bias of the fit's
 parameters, b = -F^-1 J^T W (mu_candidate - mu_exact), F = J^T W J (Poisson, J by central differences
 at the truth), in Fisher sds and scaled to 1e6 diffuse photons (z grows as sqrt(P)); the lysozyme
@@ -64,19 +70,57 @@ def amplitude(h0, a0):
                  * torch.cos(2 * math.pi * h0[..., 2] / 7))
 
 
-def lorentz(d, metric, kappa=KAPPA):
+def quadratic(d, metric):
+    """d^T M d for a diagonal (3 values) or full (3 x 3) metric."""
     m = torch.as_tensor(metric, dtype=d.dtype, device=d.device)
-    return kappa ** 2 / ((d * d * m).sum(-1) + kappa ** 2)
+    return (d * d * m).sum(-1) if m.ndim == 1 else torch.einsum("ni,ij,nj->n", d, m, d)
+
+
+def lorentz(d, metric, kappa=KAPPA):
+    return kappa ** 2 / (quadratic(d, metric) + kappa ** 2)
+
+
+CELL = (30.0, 35.0, 40.0)
+B_FACTOR = 20.0  # A^2, for the amplitude that varies within the halo
+FULL_METRIC = ((1.0, 0.2, 0.0), (0.2, 1.3, 0.1), (0.0, 0.1, 0.8))  # off-diagonal: not a LorentzianHalo's
+
+
+def form_factor(hkl):
+    """q^2 exp(-B s^2 / 2), s = |h / a| (orthogonal cell), plus a floor at h = 0: the one-phonon
+    term's amplitude, which varies across a halo as q does."""
+    s2 = ((hkl / torch.tensor(CELL, dtype=hkl.dtype)) ** 2).sum(-1)
+    return (s2 + 1 / 30.0 ** 2) * torch.exp(-B_FACTOR * s2 / 2)
+
+
+def christoffel(d, metric, eps):
+    """|d|_M^2 f(d_hat) with a quartic (non-quadratic) directional factor f = 1 + eps (sum d_hat^4 - 3/5) / 0.4."""
+    q = quadratic(d, metric)
+    r2 = (d * d).sum(-1)
+    safe = torch.where(r2 > 0, r2, torch.ones_like(r2))
+    n4 = torch.where(r2 > 0, (d ** 4).sum(-1) / (safe * safe), torch.full_like(r2, 0.6))
+    return q * (1 + eps * (n4 - 0.6) / 0.4)
 
 
 class SharpCore(nn.Module):
-    def __init__(self, a0=1000.0, b=5.0):
+    """The toy's truth. variant: "exact" (the core a supplied core can match), "q" (the amplitude
+    varies within the halo as form_factor), "christoffel" (a non-quadratic shape, eps), "offdiag"
+    (an off-diagonal metric)."""
+
+    def __init__(self, a0=1000.0, b=5.0, variant="exact", eps=0.0):
         super().__init__()
-        self.a0, self.b = a0, b
+        self.a0, self.b, self.variant, self.eps = a0, b, variant, eps
 
     def core(self, hkl, metric=METRIC):
         h0 = torch.round(hkl)
-        return amplitude(h0, self.a0) * lorentz(hkl - h0, metric)
+        d = hkl - h0
+        a = amplitude(h0, self.a0)
+        if self.variant == "q":
+            return a * form_factor(hkl) / form_factor(h0) * lorentz(d, metric)
+        if self.variant == "christoffel":
+            return a * KAPPA ** 2 / (christoffel(d, metric, self.eps) + KAPPA ** 2)
+        if self.variant == "offdiag":
+            return a * lorentz(d, FULL_METRIC)
+        return a * lorentz(d, metric)
 
     def smooth(self, hkl):
         waves = [torch.cos(2 * math.pi * hkl[..., i] / p) for i, p in enumerate((3.0, 4.0, 5.0))]
@@ -267,6 +311,16 @@ CANDIDATES = [
     # a core shape wrong by about 5% and 10% in M (the model's core approximate)
     ("core", dict(step=1 / 8, metric=(1.0, 1.25, 0.84))), ("core", dict(step=1 / 16, metric=(1.0, 1.25, 0.84))),
     ("core", dict(step=1 / 16, metric=(1.0, 1.18, 0.88))), ("core", dict(step=1 / 8, metric=(1.0, 1.3, 0.8), kappa=0.055)),
+    # same-sign errors in M, which act as an error in kappa (audit 2026-11-05)
+    ("core", dict(step=1 / 8, metric=(1.05, 1.365, 0.84))), ("core", dict(step=1 / 16, metric=(1.05, 1.365, 0.84))),
+    ("core", dict(step=1 / 16, metric=(1.1, 1.43, 0.88))),
+    ("core", dict(step=1 / 8, metric=METRIC, kappa=0.051)), ("core", dict(step=1 / 8, metric=METRIC, kappa=0.0525)),
+    ("core", dict(step=1 / 16, metric=METRIC, kappa=0.051)),
+    # realistic mismatch: the supplied core is A(h0) / (d^T M d + kappa^2), the truth departs from it
+    *[("core", dict(step=st, metric=METRIC, variant="q")) for st in (1 / 8, 1 / 16, 1 / 32)],
+    *[("core", dict(step=st, metric=METRIC, variant="christoffel", eps=e)) for e in (0.1, 0.3) for st in (1 / 8, 1 / 16, 1 / 32)],
+    *[("core", dict(step=st, metric=tuple(FULL_METRIC[i][i] for i in range(3)), variant="offdiag")) for st in (1 / 8, 1 / 16, 1 / 32)],
+    *[("core", dict(step=st, metric=FULL_METRIC, variant="offdiag")) for st in (1 / 8, 1 / 16)],
 ]
 
 
@@ -285,13 +339,16 @@ def main(argv=None):
     parser.add_argument("--size", type=int, default=128)
     parser.add_argument("--kd", choices=["frozen", "free"], default="frozen")
     parser.add_argument("--only", nargs="*", help="kinds to run")
+    parser.add_argument("--variants", nargs="*", help="model variants to run (exact, q, christoffel, offdiag)")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
-    model = SharpCore()
     rows = []
     for kind, p in CANDIDATES:
         if args.only and kind not in args.only:
             continue
+        if args.variants and p.get("variant", "exact") not in args.variants:
+            continue
+        model = SharpCore(variant=p.get("variant", "exact"), eps=p.get("eps", 0.0))
         start = time.perf_counter()
         candidate = build(kind, model, p)
         built = time.perf_counter() - start
