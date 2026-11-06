@@ -320,6 +320,47 @@ reference.
   - Recommended for lysozyme: 1/8 as the uniform base, with the core decided on V2. Use the ASU
     (119 MB) where memory binds, and P1 (944 MB) where the lookup cost binds, as on a GPU.
   - The ASU build peak is chunk work: 2¹⁹ nodes × 16 operators, transient.
+- **D3b, the core near integer hkl** (`feat/diffuse-grid-core`, measured 2026-11-05 with
+  `scripts/diffuse/core_candidates.py`).
+  - The toy: a one-phonon-like core with a k floor, A(h₀)·κ²/(dᵀMd + κ²), with κ = 0.5/N = 0.05,
+    M = diag(1, 1.3, 0.8) and A varying ±30% over h₀, plus a smooth part.
+  - The fit: V1 geometry at 128², k_d frozen. The bias is linearised,
+    b = −F⁻¹JᵀW(μ_grid − μ_exact), in sds scaled to 1e6 diffuse photons. The target is z ≤ 0.05.
+  - Memory is for lysozyme to 2 Å on the 4/mmm ASU.
+
+  | candidate | worst z at 1e6 photons | lysozyme memory | lookup |
+  |---|---|---|---|
+  | uniform 1/8, 1/16, 1/32, 1/64 | 29.8, 5.2, 1.14, 0.38 | 59 MB, 0.47, 3.7, 30 GB | 66–96 ns |
+  | warped tensor grid, 32 nodes a unit (w 0.05; 0.02) | 1.75; 2.6 | 4.2 GB | 72–79 ns |
+  | local fine cubes (coarse 1/16, r 0.25, fine 1/64) | 0.39 | 2.6 GB | 180 ns |
+  | local fine cubes (coarse 1/32, r 0.125, fine 1/128) | 0.28 | 5.9 GB | 177 ns |
+  | **model's core + residual grid, 1/8; 1/16** | **0.057; 0.014** | **59; 468 MB** | 79 ns |
+  | core with M 5% off (1.25, 0.84), 1/8; 1/16 | 0.14; 0.060 | 59; 468 MB | |
+  | core with M 10% off (1.18, 0.88), 1/16 | 0.12 | 468 MB | |
+  | isotropic core (M = 1), 1/16; 1/32 | 0.32; 0.20 | 0.47; 3.7 GB | |
+  | core with κ 10% off, 1/8 | 9.0 | 59 MB | |
+
+  - **Decided and built: the analytic core.** It is the only candidate that meets the target at
+    affordable memory. A tensor grid refines whole planes and lines to reach the points. Fine
+    cubes cost one cube per reflection and still leave the coarse grid's error at their faces.
+    - `DiffuseGrid.from_model(model, ..., core=core_module | True)`: True takes
+      `model.core()`, an optional method of the protocol. The grid stores model − core and
+      returns core(hkl) plus the interpolated residual.
+    - The core is a submodule: its parameters join the group `diffuse`, with gradients in hkl,
+      the core and the values (FD and gradcheck).
+    - `LorentzianHalo(amplitude, κ, metric)` is the reference core.
+  - **The core must be the model's own term:** κ off by 10% leaves z = 9. For eryx this means
+    `core()` returns the one-phonon leading term with its own k_floor and elastic anisotropy (an
+    E1/E2 item), not a generic fit to it.
+  - The residual is sampled at the core's parameters at build time. If the core's parameters
+    refine far, the residual must be rebuilt (measured on V2).
+  - Image table (`grid_vs_exact.py error --size 128 --only sharp sharp+core`; deviance scaled
+    to 1e6 photons):
+    - without the core, max rel 0.20 / 0.14 / 0.10 and deviance 1.2e4 / 2.0e3 / 350 at steps
+      1/8, 1/16, 1/32;
+    - with it, max rel 7.5e-5 / 2.0e-5 / 5.1e-6 and deviance 0.73 / 0.053 / 0.003.
+  - V1 `--grid --grid-core` (the halo as the refinable core, with a zero residual) recovers to
+    1e-5 noise-free in all three fits, and flags the hidden toy.
 - Pixels: diffuse fits do not need every pixel. A ROI set with a strided subset between
   spots (mask out ±n px around predicted spots, then stride) keeps one shot at 1e4–1e5
   pixels.
@@ -487,7 +528,7 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 | D1 | the hook: 31d0b2c, 3f653f1, 7b344a4 rebased; `diffuse.py` protocol plus toy models; V0 gate script | V0, full gates |
 | D2 | `ExperimentModel(diffuse=)`, groups diffuse/diffuse_scale, ROI path, components, `SerialExperiment` sharing, D2-T1 shape-integral test, gradient checks | /tdd, V1 |
 | D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test. Done: section 2.2 (error table, memory, decision); `v1_toy_recovery.py --grid` passes, V0 0 differ | V1 on the grid |
-| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory | grid vs exact on a sharp-core toy, V1 on the grid |
+| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2) | grid vs exact on a sharp-core toy, V1 on the grid |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
 | (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
