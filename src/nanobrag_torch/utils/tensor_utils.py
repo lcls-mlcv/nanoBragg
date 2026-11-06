@@ -48,3 +48,15 @@ def as_tensor_preserving_grad(
     if isinstance(x, torch.Tensor):
         return x.to(device=device, dtype=dtype)
     return torch.tensor(x, device=device, dtype=dtype)
+
+
+def to_device_and_dtype(tensor: torch.Tensor, device, dtype: torch.dtype) -> torch.Tensor:
+    """tensor on ``device`` in ``dtype``, cast on whichever side can hold the dtype.
+
+    MPS holds no float64, so a combined .to(device, dtype) from MPS float32 to CPU float64, or
+    from CPU float64 to MPS, can fail: the tensor leaves MPS before its cast and is cast before
+    it goes onto MPS.
+    """
+    if tensor.device.type == "mps":
+        return tensor.to(device=device).to(dtype=dtype)
+    return tensor.to(dtype=dtype).to(device=device)

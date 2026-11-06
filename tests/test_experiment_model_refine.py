@@ -7,6 +7,7 @@ from torch.func import functional_call
 from nanobrag_torch.config import (
     BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention, DetectorPivot,
 )
+from nanobrag_torch.diffuse import GaussianHalo
 from nanobrag_torch.models.crystal import Crystal
 from nanobrag_torch.models.detector import Detector
 from nanobrag_torch.models.experiment import ExperimentModel
@@ -55,10 +56,14 @@ def test_default_is_trainable_and_reproduces_the_config_image():
     assert all(g is not None for n, g in _grads(model).items() if n not in model.unrefinable)
 
 
-def test_groups_cover_every_parameter_exactly_once():
-    model = ExperimentModel(*_configs(), dtype=DTYPE)
-    grouped = [n for names in ExperimentModel.PARAMETER_GROUPS.values() for n in names]
+@pytest.mark.parametrize("diffuse", [False, True])
+def test_groups_cover_every_parameter_exactly_once(diffuse):
+    # The optional groups (OPTIONAL_GROUPS) are in a model's own PARAMETER_GROUPS when it has them
+    model = ExperimentModel(*_configs(), dtype=DTYPE, diffuse=GaussianHalo(10.0, 0.1) if diffuse else None)
+    grouped = [n for names in model.PARAMETER_GROUPS.values() for n in names]
     assert sorted(grouped) == sorted(n for n, _ in model.named_parameters())
+    optional = set(model.PARAMETER_GROUPS) - set(ExperimentModel.PARAMETER_GROUPS)
+    assert optional == (set(ExperimentModel.OPTIONAL_GROUPS) if diffuse else set())
 
 
 def test_freeze_then_refine_one_group():

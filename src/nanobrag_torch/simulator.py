@@ -22,6 +22,7 @@ from .utils.c_cell import c_ceil_to_int, c_cell_lengths_m
 from .utils.compile_env import compile_disabled
 from .utils.geometry import dot_product
 from .utils.physics import sincg, sincg_miller, sinc3, polarization_factor
+from .utils.tensor_utils import to_device_and_dtype
 
 logger = logging.getLogger(__name__)
 
@@ -249,7 +250,7 @@ def compute_physics_for_position(
     # does the rounding itself for the nearest-neighbour path.
     if diffuse is not None:
         hkl = torch.stack((h, k, l), dim=-1)
-        per_cell = diffuse(hkl.reshape(-1, 3)).to(device=h.device, dtype=h.dtype).reshape(h.shape)
+        per_cell = to_device_and_dtype(diffuse(hkl.reshape(-1, 3)), h.device, h.dtype).reshape(h.shape)
         intensity = (N_cells_a * N_cells_b * N_cells_c) * per_cell
     else:
         F_cell = crystal_get_structure_factor(h, k, l)

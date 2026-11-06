@@ -117,3 +117,15 @@ def test_models_run_in_float32_simulators():
     sim = simulator(GaussianHalo(5.0, 0.2), dtype=torch.float32)
     image = sim.run(oversample=1)
     assert image.dtype == torch.float32 and torch.isfinite(image).all() and image.max() > 0
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="needs MPS")
+def test_a_model_on_mps_in_float32_runs_in_a_cpu_float64_simulator():
+    """The Simulator converts the output: device first, since MPS cannot hold float64."""
+    def on_mps(hkl):
+        return GaussianHalo(5.0, 0.2, dtype=torch.float32).to("mps")(hkl.to(dtype=torch.float32).to(device="mps"))
+    sim = simulator(on_mps)
+    image = sim.run(oversample=1)
+    reference = simulator(GaussianHalo(5.0, 0.2, dtype=torch.float32)).run(oversample=1)
+    assert image.dtype == torch.float64 and image.device.type == "cpu"
+    torch.testing.assert_close(image, reference, rtol=1e-5, atol=0.0)

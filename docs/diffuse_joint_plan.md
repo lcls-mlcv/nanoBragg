@@ -1,7 +1,10 @@
 # Plan: Bragg and diffuse in one differentiable model
 
-Status: plan settled 2026-11-04; PR D1 implements section 7's first row. Branch
-`feat/diffuse-joint` off `torch` 3d863fc.
+Status: plan settled 2026-11-04. D1 (the hook, branch `feat/diffuse-joint` off `torch`
+3d863fc) is open as PR #72. D2 (ExperimentModel, `feat/diffuse-experiment`, stacked on D1)
+is implemented and has been through the audit and review of 2026-11-05. Its V1 gate,
+`scripts/diffuse/v1_toy_recovery.py`, runs at small size in the tests; the full size runs on
+the GPU gate machine.
 
 Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 (`nanobrag_torch`), eryx = the diffuse-scattering library (PyTorch, GPLv2).
@@ -68,7 +71,7 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
     configurations.
   - It fills `Simulator.components`, and a ROI mask applies to both parts.
   - `ExperimentModel` does not use it: it builds its own Simulators, has no diffuse group,
-    and the ROI path ignores it.
+    and the ROI path ignores it. (Done in D2, section 4.)
 
 ### eryx (`mdx2-compare` 4ab7329)
 - **Detector-facing model:** `total_scattering.TotalScattering(crystal, network, share,
@@ -149,6 +152,49 @@ class DiffuseModel(Protocol):          # in practice an nn.Module
   own integrals, so the tie may be off by a constant there. Test D2-T1 integrates F_latt² per
   shape and records the factor. If it is not 1, the tie divides by it, recorded as an
   extension rather than a change to the C path.
+- **Measured in D2** (`tests/test_diffuse_shape_integral.py`, through the kernel function, one
+  peak in its cell of hkl, factor = ∫F_latt² / N_cells):
+
+  | Shape | Factor |
+  |---|---|
+  | SQUARE | 1 (to 1e-15) |
+  | GAUSS, `spot_metric=HKL` (diffBragg, cctbx) | (0.315π)^(3/2) = 0.9844 |
+  | TOPHAT, HKL | (4/3)π·0.63³ = 1.0474 |
+  | ROUND | 0.8972 (N = 5), 0.9496 (10), 0.9748 (20): 1 untruncated (0.7236² = π/6), but the sinc3² tail is cut at the cell, about 1 − 0.5/N |
+  | GAUSS or TOPHAT, `RECIPROCAL` (the default, bl831 C) | the HKL factor × V/N_cells², V in Å³: 2.65 for 30×35×40 Å and 5³ cells, 0.23 for 237,000 Å³ and 10³ |
+
+  The C path and the Simulator are unchanged (N_cells·I_d for every shape).
+- **Decided 2026-11-05: the tie is corrected for the shape in `ExperimentModel`.** The
+  diffuse term is multiplied by the factor, `nanobrag_torch.diffuse.bragg_peak_factor`, so
+  integrated Bragg over diffuse is |F|²/I_d for every shape. SQUARE is 1 exactly, so it
+  behaves as before.
+  - The factor is the integral over the peak's own cell of hkl, |h − h0| < 1/2, as the
+    kernel assigns points to their nearest lattice point.
+    - GAUSS and TOPHAT: the closed forms (0.315π/fudge)^(3/2) and (4/3)π(0.3969/fudge)^(3/2),
+      over √det M, apply where the cell cuts under 1e-10 of the Gaussian or none of the ball.
+      Elsewhere it computes the cut integral (Gauss–Legendre in 3D, or the ball's chord
+      integrated over h, k).
+    - ROUND has no closed form. It is a radial integral of sinc3² times the area of the sphere
+      inside the cell, with work linear in N: 12 ms at N = 500.
+    - All of these are differentiable in N, the cell and Ndef.
+    - Audit, 2026-11-05: the first version ignored the cut. Under RECIPROCAL that was 9% off
+      for 79×79×38 Å with N = 5, and a factor of 50 off for a 100 Å cell with N = 3.
+  - It is recomputed at every forward from the current N_cells and cell, with their gradients.
+    It is not folded into k_d's starting value because it moves as they refine. It shows as
+    `model.diffuse_shape_factor()`, and `diffuse_shape_factor=False` sets it to 1.
+  - Against the kernel's measured integral (`tests/test_diffuse_shape_integral.py`):
+    - SQUARE 1e-15, GAUSS-HKL 1e-9 (4e-5 at N = 1–2);
+    - ROUND 5e-6;
+    - RECIPROCAL GAUSS 5e-5 where the cell cuts the peak; there the kernel's midpoint grid is
+      the limit, converging as h² towards the factor;
+    - TOPHAT 1e-5 to 2e-3, the grid's ball.
+- **The RECIPROCAL metric and joint fits.** Under bl831's metric the factor is about
+  V/N_cells² while the peak sits inside the cell, so with k_d frozen the integrated diffuse
+  term scales as V/N_cells, against N_cells for the Bragg term. That is faithful to C's
+  metric, whose radius is not dimensionless, but unphysical when N_cells or the cell refines:
+  the fit moves Bragg and diffuse pixels together in a way no crystal does.
+  **Recommendation: use `spot_metric=SpotMetric.HKL` (diffBragg's) for joint fits.** There the
+  factor is a constant: 0.9844 for GAUSS, 1 for SQUARE.
 - **Relative scale `k_d`** (group `diffuse_scale`, log, default frozen at 1):
   - Frozen, the absolute tie is a physical constraint.
   - Freed, the halves separate: a diffuse fit that does not lean on the Bragg scale.
@@ -226,6 +272,14 @@ Gauges:
 - **Group `radial_background`** holds the spline knots.
 - `SerialExperiment` shares one diffuse module across shots, as it shares Fhkl. The radial
   background stays per shot.
+- **Done in D2:** the module is `diffuse_params.model` and k_d is
+  `diffuse_params.delta_log_scale`; the groups are in the instance's `PARAMETER_GROUPS`
+  (`ExperimentModel.OPTIONAL_GROUPS` names them). A parameter the module froze itself is
+  unrefinable. Shots share the whole block, k_d included: one diffuse-to-Bragg ratio.
+  `model.components` gives bragg, diffuse, background and total, on the ROI path too.
+  `bragg_only=True` leaves out the diffuse term as well as the background (decided
+  2026-11-05), so `roi_centroids` and the export see the Bragg term alone.
+  `param_init="frozen"` freezes the given module's parameters in place.
 
 Gradient checks (/tdd, CPU float64, central finite differences plus gradcheck on a 16² case):
 - each eryx parameter (log γ per class, solvent log k and log B, log share, extra_U, LLM σ)
@@ -244,11 +298,12 @@ Each rung uses the result of the one before; real data only after synthetic reco
 - **V0 Off is off.**
   - Parity matrix (306 cases) unchanged.
   - `scripts/diffuse/off_is_identical.py` covers:
-    - 7 Simulator cases, among them `pixels=`, with gradients for distance, cell a and
-      wavelength;
-    - 4 ExperimentModel cases (whole image, ROI, multi-panel, GAUSS with mosaic) and a
-      SerialExperiment, with gradients for every trainable parameter and their `state_dict`
-      keys.
+    - 9 Simulator cases, among them `pixels=`, ROUND and TOPHAT, with gradients for distance,
+      cell a and wavelength;
+    - 9 ExperimentModel cases and a SerialExperiment, with gradients for every trainable
+      parameter and their `state_dict` keys. The model cases are whole image, ROI,
+      multi-panel, ROI across panels, GAUSS with mosaic, ROUND, TOPHAT, and `bragg_only` on
+      the whole image and on the ROI.
   - It runs in float32 and float64, eager and compiled, writes on the base tree and on the
     branch, and compares with `np.array_equal`.
   - The .expt/.refl export reads only model state, which this gate already covers; its own
@@ -261,6 +316,37 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - recover each half alone and jointly;
   - report the Fisher-matrix condition number and the correlations between shared
     parameters.
+  - **Gate design (2026-11-05)**, `scripts/diffuse/v1_toy_recovery.py`:
+    - **Fits:** bragg (G, misset, cell), diffuse (misset, cell, halo amplitude and σ, with G
+      known, since with k_d frozen G and the amplitude are one number there), and joint (all).
+      They run on the Poisson deviance, GAUSS with the HKL metric.
+    - **Separability:** for each joint parameter, its Fisher sd in the joint fit over its sd
+      in the fit of its own half (G: bragg; halo: diffuse; misset and cell: the better of the
+      two). Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and seed (noise-free: errors
+      < 1e-5).
+    - **Exit code:** 0 only if the separable toy passes and the negative toy is flagged
+      (ratio > 1.5), so the metric is shown to tell them apart.
+    - **What sets the ratio:** halo σ over the spot's sd in h, 0.397/N (Fisher at the truth,
+      the same at 24² and 64²).
+      - N = 5 (spot sd 0.079): σ = 0.05, 0.12, 0.3, 0.5 give 22, 14, 2.6, 2.3.
+      - N = 10 (spot sd 0.040): 40, 2.2, 1.28, 1.23.
+      - corr(amplitude, σ) is about −0.9 in every joint fit.
+    - **The gate toy:** N = 10, σ = 0.3 (7.5 spot sds). Peak 128 e² per cell under F = 100.
+      At 24² that is 8.4 diffuse photons a pixel under spots of 9e5 (about 4800 diffuse photons
+      over the image). The fluence is the same at every size, so photons per solid angle are
+      fixed: 1.2 a pixel at 64², 0.30 at 128², the same total.
+      - **Corrected 2026-11-05.** The first version also scaled the fluence by (24/size)². That
+        cut the photons as size⁻²: 0.17 a pixel and 680 over the image at 64², 28× fewer at 128².
+        The diagnosis is the D3b sharp_wide failure at 128² (101 diffuse photons), in section 2.2
+        of the D3b plan.
+      - Ratios are 1.28 (amplitude), 1.11 (σ) and 1.00 for G, misset and cell. They do not
+        depend on the photons.
+      - Poisson |z| ≤ 2.3 over seeds 1–3 at 64² was measured at the old, lower photon level and
+        is to be re-measured.
+    - **Negative case:** the first toy, N = 5 and σ = 0.12 (1.5 spot sds). The halo hides under
+      the spots: ratios 14 (amplitude) and 4.5 (σ). At 128² with seed 1 the joint fit
+      collapsed σ to 0.025 (z = −4.9). That was at the old photon level, 28× too low, and is to
+      be re-measured. The report flags it as weakly identified.
 - **V2 eryx synthetic recovery:**
   - lysozyme from a public PDB in the SBGrid 747 cell, stills and a rotation wedge, with
     known springs, solvent, G and misset;
@@ -328,8 +414,10 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    evaluation as the reference. The fineness of the grid near integer hkl is set by the
    measured grid-vs-exact error.
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
-   `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The GAUSS/ROUND
-   peak-integral factor is measured (D2-T1) before the tie is trusted for those shapes.
+   `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
+   factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse
+   term by it, recomputed from the current crystal, with an opt-out (section 2.1). k_d
+   stays one value shared by all shots.
 4. **Isotropic part.** A radial background b(|q|) owns everything radial. The diffuse model's
    shell mean is projected out by default, and the projection can be switched off for a
    future absolute model.
