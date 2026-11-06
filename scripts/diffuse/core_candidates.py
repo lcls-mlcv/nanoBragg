@@ -31,7 +31,10 @@ supplied with its diagonal or in full).
 
 For each, at the V1 toy's geometry (128^2, GAUSS-HKL, k_d frozen): the linearised bias of the fit's
 parameters, b = -F^-1 J^T W (mu_candidate - mu_exact), F = J^T W J (Poisson, J by central differences
-at the truth), in Fisher sds and scaled to 1e6 diffuse photons (z grows as sqrt(P)); the lysozyme
+at the truth), under V1's current rules (linear_bias_parts): with k_d frozen only the joint fit, the
+diffuse-alone fit having the geometry given and nothing else to refine; G (and k_d) judged by the absolute
+bias in log, the rest in Fisher sds scaled to 1e6 diffuse photons (z grows as sqrt(P)). The first
+version also refined the geometry in a diffuse fit and judged G in sds (plan section 2.2: "old metric"). The lysozyme
 memory (79 x 79 x 38 A to 2 A, Laue 4/mmm: the box over 16, the lattice points of the sphere over 16);
 and the lookup time of 2^20 points.
 
@@ -237,16 +240,30 @@ class CorePlusResidual(nn.Module):
         return self.core(hkl) + self.residual(hkl)
 
 
-def linear_bias(exact, candidate, size, kd):
-    """z of every refined parameter, scaled to TARGET_PHOTONS diffuse photons: diffuse and joint fits."""
+def linear_bias_parts(exact, candidate, size, kd):
+    """The linearised bias under V1's current rules (final D3b audit, 2026-11-06).
+
+    - The diffuse-alone fit has the geometry given and refines only diffuse parameters. A candidate
+      grid has none of its own, so with k_d frozen there is no diffuse-alone fit, and with k_d free it
+      refines k_d alone.
+    - The joint fit refines G, misset and cell (and k_d if free).
+    - Scale-like parameters (G, k_d) are judged by their absolute bias in log, which does not depend on
+      the photons. The rest are judged by z = b / sd, scaled to TARGET_PHOTONS diffuse photons.
+
+    Returns {"z": {fit: {param: z}}, "scale": {fit: {param: |b| in log}}}.
+    """
     toy = v1.TOYS["separable"]
-    out = {}
+    scale_like = {v1.label(v1.SCALE), v1.label(v1.K_D)}
+    out = {"z": {}, "scale": {}}
     for fit in ("diffuse", "joint"):
+        keys = [*v1.MISSET, *v1.CELL, v1.SCALE] if fit == "joint" else []
+        keys += [v1.K_D] if kd == "free" else []
+        if not keys:
+            continue
         shot = v1.build(toy, size, diffuse=True, bragg=fit == "joint")
         truth = toy.truth()
         for key in [v1.SCALE, *v1.MISSET, *v1.CELL]:
             v1.put(shot, key, truth[key])
-        keys = [*v1.MISSET, *v1.CELL] + ([v1.SCALE] if fit == "joint" else []) + ([v1.K_D] if kd == "free" else [])
         shot.diffuse_params.model = exact
         with torch.no_grad():
             mu = v1.image(shot).reshape(-1)
@@ -269,8 +286,16 @@ def linear_bias(exact, candidate, size, kd):
         cov = torch.linalg.inv(F)
         b = -cov @ (J[keep] * W[:, None]).T @ (mu_c - mu)[keep]
         z = b / cov.diagonal().sqrt() * math.sqrt(TARGET_PHOTONS / photons)
-        out[fit] = {v1.label(k).split(".")[-1]: float(v) for k, v in zip(keys, z)}
+        labels = [v1.label(k) for k in keys]
+        out["z"][fit] = {lab.split(".")[-1]: float(v) for lab, v in zip(labels, z) if lab not in scale_like}
+        out["scale"][fit] = {lab.split(".")[-1]: float(abs(v)) for lab, v in zip(labels, b) if lab in scale_like}
     return out
+
+
+def linear_bias(exact, candidate, size, kd):
+    """{fit: {param: z}}, the shape callers had, now under V1's current rules: the non-scale parameters'
+    z only (see linear_bias_parts for the scale-like parameters' absolute bias)."""
+    return linear_bias_parts(exact, candidate, size, kd)["z"]
 
 
 def lysozyme_memory(kind, **p):
@@ -315,7 +340,8 @@ CANDIDATES = [
     ("core", dict(step=1 / 8, metric=(1.05, 1.365, 0.84))), ("core", dict(step=1 / 16, metric=(1.05, 1.365, 0.84))),
     ("core", dict(step=1 / 16, metric=(1.1, 1.43, 0.88))),
     ("core", dict(step=1 / 8, metric=METRIC, kappa=0.051)), ("core", dict(step=1 / 8, metric=METRIC, kappa=0.0525)),
-    ("core", dict(step=1 / 16, metric=METRIC, kappa=0.051)),
+    ("core", dict(step=1 / 16, metric=METRIC, kappa=0.051)), ("core", dict(step=1 / 32, metric=METRIC, kappa=0.051)),
+    ("core", dict(step=1 / 16, metric=METRIC, kappa=0.0525)), ("core", dict(step=1 / 32, metric=METRIC, kappa=0.0525)),
     # realistic mismatch: the supplied core is A(h0) / (d^T M d + kappa^2), the truth departs from it
     *[("core", dict(step=st, metric=METRIC, variant="q")) for st in (1 / 8, 1 / 16, 1 / 32)],
     *[("core", dict(step=st, metric=METRIC, variant="christoffel", eps=e)) for e in (0.1, 0.3) for st in (1 / 8, 1 / 16, 1 / 32)],
@@ -352,14 +378,16 @@ def main(argv=None):
         start = time.perf_counter()
         candidate = build(kind, model, p)
         built = time.perf_counter() - start
-        bias = linear_bias(model, candidate, args.size, args.kd)
+        parts = linear_bias_parts(model, candidate, args.size, args.kd)
+        bias = parts["z"]
         worst = max(abs(z) for fit in bias.values() for z in fit.values())
+        worst_scale = max((v for fit in parts["scale"].values() for v in fit.values()), default=0.0)
         row = {"kind": kind, **{k: (list(v) if isinstance(v, tuple) else v) for k, v in p.items()}, "worst_z": worst,
-               "bias": bias, "lysozyme_MB": lysozyme_memory(kind, **p), "lookup_ns": lookup_ns(candidate),
+               "worst_scale_bias": worst_scale, "scale_bias": parts["scale"], "bias": bias, "lysozyme_MB": lysozyme_memory(kind, **p), "lookup_ns": lookup_ns(candidate),
                "build_s": built}
         rows.append(row)
         where = max(((fit, k) for fit in bias for k in bias[fit]), key=lambda t: abs(bias[t[0]][t[1]]))
-        print(f"{kind:8s} {p}  worst z at 1e6 photons {worst:.3f} ({where[0]} {where[1]})  "
+        print(f"{kind:8s} {p}  worst z at 1e6 photons {worst:.3f} ({where[0]} {where[1]}), scale bias {worst_scale:.1e}  "
               f"lysozyme {row['lysozyme_MB']:.0f} MB  lookup {row['lookup_ns']:.0f} ns", flush=True)
     if args.out:
         with open(args.out, "w") as handle:
