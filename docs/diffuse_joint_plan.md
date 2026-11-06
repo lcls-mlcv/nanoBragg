@@ -568,13 +568,30 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - report the Fisher-matrix condition number and the correlations between shared
     parameters.
   - **Gate design (2026-11-05)**, `scripts/diffuse/v1_toy_recovery.py`:
-    - **Fits:** bragg (G, misset, cell), diffuse (misset, cell, halo amplitude and σ, with G
-      known, since with k_d frozen G and the amplitude are one number there), and joint (all).
-      They run on the Poisson deviance, GAUSS with the HKL metric.
-    - **Separability:** for each joint parameter, its Fisher sd in the joint fit over its sd
-      in the fit of its own half (G: bragg; halo: diffuse; misset and cell: the better of the
-      two). Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and seed (noise-free: errors
-      < 1e-5).
+    - **Fits:** bragg (G, misset, cell), diffuse (halo amplitude and σ, with G known and the
+      geometry given), and joint (all). They run on the Poisson deviance, GAUSS with the HKL
+      metric.
+      - G is known in the diffuse fit because with k_d frozen, G and the amplitude are one number
+        there.
+    - **Diffuse alone means geometry given (decided 2026-11-06).** The diffuse-only fit holds
+      misset and cell at their known values, from indexing and the Bragg data, as a diffuse-only
+      program has them; the joint fit refines them. Each half is analysable alone and jointly.
+      - The reason: a halo whose image is nearly featureless does not constrain the geometry.
+        The 128² sharp_wide diffuse-only fit (κ = 0.7) had geometry Fisher sds of 0.45–1.1, and
+        it found a collapsed-cell basin 10 NLL below the truth.
+      - With k_d and the grid frozen there is nothing diffuse to refine, so `--grid` (k_d
+        frozen) has no diffuse-alone fit.
+    - **Separability.** For each joint parameter, its Fisher sd in the joint fit over its sd in
+      the fit of its own half: G, misset and cell against Bragg alone; the halo against diffuse
+      alone with the geometry given. Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and
+      seed (noise-free: errors < 1e-5).
+      - Measured, old (diffuse alone refining the geometry too) → new, at 24²:
+        - separable 1.28 → 1.29 exact, 1.00 → 1.09 on the grid with k_d free;
+        - sharp_wide 1.33 → 1.33;
+        - the negative cases stay flagged: hidden 14.1 → 14.1 (grid, k_d free: 4.25 → 4.82),
+          sharp 10.0 → 11.5.
+        - The geometry's joint/Bragg-alone ratio is ≤ 1.04 in every toy.
+      - The limit is unchanged.
     - **Exit code:** 0 only if the separable toy passes and the negative toy is flagged
       (ratio > 1.5), so the metric is shown to tell them apart.
     - **What sets the ratio:** halo σ over the spot's sd in h, 0.397/N (Fisher at the truth,
