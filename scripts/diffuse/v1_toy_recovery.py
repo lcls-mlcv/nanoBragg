@@ -24,15 +24,18 @@ Two toys (TOYS). "separable" is the gate: a halo 7.5 times as wide as the spot (
 it is not hidden under it. "hidden" is a documented negative case, a halo about as wide as the spot,
 where the joint fit cannot tell halo from spot: the gate requires it to be flagged as weakly
 identified (a ratio above the limit), so that the metric is shown to discriminate. The exit
-code is 0 only if the separable toy passes and the hidden one is flagged.
+code is 0 only if the separable toy passes and the hidden one is flagged (with --grid and k_d
+frozen there is no diffuse parameter to flag, and only the separable toy counts).
 
     python scripts/diffuse/v1_toy_recovery.py                                   # 24^2, noise-free
     python scripts/diffuse/v1_toy_recovery.py --size 128 --poisson --seeds 1 2 3 --out v1.json
 
 --grid [STEP] (plan D3) fits with the halo replaced by its DiffuseGrid, sampled from the true halo
-at nodes STEP apart (default GRID_STEP) on the mmm ASU, values frozen. The halo's amplitude and
-sigma are then not parameters; k_d (group diffuse_scale) stands in for the amplitude, starting
-at 0.7 as the amplitude does. The data are still rendered with the exact halo, so the fits see the
+at nodes STEP apart (default: grid_step_for, from the bias law below) on the mmm ASU, values
+frozen. The halo's amplitude and sigma are then not parameters. With --grid-kd frozen (the
+default, plan decision 3) k_d stays 1 and the grid's error can only move G and the geometry; with
+--grid-kd free k_d (group diffuse_scale) stands in for the amplitude, starting at 0.7 as the
+amplitude does. The data are still rendered with the exact halo, so the fits see the
 grid's interpolation error as a model error: noise-free, they pass if every error is under
 GRID_BIAS_LIMIT Fisher sds (the bias the grid adds to a z-score), and with --poisson by the same
 |z| < Z_LIMIT and separability rule as the exact halo. The interpolant's gradient jumps at the grid's
@@ -63,11 +66,18 @@ from nanobrag_torch.utils.refinement import refine_lbfgsb
 DTYPE = torch.float64
 SEPARABILITY_LIMIT = 1.5
 Z_LIMIT = 4.0
-# --grid's default (plan section 2.2, measured 2026-11-05 at 24^2): noise-free, the grid's bias goes
-# into the amplitude k_d and falls as step^2, 1.44, 0.40 and 0.097 Fisher sds at 1/8, 1/16 and 1/32
-# (step / sigma 0.42, 0.21, 0.10); misset and cell stay under 0.14 sd at every step. 1/32 is 4.2M
-# values on the mmm ASU, built in 2.4 s.
-GRID_STEP = 1 / 32
+# --grid's step comes from a law, not a fit to the gate. Noise-free, the grid's worst bias over the fits,
+# in Fisher sds, is z = K (step / sigma)^2 sqrt(P), P the diffuse photons of the image: the trilinear
+# error goes as (step / sigma)^2, the parameter error it causes does not depend on the photons, and
+# the sd falls as 1 / sqrt(P). Measured 2026-11-05 (24^2, the separable toy, P = 4835 and 4 x 4835;
+# step 1/16 and 1/32): z doubles with 4x the photons and falls 3.9-4.1x per halved step. K is set
+# from step 1/32 at P = 4835 (z = K * 0.7545):
+#   k_d frozen (the default): z 0.014 (cell a, diffuse fit; G 0.004 in the joint one): K = 0.0186
+#   k_d free: z 0.097, all of it in k_d (geometry <= 0.009): K = 0.129
+# The step is the largest 1/(2n) (nodes on the half-integer kinks) whose predicted z is at most
+# GRID_BIAS_TARGET, half of the pass limit GRID_BIAS_LIMIT, which was fixed before the step.
+GRID_BIAS_K = {"frozen": 0.0186, "free": 0.129}
+GRID_BIAS_TARGET = 0.05
 GRID_BIAS_LIMIT = 0.1  # noise-free with --grid: the grid's bias, in Fisher sds
 GRID_D_MIN = 7.0  # Angstrom: the detector reaches 8.0 A; the margin covers the misset and cell offsets
 MMM = np.array([np.diag(d) for d in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))])  # 222, Laue mmm
@@ -93,8 +103,49 @@ GRID_FITS = {  # --grid: the halo is a frozen grid, its amplitude k_d
 }
 
 
-def fits(grid_step=None):
-    return FITS if grid_step is None else GRID_FITS
+GRID_FITS_KD_FROZEN = {  # --grid with k_d frozen at 1, plan decision 3's default: the grid's scale error has
+    "bragg": FITS["bragg"],  # nowhere to go but G and the geometry
+    "diffuse": dict(diffuse=True, bragg=False, refine=[*MISSET, *CELL], known=[SCALE]),
+    "joint": dict(diffuse=True, bragg=True, refine=[SCALE, *MISSET, *CELL]),
+}
+
+
+@dataclass(frozen=True)
+class GridSpec:
+    """--grid: the true halo on a DiffuseGrid, nodes ``step`` apart; k_d "frozen" (the default) or "free"."""
+
+    step: float
+    kd: str = "frozen"
+
+    def __post_init__(self):
+        if self.kd not in ("frozen", "free"):
+            raise ValueError(f"kd must be 'frozen' or 'free', got {self.kd!r}")
+
+
+def diffuse_photons(toy, size, device="cpu"):
+    """The diffuse photons of the toy's diffuse-only image at the truth (with the shape factor)."""
+    model = truth_model(toy, "diffuse", size, device)
+    with torch.no_grad():
+        model()
+    return float(model.components["diffuse"].sum())
+
+
+def predicted_grid_bias(step, sigma, photons, kd="frozen"):
+    """The bias law: z = K (step / sigma)^2 sqrt(photons), in Fisher sds."""
+    return GRID_BIAS_K[kd] * (step / sigma) ** 2 * math.sqrt(photons)
+
+
+def grid_step_for(toy, size, kd="frozen", device="cpu"):
+    """The largest 1/(2n) whose predicted bias is at most GRID_BIAS_TARGET for this toy's photons."""
+    photons = diffuse_photons(toy, size, device)
+    widest = toy.sigma * math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K[kd] * math.sqrt(photons)))
+    return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
+
+
+def fits(grid=None):
+    if grid is None:
+        return FITS
+    return GRID_FITS if grid.kd == "free" else GRID_FITS_KD_FROZEN
 
 
 @dataclass(frozen=True)
@@ -136,7 +187,7 @@ _GRIDS = {}
 
 def toy_grid(toy, step, device="cpu"):
     """The true halo on a DiffuseGrid (mmm ASU, values frozen), built once per toy and step."""
-    key = (toy, float(step), str(device))
+    key = (toy.amplitude, toy.sigma, float(step), str(device))
     if key not in _GRIDS:
         halo = GaussianHalo(toy.amplitude, toy.sigma)
         _GRIDS[key] = DiffuseGrid.from_model(halo, step=step, d_min=GRID_D_MIN, cell=(30.0, 35.0, 40.0),
@@ -144,7 +195,7 @@ def toy_grid(toy, step, device="cpu"):
     return _GRIDS[key]
 
 
-def build(toy, size, diffuse, bragg, device="cpu", grid_step=None, oversample=1):
+def build(toy, size, diffuse, bragg, device="cpu", grid=None, oversample=1):
     n = toy.n_cells
     crystal = CrystalConfig(cell_a=30.0, cell_b=35.0, cell_c=40.0, misset_deg=(5.0, -3.0, 2.0), N_cells=(n, n, n),
                             default_F=100.0 if bragg else 0.0, shape=CrystalShape.GAUSS, spot_metric=SpotMetric.HKL)
@@ -153,13 +204,13 @@ def build(toy, size, diffuse, bragg, device="cpu", grid_step=None, oversample=1)
     beam = BeamConfig(wavelength_A=1.2, fluence=toy.fluence)
     if not diffuse:
         halo = None
-    elif grid_step is None:
+    elif grid is None:
         halo = GaussianHalo(*toy.start_halo())
     else:
-        halo = toy_grid(toy, grid_step, device)
+        halo = toy_grid(toy, grid.step, device)
     model = ExperimentModel(crystal, detector, beam, dtype=DTYPE, device=torch.device(device), diffuse=halo,
                             crystal_system="orthorhombic")
-    if diffuse and grid_step is not None:
+    if diffuse and grid is not None and grid.kd == "free":
         put(model, K_D, math.log(toy.start_halo()[0] / toy.amplitude))
     return model.freeze()
 
@@ -219,29 +270,29 @@ def fisher(model, keys, step=1e-6):
     return (J[keep] / mu[keep, None]).T @ J[keep]
 
 
-def truth_model(toy, fit, size, device="cpu", grid_step=None, oversample=1):
-    spec = fits(grid_step)[fit]
-    model = build(toy, size, spec["diffuse"], spec["bragg"], device, grid_step, oversample=oversample)
+def truth_model(toy, fit, size, device="cpu", grid=None, oversample=1):
+    spec = fits(grid)[fit]
+    model = build(toy, size, spec["diffuse"], spec["bragg"], device, grid, oversample=oversample)
     truth = toy.truth()
-    diffuse_keys = (HALO if grid_step is None else [K_D]) if spec["diffuse"] else []
+    diffuse_keys = (HALO if grid is None else [K_D] if grid.kd == "free" else []) if spec["diffuse"] else []
     for key in [SCALE, *MISSET, *CELL] + diffuse_keys:
         put(model, key, truth[key])
     return model
 
 
-def fisher_sd(toy, fit, size, device="cpu", grid_step=None):
+def fisher_sd(toy, fit, size, device="cpu", grid=None):
     """{label: Fisher sd} of a fit's parameters at the truth, and the information matrix."""
-    keys = fits(grid_step)[fit]["refine"]
-    information = fisher(truth_model(toy, fit, size, device, grid_step), keys).cpu().numpy()
+    keys = fits(grid)[fit]["refine"]
+    information = fisher(truth_model(toy, fit, size, device, grid), keys).cpu().numpy()
     sd = np.sqrt(np.diag(np.linalg.inv(information)))
     return dict(zip(map(label, keys), sd.tolist())), information
 
 
-def separability(toy, size, device="cpu", grid_step=None):
+def separability(toy, size, device="cpu", grid=None):
     """Joint Fisher sd over the sd of the half each parameter belongs to (see the module's docstring)."""
-    joint, _ = fisher_sd(toy, "joint", size, device, grid_step)
-    bragg, _ = fisher_sd(toy, "bragg", size, device, grid_step)
-    diffuse, _ = fisher_sd(toy, "diffuse", size, device, grid_step)
+    joint, _ = fisher_sd(toy, "joint", size, device, grid)
+    bragg, _ = fisher_sd(toy, "bragg", size, device, grid)
+    diffuse, _ = fisher_sd(toy, "diffuse", size, device, grid)
     ratios = {}
     for name, sd in joint.items():
         alone = [half[name] for half in (bragg, diffuse) if name in half]
@@ -249,17 +300,17 @@ def separability(toy, size, device="cpu", grid_step=None):
     return ratios
 
 
-def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid_step=None):
-    """One fit. The data come from the exact halo; with grid_step the model fitted (and its Fisher
+def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid=None):
+    """One fit. The data come from the exact halo; with a GridSpec the model fitted (and its Fisher
     information) uses the halo's grid."""
-    fit = fits(grid_step)[name]
+    fit = fits(grid)[name]
     exact = truth_model(toy, name, size, device)
     with torch.no_grad():
         expected = image(exact)
     photons = {"bragg_max": float(exact.components["bragg"].max()) if fit["diffuse"] and fit["bragg"]
                else float(expected.max()) if fit["bragg"] else None,
                "diffuse_mean": float(exact.components["diffuse"].mean()) if fit["diffuse"] else None}
-    truth = exact if grid_step is None else truth_model(toy, name, size, device, grid_step)
+    truth = exact if grid is None else truth_model(toy, name, size, device, grid)
     data = expected
     if poisson:
         data = torch.poisson(expected.cpu(), generator=torch.Generator().manual_seed(seed)).to(expected.device)
@@ -267,7 +318,7 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
     information = fisher(truth, keys).cpu().numpy()
 
     values = toy.truth()
-    model = build(toy, size, fit["diffuse"], fit["bragg"], device, grid_step)
+    model = build(toy, size, fit["diffuse"], fit["bragg"], device, grid)
     for key in fit.get("known", []):
         put(model, key, values[key])
     for key in keys:
@@ -281,7 +332,7 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
     labels = list(map(label, keys))
     errors = {lab: get(model, key) - values[key] for lab, key in zip(labels, keys)}
     return {
-        "fit": name, "size": size, "poisson": poisson, "seed": seed, "grid_step": grid_step,
+        "fit": name, "size": size, "poisson": poisson, "seed": seed, "grid": None if grid is None else asdict(grid),
         "converged": bool(result.success),
         "iterations": int(result.nit), "message": str(result.message), "photons": photons,
         "errors": errors,
@@ -294,17 +345,17 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
     }
 
 
-def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=1e-5, grid_step=None):
+def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=1e-5, grid=None):
     """The gate's verdict for one toy: separability ratios, every fit and seed, and pass/fail."""
     toy = TOYS[toy_name]
-    ratios = separability(toy, size, device, grid_step)
-    fits = [run_fit(name, size, poisson, seed, toy, device, grid_step)
+    ratios = separability(toy, size, device, grid)
+    fits = [run_fit(name, size, poisson, seed, toy, device, grid)
             for seed in (seeds if poisson else [0]) for name in FITS]
     worst_ratio = float(max(ratios.values()))
     if poisson:
         worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
         recovered = bool(worst_recovery < Z_LIMIT)
-    elif grid_step is not None:  # the grid's bias, in Fisher sds at this size's photons
+    elif grid is not None:  # the grid's bias, in Fisher sds at this size's photons
         worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
         recovered = bool(worst_recovery < GRID_BIAS_LIMIT)
     else:
@@ -312,7 +363,7 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
         recovered = bool(worst_recovery < noise_free_tolerance)
     separable = bool(worst_ratio <= SEPARABILITY_LIMIT)
     return {"toy": toy_name, **asdict(toy), "spot_sd": toy.spot_sd, "size": size, "poisson": poisson,
-            "grid_step": grid_step,
+            "grid": None if grid is None else asdict(grid),
             "separability": ratios, "worst_ratio": worst_ratio, "separable": separable,
             "worst_recovery": worst_recovery, "recovered": recovered, "passed": separable and recovered,
             "fits": fits}
@@ -324,29 +375,41 @@ def main(argv=None):
     parser.add_argument("--poisson", action="store_true")
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--grid", type=float, nargs="?", const=GRID_STEP, default=None, metavar="STEP",
-                        help=f"fit with the halo's DiffuseGrid, nodes STEP apart (default {GRID_STEP})")
+    parser.add_argument("--grid", type=float, nargs="?", const=0.0, default=None, metavar="STEP",
+                        help="fit with the halo's DiffuseGrid, nodes STEP apart (default: grid_step_for)")
+    parser.add_argument("--grid-kd", choices=["frozen", "free"], default="frozen",
+                        help="with --grid: k_d frozen at 1 (plan decision 3, the default) or refined")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
-    reports = {name: evaluate(name, args.size, args.poisson, args.seeds, args.device, grid_step=args.grid)
+    grid = None
+    if args.grid is not None:  # one step for both toys, the separable one's: the hidden toy is judged on separability
+        step = args.grid or grid_step_for(TOYS["separable"], args.size, args.grid_kd, args.device)
+        grid = GridSpec(step, args.grid_kd)
+    reports = {name: evaluate(name, args.size, args.poisson, args.seeds, args.device, grid=grid)
                for name in TOYS}
     for name, report in reports.items():
         noise_free = "|error|" if args.grid is None else "|bias| / sd"
         print(f"toy {name}: N={report['n_cells']} spot sd {report['spot_sd']:.3f}, halo sigma {report['sigma']}, "
               f"worst joint/alone sd {report['worst_ratio']:.2f} (limit {SEPARABILITY_LIMIT}), "
               f"worst {'|z|' if args.poisson else noise_free} {report['worst_recovery']:.2e}"
-              + ("" if args.grid is None else f" (grid step {args.grid})"))
+              + ("" if grid is None else f" (grid step 1/{round(1 / grid.step)}, k_d {grid.kd})"))
         for r in report["fits"]:
             print(f"  {r['fit']:8s} seed {r['seed']} converged={r['converged']} scaled cond "
                   f"{r['fisher_condition_scaled']:.1e} photons {r['photons']}")
     gate = reports["separable"]["passed"]
     flagged = not reports["hidden"]["separable"]
-    print(f"separable toy: {'PASS' if gate else 'FAIL'}; hidden toy "
-          f"{'flagged as weakly identified (expected)' if flagged else 'NOT flagged: the metric does not discriminate'}")
+    # With the grid's shape and k_d both frozen the diffuse term has no parameter of its own, so
+    # nothing can trade off with the spots: the hidden toy cannot be flagged and is not required to be.
+    needs_flag = grid is None or grid.kd == "free"
+    if needs_flag:
+        verdict = 'flagged as weakly identified (expected)' if flagged else 'NOT flagged: the metric does not discriminate'
+    else:
+        verdict = "not applicable (k_d frozen: no diffuse parameter to trade with the spots)"
+    print(f"separable toy: {'PASS' if gate else 'FAIL'}; hidden toy {verdict}")
     if args.out:
         with open(args.out, "w") as handle:
             json.dump(reports, handle, indent=1)
-    return 0 if gate and flagged else 1
+    return 0 if gate and (flagged or not needs_flag) else 1
 
 
 if __name__ == "__main__":

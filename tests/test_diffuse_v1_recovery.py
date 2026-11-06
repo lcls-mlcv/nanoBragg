@@ -54,24 +54,68 @@ def test_poisson_recovery_is_within_the_fisher_errors():
     assert report["passed"], (report["worst_ratio"], report["worst_recovery"])
 
 
-# --grid (plan D3): the halo replaced by its DiffuseGrid, values frozen, k_d as its amplitude
+# --grid (plan D3): the halo replaced by its DiffuseGrid, values frozen; k_d frozen (the default) or free
 
-def test_on_the_grid_the_separable_toy_separates_and_the_hidden_one_is_flagged():
-    separable = v1.separability(v1.TOYS["separable"], 24, grid_step=v1.GRID_STEP)
-    hidden = v1.separability(v1.TOYS["hidden"], 24, grid_step=v1.GRID_STEP)
+import dataclasses
+
+
+@pytest.mark.parametrize("kd", ["frozen", "free"])
+def test_on_the_grid_the_separable_toy_separates_and_the_hidden_one_is_flagged_if_k_d_is_free(kd):
+    """k_d free: the hidden toy's k_d trades with the spots (5.95). k_d frozen: the diffuse term has no
+    parameter of its own, so nothing trades with the spots and every ratio is about 1."""
+    grid = v1.GridSpec(v1.grid_step_for(v1.TOYS["separable"], 24, kd), kd)
+    separable = v1.separability(v1.TOYS["separable"], 24, grid=grid)
+    hidden = v1.separability(v1.TOYS["hidden"], 24, grid=grid)
     assert max(separable.values()) <= v1.SEPARABILITY_LIMIT, separable
-    assert max(hidden.values()) > v1.SEPARABILITY_LIMIT, hidden
+    if kd == "free":
+        assert max(hidden.values()) > v1.SEPARABILITY_LIMIT, hidden
+    else:
+        assert max(hidden.values()) < 1.01, hidden
 
 
+def test_the_grid_gate_with_k_d_free_requires_the_flag():
+    assert v1.main(["--size", "24", "--grid", "--grid-kd", "free"]) == 0
+
+
+def test_the_step_rule_is_the_bias_law_solved_for_the_target():
+    """predicted z = K (step / sigma)^2 sqrt(photons); the step is the largest 1/(2n) with z <= the target."""
+    toy = v1.TOYS["separable"]
+    photons = v1.diffuse_photons(toy, 24)
+    for kd in ("frozen", "free"):
+        step = v1.grid_step_for(toy, 24, kd)
+        assert abs(round(1 / (2 * step)) - 1 / (2 * step)) < 1e-9  # a half-integer divisor: nodes on the kinks
+        assert v1.predicted_grid_bias(step, toy.sigma, photons, kd) <= v1.GRID_BIAS_TARGET
+        coarser = 1 / (1 / step - 2)
+        assert v1.predicted_grid_bias(coarser, toy.sigma, photons, kd) > v1.GRID_BIAS_TARGET
+    assert v1.GRID_BIAS_TARGET <= v1.GRID_BIAS_LIMIT / 2
+
+
+# fluence scales, per k_d mode: the rule's step changes with the photons and the bias stays under the limit
+FLUENCES = [("frozen", 1.0), ("frozen", 4.0), ("free", 1 / 16), ("free", 1 / 4)]
+
+
+@pytest.mark.parametrize("kd,scale", FLUENCES)
 @pytest.mark.parametrize("fit", ["diffuse", "joint"])
-def test_noise_free_on_the_grid_the_bias_is_under_a_tenth_of_an_sd(fit):
-    """Data from the exact halo, model on the grid: the grid's error is a bias, small against the noise."""
-    result = v1.run_fit(fit, size=24, poisson=False, seed=0, grid_step=v1.GRID_STEP)
+def test_noise_free_on_the_grid_the_bias_follows_the_rule(kd, scale, fit):
+    """Data from the exact halo, model on the grid at the rule's step for these photons."""
+    base = v1.TOYS["separable"]
+    toy = dataclasses.replace(base, fluence=base.fluence * scale)
+    step = v1.grid_step_for(toy, 24, kd)
+    result = v1.run_fit(fit, size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(step, kd))
     # not result["converged"]: on the interpolant's kinks L-BFGS-B may end in its line search (see the script)
     assert result["iterations"] > 10
-    assert "diffuse_params.delta_log_scale" in result["errors"]
-    for label, z in result["z"].items():
-        assert abs(z) < v1.GRID_BIAS_LIMIT, (label, z, result["errors"][label])
+    assert ("diffuse_params.delta_log_scale" in result["errors"]) == (kd == "free")
+    worst = max(abs(z) for z in result["z"].values())
+    assert worst < v1.GRID_BIAS_LIMIT, (step, result["z"])
+    # the law predicts the worst bias to within a factor of 1.5 (it is fitted on the worst fit, the diffuse one)
+    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), kd)
+    assert worst < 1.5 * predicted
+
+
+def test_the_rule_gives_a_finer_step_for_more_photons():
+    base = v1.TOYS["separable"]
+    steps = [v1.grid_step_for(dataclasses.replace(base, fluence=base.fluence * k), 24) for k in (1.0, 4.0)]
+    assert steps[1] < steps[0]
 
 
 def test_the_grid_gate_passes_with_its_exit_code():
