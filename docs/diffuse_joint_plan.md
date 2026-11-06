@@ -331,8 +331,42 @@ reference.
   - The fit: V1 geometry at 128², k_d frozen. The bias is linearised,
     b = −F⁻¹JᵀW(μ_grid − μ_exact), in sds scaled to 1e6 diffuse photons. The target is z ≤ 0.05.
   - Memory is for lysozyme to 2 Å on the 4/mmm ASU.
+  - **Current metric (re-measured 2026-11-06, final D3b audit).** These are V1's current rules,
+    `core_candidates.linear_bias_parts`:
+    - with k_d frozen there is no diffuse-alone fit, since the geometry is given and the grid has
+      nothing else to refine;
+    - the joint fit's G is judged by its absolute bias (all ≤ 6.4e-6 in log, against 1e-3), the
+      rest in sds at 1e6 diffuse photons.
 
-  | candidate | worst z at 1e6 photons | lysozyme memory | lookup |
+    | candidate | worst z, current metric | lysozyme memory |
+    |---|---|---|
+    | uniform 1/8, 1/16, 1/32, 1/64 | 0.49, 0.155, 0.062, 0.015 | 59 MB, 0.47, 3.7, 30 GB |
+    | warped, w 0.02, 16; 24; 32 nodes a unit | 0.161; 0.059; 0.031 | 0.53; 1.8; 4.2 GB |
+    | warped, 24 nodes (w 0.01); 32 nodes (w 0.05) | 0.072; 0.027 | 1.8; 4.2 GB |
+    | local cubes (coarse 1/16, r 0.25, fine 1/64) | 0.004 | 2.6 GB |
+    | local cubes (coarse 1/16 or 1/32, r 0.125, fine 1/128) | 0.011; 0.011 | 2.6; 5.9 GB |
+    | **model's core + residual grid, 1/8; 1/16** | **0.001; 0.000** | **59; 468 MB** |
+    | core, M off by errors that cancel (−4%/+5%), 1/8; 1/16 | 0.014; 0.002 | |
+    | core, M off by errors that cancel (−9%/+10%), 1/16 | 0.005 | |
+    | core, M all +5%, 1/8; 1/16; M all +10%, 1/16 | 0.070; 0.002; 0.004 | |
+    | core, κ +2%, 1/8; 1/16; 1/32 | 0.059; 0.003; 0.001 | |
+    | core, κ +5%, 1/8; 1/16; 1/32; κ +10%, 1/8 | 0.149; 0.007; 0.002; 0.300 | |
+    | core, isotropic (M = 1), 1/16; 1/32 | 0.013; 0.006 | |
+    | truth with q-dependent amplitude, 1/8; 1/16; 1/32 | 0.124; 0.032; 0.008 | |
+    | truth with a quartic shape, ε 0.1, 1/8; 1/16; 1/32 | 0.287; 0.030; 0.009 | |
+    | truth with a quartic shape, ε 0.3, 1/8; 1/16; 1/32 | 0.775; 0.082; 0.026 | |
+    | off-diagonal truth, diagonal core, 1/8; 1/16; 1/32 | 0.258; 0.503; 0.629 | |
+    | off-diagonal truth, full-metric core, 1/8; 1/16 | 0.001; 0.000 | |
+
+    - The ranking stands: the core is the only candidate under the target at 59 MB.
+    - Every candidate does better than in the old metric. Local cubes (2.6 GB), warped grids at
+      32 nodes (4.2 GB) and uniform 1/64 (30 GB) now meet z ≤ 0.05 as well.
+    - The old diffuse-alone fit, which refined the geometry and judged G in sds, was the binding
+      and stricter one.
+  - The table below is the **old metric** (2026-11-05): a diffuse fit that refined the geometry,
+    with G in sds. It is kept for the record.
+
+  | candidate | worst z at 1e6 photons (old metric) | lysozyme memory | lookup |
   |---|---|---|---|
   | uniform 1/8, 1/16, 1/32, 1/64 | 29.8, 5.2, 1.14, 0.38 | 59 MB, 0.47, 3.7, 30 GB | 66–96 ns |
   | warped tensor grid, w 0.02, 16; 24; 32 nodes a unit | 11.5; 4.9; 2.6 | 0.53; 1.8; 4.2 GB | 63–72 ns |
@@ -367,22 +401,31 @@ reference.
     - The core is a submodule: its parameters join the group `diffuse`, with gradients in hkl,
       the core and the values (FD and gradcheck).
     - `LorentzianHalo(amplitude, κ, metric)` is the reference core.
-  - **The core must be the model's own term, computed from its own parameters.** The audit
-    corrected an earlier claim here. The robustness the first rows suggested held only for errors
-    that cancel; same-sign errors act as an error in κ, and κ off by 2% already gives z = 1.8 at
-    1/8. What eryx's `core()` must reach:
-    - **The rule:** the sharp residual must be under about 1% of the core at step 1/16, and
-      about 4% at 1/32. The core's bias is the uniform grid's (29.8, 5.2, 1.14 at 1/8–1/32)
-      times the residual's share of the core.
-    - **Amplitude:** the q-dependence across the halo (|F(q)|², q², the Debye–Waller factor)
-      evaluated at hkl, not frozen at h₀. A per-lattice-point amplitude table is not enough.
-    - **Shape:** the directional shape from its own elastic or Christoffel term, |k|⁻²f(k̂). A
-      quadratic form misses it by z = 1.4 at 1/16 for a 10% quartic anisotropy.
-    - **Width:** κ, its own k_floor, exactly.
+  - **What eryx's `core()` must reach, in the current metric (2026-11-06).** This replaces the
+    old-metric rule, "residual under about 1% of the core at 1/16, 4% at 1/32", which came from
+    the stricter diffuse fit.
+    - **Anisotropy:** the core must carry the full (off-diagonal) metric of its own elastic term.
+      An off-diagonal truth with a diagonal core fails at every step (0.26, 0.50, 0.63 at 1/8,
+      1/16, 1/32), getting worse with a finer step because the residual stays sharp.
+    - **At step 1/16, tolerated:**
+      - κ within 5% (0.007);
+      - a q-dependent amplitude across the halo, frozen at h₀ (0.032);
+      - a quartic shape error of ε ≤ 0.1 (0.030).
+      ε = 0.3 fails (0.082).
+    - **At step 1/32, tolerated:** ε = 0.3 (0.026), κ within 5% (0.002) and the q amplitude
+      (0.008).
+    - **At step 1/8:** κ within about 2% (0.059 at +2%, already over), and neither the q
+      amplitude (0.124) nor the shape (0.29) is tolerated.
+    - Roughly, the core's bias is the uniform grid's (0.49, 0.155, 0.062 at 1/8–1/32) times the
+      leftover's share of the core. That share must stay under about 10% at 1/8, 30% at 1/16 and
+      80% at 1/32. The κ rows follow this only within about 3×, so the measured rows above are
+      the requirement.
+    - The pilot's recommendation, an order-3 core at 1/32, sits inside these with margin.
     - This is an E1/E2 item. Until it exists the D3b decision rests on a core that is not yet
       shown to exist for eryx.
   - **LorentzianHalo** takes a full 3 × 3 metric (built). An off-diagonal truth with a diagonal
-    core gives z = 12–22, and with the full metric 0.056 and 0.014. It stays a reference core for
+    core gives z = 0.26–0.63 in the current metric (12–22 in the old one); with the full metric,
+    0.001 and 0.000 (old metric 0.056 and 0.014). It stays a reference core for
     tests. A per-lattice-point amplitude would not make it a usable stand-in: the amplitude varies
     within the halo.
   - **The frozen residual.** The grid returns core(θ) + [model(θ_b) − core(θ_b)], θ_b the core's
@@ -414,9 +457,14 @@ reference.
       starting parameters, so `core_drift()` counts from the start.
     - The step comes from the residual's own bias law, z = K_core·step²·√P. K_core is measured
       per toy, since it depends on the Fisher sds the bias is measured in.
-    - **κ = 0.5/N = 0.05**, the negative case. K_core = 0.00276 (z 0.075, 0.0165, 0.0046 at 1/2,
-      1/4, 1/8). The rule gives 1/4 at 24² and 1/8 at 1e6 photons.
-      - Noise-free bias: 0.0165 sd.
+    - **κ = 0.5/N = 0.05**, the negative case.
+      - Under the current rule (2026-11-06; the scale-like parameters judged absolutely, the
+        geometry given in the diffuse-alone fit): K_core = 0.00045, C_core = 5e-6.
+      - The rule picks 1/2. That is the coarsest step the 1/(2n) rule allows, not the law's answer
+        (the law's widest step is 1.08). It is checked directly: at 1/2 the noise-free bias is
+        0.0084 sd at 24² and 0.019 at 64².
+      - Old rule: K_core 0.00276 (z 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8), step 1/4, bias
+        0.0165 sd.
       - The core is 1.25 spot sds, so it is weakly identified: ratio 10, like the hidden toy.
         It must be flagged.
       - With Poisson noise its z is reported, not gated (seed 3, joint: 15.7 exact, 15.8 on the
@@ -425,13 +473,16 @@ reference.
       only well past them: with no spot mask the worst ratio is 4.96, 3.17, 2.43, 1.82, 1.57,
       1.45, 1.33 at κ 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7 (2.5 to 17.6 spot sds), against 1.28
       for a Gaussian at 7.5 spot sds.
-      - K_core = 0.0189 (z 0.058, 0.016 at 1/4, 1/8; 0.47 at 1/2, not yet in the step² regime).
-        The rule gives 1/6.
-      - Noise-free bias: 0.024 sd. Ratio 1.33. Poisson worst |z|: 3.06 (seeds 1–3, 24²).
-    - Drift each fit ends with, as data for the V2 tolerance: 0.19–0.57 where the fit recovers
-      (the start is 0.7× the amplitude and 1.3× the width, ln 1/0.7 = 0.36), and up to 14.7 in
+      - Current rule: K_core = 0.00548 and C_core = 2.4e-5, so the rule gives 1/4. Noise-free bias:
+        0.018 sd at 24² and 0.019 at 64².
+      - Old rule: K_core 0.0189 (z 0.058, 0.016 at 1/4, 1/8; 0.47 at 1/2, not yet in the step²
+        regime), step 1/6, bias 0.024 sd.
+      - Ratio 1.33. Poisson worst |z| 3.06 (seeds 1–3, 24², old rule).
+    - Drift each fit ends with: 0.19–0.57 where the fit recovers. These drifts cannot set the V2
+      threshold: the sharp toys' residual does not depend on θ, so drift costs them nothing. The
+      θ-dependent case is covered only by the unit test with a shared amplitude. (The start is 0.7× the amplitude and 1.3× the width, ln 1/0.7 = 0.36), and up to 14.7 in
       the narrow toy's collapsed Poisson fit. The placeholder of 0.05 warns in every one of these
-      fits, so V2 must set it from the drifts it sees.
+      fits.) V2 must set it from drifts that cost something.
   - **The 128² sharp_wide failure** (2026-11-06, diagnosed with /diagnosing-bugs).
     - **The root cause was V1's fluence scaling.** The fluence was scaled by (24/size)² while
       each pixel's solid angle also falls as size⁻², so 128² had 28× fewer photons than 24².
@@ -449,10 +500,16 @@ reference.
       κ = 0.7 halo is nearly featureless, so the diffuse-only fit hardly constrains the geometry:
       misset and log a have Fisher sds 0.45–1.1. The fit finds the collapsed-cell basin, 10 NLL
       below the truth.
-      - Under the profile rule below: misset[1] z −0.5, log a −4.5, both with intervals unbounded
-        over 16 sds.
+      - Under the profile rule below, log a gives z −4.5 with an interval unbounded over 16 sds.
+        **Corrected 2026-11-06:** the "misset[1] z −0.5" recorded here was an artifact. The
+        profile refit re-optimised the held misset angle through the rest of the misset tensor
+        (fixed: a gradient mask now holds it).
       - misset[2] has sd 0.45, under the rule's threshold, and keeps its Fisher z of 21.
-      - **The 128² gate fails on this toy. It is not tuned.** What would change it is a choice
+      - **Re-run 2026-11-06 under the current definitions** (the diffuse-alone fit with the
+        geometry given; the per-parameter grid rule, cored step 1/4): sharp_wide passes at 128²
+        with Poisson seeds 1–3. Worst |z| is 3.23, the ratio 1.33, and no parameter needed the
+        profile rule (44 s on the Mac).
+      - **The 128² gate fails on this toy under the old definition. It is not tuned.** What would change it is a choice
         about the toy: fix the geometry in a diffuse-only fit of a near-featureless halo, or
         separate a narrower core with the spot mask (below) rather than by width.
   - **Profile likelihood in the gate.** Where a parameter's Fisher sd at the truth exceeds 0.5
@@ -627,8 +684,12 @@ Each rung uses the result of the one before; real data only after synthetic reco
         - Steps the rule now picks (24² and 64² alike): 1/6 (k_d frozen, was 1/18), 1/56 (k_d
           free, set by k_d's absolute bias, was 1/46), 1/2 (sharp, was 1/4), 1/4 (sharp_wide,
           was 1/6).
-        - Gates at 24² and 64² pass. Noise-free worst: 0.041 and 0.031 sd at k_d frozen, with G
-          at 7e-5 in log.
+        - Gates at 24² and 64² pass. With k_d frozen at the chosen step (1/6), the worst non-scale
+          bias is 0.041 and 0.031 sd; that figure excludes the scale-like parameters.
+        - G's bias is 7.3e-5 in log, inside its absolute bound of 1e-3, and it is 0.095 sd. In V1
+          the bound is about 1.3 G sds (G's joint sd is 7.7e-4 at 24²), so the "bright spots" reason
+          for an absolute bound comes from the eryx pilot rather than from V1. G is reported in sds
+          as well.
       - Measured, old (diffuse alone refining the geometry too) → new, at 24²:
         - separable 1.28 → 1.29 exact, 1.00 → 1.09 on the grid with k_d free;
         - sharp_wide 1.33 → 1.33;
@@ -716,7 +777,7 @@ eryx (pushed to `backup` only):
 | Branch | Content |
 |---|---|
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
-| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach (section 2.2): the leftover below about 1% of the core at step 1/16, or below 4% at 1/32. That means the q-dependent amplitude across the halo (\|F(q)\|², q², Debye–Waller) evaluated at hkl, not frozen at h₀; the directional shape from its own elastic or Christoffel term, \|k\|⁻²f(k̂), not a quadratic form; and the exact k_floor (κ off by 2% gives z = 1.8 at 1/8), which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model. Pilot (torchbragg-core ebe9e81, 2026-11-06): the order-3 core at 1/32 meets it unmasked, with worst z 0.037 once G is judged absolutely (bias 8e-5 in log G); 1/16 gives 0.145 and order 2 gives 0.59 |
+| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach, in the current metric (section 2.2, 2026-11-06; the old metric said a leftover under 1% at 1/16, 4% at 1/32). It must carry the full, off-diagonal anisotropy of its elastic term (a diagonal core fails at every step). At 1/16 it tolerates κ within 5%, an amplitude frozen at h₀ and a 10% quartic shape error. At 1/32 it tolerates a 30% shape error. At 1/8 it needs κ within about 2% and the q-dependent amplitude and shape. Its k_floor must be exact, which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model. Pilot (torchbragg-core ebe9e81, 2026-11-06): the order-3 core at 1/32 meets it unmasked, with worst z 0.037 once G is judged absolutely (bias 8e-5 in log G); 1/16 gives 0.145 and order 2 gives 0.59 |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
@@ -734,7 +795,8 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    evaluation as the reference. The fineness of the grid near integer hkl is set by the
    measured grid-vs-exact error. Measured in D3 (section 2.2): uniform trilinear with the step
    from the bias law (1/18 for the V1 toy with k_d frozen) passes V1, and D3 builds no refined
-   core. Real photon counts (1e5–1e6) need step/σ of about 0.05–0.09 (k_d frozen) or 0.02–0.035
+   core. (These D3 numbers predate the per-parameter rule: see the 2026-11-06 addendum below,
+   under which the step is 1/6.) Real photon counts (1e5–1e6) need step/σ of about 0.05–0.09 (k_d frozen) or 0.02–0.035
    (free).
    **Decided 2026-11-05, after the D3 audit:**
    - The finer grid near integer hkl is built as its own PR, D3b, before V2.

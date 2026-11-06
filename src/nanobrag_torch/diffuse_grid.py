@@ -40,10 +40,10 @@ With a ``core`` (D3b), a cheap closed-form DiffuseModel for the sharp part near 
 that the model supplies (DiffuseModel.core), the grid holds model - core and its value is
 core(hkl) + the residual's interpolant. The core is a submodule, so its parameters refine with the
 values (group ``diffuse``); the residual was sampled at the core's parameters when built, so a core
-that moves far from them should be followed by a rebuild. Measured (plan section 2.2): on a
-1/k^2-like core with a k floor of 0.05, a uniform grid needs a step finer than 1/64 (30 GB for
-lysozyme) to keep the bias under 0.05 sd at 1e6 photons; with the model's own core, 1/8 to 1/16
-(59 to 468 MB) does.
+that moves far from them should be followed by a rebuild. Measured (plan section 2.2, V1's current
+rules): on a 1/k^2-like core with a k floor of 0.05, a uniform grid needs a step of 1/64 (30 GB for
+lysozyme) to keep the bias under 0.05 sd at 1e6 photons; with the model's own core, 1/8 does on the toy
+(59 MB). For eryx's lysozyme model the recommendation is an order-3 core at 1/32 (about 3.7 GB).
 
 Trilinear interpolation is exact for multilinear functions and its error elsewhere is bounded by
 (step^2 / 8) times the second derivatives, per axis. Its gradient in hkl is constant within a cell
