@@ -35,6 +35,19 @@ def _rotations(rotations) -> np.ndarray:
     return np.unique(Ri, axis=0)
 
 
+def point_group_operators(rotations=None, anomalous: bool = False) -> np.ndarray:
+    """The integer operators R whose h·R are the symmetry mates of h, each once.
+
+    ``rotations`` as for StructureFactors (default: P1, identity only). Without
+    ``anomalous`` they include -R (Friedel's law). StructureFactors and
+    nanobrag_torch.diffuse_grid.DiffuseGrid both take their orbits from these.
+    """
+    R = _rotations(np.eye(3) if rotations is None else rotations)
+    if not anomalous:
+        R = np.unique(np.concatenate([R, -R]), axis=0)
+    return R
+
+
 def expand_to_p1(asu_indices, rotations=None, anomalous: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """Every symmetry mate of every reflection, and which input reflection it came from.
 
@@ -42,9 +55,7 @@ def expand_to_p1(asu_indices, rotations=None, anomalous: bool = False) -> Tuple[
     ValueError if two input reflections are symmetry mates of each other.
     """
     hkl = np.asarray(asu_indices, dtype=np.int64).reshape(-1, 3)
-    R = _rotations(np.eye(3) if rotations is None else rotations)
-    if not anomalous:
-        R = np.unique(np.concatenate([R, -R]), axis=0)
+    R = point_group_operators(rotations, anomalous)
     mates = np.einsum("ni,rij->nrj", hkl, R).reshape(-1, 3)
     source = np.repeat(np.arange(hkl.shape[0]), R.shape[0])
     p1, first, inverse = np.unique(mates, axis=0, return_index=True, return_inverse=True)

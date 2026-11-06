@@ -4,7 +4,8 @@ Status: plan settled 2026-11-04. D1 (the hook, branch `feat/diffuse-joint` off `
 3d863fc) is open as PR #72. D2 (ExperimentModel, `feat/diffuse-experiment`, stacked on D1)
 is implemented and has been through the audit and review of 2026-11-05. Its V1 gate,
 `scripts/diffuse/v1_toy_recovery.py`, runs at small size in the tests; the full size runs on
-the GPU gate machine.
+the GPU gate machine. D3 (`DiffuseGrid`, `feat/diffuse-grid`, stacked on D2) is implemented; its
+grid-vs-exact measurement and the decision it informs are in section 2.2.
 
 Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 (`nanobrag_torch`), eryx = the diffuse-scattering library (PyTorch, GPLv2).
@@ -128,8 +129,9 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 # nanobrag_torch/diffuse.py (MIT)
 class DiffuseModel(Protocol):          # in practice an nn.Module
     def __call__(self, hkl: Tensor) -> Tensor: ...       # (n,3) fractional -> (n,) e^2 per cell
-    # added in D3, optional:
+    # added in D3, optional (not in the runtime check):
     # def grid(self) -> "DiffuseGrid": ...               # values on a reciprocal grid, see 2.2
+    # DiffuseGrid.from_model(model, step, d_min=, cell=) samples any model; DiffuseGrid.grid() is itself
 ```
 
 - torchBragg ships only the protocol, reference toy models and a grid interpolator:
@@ -221,6 +223,103 @@ reference.
   gather that `StructureFactors` already uses.
 - It can be finer near integer hkl, or carry an analytic 1/k² core: decide after measuring
   the error.
+- **Done in D3** (`nanobrag_torch/diffuse_grid.py`, `DiffuseGrid`):
+  - Values at hkl = origin + step·(i, j, k), eryx's HKLGrid layout, taken from its fields
+    (`from_values`, `from_hkl_grid`) without importing eryx, or sampled from any model
+    (`from_model(model, step, d_min=, cell=)`, extent a/d_min per axis plus a node, in chunks).
+    With a point group, each orbit is sampled at a node inside the box, so a bounded source
+    (another grid, `outside="error"`) works under hexagonal operators too.
+  - A parameter (group `diffuse`) or, with `refinable=False`, a buffer.
+  - Storage:
+    - `point_group=None`: P1, with no operators and no Friedel mates.
+    - With a point group: one value per orbit of the integer operators (Friedel's law unless
+      `anomalous`), the ones StructureFactors uses (`point_group_operators`).
+    - The argument is not called `rotations` because StructureFactors' `rotations=None` means
+      the identity with Friedel's law; here that is `point_group=np.eye(3)`. `anomalous`
+      without a point group is refused.
+    - The operators must form a group: generators alone are refused, not closed silently. The
+      audit found that {I, 4-fold} read another orbit's value for 180 of 729 nodes.
+    - Every lookup must find its orbit's key exactly.
+    - On a step-1 grid the orbits are expand_to_p1's. A symmetric grid holds the values and one
+      int64 key per orbit, with no index box.
+  - Outside the box:
+    - Zero (the trilinear interpolant of the values padded with zeros, so continuous). ±inf is
+      outside and NaN stays NaN.
+    - Or `outside="error"`, which also refuses non-finite hkl.
+  - The result is on the query's device and in its dtype. The interpolation runs where the
+    values are.
+  - float32 at lysozyme-sized indices (u ≈ 640 at step 1/8): worst error 3.9e-5 absolute
+    (4e-6 relative), under the bound 2·640·ε₃₂ times a cell's change in value.
+  - Trilinear in hkl and the values. The gradient in hkl is constant within a cell; every
+    finite-difference test asserts that no sample changes cell.
+- **Measured, 2026-11-05** (`scripts/diffuse/grid_vs_exact.py error --size 64`: the V1 toy's
+  diffuse-only shot, the amplitude scaled as σ⁻³ from V1's 128 at σ = 0.3, mmm ASU).
+  - Deviance is 2Σ(g − μ + μ log(μ/g)) of the grid image g against the exact μ: the whole
+    image's detectability, at about 530 diffuse photons over the image for σ = 0.3.
+  - "scaled" is the deviance after the best-fit scale c = Σμ/Σg, the part a free k_d cannot
+    absorb. The grid image is low by c − 1.
+
+  | σ | step | step/σ | max rel | rms rel | max \|Δ\|/√μ | deviance | scaled (c) |
+  |---|---|---|---|---|---|---|---|
+  | 0.3 | 1/4 | 0.83 | 0.16 | 0.11 | 0.094 | 5.4 | 2.2 (1.083) |
+  | 0.3 | 1/8 | 0.42 | 0.057 | 0.032 | 0.032 | 0.42 | 0.16 (1.022) |
+  | 0.3 | 1/16 | 0.21 | 0.016 | 0.0083 | 0.0087 | 0.028 | 0.010 (1.006) |
+  | 0.3 | 1/32 | 0.10 | 0.0039 | 0.0020 | 0.0021 | 0.0017 | 0.0006 (1.001) |
+  | 0.2 | 1/16 | 0.31 | 0.034 | 0.018 | 0.035 | 0.27 | 0.21 (1.008) |
+  | 0.2 | 1/32 | 0.16 | 0.0085 | 0.0045 | 0.0086 | 0.016 | 0.013 (1.002) |
+  | 0.1 | 1/4 | 2.5 | 0.19 | 0.21 | 0.57 | 254 | 226 (0.871) |
+  | 0.1 | 1/8 | 1.25 | 0.23 | 0.23 | 0.72 | 103 | 98 (1.064) |
+  | 0.1 | 1/16 | 0.62 | 0.11 | 0.071 | 0.33 | 8.4 | 7.8 (1.022) |
+  | 0.1 | 1/32 | 0.31 | 0.029 | 0.017 | 0.085 | 0.54 | 0.51 (1.005) |
+  | 0.05 | 1/32 | 0.62 | 0.074 | 0.052 | 0.54 | 9.4 | 9.2 (1.009) |
+  | smooth | 1/4 | | 0.020 | 0.0097 | 0.012 | 0.045 | 0.045 |
+  | smooth | 1/8 | | 0.0047 | 0.0025 | 0.0030 | 0.0029 | 0.0029 |
+
+  - Below step/σ ≈ 0.6 the error falls as step², as the trilinear bound says. Above it the halo
+    is aliased: from step/σ 2.5 to 1.25 the max error rises (0.19 to 0.23) and the deviance
+    falls only 2.5×. The tests check the bound itself: (step²/8)·Σ max |∂²I| times the image of
+    a constant.
+  - Per pixel the grid error is under the Poisson sd once step/σ ≤ 0.6. Over the whole image it
+    is undetectable (deviance < 1) once step/σ ≤ 0.3–0.4, at about 500 photons.
+  - A free scale removes about 60% of the deviance at σ = 0.3, and under 25% at σ ≤ 0.2.
+  - **V1 with `--grid`** (`v1_toy_recovery.py`): the data come from the exact halo, and the
+    model is its grid with σ and the shape known. Noise-free bias, at 24², in Fisher sds:
+    - k_d frozen (plan decision 3, the default): the bias goes into the cell and G. Cell a takes
+      0.055 at step 1/16 and 0.014 at 1/32 (diffuse fit); G takes 0.016 and 0.004 (joint fit).
+      Geometry stays under 0.1 sd at every step measured.
+    - k_d free: the bias goes into k_d, 0.397 and 0.097, and geometry stays ≤ 0.04.
+    - The law z = K (step/σ)² √P (P the diffuse photons) holds: 4× the photons doubles z, and
+      halving the step divides it by 3.9–4.1. K is 0.0186 (k_d frozen) and 0.129 (k_d free),
+      from step 1/32 at P = 4835.
+    - The step is the largest 1/(2n) with predicted z ≤ 0.05, half the pass limit of 0.1 sd,
+      which was not changed. For the toy that is 1/18 (k_d frozen) and 1/46 (k_d free).
+      - Measured there: noise-free 0.051 and 0.046 sd.
+      - With Poisson noise (seeds 1–3): worst |z| 3.14 and 3.12, against 3.12 for the exact halo.
+    - Tests at two fluences per mode show the rule holding as the photons change.
+    - With k_d and the grid both frozen the diffuse term has no parameter, so the hidden toy
+      cannot be flagged (ratios 1.00). The gate requires the flag only with k_d free (6.06).
+- **Decided (decision 2), on these numbers:**
+  - Uniform trilinear is enough for the V1 toy, with the step from the law above.
+  - No refined or analytic core in D3. The law says one is needed at real photon counts: at
+    1e5–1e6 diffuse photons a shot, z ≤ 0.05 needs step/σ of about 0.05–0.09 with k_d frozen
+    and 0.02–0.035 with it free. For a halo core as sharp as eryx's k floor (0.5/N_cells, σ of
+    about 0.05), uniform nodes would need a step of 1/220–1/390 (frozen) or 1/570–1/1000 (free),
+    which is not affordable.
+    The refined core is decided on V2, with eryx's real halo shape.
+- **Memory** (`grid_vs_exact.py memory`: lysozyme 79×79×38 Å to 2 Å, P4₃2₁2 so Laue 4/mmm, the box
+  ±(a/d_min + one node)):
+
+  | step | nodes | ASU values (held) | P1 (held) | peak RSS, ASU / P1 | build, ASU / P1 |
+  |---|---|---|---|---|---|
+  | 1/4 | 15.8M | 1.00M (15 MB) | 120 MB | 1.19 / 0.48 GB | 1.7 / 0.25 s |
+  | 1/8 | 124M | 7.8M (119 MB) | 944 MB | 1.37 / 1.36 GB | 13 / 1.8 s |
+
+  - Lookup (`grid_vs_exact.py bench`, 2²⁰ points, step 1/4), ASU vs P1: 1015 vs 70 ns a point
+    on the CPU (float64), and 318 vs 15 ns on MPS (float32). The ASU costs 15–20× per lookup
+    for 8× less memory.
+  - Recommended for lysozyme: 1/8 as the uniform base, with the core decided on V2. Use the ASU
+    (119 MB) where memory binds, and P1 (944 MB) where the lookup cost binds, as on a GPU.
+  - The ASU build peak is chunk work: 2¹⁹ nodes × 16 operators, transient.
 - Pixels: diffuse fits do not need every pixel. A ROI set with a strided subset between
   spots (mask out ±n px around predicted spots, then stride) keeps one shot at 1e4–1e5
   pixels.
@@ -387,7 +486,8 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 |---|---|---|
 | D1 | the hook: 31d0b2c, 3f653f1, 7b344a4 rebased; `diffuse.py` protocol plus toy models; V0 gate script | V0, full gates |
 | D2 | `ExperimentModel(diffuse=)`, groups diffuse/diffuse_scale, ROI path, components, `SerialExperiment` sharing, D2-T1 shape-integral test, gradient checks | /tdd, V1 |
-| D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test | V1 on the grid |
+| D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test. Done: section 2.2 (error table, memory, decision); `v1_toy_recovery.py --grid` passes, V0 0 differ | V1 on the grid |
+| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory | grid vs exact on a sharp-core toy, V1 on the grid |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
 | (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
@@ -400,7 +500,7 @@ eryx (pushed to `backup` only):
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
-Order: D1 → E1 + D2 → V1 → D3 → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
+Order: D1 → E1 + D2 → V1 → D3 → D3b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
 major goal and on the critical path. The spot-broadening diagnosis runs in parallel from
 the start and must finish before V4. This plan document goes in with D1.
 Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
@@ -412,7 +512,15 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    optional extra (`nanobrag_torch[eryx]`), still with no hard eryx dependency.
 2. **Evaluation.** A reciprocal grid with interpolation for refinement; exact per-pixel
    evaluation as the reference. The fineness of the grid near integer hkl is set by the
-   measured grid-vs-exact error.
+   measured grid-vs-exact error. Measured in D3 (section 2.2): uniform trilinear with the step
+   from the bias law (1/18 for the V1 toy with k_d frozen) passes V1, and D3 builds no refined
+   core. Real photon counts (1e5–1e6) need step/σ of about 0.05–0.09 (k_d frozen) or 0.02–0.035
+   (free).
+   **Decided 2026-11-05, after the D3 audit:**
+   - The finer grid near integer hkl is built as its own PR, D3b, before V2.
+   - The V1 grid pass rule stays: bias under 0.1 Fisher sd, with the step from the bias law.
+   - L-BFGS-B's ABNORMAL stops on the grid are accepted for now; an AdamW check comes later.
+   - Refining the grid values with a smoothness restraint is deferred until after V2.
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
    `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
    factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse
