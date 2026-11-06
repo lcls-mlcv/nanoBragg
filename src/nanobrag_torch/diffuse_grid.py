@@ -156,24 +156,35 @@ class DiffuseGrid(nn.Module):
 
     def _setup_core(self, core) -> None:
         """Checks a core and records its parameters at build, theta_b (see forward)."""
-        if not np.allclose(0.5 / self._step, np.round(0.5 / self._step), rtol=0, atol=1e-9):
-            raise ValueError(f"with a core, 1 / (2 step) must be an integer (step {self._step.tolist()}): the "
-                             "nearest-lattice-point core has a kink on the half-integer planes, which nodes must lie on")
+        on_planes = (np.allclose(0.5 / self._step, np.round(0.5 / self._step), rtol=0, atol=1e-9)
+                     and np.allclose(self._origin / self._step, np.round(self._origin / self._step), rtol=0, atol=1e-9))
+        if not on_planes:
+            raise ValueError(f"with a core, the nodes must lie on the half-integer planes: 1 / (2 step) an integer "
+                             f"and the origin a multiple of the step (step {self._step.tolist()}, origin "
+                             f"{self._origin.tolist()}): the nearest-lattice-point core has a kink there")
         if self.symmetric:
             g = torch.Generator().manual_seed(0)
             device = self.values.device
             half = torch.as_tensor(self._half * self._step, dtype=torch.float64)
             hkl = ((torch.rand(256, 3, generator=g, dtype=torch.float64) * 2 - 1) * half).to(device)
             with torch.no_grad():
-                reference = torch.as_tensor(core(hkl)).double()
+                computed = torch.as_tensor(core(hkl))
+                # the tolerance follows the dtype the core computes in: 1e-9 in float64, 1e3 eps otherwise
+                eps = torch.finfo(computed.dtype).eps if computed.is_floating_point() else 0.0
+                rtol = 1e-9 if computed.dtype == torch.float64 else 1e3 * eps
+                reference = computed.double()
                 for R in self._ops.to(torch.float64):
                     mate = torch.as_tensor(core(hkl @ R)).double()
-                    if not torch.allclose(mate, reference, rtol=1e-9, atol=1e-12 * float(reference.abs().max())):
+                    if not torch.allclose(mate, reference, rtol=rtol, atol=rtol * 1e-3 * float(reference.abs().max())):
                         raise ValueError(f"the core is not invariant under the point group (operator {R.long().tolist()}): "
                                          "the grid stores one residual per orbit, so the core must have its symmetry")
         self._core_reference = ({name: p.detach().clone().cpu() for name, p in core.named_parameters()}
                                 if isinstance(core, nn.Module) else {})
         self.core_drift_tolerance = 0.05  # placeholder, to be set on V2 (plan section 2.2)
+        # forward checks the drift on its first call and every core_drift_check_every calls (0: never;
+        # core_drift() on demand): each check copies the core's parameters to the host, a sync on a GPU
+        self.core_drift_check_every = 64
+        self._core_calls = 0
         self._core_drift_warned = False
 
     def core_drift(self) -> float:
@@ -384,13 +395,18 @@ class DiffuseGrid(nn.Module):
         alone; any dependence of the rest of the model on theta is not in it, and a core that is not the
         model's exact sharp term leaves a sharp residual fixed at theta_b while the core moves.
         core_drift() is |theta - theta_b|; past core_drift_tolerance (0.05, a placeholder to be set on V2)
-        a warning is given, once: rebuild the grid there. With refinable values the residual's values and
+        a warning is given, once: rebuild the grid there. forward checks it on its first call and every
+        core_drift_check_every calls (64; 0 for never), since each check syncs the core's parameters to
+        the host. With refinable values the residual's values and
         the core's amplitude are nearly degenerate (both scale the halo near the lattice points); refine
         one of them. Outside the box the residual is zero (or an error) and the core remains.
         """
         result = self._interpolate(hkl)
         if self.core is not None:
-            if not self._core_drift_warned and self.core_drift() > self.core_drift_tolerance:
+            check = (not self._core_drift_warned and self.core_drift_check_every > 0
+                     and self._core_calls % self.core_drift_check_every == 0)
+            self._core_calls += 1
+            if check and self.core_drift() > self.core_drift_tolerance:
                 self._core_drift_warned = True
                 warnings.warn(f"the core's parameters drifted {self.core_drift():.3g} from where the residual was "
                               f"sampled (tolerance {self.core_drift_tolerance}): rebuild the grid", UserWarning)

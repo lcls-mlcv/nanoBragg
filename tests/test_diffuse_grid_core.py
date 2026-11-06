@@ -340,6 +340,7 @@ def test_the_residual_is_frozen_at_build_and_its_drift_is_exposed_and_warned():
     torch.testing.assert_close(core.log_amplitude.grad, reference.log_amplitude.grad, rtol=1e-12, atol=0)
     # past the tolerance (a placeholder, to be set on V2) a warning, once
     grid.core_drift_tolerance = 0.03
+    grid.core_drift_check_every = 1
     with pytest.warns(UserWarning, match="drifted"):
         grid(hkl)
     with warnings.catch_warnings():
@@ -365,3 +366,54 @@ def test_float32_core_and_cored_grid_at_lysozyme_sized_indices():
     ulp40 = 2 ** (math.floor(math.log2(40)) - 23)
     tolerance = 2 * ulp40 * math.sqrt(1.3) / 0.05 + 16 * torch.finfo(torch.float32).eps
     assert float(((single - exact) / exact).abs().max()) <= tolerance
+
+
+# Final audit (2026-11-06)
+
+def test_a_core_needs_its_nodes_on_the_half_integer_planes_origin_too():
+    core = _sharp()
+    with pytest.raises(ValueError, match="half-integer"):
+        DiffuseGrid(torch.zeros(5, 5, 5, dtype=DTYPE), origin=(-1.1, -1.0, -1.0), step=0.5, core=core)
+    DiffuseGrid(torch.zeros(5, 5, 5, dtype=DTYPE), origin=(-1.0, -1.0, -1.0), step=0.5, core=core)
+
+
+class _Float32Core(nn.Module):
+    """A core that computes in float32 whatever the query (as a model on MPS would)."""
+
+    def __init__(self):
+        super().__init__()
+        # isotropic: invariant under a cubic group, whose 3-fold permutes all three terms of d^T d, so
+        # float32 sums them in a different order for each mate (a few eps apart)
+        self.inner = LorentzianHalo(100.0, 0.05, dtype=torch.float32)
+
+    def forward(self, hkl):
+        return self.inner(hkl.to(torch.float32))
+
+
+PG_23 = np.array([np.linalg.matrix_power(np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]]), i) @ np.diag(d)
+                  for i in range(3) for d in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))])
+
+
+def test_the_symmetry_check_follows_the_cores_dtype():
+    """A float32 core under cubic 23 is invariant to float32 precision: the check must not refuse it
+    (it did at rtol 1e-9); a core that breaks the group is still refused."""
+    core = _Float32Core()
+    DiffuseGrid.from_model(Sum(core, Smooth()), step=1 / 4, extent=(2, 2, 2), point_group=PG_23, core=core)
+    broken = LorentzianHalo(100.0, 0.05, metric=(1.0, 1.0, 1.3), dtype=torch.float32)
+    with pytest.raises(ValueError, match="not invariant"):
+        DiffuseGrid.from_model(Sum(broken, Smooth()), step=1 / 4, extent=(2, 2, 2), point_group=PG_23, core=broken)
+
+
+def test_the_drift_check_runs_every_n_calls_not_every_call():
+    grid, _, core = _cored()
+    hkl = torch.zeros(4, 3, dtype=DTYPE) + 0.1
+    calls = []
+    original = grid.core_drift
+    grid.core_drift = lambda: calls.append(1) or original()
+    for _ in range(3 * grid.core_drift_check_every):
+        grid(hkl)
+    assert len(calls) == 3
+    grid.core_drift_check_every = 0  # off
+    for _ in range(10):
+        grid(hkl)
+    assert len(calls) == 3
