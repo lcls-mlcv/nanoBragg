@@ -30,7 +30,11 @@ def test_the_separable_toy_separates_and_the_hidden_one_is_flagged():
 @pytest.mark.parametrize("fit", sorted(v1.FITS))
 def test_noise_free_recovery_of_the_separable_toy(fit):
     result = v1.run_fit(fit, size=24, poisson=False, seed=0)
-    assert result["converged"], result["message"]
+    # Noise-free, the loss reaches the floating-point floor at the truth, and L-BFGS-B may then end
+    # on a failed line search ("ABNORMAL") rather than on its tolerance, depending on the scipy
+    # build: measured with errors of 2e-10. The recovery errors below are the test; running out of
+    # iterations or evaluations is still a failure.
+    assert result["converged"] or result["message"].startswith("ABNORMAL"), result["message"]
     for label, error in result["errors"].items():
         assert abs(error) < 1e-5, (label, error)
     assert math.isfinite(result["fisher_condition"]) and result["fisher_condition_scaled"] >= 1
