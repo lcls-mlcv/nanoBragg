@@ -52,6 +52,7 @@ and jumps at the cell faces; finite-difference checks must not straddle one.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -150,6 +151,38 @@ class DiffuseGrid(nn.Module):
             self.values = nn.Parameter(stored)
         else:
             self.register_buffer("values", stored)
+        if core is not None:
+            self._setup_core(core)
+
+    def _setup_core(self, core) -> None:
+        """Checks a core and records its parameters at build, theta_b (see forward)."""
+        if not np.allclose(0.5 / self._step, np.round(0.5 / self._step), rtol=0, atol=1e-9):
+            raise ValueError(f"with a core, 1 / (2 step) must be an integer (step {self._step.tolist()}): the "
+                             "nearest-lattice-point core has a kink on the half-integer planes, which nodes must lie on")
+        if self.symmetric:
+            g = torch.Generator().manual_seed(0)
+            device = self.values.device
+            half = torch.as_tensor(self._half * self._step, dtype=torch.float64)
+            hkl = ((torch.rand(256, 3, generator=g, dtype=torch.float64) * 2 - 1) * half).to(device)
+            with torch.no_grad():
+                reference = torch.as_tensor(core(hkl)).double()
+                for R in self._ops.to(torch.float64):
+                    mate = torch.as_tensor(core(hkl @ R)).double()
+                    if not torch.allclose(mate, reference, rtol=1e-9, atol=1e-12 * float(reference.abs().max())):
+                        raise ValueError(f"the core is not invariant under the point group (operator {R.long().tolist()}): "
+                                         "the grid stores one residual per orbit, so the core must have its symmetry")
+        self._core_reference = ({name: p.detach().clone().cpu() for name, p in core.named_parameters()}
+                                if isinstance(core, nn.Module) else {})
+        self.core_drift_tolerance = 0.05  # placeholder, to be set on V2 (plan section 2.2)
+        self._core_drift_warned = False
+
+    def core_drift(self) -> float:
+        """The largest change of any core parameter since the residual was sampled (theta - theta_b, in the
+        parameters' own units: for log parameters a relative change)."""
+        if self.core is None or not self._core_reference:
+            return 0.0
+        params = dict(self.core.named_parameters())
+        return max(float((params[name].detach().cpu() - ref).abs().max()) for name, ref in self._core_reference.items())
 
     # -- construction ---------------------------------------------------------------------------
 
@@ -199,8 +232,13 @@ class DiffuseGrid(nn.Module):
         """A grid from a box of values at hkl = origin + step * (i, j, k) (eryx's HKLGrid layout).
 
         With ``point_group`` the values are averaged over the symmetry mates inside the box, so a
-        symmetric box is stored exactly. Other keywords as DiffuseGrid.
+        symmetric box is stored exactly. Other keywords as DiffuseGrid, except ``core``: the values here
+        are a model's, and adding a core to them would count it twice. A residual (model - core) with
+        its core goes to DiffuseGrid(values, origin, step, core=...) directly.
         """
+        if kwargs.get("core") is not None:
+            raise ValueError("from_values takes a model's values; a residual with its core goes to "
+                             "DiffuseGrid(values, origin, step, core=...)")
         return cls(torch.as_tensor(values), origin, step, **kwargs)
 
     @classmethod
@@ -268,10 +306,12 @@ class DiffuseGrid(nn.Module):
         return self
 
     def nbytes(self) -> int:
-        """Bytes held: the values, plus the orbit keys of a symmetric grid."""
+        """Bytes held: the values, the orbit keys of a symmetric grid, and the core's parameters and buffers."""
         held = self.values.numel() * self.values.element_size()
         if self.symmetric:
             held += self._keys.numel() * self._keys.element_size()
+        if isinstance(self.core, nn.Module):
+            held += sum(t.numel() * t.element_size() for t in list(self.core.parameters()) + list(self.core.buffers()))
         return held
 
     def _flat_to_ijk(self, flat: torch.Tensor) -> torch.Tensor:
@@ -337,9 +377,23 @@ class DiffuseGrid(nn.Module):
     # -- evaluation ---------------------------------------------------------------------------------
 
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
-        """Scattering per cell at fractional hkl (n, 3): trilinear in the nodes, plus the core if any."""
+        """Scattering per cell at fractional hkl (n, 3): trilinear in the nodes, plus the core if any.
+
+        With a core the residual is frozen: the grid returns core(theta) + [model(theta_b) - core(theta_b)],
+        theta_b the core's parameters when the residual was sampled. Its gradient in theta is the core's
+        alone; any dependence of the rest of the model on theta is not in it, and a core that is not the
+        model's exact sharp term leaves a sharp residual fixed at theta_b while the core moves.
+        core_drift() is |theta - theta_b|; past core_drift_tolerance (0.05, a placeholder to be set on V2)
+        a warning is given, once: rebuild the grid there. With refinable values the residual's values and
+        the core's amplitude are nearly degenerate (both scale the halo near the lattice points); refine
+        one of them. Outside the box the residual is zero (or an error) and the core remains.
+        """
         result = self._interpolate(hkl)
         if self.core is not None:
+            if not self._core_drift_warned and self.core_drift() > self.core_drift_tolerance:
+                self._core_drift_warned = True
+                warnings.warn(f"the core's parameters drifted {self.core_drift():.3g} from where the residual was "
+                              f"sampled (tolerance {self.core_drift_tolerance}): rebuild the grid", UserWarning)
             result = result + torch.as_tensor(self.core(hkl)).to(device=result.device).to(dtype=result.dtype)
         return result
 

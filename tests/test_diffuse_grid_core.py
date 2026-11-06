@@ -245,3 +245,123 @@ def test_gradcheck_in_the_residual_values_and_the_core():
 
     assert gradcheck(loss, (torch.zeros(2, dtype=DTYPE, requires_grad=True), kappa.requires_grad_()),
                      eps=1e-6, atol=1e-7, rtol=1e-5)
+
+
+# 5. Audit fixes (2026-11-05): full metric, symmetry, the half-integer kink, the frozen residual,
+#    outside the box, from_values, nbytes, float32.
+
+import warnings
+
+PG_422 = np.array([np.linalg.matrix_power(np.array([[0, 1, 0], [-1, 0, 0], [0, 0, 1]]), i) @ m
+                   for i in range(4) for m in (np.eye(3, dtype=np.int64), np.diag([1, -1, -1]))])
+
+
+def test_lorentzian_halo_takes_a_full_metric():
+    metric = ((1.0, 0.2, 0.0), (0.2, 1.3, 0.1), (0.0, 0.1, 0.8))
+    halo = LorentzianHalo(10.0, 0.05, metric=metric)
+    hkl = torch.tensor([[0.1, -0.05, 0.02], [2.03, 1.0, -0.04]], dtype=DTYPE)
+    d = hkl - torch.round(hkl)
+    q = torch.einsum("ni,ij,nj->n", d, torch.tensor(metric, dtype=DTYPE), d)
+    torch.testing.assert_close(halo(hkl), 10.0 * 0.0025 / (q + 0.0025), rtol=1e-13, atol=0)
+    with pytest.raises(ValueError, match="symmetric positive definite"):
+        LorentzianHalo(1.0, 0.05, metric=((1.0, 2.0, 0.0), (2.0, 1.0, 0.0), (0.0, 0.0, 1.0)))
+
+
+def test_a_core_that_breaks_the_point_group_is_refused():
+    broken = LorentzianHalo(100.0, 0.05, metric=(1.0, 1.3, 1.0))  # m_h != m_k: not 4/mmm
+    model = Sum(broken, Smooth())
+    with pytest.raises(ValueError, match="not invariant"):
+        DiffuseGrid.from_model(model, step=1 / 4, extent=(2, 2, 2), point_group=PG_422, core=broken)
+    fine = LorentzianHalo(100.0, 0.05, metric=(1.0, 1.0, 1.3))
+    DiffuseGrid.from_model(Sum(fine, Smooth()), step=1 / 4, extent=(2, 2, 2), point_group=PG_422, core=fine)
+
+
+def test_a_core_needs_nodes_on_the_half_integer_planes():
+    core = _sharp()
+    with pytest.raises(ValueError, match="half-integer"):
+        DiffuseGrid.from_model(Sum(core, Smooth()), step=1 / 3, extent=(1, 1, 1), core=core)
+
+
+def test_from_values_refuses_a_core_and_the_constructor_takes_the_residual():
+    with pytest.raises(ValueError, match="residual"):
+        DiffuseGrid.from_values(torch.zeros(5, 5, 5), origin=(-1.0, -1.0, -1.0), step=0.5, core=_sharp())
+    core = _sharp()
+    grid = DiffuseGrid(torch.zeros(5, 5, 5, dtype=DTYPE), origin=(-1.0, -1.0, -1.0), step=0.5, core=core)
+    hkl = torch.tensor([[0.1, 0.2, 0.3]], dtype=DTYPE)
+    torch.testing.assert_close(grid(hkl), core(hkl).detach())
+
+
+def test_outside_the_box_only_the_core_remains():
+    grid, model, core = _cored()
+    far = torch.tensor([[40.02, 0.0, 0.0]], dtype=DTYPE)
+    torch.testing.assert_close(grid(far), core(far).detach())
+
+
+class _SharedAmplitude(nn.Module):
+    """core(theta) + smooth(theta): the smooth part scales with the core's amplitude, so a residual
+    sampled at theta_b goes stale as the amplitude moves."""
+
+    def __init__(self, core):
+        super().__init__()
+        self.core_term, self.smooth = core, Smooth()
+
+    def forward(self, hkl):
+        return self.core_term(hkl) + self.smooth(hkl) * torch.exp(self.core_term.log_amplitude - math.log(1000.0))
+
+
+def test_the_residual_is_frozen_at_build_and_its_drift_is_exposed_and_warned():
+    core = _sharp()
+    model = _SharedAmplitude(core)
+    grid = DiffuseGrid.from_model(model, step=1 / 4, d_min=D_MIN, cell=CELL, point_group=MMM, refinable=False,
+                                  core=core)
+    assert grid.core_drift() == 0.0
+    nodes = grid.value_hkl()[:400]
+    errors = []
+    for delta in (0.01, 0.04):
+        with torch.no_grad():
+            core.log_amplitude.fill_(math.log(1000.0) + delta)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            stale = grid(nodes) - model(nodes)
+        # the grid is core(theta) + model(theta_b) - core(theta_b): its error is smooth(theta_b) - smooth(theta)
+        expected = Smooth()(nodes) * (1 - math.exp(delta))
+        torch.testing.assert_close(stale.detach(), expected, rtol=1e-10, atol=1e-10)
+        errors.append(float(stale.abs().max()))
+        assert grid.core_drift() == pytest.approx(delta)
+    assert errors[1] > 3.5 * errors[0]
+    # the gradient in theta is the core's alone
+    grid.zero_grad()
+    hkl = nodes[:50]
+    grid(hkl).sum().backward()
+    reference = _sharp()
+    with torch.no_grad():
+        reference.log_amplitude.copy_(core.log_amplitude)
+    reference(hkl).sum().backward()
+    torch.testing.assert_close(core.log_amplitude.grad, reference.log_amplitude.grad, rtol=1e-12, atol=0)
+    # past the tolerance (a placeholder, to be set on V2) a warning, once
+    grid.core_drift_tolerance = 0.03
+    with pytest.warns(UserWarning, match="drifted"):
+        grid(hkl)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        grid(hkl)  # once only
+
+
+def test_nbytes_counts_the_core():
+    grid, _, core = _cored()
+    held = sum(t.numel() * t.element_size() for t in list(core.parameters()) + list(core.buffers()))
+    assert held > 0
+    assert grid.nbytes() == grid.values.numel() * 8 + grid._keys.numel() * 8 + held
+
+
+def test_float32_core_and_cored_grid_at_lysozyme_sized_indices():
+    """d = hkl - round(hkl) in float32 carries about ulp(|h|) at |h| = 40, so the core's relative error
+    is about ulp(40) * |d ln L / d d| <= ulp(40) sqrt(max m) / kappa, plus float32 rounding."""
+    core = _sharp()
+    g = torch.Generator().manual_seed(11)
+    hkl = (torch.rand(5000, 3, generator=g, dtype=DTYPE) - 0.5) * 80
+    exact = core(hkl).detach()
+    single = core(hkl.float()).detach().double()
+    ulp40 = 2 ** (math.floor(math.log2(40)) - 23)
+    tolerance = 2 * ulp40 * math.sqrt(1.3) / 0.05 + 16 * torch.finfo(torch.float32).eps
+    assert float(((single - exact) / exact).abs().max()) <= tolerance

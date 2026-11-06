@@ -99,26 +99,41 @@ class LorentzianHalo(nn.Module):
 
         I(hkl) = amplitude * kappa^2 / (sum_i m_i d_i^2 + kappa^2),   d = hkl - round(hkl),
 
-    in Miller units, with amplitude (electrons squared per cell, the peak) and kappa refinable as logs
-    and the diagonal metric m fixed. Sharp near the lattice points (width kappa) with 1/d^2 tails; as
-    DiffuseGrid's core it is evaluated exactly at every query. round() has zero derivative, so the
-    gradient in hkl is that of the offset from the nearest lattice point.
+    in Miller units (the sum is d^T M d for a full 3 x 3 metric), with amplitude (electrons squared per
+    cell, the peak) and kappa refinable as logs and the metric fixed. Sharp near the lattice points
+    (width kappa) with 1/d^2 tails; as DiffuseGrid's core it is evaluated exactly at every query.
+    round() has zero derivative, so the gradient in hkl is that of the offset from the nearest
+    lattice point.
+
+    A reference core for tests, not a stand-in for a physical one: measured (plan section 2.2), a core
+    that misses the model's term by an amplitude varying within the halo, a non-quadratic directional
+    shape, or 2% in kappa leaves a sharp residual whose bias exceeds the target.
     """
 
     def __init__(self, amplitude: float, kappa: float, metric=(1.0, 1.0, 1.0), dtype: torch.dtype = torch.float64):
         super().__init__()
-        if not (amplitude > 0 and kappa > 0 and all(m > 0 for m in metric)):
-            raise ValueError(f"amplitude, kappa and the metric must be positive, got {amplitude!r}, {kappa!r}, {metric!r}")
+        m = torch.tensor(metric, dtype=dtype)
+        if m.shape == (3, 3):
+            if not (torch.allclose(m, m.T) and bool((torch.linalg.eigvalsh(m) > 0).all())):
+                raise ValueError(f"a full metric must be symmetric positive definite, got {metric!r}")
+        elif m.shape != (3,) or not bool((m > 0).all()):
+            raise ValueError(f"the metric must be 3 positive values or a 3 x 3 matrix, got {metric!r}")
+        if not (amplitude > 0 and kappa > 0):
+            raise ValueError(f"amplitude and kappa must be positive, got {amplitude!r}, {kappa!r}")
         self.log_amplitude = nn.Parameter(torch.tensor(math.log(amplitude), dtype=dtype))
         self.log_kappa = nn.Parameter(torch.tensor(math.log(kappa), dtype=dtype))
-        self.register_buffer("metric", torch.tensor(metric, dtype=dtype))
+        self.register_buffer("metric", m)
 
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
         offset = hkl - torch.round(hkl)
         kappa2 = torch.exp(2 * self.log_kappa).to(device=hkl.device, dtype=hkl.dtype)
         amplitude = self.log_amplitude.exp().to(device=hkl.device, dtype=hkl.dtype)
         metric = self.metric.to(device=hkl.device, dtype=hkl.dtype)
-        return amplitude * kappa2 / ((offset * offset * metric).sum(dim=-1) + kappa2)
+        if metric.ndim == 2:
+            quadratic = ((offset @ metric) * offset).sum(dim=-1)
+        else:
+            quadratic = (offset * offset * metric).sum(dim=-1)
+        return amplitude * kappa2 / (quadratic + kappa2)
 
 
 def bragg_peak_factor(shape: CrystalShape, N: torch.Tensor, spot_metric: SpotMetric = SpotMetric.RECIPROCAL,
