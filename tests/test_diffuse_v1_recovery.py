@@ -54,6 +54,30 @@ def test_poisson_recovery_is_within_the_fisher_errors():
     assert report["passed"], (report["worst_ratio"], report["worst_recovery"])
 
 
+# --grid (plan D3): the halo replaced by its DiffuseGrid, values frozen, k_d as its amplitude
+
+def test_on_the_grid_the_separable_toy_separates_and_the_hidden_one_is_flagged():
+    separable = v1.separability(v1.TOYS["separable"], 24, grid_step=v1.GRID_STEP)
+    hidden = v1.separability(v1.TOYS["hidden"], 24, grid_step=v1.GRID_STEP)
+    assert max(separable.values()) <= v1.SEPARABILITY_LIMIT, separable
+    assert max(hidden.values()) > v1.SEPARABILITY_LIMIT, hidden
+
+
+@pytest.mark.parametrize("fit", ["diffuse", "joint"])
+def test_noise_free_on_the_grid_the_bias_is_under_a_tenth_of_an_sd(fit):
+    """Data from the exact halo, model on the grid: the grid's error is a bias, small against the noise."""
+    result = v1.run_fit(fit, size=24, poisson=False, seed=0, grid_step=v1.GRID_STEP)
+    # not result["converged"]: on the interpolant's kinks L-BFGS-B may end in its line search (see the script)
+    assert result["iterations"] > 10
+    assert "diffuse_params.delta_log_scale" in result["errors"]
+    for label, z in result["z"].items():
+        assert abs(z) < v1.GRID_BIAS_LIMIT, (label, z, result["errors"][label])
+
+
+def test_the_grid_gate_passes_with_its_exit_code():
+    assert v1.main(["--size", "24", "--grid"]) == 0
+
+
 def _photons(toy, size, oversample=1):
     """(diffuse, Bragg) photons of the joint truth image at a size."""
     import torch
