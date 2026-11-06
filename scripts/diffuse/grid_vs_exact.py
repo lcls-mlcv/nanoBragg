@@ -19,8 +19,8 @@ DiffuseGrid (mmm ASU) at each step. Per case:
   of the error a free k_d cannot absorb (c = sum exact / sum grid);
 - photons: mean diffuse photons per pixel.
 
-"bench" times 2^20 evaluations of the lysozyme grid (step 1/4), ASU and P1, on the CPU in float64
-and, if available, on MPS in float32.
+"bench" times 2^20 evaluations of the lysozyme grid (step 1/4), ASU and P1, without and with a
+LorentzianHalo core (the shipped D3b path), on the CPU in float64 and, if available, on MPS in float32.
 
 A smooth model (cosines, periods 3, 4 and 5 in h, k, l) is the control.
 
@@ -173,9 +173,12 @@ def bench(step, n=1 << 20):
     hkl = (torch.rand(n, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(0)) * 2 - 1) * torch.tensor(
         [39.0, 39.0, 18.5], dtype=torch.float64)
     devices = [("cpu", torch.float64)] + ([("mps", torch.float32)] if torch.backends.mps.is_available() else [])
-    for storage in ("asu", "p1"):
-        grid = DiffuseGrid.from_model(GaussianHalo(100.0, 0.1), step=step, d_min=2.0, cell=(79.0, 79.0, 38.0),
-                                      point_group=point_group_422() if storage == "asu" else None, refinable=False)
+    for storage in ("asu", "p1", "asu+core", "p1+core"):
+        core = LorentzianHalo(1000.0, 0.05) if storage.endswith("+core") else None  # isotropic: 4/mmm-invariant
+        model = GaussianHalo(100.0, 0.1) if core is None else _Sum(core, GaussianHalo(100.0, 0.1))
+        grid = DiffuseGrid.from_model(model, step=step, d_min=2.0, cell=(79.0, 79.0, 38.0), core=core,
+                                      point_group=point_group_422() if storage.startswith("asu") else None,
+                                      refinable=False)
         for device, dtype in devices:
             g = grid.to(device=device, dtype=dtype)
             q = hkl.to(dtype=dtype).to(device)

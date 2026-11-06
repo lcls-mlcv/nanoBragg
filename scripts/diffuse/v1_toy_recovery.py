@@ -56,10 +56,11 @@ os.environ.setdefault("NANOBRAGG_DISABLE_COMPILE", "1")
 
 import numpy as np
 import torch
+from torch import nn
 
 from nanobrag_torch.config import (BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, DetectorConvention,
                                    DetectorPivot, SpotMetric)
-from nanobrag_torch.diffuse import DiffuseGrid, GaussianHalo
+from nanobrag_torch.diffuse import DiffuseGrid, GaussianHalo, LorentzianHalo
 from nanobrag_torch.models.experiment import ExperimentModel
 from nanobrag_torch.utils.refinement import refine_lbfgsb
 
@@ -77,6 +78,11 @@ Z_LIMIT = 4.0
 # The step is the largest 1/(2n) (nodes on the half-integer kinks) whose predicted z is at most
 # GRID_BIAS_TARGET, half of the pass limit GRID_BIAS_LIMIT, which was fixed before the step.
 GRID_BIAS_K = {"frozen": 0.0186, "free": 0.129}
+# With a core (D3b) the grid carries only the residual, whose scale is fixed (the sharp toy's smooth
+# part), so the law is z = K_core step^2 sqrt(P). Measured 2026-11-05 on the sharp toy (24^2, P = 9174,
+# cored grid, noise-free diffuse fit, the worst): z 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8; K_core from
+# 1/4. At 1e6 photons the rule gives 1/8.
+GRID_BIAS_K_CORE = 0.00276
 GRID_BIAS_TARGET = 0.05
 GRID_BIAS_LIMIT = 0.1  # noise-free with --grid: the grid's bias, in Fisher sds
 GRID_D_MIN = 7.0  # Angstrom: the detector reaches 8.0 A; the margin covers the misset and cell offsets
@@ -133,14 +139,20 @@ def diffuse_photons(toy, size, device="cpu"):
     return float(model.components["diffuse"].sum())
 
 
-def predicted_grid_bias(step, sigma, photons, kd="frozen"):
-    """The bias law: z = K (step / sigma)^2 sqrt(photons), in Fisher sds."""
+def predicted_grid_bias(step, sigma, photons, kd="frozen", core=False):
+    """The bias law, in Fisher sds: z = K (step / sigma)^2 sqrt(photons); with a core (the residual on
+    the grid) z = K_core step^2 sqrt(photons)."""
+    if core:
+        return GRID_BIAS_K_CORE * step ** 2 * math.sqrt(photons)
     return GRID_BIAS_K[kd] * (step / sigma) ** 2 * math.sqrt(photons)
 
 
-def grid_step_for(toy, size, kd="frozen", device="cpu"):
+def grid_step_for(toy, size, kd="frozen", device="cpu", core=False):
     """The largest 1/(2n) whose predicted bias is at most GRID_BIAS_TARGET for this toy's photons."""
     photons = diffuse_photons(toy, size, device)
+    if core:
+        widest = math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K_CORE * math.sqrt(photons)))
+        return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
     widest = toy.sigma * math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K[kd] * math.sqrt(photons)))
     return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
 
@@ -150,7 +162,19 @@ GRID_CORE_FITS = {name: {**spec, "refine": [CORE_HALO[HALO.index(k)] if k in HAL
                   for name, spec in FITS.items()}
 
 
-def fits(grid=None):
+def _for_toy(table, toy):
+    """A Lorentzian toy's halo has log_kappa where the Gaussian's has log_sigma."""
+    if toy is None or toy.kind == "gauss":
+        return table
+    return {name: {**spec, "refine": [(k[0].replace("log_sigma", "log_kappa"), k[1]) for k in spec["refine"]]}
+            for name, spec in table.items()}
+
+
+def fits(grid=None, toy=None):
+    return _for_toy(_fits(grid), toy)
+
+
+def _fits(grid=None):
     if grid is None:
         return FITS
     if grid.core:
@@ -168,14 +192,29 @@ class Toy:
     sigma: float = 0.3
     amplitude: float = 128.0
     fluence: float = 2e29  # the same at every size: the detector's extent is fixed, so its photons per solid angle are
+    kind: str = "gauss"  # "lorentz" (D3b): LorentzianHalo(amplitude, kappa = sigma) plus Smooth(smooth)
+    smooth: float = 0.0
 
     @property
     def spot_sd(self) -> float:
         return math.sqrt(0.63 / 4) / self.n_cells
 
     def truth(self) -> dict:
+        kappa = {(k[0].replace("log_sigma", "log_kappa"), None): math.log(self.sigma) for k in (HALO[1], CORE_HALO[1])}
         return {**GEOMETRY_TRUTH, HALO[0]: math.log(self.amplitude), HALO[1]: math.log(self.sigma), K_D: 0.0,
-                CORE_HALO[0]: math.log(self.amplitude), CORE_HALO[1]: math.log(self.sigma)}
+                CORE_HALO[0]: math.log(self.amplitude), CORE_HALO[1]: math.log(self.sigma), **kappa}
+
+    def halo(self, amplitude=None, sigma=None):
+        """The exact diffuse model at (amplitude, sigma), the truth by default."""
+        amplitude = self.amplitude if amplitude is None else amplitude
+        sigma = self.sigma if sigma is None else sigma
+        if self.kind == "gauss":
+            return GaussianHalo(amplitude, sigma)
+        return SharpHalo(amplitude, sigma, self.smooth)
+
+    def core(self):
+        """The core the cored grid refines: the halo itself, or the Lorentzian part of a sharp toy."""
+        return GaussianHalo(self.amplitude, self.sigma) if self.kind == "gauss" else LorentzianHalo(self.amplitude, self.sigma)
 
     def start_halo(self) -> tuple:
         return 0.7 * self.amplitude, 1.3 * self.sigma
@@ -185,12 +224,37 @@ class Toy:
 # is set by halo sigma over spot sd. N = 5 (spot sd 0.079): sigma 0.05, 0.12, 0.3, 0.5 give 22, 14,
 # 2.6, 2.3. N = 10 (0.040): 40, 2.2, 1.28, 1.23. The amplitude is scaled as sigma^-3 to keep the
 # diffuse photons fixed; corr(amplitude, sigma) is about -0.9 in every joint fit.
+class Smooth(nn.Module):
+    """A smooth, mmm-symmetric part: amplitude (2 + cos(2 pi h / 3) cos(2 pi k / 4) cos(2 pi l / 5))."""
+
+    def __init__(self, amplitude):
+        super().__init__()
+        self.amplitude = amplitude
+
+    def forward(self, hkl):
+        waves = [torch.cos(2 * math.pi * hkl[:, i] / p) for i, p in enumerate((3.0, 4.0, 5.0))]
+        return self.amplitude * (2 + waves[0] * waves[1] * waves[2])
+
+
+class SharpHalo(LorentzianHalo):
+    """D3b's sharp toy: a Lorentzian core (kappa = 0.5 / N, eryx's k floor) plus a fixed smooth part."""
+
+    def __init__(self, amplitude, kappa, smooth):
+        super().__init__(amplitude, kappa)
+        self.smooth = Smooth(smooth)
+
+    def forward(self, hkl):
+        return super().forward(hkl) + self.smooth(hkl)
+
+
 TOYS = {
     # sigma / spot sd = 7.5: about 8 diffuse photons a pixel at 24^2 under spots of about 1e6
     "separable": Toy(n_cells=10, sigma=0.3, amplitude=128.0),
     # negative case, the first toy: sigma / spot sd = 1.5, the halo hides under the spots
     "hidden": Toy(n_cells=5, sigma=0.12, amplitude=2000.0),
 }
+# D3b (--sharp): a one-phonon-like core, kappa = 0.5 / N, with a smooth part the grid must carry
+EXTRA_TOYS = {"sharp": Toy(n_cells=10, sigma=0.05, amplitude=3000.0, kind="lorentz", smooth=10.0)}
 
 
 _GRIDS = {}
@@ -198,25 +262,26 @@ _GRIDS = {}
 
 def toy_grid(toy, step, device="cpu"):
     """The true halo on a DiffuseGrid (mmm ASU, values frozen), built once per toy and step."""
-    key = (toy.amplitude, toy.sigma, float(step), str(device))
+    key = (toy.kind, toy.amplitude, toy.sigma, toy.smooth, float(step), str(device))
     if key not in _GRIDS:
-        halo = GaussianHalo(toy.amplitude, toy.sigma)
+        halo = toy.halo()
         _GRIDS[key] = DiffuseGrid.from_model(halo, step=step, d_min=GRID_D_MIN, cell=(30.0, 35.0, 40.0),
                                              point_group=MMM, refinable=False, device=torch.device(device))
     return _GRIDS[key]
 
 
 def cored_grid(toy, step, device="cpu"):
-    """A grid whose core is a refinable GaussianHalo at the start values; the residual, the true halo
-    less the core at the truth, is zero for this toy (the machinery's check: it fits as the exact halo)."""
-    core = GaussianHalo(toy.amplitude, toy.sigma).to(device)
-    grid = DiffuseGrid.from_model(GaussianHalo(toy.amplitude, toy.sigma), step=step, d_min=GRID_D_MIN,
+    """A grid whose core is refinable, at the start values; the residual is the true halo less the core
+    at the truth: zero for a Gaussian toy (the machinery's check: it fits as the exact halo), the
+    smooth part for the sharp toy (kept frozen, as the cored grid does)."""
+    core = toy.core().to(device)
+    grid = DiffuseGrid.from_model(toy.halo(), step=step, d_min=GRID_D_MIN,
                                   cell=(30.0, 35.0, 40.0), point_group=MMM, refinable=False,
                                   device=torch.device(device), core=core)
     amplitude, sigma = toy.start_halo()
     with torch.no_grad():
         core.log_amplitude.fill_(math.log(amplitude))
-        core.log_sigma.fill_(math.log(sigma))
+        (core.log_sigma if toy.kind == "gauss" else core.log_kappa).fill_(math.log(sigma))
     return grid
 
 
@@ -230,7 +295,7 @@ def build(toy, size, diffuse, bragg, device="cpu", grid=None, oversample=1):
     if not diffuse:
         halo = None
     elif grid is None:
-        halo = GaussianHalo(*toy.start_halo())
+        halo = toy.halo(*toy.start_halo())
     else:
         halo = toy_grid(toy, grid.step, device) if not grid.core else cored_grid(toy, grid.step, device)
     model = ExperimentModel(crystal, detector, beam, dtype=DTYPE, device=torch.device(device), diffuse=halo,
@@ -296,13 +361,15 @@ def fisher(model, keys, step=1e-6):
 
 
 def truth_model(toy, fit, size, device="cpu", grid=None, oversample=1):
-    spec = fits(grid)[fit]
+    spec = fits(grid, toy)[fit]
     model = build(toy, size, spec["diffuse"], spec["bragg"], device, grid, oversample=oversample)
     truth = toy.truth()
     if grid is None:
         diffuse_keys = HALO
     else:
         diffuse_keys = CORE_HALO if grid.core else [K_D] if grid.kd == "free" else []
+    if toy.kind != "gauss":
+        diffuse_keys = [(k[0].replace("log_sigma", "log_kappa"), k[1]) for k in diffuse_keys]
     diffuse_keys = diffuse_keys if spec["diffuse"] else []
     for key in [SCALE, *MISSET, *CELL] + diffuse_keys:
         put(model, key, truth[key])
@@ -311,7 +378,7 @@ def truth_model(toy, fit, size, device="cpu", grid=None, oversample=1):
 
 def fisher_sd(toy, fit, size, device="cpu", grid=None):
     """{label: Fisher sd} of a fit's parameters at the truth, and the information matrix."""
-    keys = fits(grid)[fit]["refine"]
+    keys = fits(grid, toy)[fit]["refine"]
     information = fisher(truth_model(toy, fit, size, device, grid), keys).cpu().numpy()
     sd = np.sqrt(np.diag(np.linalg.inv(information)))
     return dict(zip(map(label, keys), sd.tolist())), information
@@ -332,7 +399,7 @@ def separability(toy, size, device="cpu", grid=None):
 def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid=None):
     """One fit. The data come from the exact halo; with a GridSpec the model fitted (and its Fisher
     information) uses the halo's grid."""
-    fit = fits(grid)[name]
+    fit = fits(grid, toy)[name]
     exact = truth_model(toy, name, size, device)
     with torch.no_grad():
         expected = image(exact)
@@ -376,7 +443,7 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
 
 def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=1e-5, grid=None):
     """The gate's verdict for one toy: separability ratios, every fit and seed, and pass/fail."""
-    toy = TOYS[toy_name]
+    toy = {**TOYS, **EXTRA_TOYS}[toy_name]
     ratios = separability(toy, size, device, grid)
     fits = [run_fit(name, size, poisson, seed, toy, device, grid)
             for seed in (seeds if poisson else [0]) for name in FITS]
@@ -384,7 +451,7 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
     if poisson:
         worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
         recovered = bool(worst_recovery < Z_LIMIT)
-    elif grid is not None and not grid.core:  # the grid's bias, in Fisher sds at this size's photons
+    elif grid is not None and (not grid.core or toy.smooth > 0):  # the grid's bias (a nonzero residual), in sds
         worst_recovery = float(max(abs(z) for r in fits for z in r["z"].values()))
         recovered = bool(worst_recovery < GRID_BIAS_LIMIT)
     else:
@@ -409,7 +476,11 @@ def main(argv=None):
     parser.add_argument("--grid-kd", choices=["frozen", "free"], default="frozen",
                         help="with --grid: k_d frozen at 1 (plan decision 3, the default) or refined")
     parser.add_argument("--grid-core", action="store_true",
-                        help="with --grid: the halo as the grid's refinable core (D3b), the grid its residual")
+                        help="with --grid: the machinery check of D3b: the Gaussian halo as the grid's refinable "
+                             "core, with a zero residual")
+    parser.add_argument("--sharp", action="store_true",
+                        help="also the sharp toy (D3b): a Lorentzian core, kappa = 0.5 / N, on a cored grid whose "
+                             "residual is a smooth part, the step from the residual's bias law")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     grid = None
@@ -428,6 +499,22 @@ def main(argv=None):
             print(f"  {r['fit']:8s} seed {r['seed']} converged={r['converged']} scaled cond "
                   f"{r['fisher_condition_scaled']:.1e} photons {r['photons']}")
     gate = reports["separable"]["passed"]
+    if args.sharp:
+        toy = EXTRA_TOYS["sharp"]
+        spec = GridSpec(grid_step_for(toy, args.size, core=True, device=args.device), core=True)
+        sharp = evaluate("sharp", args.size, args.poisson, args.seeds, args.device, grid=spec)
+        reports["sharp"] = sharp
+        # kappa is 1.25 spot sds: the core trades with the spots as the hidden toy's halo does (ratio
+        # about 10). The sharp toy is judged on the grid's noise-free bias alone. With --poisson its z is
+        # reported, not gated: the exact halo itself is weakly identified there (measured 2026-11-05,
+        # 24^2, seed 3, joint: z 15.7 exact, 34 on the grid, both ABNORMAL; the other fits and seeds
+        # agree between grid and exact to about 0.01).
+        verdict = ("reported, not gated (weakly identified)" if args.poisson
+                   else "PASS" if sharp["recovered"] else "FAIL")
+        print(f"toy sharp: kappa {toy.sigma}, cored grid step 1/{round(1 / spec.step)}, worst "
+              f"{'|z|' if args.poisson else '|bias| / sd'} {sharp['worst_recovery']:.2e}, worst joint/alone sd "
+              f"{sharp['worst_ratio']:.2f} (weakly identified, as expected): {verdict}")
+        gate = gate and (args.poisson or sharp["recovered"])
     flagged = not reports["hidden"]["separable"]
     # With the grid's shape and k_d both frozen the diffuse term has no parameter of its own, so
     # nothing can trade off with the spots: the hidden toy cannot be flagged and is not required to be.

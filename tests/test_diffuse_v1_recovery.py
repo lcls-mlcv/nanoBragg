@@ -138,6 +138,36 @@ def test_the_core_gate_passes_and_flags_the_hidden_toy():
     assert v1.main(["--size", "24", "--grid", "0.125", "--grid-core"]) == 0
 
 
+# --sharp (D3b audit): a Lorentzian core (kappa = 0.5 / N) with a smooth residual the grid carries,
+# under the bias law for the residual: z = K_core step^2 sqrt(P)
+
+def test_the_sharp_toys_step_follows_the_residuals_bias_law():
+    toy = v1.EXTRA_TOYS["sharp"]
+    photons = v1.diffuse_photons(toy, 24)
+    step = v1.grid_step_for(toy, 24, core=True)
+    assert v1.predicted_grid_bias(step, toy.sigma, photons, core=True) <= v1.GRID_BIAS_TARGET
+    assert v1.predicted_grid_bias(1 / (1 / step - 2), toy.sigma, photons, core=True) > v1.GRID_BIAS_TARGET
+
+
+@pytest.mark.parametrize("fit", ["diffuse", "joint"])
+def test_noise_free_on_the_cored_grid_the_sharp_toy_meets_the_bias_rule(fit):
+    toy = v1.EXTRA_TOYS["sharp"]
+    step = v1.grid_step_for(toy, 24, core=True)
+    result = v1.run_fit(fit, size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(step, core=True))
+    assert "diffuse_params.model.core.log_kappa" in result["errors"]
+    worst = max(abs(z) for z in result["z"].values())
+    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), core=True)
+    assert worst < v1.GRID_BIAS_LIMIT and worst < 1.5 * predicted, result["z"]
+
+
+def test_the_sharp_gate_passes_on_the_bias_and_reports_the_core_as_weakly_identified():
+    """kappa = 0.05 is 1.25 spot sds: like the hidden toy its core trades with the spots (about 10)."""
+    report = v1.evaluate("sharp", 24, poisson=False, seeds=[0],
+                         grid=v1.GridSpec(v1.grid_step_for(v1.EXTRA_TOYS["sharp"], 24, core=True), core=True))
+    assert report["recovered"] and not report["separable"]
+    assert v1.main(["--size", "24", "--sharp"]) == 0
+
+
 def _photons(toy, size, oversample=1):
     """(diffuse, Bragg) photons of the joint truth image at a size."""
     import torch
