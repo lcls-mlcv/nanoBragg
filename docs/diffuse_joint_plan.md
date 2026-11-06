@@ -409,17 +409,42 @@ reference.
     - with it, max rel 7.5e-5 / 2.0e-5 / 5.1e-6 and deviance 0.73 / 0.053 / 0.003.
   - V1 `--grid --grid-core` is a machinery check: the halo is the refinable core, with a zero
     residual. It recovers to 1e-5 noise-free in all three fits, and flags the hidden toy.
-  - V1 `--sharp`: a Lorentzian core (κ = 0.05) plus a smooth part, on a cored grid.
-    - The step comes from the residual's own bias law, z = K_core·step²·√P, with K_core =
-      0.00276 (measured z: 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8). The rule gives 1/4 at 24²
-      and 1/8 at 1e6 photons. Noise-free bias: 0.0165 sd.
-    - The core is 1.25 spot sds, so it is weakly identified: ratio 10, like the hidden toy.
-    - With Poisson noise its z is reported, not gated. The exact halo fails there too (seed 3,
-      joint: z 15.7 exact, 34 on the grid, both ABNORMAL). The other fits and seeds agree
-      between grid and exact to about 0.01.
+  - V1 `--sharp`: a Lorentzian core plus a smooth part, on a cored grid.
+    - The grid is built as a real fit would build it: from the model and its core at the fit's
+      starting parameters, so `core_drift()` counts from the start.
+    - The step comes from the residual's own bias law, z = K_core·step²·√P. K_core is measured
+      per toy, since it depends on the Fisher sds the bias is measured in.
+    - **κ = 0.5/N = 0.05**, the negative case. K_core = 0.00276 (z 0.075, 0.0165, 0.0046 at 1/2,
+      1/4, 1/8). The rule gives 1/4 at 24² and 1/8 at 1e6 photons.
+      - Noise-free bias: 0.0165 sd.
+      - The core is 1.25 spot sds, so it is weakly identified: ratio 10, like the hidden toy.
+        It must be flagged.
+      - With Poisson noise its z is reported, not gated (seed 3, joint: 15.7 exact, 15.8 on the
+        grid).
+    - **κ = 0.7**, separable, with the usual rules. A Lorentzian's wings separate from the spots
+      only well past them: with no spot mask the worst ratio is 4.96, 3.17, 2.43, 1.82, 1.57,
+      1.45, 1.33 at κ 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7 (2.5 to 17.6 spot sds), against 1.28
+      for a Gaussian at 7.5 spot sds.
+      - K_core = 0.0189 (z 0.058, 0.016 at 1/4, 1/8; 0.47 at 1/2, not yet in the step² regime).
+        The rule gives 1/6.
+      - Noise-free bias: 0.024 sd. Ratio 1.33. Poisson worst |z|: 3.06 (seeds 1–3, 24²).
+    - Drift each fit ends with, as data for the V2 tolerance: 0.19–0.57 where the fit recovers
+      (the start is 0.7× the amplitude and 1.3× the width, ln 1/0.7 = 0.36), and up to 14.7 in
+      the narrow toy's collapsed Poisson fit. The placeholder of 0.05 warns in every one of these
+      fits, so V2 must set it from the drifts it sees.
 - Pixels: diffuse fits do not need every pixel. A ROI set with a strided subset between
   spots (mask out ±n px around predicted spots, then stride) keeps one shot at 1e4–1e5
   pixels.
+- **Spot masks (decided 2026-11-05).** Near the lattice points the diffuse core and the Bragg
+  peak trade off: the core's amplitude and width are the parameters the joint fit cannot tell
+  from the spot. Separability has to come from the halo's wings.
+  - Diffuse and joint fits therefore mask ±n pixels around the predicted spots.
+  - V2 reports the separability ratio and the grid bias against the mask radius n.
+  - What exists: `DetectorConfig.mask_array`, a per-pixel mask that the Simulator and the ROI
+    path (`ExperimentModel._roi_mask_values`) apply.
+  - What is missing, and not built in D3b: a helper that builds the ±n mask from the predicted
+    spots (from the model's Bragg term or `roi_centroids`), keeps it fixed while the geometry
+    refines, and feeds it to `mask_array` or a strided ROI set. It belongs with the V2 setup.
 
 ## 3. Joint objective
 
@@ -547,7 +572,9 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - lysozyme from a public PDB in the SBGrid 747 cell, stills and a rotation wedge, with
     known springs, solvent, G and misset;
   - recover jointly, and with each half frozen;
-  - grid vs exact error.
+  - grid vs exact error;
+  - diffuse and joint fits with ±n pixels masked around the predicted spots (section 2.2),
+    reporting the separability ratio and the grid bias against n.
 - **V3 Separability cross-check:**
   - merge the V2 images with `merge_map.py` and fit with ShellFit (map space alone);
   - the springs must agree with the image-space joint fit within the bootstrap SE;
@@ -594,10 +621,11 @@ eryx (pushed to `backup` only):
 | Branch | Content |
 |---|---|
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
+| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach (section 2.2): the leftover below about 1% of the core at step 1/16, or below 4% at 1/32. That means the q-dependent amplitude across the halo (\|F(q)\|², q², Debye–Waller) evaluated at hkl, not frozen at h₀; the directional shape from its own elastic or Christoffel term, \|k\|⁻²f(k̂), not a quadratic form; and the exact k_floor (κ off by 2% gives z = 1.8 at 1/8). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
-Order: D1 → E1 + D2 → V1 → D3 → D3b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
+Order: D1 → E1 + D2 → V1 → D3 → D3b → E1b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
 major goal and on the critical path. The spot-broadening diagnosis runs in parallel from
 the start and must finish before V4. This plan document goes in with D1.
 Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
