@@ -81,7 +81,10 @@ GRID_BIAS_K = {"frozen": 0.0186, "free": 0.129}
 # With a core (D3b) the grid carries only the residual, whose scale is fixed (the sharp toy's smooth
 # part), so the law is z = K_core step^2 sqrt(P). Measured 2026-11-05 on the sharp toy (24^2, P = 9174,
 # cored grid, noise-free diffuse fit, the worst): z 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8; K_core from
-# 1/4. At 1e6 photons the rule gives 1/8.
+# 1/4. At 1e6 photons the rule gives 1/8. K_core depends on the toy (the Fisher sds the bias is measured
+# in, not only the residual): the wide sharp toy (kappa 0.7, P = 2878) gives z 0.058 and 0.016 at 1/4
+# and 1/8, K_core 0.0189, about 7x (at 1/2 it is not yet in the step^2 regime: 0.47). Each toy carries
+# its own (Toy.core_bias_k); this is the narrow one's.
 GRID_BIAS_K_CORE = 0.00276
 GRID_BIAS_TARGET = 0.05
 GRID_BIAS_LIMIT = 0.1  # noise-free with --grid: the grid's bias, in Fisher sds
@@ -139,11 +142,11 @@ def diffuse_photons(toy, size, device="cpu"):
     return float(model.components["diffuse"].sum())
 
 
-def predicted_grid_bias(step, sigma, photons, kd="frozen", core=False):
+def predicted_grid_bias(step, sigma, photons, kd="frozen", core=False, core_k=GRID_BIAS_K_CORE):
     """The bias law, in Fisher sds: z = K (step / sigma)^2 sqrt(photons); with a core (the residual on
-    the grid) z = K_core step^2 sqrt(photons)."""
+    the grid) z = K_core step^2 sqrt(photons), K_core the toy's."""
     if core:
-        return GRID_BIAS_K_CORE * step ** 2 * math.sqrt(photons)
+        return core_k * step ** 2 * math.sqrt(photons)
     return GRID_BIAS_K[kd] * (step / sigma) ** 2 * math.sqrt(photons)
 
 
@@ -151,7 +154,7 @@ def grid_step_for(toy, size, kd="frozen", device="cpu", core=False):
     """The largest 1/(2n) whose predicted bias is at most GRID_BIAS_TARGET for this toy's photons."""
     photons = diffuse_photons(toy, size, device)
     if core:
-        widest = math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K_CORE * math.sqrt(photons)))
+        widest = math.sqrt(GRID_BIAS_TARGET / (toy.core_bias_k * math.sqrt(photons)))
         return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
     widest = toy.sigma * math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K[kd] * math.sqrt(photons)))
     return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
@@ -194,6 +197,7 @@ class Toy:
     fluence: float = 2e29  # the same at every size: the detector's extent is fixed, so its photons per solid angle are
     kind: str = "gauss"  # "lorentz" (D3b): LorentzianHalo(amplitude, kappa = sigma) plus Smooth(smooth)
     smooth: float = 0.0
+    core_bias_k: float = GRID_BIAS_K_CORE  # the cored grid's bias law constant, measured per toy
 
     @property
     def spot_sd(self) -> float:
@@ -254,7 +258,13 @@ TOYS = {
     "hidden": Toy(n_cells=5, sigma=0.12, amplitude=2000.0),
 }
 # D3b (--sharp): a one-phonon-like core, kappa = 0.5 / N, with a smooth part the grid must carry
-EXTRA_TOYS = {"sharp": Toy(n_cells=10, sigma=0.05, amplitude=3000.0, kind="lorentz", smooth=10.0)}
+# and its separable variant. A Lorentzian's wings separate from the spots only well past them: measured
+# 2026-11-05 (24^2, no spot mask, Fisher at the truth, amplitude scaled as kappa^-2), worst joint/alone
+# sd 4.96, 3.17, 2.43, 1.82, 1.57, 1.45, 1.33 at kappa 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7 (2.5 to 17.6
+# spot sds). kappa = 0.7 is the first with a margin under the limit.
+EXTRA_TOYS = {"sharp": Toy(n_cells=10, sigma=0.05, amplitude=3000.0, kind="lorentz", smooth=10.0),
+              "sharp_wide": Toy(n_cells=10, sigma=0.7, amplitude=3000.0 * (0.05 / 0.7) ** 2, kind="lorentz",
+                                smooth=10.0, core_bias_k=0.0189)}
 
 
 _GRIDS = {}
@@ -271,18 +281,18 @@ def toy_grid(toy, step, device="cpu"):
 
 
 def cored_grid(toy, step, device="cpu"):
-    """A grid whose core is refinable, at the start values; the residual is the true halo less the core
-    at the truth: zero for a Gaussian toy (the machinery's check: it fits as the exact halo), the
-    smooth part for the sharp toy (kept frozen, as the cored grid does)."""
-    core = toy.core().to(device)
-    grid = DiffuseGrid.from_model(toy.halo(), step=step, d_min=GRID_D_MIN,
-                                  cell=(30.0, 35.0, 40.0), point_group=MMM, refinable=False,
-                                  device=torch.device(device), core=core)
+    """A grid whose core is refinable, built as a real fit would be: the model and its core at the fit's
+    starting parameters (0.7 x the amplitude, 1.3 x the width), so theta_b is the start and core_drift()
+    counts from there. The residual is zero for a Gaussian toy (the machinery's check: it fits as the
+    exact halo) and the smooth part for a sharp one, which does not depend on the core's parameters."""
     amplitude, sigma = toy.start_halo()
+    core = toy.core().to(device)
     with torch.no_grad():
         core.log_amplitude.fill_(math.log(amplitude))
         (core.log_sigma if toy.kind == "gauss" else core.log_kappa).fill_(math.log(sigma))
-    return grid
+    return DiffuseGrid.from_model(toy.halo(amplitude, sigma), step=step, d_min=GRID_D_MIN,
+                                  cell=(30.0, 35.0, 40.0), point_group=MMM, refinable=False,
+                                  device=torch.device(device), core=core)
 
 
 def build(toy, size, diffuse, bragg, device="cpu", grid=None, oversample=1):
@@ -430,7 +440,9 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
     return {
         "fit": name, "size": size, "poisson": poisson, "seed": seed, "grid": None if grid is None else asdict(grid),
         "converged": bool(result.success),
-        "iterations": int(result.nit), "message": str(result.message), "photons": photons,
+        "iterations": int(result.nit),
+        # the cored grid's drift at the fit's end (data for the V2 drift tolerance)
+        "core_drift": model.diffuse.core_drift() if fit["diffuse"] and grid is not None and grid.core else None, "message": str(result.message), "photons": photons,
         "errors": errors,
         "z": {lab: float(errors[lab] / s) for lab, s in zip(labels, sd)},
         "fisher_sd": dict(zip(labels, sd.tolist())),
@@ -479,8 +491,9 @@ def main(argv=None):
                         help="with --grid: the machinery check of D3b: the Gaussian halo as the grid's refinable "
                              "core, with a zero residual")
     parser.add_argument("--sharp", action="store_true",
-                        help="also the sharp toy (D3b): a Lorentzian core, kappa = 0.5 / N, on a cored grid whose "
-                             "residual is a smooth part, the step from the residual's bias law")
+                        help="also the sharp toys (D3b): a Lorentzian core plus a smooth part on a cored grid, the "
+                             "step from the residual's bias law; kappa = 0.5 / N (a flagged negative case) and "
+                             "kappa = 0.7 (separable, gated by the usual rules)")
     parser.add_argument("--out")
     args = parser.parse_args(argv)
     grid = None
@@ -500,21 +513,27 @@ def main(argv=None):
                   f"{r['fisher_condition_scaled']:.1e} photons {r['photons']}")
     gate = reports["separable"]["passed"]
     if args.sharp:
-        toy = EXTRA_TOYS["sharp"]
-        spec = GridSpec(grid_step_for(toy, args.size, core=True, device=args.device), core=True)
-        sharp = evaluate("sharp", args.size, args.poisson, args.seeds, args.device, grid=spec)
-        reports["sharp"] = sharp
-        # kappa is 1.25 spot sds: the core trades with the spots as the hidden toy's halo does (ratio
-        # about 10). The sharp toy is judged on the grid's noise-free bias alone. With --poisson its z is
-        # reported, not gated: the exact halo itself is weakly identified there (measured 2026-11-05,
-        # 24^2, seed 3, joint: z 15.7 exact, 34 on the grid, both ABNORMAL; the other fits and seeds
-        # agree between grid and exact to about 0.01).
-        verdict = ("reported, not gated (weakly identified)" if args.poisson
-                   else "PASS" if sharp["recovered"] else "FAIL")
-        print(f"toy sharp: kappa {toy.sigma}, cored grid step 1/{round(1 / spec.step)}, worst "
-              f"{'|z|' if args.poisson else '|bias| / sd'} {sharp['worst_recovery']:.2e}, worst joint/alone sd "
-              f"{sharp['worst_ratio']:.2f} (weakly identified, as expected): {verdict}")
-        gate = gate and (args.poisson or sharp["recovered"])
+        for name in ("sharp", "sharp_wide"):
+            toy = EXTRA_TOYS[name]
+            spec = GridSpec(grid_step_for(toy, args.size, core=True, device=args.device), core=True)
+            report = evaluate(name, args.size, args.poisson, args.seeds, args.device, grid=spec)
+            reports[name] = report
+            drifts = [r["core_drift"] for r in report["fits"] if r["core_drift"] is not None]
+            if name == "sharp":
+                # kappa = 0.5 / N is 1.25 spot sds: a negative case, as the hidden toy is. It must be
+                # flagged (ratio about 10), and noise-free the grid's bias is gated; with --poisson its z
+                # is reported, not gated, as the exact halo is weakly identified there too (measured
+                # 2026-11-05, 24^2, seed 3, joint: z 15.7 exact, 34 on the grid, both ABNORMAL).
+                ok = (not report["separable"]) and (args.poisson or report["recovered"])
+                rule = "flagged as weakly identified (expected)" + ("" if args.poisson else ", bias gated")
+            else:  # separable: the usual rules, separability and recovery (bias, or |z| with --poisson)
+                ok = report["passed"]
+                rule = "separability and recovery gated"
+            print(f"toy {name}: kappa {toy.sigma} ({toy.sigma / toy.spot_sd:.1f} spot sds), cored grid step "
+                  f"1/{round(1 / spec.step)}, worst joint/alone sd {report['worst_ratio']:.2f}, worst "
+                  f"{'|z|' if args.poisson else '|bias| / sd'} {report['worst_recovery']:.2e}, core drift at the "
+                  f"end {min(drifts):.3f}-{max(drifts):.3f}; {rule}: {'PASS' if ok else 'FAIL'}")
+            gate = gate and ok
     flagged = not reports["hidden"]["separable"]
     # With the grid's shape and k_d both frozen the diffuse term has no parameter of its own, so
     # nothing can trade off with the spots: the hidden toy cannot be flagged and is not required to be.

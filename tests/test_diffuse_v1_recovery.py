@@ -168,6 +168,32 @@ def test_the_sharp_gate_passes_on_the_bias_and_reports_the_core_as_weakly_identi
     assert v1.main(["--size", "24", "--sharp"]) == 0
 
 
+def test_the_cored_grids_residual_is_built_at_the_fits_start_and_the_drift_is_recorded():
+    """As a real fit would: the leftover is sampled at the starting core, so the drift counts from there."""
+    toy = v1.EXTRA_TOYS["sharp"]
+    model = v1.build(toy, 24, diffuse=True, bragg=False, grid=v1.GridSpec(1 / 4, core=True))
+    assert model.diffuse.core_drift() == 0.0
+    result = v1.run_fit("diffuse", size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(1 / 4, core=True))
+    # the fit moves the amplitude from 0.7 x and kappa from 1.3 x the truth: ln(1.3) = 0.26, ln(1 / 0.7) = 0.36
+    assert result["core_drift"] == pytest.approx(math.log(1 / 0.7), abs=0.01)
+
+
+def test_the_wide_sharp_toy_separates():
+    """A Lorentzian's wings separate from the spots only well past them: measured 2026-11-05 (24^2, no
+    spot mask), worst ratio 4.96, 2.43, 1.82, 1.45, 1.33 at kappa 0.1, 0.2, 0.3, 0.5, 0.7."""
+    toy = v1.EXTRA_TOYS["sharp_wide"]
+    assert toy.sigma / toy.spot_sd >= 5
+    ratios = v1.separability(toy, 24, grid=v1.GridSpec(v1.grid_step_for(toy, 24, core=True), core=True))
+    assert max(ratios.values()) <= v1.SEPARABILITY_LIMIT, ratios
+
+
+def test_poisson_recovery_of_the_wide_sharp_toy_on_the_cored_grid():
+    toy = v1.EXTRA_TOYS["sharp_wide"]
+    report = v1.evaluate("sharp_wide", 24, poisson=True, seeds=[3],
+                         grid=v1.GridSpec(v1.grid_step_for(toy, 24, core=True), core=True))
+    assert report["passed"], (report["worst_ratio"], report["worst_recovery"])
+
+
 def _photons(toy, size, oversample=1):
     """(diffuse, Bragg) photons of the joint truth image at a size."""
     import torch
