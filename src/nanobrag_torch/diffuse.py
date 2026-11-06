@@ -23,7 +23,7 @@ from torch import nn
 from .config import CrystalShape, SpotMetric
 from .diffuse_grid import DiffuseGrid
 
-__all__ = ["DiffuseModel", "ConstantDiffuse", "GaussianHalo", "DiffuseGrid", "bragg_peak_factor"]
+__all__ = ["DiffuseModel", "ConstantDiffuse", "GaussianHalo", "LorentzianHalo", "DiffuseGrid", "bragg_peak_factor"]
 
 
 @runtime_checkable
@@ -47,6 +47,11 @@ class DiffuseModel(Protocol):
 
     # Optional, not part of the runtime check: ``grid() -> DiffuseGrid``, the model's values on a
     # reciprocal grid (nanobrag_torch.diffuse_grid). DiffuseGrid.from_model samples any model.
+    # Optional: ``core() -> DiffuseModel``, the model's sharp part near the lattice points as a cheap
+    # closed form (for a one-phonon model, its leading 1/k^2 term with the k floor). A grid built with
+    # DiffuseGrid.from_model(model, ..., core=True) holds only model - core, which is smooth, and adds
+    # the core back at every query. The core must be the model's own term, not an approximation of it:
+    # measured, a 10% error in its width leaves a residual as sharp as the core (plan section 2.2).
 
 
 class ConstantDiffuse(nn.Module):
@@ -86,6 +91,34 @@ class GaussianHalo(nn.Module):
         sigma = self.log_sigma.exp().to(device=hkl.device, dtype=hkl.dtype)
         amplitude = self.log_amplitude.exp().to(device=hkl.device, dtype=hkl.dtype)
         return amplitude * torch.exp(-(offset * offset).sum(dim=-1) / (2 * sigma * sigma))
+
+
+class LorentzianHalo(nn.Module):
+    """
+    A Lorentzian halo about every lattice point, a stand-in for a one-phonon core with a k floor:
+
+        I(hkl) = amplitude * kappa^2 / (sum_i m_i d_i^2 + kappa^2),   d = hkl - round(hkl),
+
+    in Miller units, with amplitude (electrons squared per cell, the peak) and kappa refinable as logs
+    and the diagonal metric m fixed. Sharp near the lattice points (width kappa) with 1/d^2 tails; as
+    DiffuseGrid's core it is evaluated exactly at every query. round() has zero derivative, so the
+    gradient in hkl is that of the offset from the nearest lattice point.
+    """
+
+    def __init__(self, amplitude: float, kappa: float, metric=(1.0, 1.0, 1.0), dtype: torch.dtype = torch.float64):
+        super().__init__()
+        if not (amplitude > 0 and kappa > 0 and all(m > 0 for m in metric)):
+            raise ValueError(f"amplitude, kappa and the metric must be positive, got {amplitude!r}, {kappa!r}, {metric!r}")
+        self.log_amplitude = nn.Parameter(torch.tensor(math.log(amplitude), dtype=dtype))
+        self.log_kappa = nn.Parameter(torch.tensor(math.log(kappa), dtype=dtype))
+        self.register_buffer("metric", torch.tensor(metric, dtype=dtype))
+
+    def forward(self, hkl: torch.Tensor) -> torch.Tensor:
+        offset = hkl - torch.round(hkl)
+        kappa2 = torch.exp(2 * self.log_kappa).to(device=hkl.device, dtype=hkl.dtype)
+        amplitude = self.log_amplitude.exp().to(device=hkl.device, dtype=hkl.dtype)
+        metric = self.metric.to(device=hkl.device, dtype=hkl.dtype)
+        return amplitude * kappa2 / ((offset * offset * metric).sum(dim=-1) + kappa2)
 
 
 def bragg_peak_factor(shape: CrystalShape, N: torch.Tensor, spot_metric: SpotMetric = SpotMetric.RECIPROCAL,

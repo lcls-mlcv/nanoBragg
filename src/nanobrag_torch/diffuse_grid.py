@@ -36,6 +36,15 @@ Device and dtype: the result is on the query's device and in its dtype, as for t
 The interpolation runs where the values are (a large grid is not copied per call): a query on
 another device is moved there, in the values' dtype, and the result moved back.
 
+With a ``core`` (D3b), a cheap closed-form DiffuseModel for the sharp part near the lattice points
+that the model supplies (DiffuseModel.core), the grid holds model - core and its value is
+core(hkl) + the residual's interpolant. The core is a submodule, so its parameters refine with the
+values (group ``diffuse``); the residual was sampled at the core's parameters when built, so a core
+that moves far from them should be followed by a rebuild. Measured (plan section 2.2): on a
+1/k^2-like core with a k floor of 0.05, a uniform grid needs a step finer than 1/64 (30 GB for
+lysozyme) to keep the bias under 0.05 sd at 1e6 photons; with the model's own core, 1/8 to 1/16
+(59 to 468 MB) does.
+
 Trilinear interpolation is exact for multilinear functions and its error elsewhere is bounded by
 (step^2 / 8) times the second derivatives, per axis. Its gradient in hkl is constant within a cell
 and jumps at the cell faces; finite-difference checks must not straddle one.
@@ -97,8 +106,9 @@ class DiffuseGrid(nn.Module):
 
     def __init__(self, values, origin, step, *, shape: Optional[Sequence[int]] = None, point_group=None,
                  anomalous: bool = False, refinable: bool = True, outside: str = "zero",
-                 dtype: torch.dtype = torch.float64, device=None):
+                 dtype: torch.dtype = torch.float64, device=None, core=None):
         super().__init__()
+        self.core = core  # an nn.Module core registers as a submodule
         if outside not in ("zero", "error"):
             raise ValueError(f"outside must be 'zero' or 'error', got {outside!r}")
         self.outside = outside
@@ -201,7 +211,7 @@ class DiffuseGrid(nn.Module):
     @classmethod
     def from_model(cls, model, step: Union[float, Sequence[float]], extent: Optional[Sequence[float]] = None,
                    d_min: Optional[float] = None, cell: Optional[Sequence[float]] = None,
-                   chunk: Optional[int] = 1 << 18, dtype: torch.dtype = torch.float64, device=None,
+                   chunk: Optional[int] = 1 << 18, dtype: torch.dtype = torch.float64, device=None, core=None,
                    **kwargs) -> "DiffuseGrid":
         """Sample a DiffuseModel on the box |h_i| <= extent_i, centred on hkl = 0, nodes step apart.
 
@@ -213,8 +223,14 @@ class DiffuseGrid(nn.Module):
             them at once (None: one call). The model runs under no_grad at the values it stores:
             with a point group, once per orbit (at a node inside the box, value_hkl()), so it must have
             the point group's symmetry.
+        core: a DiffuseModel for the model's sharp part, or True for ``model.core()``. The grid then
+            stores model - core (sampled under no_grad) and adds the core back at every query.
         Other keywords (point_group, anomalous, refinable, outside) as DiffuseGrid.
         """
+        if core is True:
+            if not callable(getattr(model, "core", None)):
+                raise ValueError("core=True needs a model with a core() method")
+            core = model.core()
         step = _triple(step, "step")
         if extent is None:
             if d_min is None or cell is None:
@@ -222,7 +238,8 @@ class DiffuseGrid(nn.Module):
             extent = np.asarray(cell, dtype=np.float64)[:3] / float(d_min)
         extent = _triple(extent, "extent")
         half = np.ceil(extent / step - 1e-9).astype(np.int64) + 1
-        grid = cls(None, -half * step, step, shape=tuple(2 * half + 1), dtype=dtype, device=device, **kwargs)
+        grid = cls(None, -half * step, step, shape=tuple(2 * half + 1), dtype=dtype, device=device, core=core,
+                   **kwargs)
         total = grid.values.numel()
         chunk = total if chunk is None else int(chunk)
         with torch.no_grad():
@@ -230,8 +247,10 @@ class DiffuseGrid(nn.Module):
             for start in range(0, total, chunk):
                 stop = min(start + chunk, total)
                 hkl = grid.value_hkl(torch.arange(start, stop, device=flat_values.device))
-                flat_values[start:stop] = torch.as_tensor(model(hkl)).to(dtype=flat_values.dtype,
-                                                                           device=flat_values.device)
+                sampled = torch.as_tensor(model(hkl))
+                if core is not None:
+                    sampled = sampled - torch.as_tensor(core(hkl)).to(sampled)
+                flat_values[start:stop] = sampled.to(dtype=flat_values.dtype, device=flat_values.device)
         return grid
 
     # -- geometry of the nodes --------------------------------------------------------------------
@@ -318,7 +337,13 @@ class DiffuseGrid(nn.Module):
     # -- evaluation ---------------------------------------------------------------------------------
 
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
-        """Scattering per cell at fractional hkl (n, 3), trilinear in the nodes; on the grid's device."""
+        """Scattering per cell at fractional hkl (n, 3): trilinear in the nodes, plus the core if any."""
+        result = self._interpolate(hkl)
+        if self.core is not None:
+            result = result + torch.as_tensor(self.core(hkl)).to(device=result.device).to(dtype=result.dtype)
+        return result
+
+    def _interpolate(self, hkl: torch.Tensor) -> torch.Tensor:
         values = self.values
         query_device, query_dtype = hkl.device, hkl.dtype
         if hkl.device != values.device:
@@ -360,4 +385,5 @@ class DiffuseGrid(nn.Module):
     def extra_repr(self) -> str:
         storage = f"ASU of {self.values.numel()} orbits" if self.symmetric else "P1"
         return (f"shape={self.shape}, origin={self._origin.tolist()}, step={self._step.tolist()}, {storage}, "
-                f"outside={self.outside!r}, refinable={isinstance(self.values, nn.Parameter)}")
+                f"outside={self.outside!r}, refinable={isinstance(self.values, nn.Parameter)}, "
+                f"core={'yes' if self.core is not None else 'no'}")
