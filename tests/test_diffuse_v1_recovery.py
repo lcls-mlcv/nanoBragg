@@ -85,9 +85,11 @@ def test_the_step_rule_is_the_bias_law_solved_for_the_target():
         step = v1.grid_step_for(toy, 24, kd)
         assert abs(round(1 / (2 * step)) - 1 / (2 * step)) < 1e-9  # a half-integer divisor: nodes on the kinks
         assert v1.predicted_grid_bias(step, toy.sigma, photons, kd) <= v1.GRID_BIAS_TARGET
+        assert v1.predicted_scale_bias(step, toy.sigma, kd) <= v1.SCALE_ABS_TARGET
         coarser = 1 / (1 / step - 2)
-        assert v1.predicted_grid_bias(coarser, toy.sigma, photons, kd) > v1.GRID_BIAS_TARGET
-    assert v1.GRID_BIAS_TARGET <= v1.GRID_BIAS_LIMIT / 2
+        assert (v1.predicted_grid_bias(coarser, toy.sigma, photons, kd) > v1.GRID_BIAS_TARGET
+                or v1.predicted_scale_bias(coarser, toy.sigma, kd) > v1.SCALE_ABS_TARGET)
+    assert v1.GRID_BIAS_TARGET <= v1.GRID_BIAS_LIMIT / 2 and v1.SCALE_ABS_TARGET <= v1.SCALE_ABS_LIMIT / 2
 
 
 # fluence scales, per k_d mode: the rule's step changes with the photons and the bias stays under the limit
@@ -110,11 +112,11 @@ def test_noise_free_on_the_grid_the_bias_follows_the_rule(kd, scale, fit):
     # the diffuse-alone fit refines k_d alone (geometry given) and needs only a few iterations
     assert result["iterations"] > (10 if fit == "joint" else 1)
     assert ("diffuse_params.delta_log_scale" in result["errors"]) == (kd == "free")
-    worst = max(abs(z) for z in result["z"].values())
-    assert worst < v1.GRID_BIAS_LIMIT, (step, result["z"])
-    # the law predicts the worst bias to within a factor of 1.5 (it is fitted on the worst fit, the diffuse one)
-    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), kd)
-    assert worst < 1.5 * predicted
+    worst, scale = v1.grid_bias(result)
+    assert worst < v1.GRID_BIAS_LIMIT and scale < v1.SCALE_ABS_LIMIT, (step, result["z"], result["errors"])
+    # each law bounds its part (fitted on the worst fit at two steps)
+    assert worst < 1.5 * v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), kd)
+    assert scale < 1.5 * v1.predicted_scale_bias(step, toy.sigma, kd)
 
 
 def test_the_rule_gives_a_finer_step_for_more_photons():
@@ -150,8 +152,12 @@ def test_the_sharp_toys_step_follows_the_residuals_bias_law():
     toy = v1.EXTRA_TOYS["sharp"]
     photons = v1.diffuse_photons(toy, 24)
     step = v1.grid_step_for(toy, 24, core=True)
-    assert v1.predicted_grid_bias(step, toy.sigma, photons, core=True) <= v1.GRID_BIAS_TARGET
-    assert v1.predicted_grid_bias(1 / (1 / step - 2), toy.sigma, photons, core=True) > v1.GRID_BIAS_TARGET
+    assert v1.predicted_grid_bias(step, toy.sigma, photons, core=True, core_k=toy.core_bias_k) <= v1.GRID_BIAS_TARGET
+    assert v1.predicted_scale_bias(step, toy.sigma, core=True, core_c=toy.core_scale_c) <= v1.SCALE_ABS_TARGET
+    if step < 0.5:  # a coarser 1/(2n) breaks one of the two
+        coarser = 1 / (1 / step - 2)
+        assert (v1.predicted_grid_bias(coarser, toy.sigma, photons, core=True, core_k=toy.core_bias_k) > v1.GRID_BIAS_TARGET
+                or v1.predicted_scale_bias(coarser, toy.sigma, core=True, core_c=toy.core_scale_c) > v1.SCALE_ABS_TARGET)
 
 
 @pytest.mark.parametrize("fit", ["diffuse", "joint"])
@@ -160,9 +166,10 @@ def test_noise_free_on_the_cored_grid_the_sharp_toy_meets_the_bias_rule(fit):
     step = v1.grid_step_for(toy, 24, core=True)
     result = v1.run_fit(fit, size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(step, core=True))
     assert "diffuse_params.model.core.log_kappa" in result["errors"]
-    worst = max(abs(z) for z in result["z"].values())
-    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), core=True)
+    worst, scale = v1.grid_bias(result)
+    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), core=True, core_k=toy.core_bias_k)
     assert worst < v1.GRID_BIAS_LIMIT and worst < 1.5 * predicted, result["z"]
+    assert scale < v1.SCALE_ABS_LIMIT
 
 
 def test_the_sharp_gate_passes_on_the_bias_and_reports_the_core_as_weakly_identified():
@@ -291,3 +298,27 @@ def test_separability_with_the_geometry_given_keeps_the_gated_toys_under_the_lim
     assert max(separable.values()) <= v1.SEPARABILITY_LIMIT and max(wide.values()) <= v1.SEPARABILITY_LIMIT
     assert max(hidden.values()) > v1.SEPARABILITY_LIMIT
     assert max(v for k, v in separable.items() if k in GEOMETRY_LABELS) < 1.05
+
+
+
+# Per-parameter grid-bias targets (decided 2026-11-06): scale-like parameters (G, k_d) by an absolute
+# bound, |error in log| < SCALE_ABS_LIMIT = 1e-3 (0.1%); the diffuse and geometry parameters by
+# |z| < GRID_BIAS_LIMIT. The Poisson |z| < Z_LIMIT rule is unchanged for every parameter.
+
+def _result(z, errors):
+    return {"z": z, "z_gate": z, "errors": errors}
+
+
+def test_grid_bias_judges_scales_absolutely_and_the_rest_in_sds():
+    G, kd, a = "beam_params.delta_log_spot_scale", "diffuse_params.delta_log_scale", "crystal_params.delta_log_a"
+    worst, scale = v1.grid_bias(_result({G: 12.0, a: 0.03}, {G: 5e-4, a: 1e-6}))
+    assert worst == pytest.approx(0.03) and scale == pytest.approx(5e-4)  # G's z of 12 is not a failure
+    assert v1.grid_bias(_result({kd: 0.01, a: 0.0}, {kd: -2e-3, a: 0.0}))[1] == pytest.approx(2e-3)
+    assert v1.SCALE_ABS_LIMIT == 1e-3
+
+
+def test_the_noise_free_grid_verdict_uses_the_per_parameter_rule():
+    report = v1.evaluate("separable", 24, poisson=False, seeds=[0],
+                         grid=v1.GridSpec(v1.grid_step_for(v1.TOYS["separable"], 24), "frozen"))
+    assert report["recovered"] and report["worst_scale_bias"] < v1.SCALE_ABS_LIMIT
+    assert report["worst_recovery"] < v1.GRID_BIAS_LIMIT

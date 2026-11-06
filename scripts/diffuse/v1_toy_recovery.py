@@ -68,26 +68,34 @@ from nanobrag_torch.utils.refinement import refine_lbfgsb
 DTYPE = torch.float64
 SEPARABILITY_LIMIT = 1.5
 Z_LIMIT = 4.0
-# --grid's step comes from a law, not a fit to the gate. Noise-free, the grid's worst bias over the fits,
-# in Fisher sds, is z = K (step / sigma)^2 sqrt(P), P the diffuse photons of the image: the trilinear
-# error goes as (step / sigma)^2, the parameter error it causes does not depend on the photons, and
-# the sd falls as 1 / sqrt(P). Measured 2026-11-05 (24^2, the separable toy, P = 4835 and 4 x 4835;
-# step 1/16 and 1/32): z doubles with 4x the photons and falls 3.9-4.1x per halved step. K is set
-# from step 1/32 at P = 4835 (z = K * 0.7545):
-#   k_d frozen (the default): z 0.014 (cell a, diffuse fit; G 0.004 in the joint one): K = 0.0186
-#   k_d free: z 0.097, all of it in k_d (geometry <= 0.009): K = 0.129
-# The step is the largest 1/(2n) (nodes on the half-integer kinks) whose predicted z is at most
-# GRID_BIAS_TARGET, half of the pass limit GRID_BIAS_LIMIT, which was fixed before the step.
-GRID_BIAS_K = {"frozen": 0.0186, "free": 0.129}
-# With a core (D3b) the grid carries only the residual, whose scale is fixed (the sharp toy's smooth
-# part), so the law is z = K_core step^2 sqrt(P). Measured 2026-11-05 on the sharp toy (24^2, P = 9174,
-# cored grid, noise-free diffuse fit, the worst): z 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8; K_core from
-# 1/4. At 1e6 photons the rule gives 1/8. K_core depends on the toy (the Fisher sds the bias is measured
-# in, not only the residual): the wide sharp toy (kappa 0.7, P = 2878) gives z 0.058 and 0.016 at 1/4
-# and 1/8, K_core 0.0189, about 7x (at 1/2 it is not yet in the step^2 regime: 0.47). Each toy carries
-# its own (Toy.core_bias_k); this is the narrow one's.
-GRID_BIAS_K_CORE = 0.00276
+# --grid's step comes from laws, not a fit to the gate. Noise-free, the grid's bias is judged per
+# parameter (decided 2026-11-06): scale-like parameters (the Bragg scale G, and k_d if free) by an
+# absolute bound, |error in log| < SCALE_ABS_LIMIT = 1e-3 (0.1%), since G's Fisher sd is set by the
+# bright spots and a negligible bias is many sds there; the diffuse and geometry parameters by
+# |z| < GRID_BIAS_LIMIT Fisher sds. Two laws, each with its constant measured per mode:
+#   z (worst non-scale parameter) = K (step / sigma)^2 sqrt(P), P the diffuse photons: the trilinear
+#     error goes as (step / sigma)^2, the parameter error it causes does not depend on the photons, and
+#     the sd falls as 1 / sqrt(P);
+#   |error| (worst scale-like parameter) = C (step / sigma)^2, independent of the photons.
+# With a core (D3b) the grid carries only the residual, whose scale is fixed, so both drop sigma:
+# z = K_core step^2 sqrt(P) and |error| = C_core step^2, measured per toy (Toy.core_bias_k, core_scale_c).
+# Measured 2026-11-06 at 24^2, noise-free, the diffuse-alone fit with the geometry given, each constant
+# the larger of two steps (law holds to 10%):
+#   k_d frozen: z 0.026, 0.0063 at 1/8, 1/16 (joint, log c): K = 0.00215; G 4.5e-5, 1.2e-5: C = 2.8e-4
+#   k_d free:   z 0.013, 0.0028 (joint, log a): K = 0.00107; k_d 2.2e-2, 5.8e-3 (diffuse): C = 0.134
+#   sharp (cored, kappa 0.05): z 0.0026, 0.0007 at 1/4, 1/8: K_core = 0.00045; G: C_core = 5.0e-6
+#   sharp_wide (cored, kappa 0.7): z 0.0184, 0.0042: K_core = 0.00548; G: C_core = 2.4e-5
+# The step is the largest 1/(2n) (nodes on the half-integer kinks) with predicted z <= GRID_BIAS_TARGET
+# and predicted scale error <= SCALE_ABS_TARGET, each half of its pass limit, both limits fixed before
+# the step. (The first constants, 0.0186 and 0.129, were driven by G and k_d in sds, and by the geometry
+# in a diffuse-alone fit that refined it.)
+GRID_BIAS_K = {"frozen": 0.00215, "free": 0.00107}
+GRID_SCALE_C = {"frozen": 2.8e-4, "free": 0.134}
+GRID_BIAS_K_CORE = 0.00045  # the narrow sharp toy's; each toy carries its own
+GRID_SCALE_C_CORE = 5.0e-6
 GRID_BIAS_TARGET = 0.05
+SCALE_ABS_LIMIT = 1e-3  # noise-free with --grid: a scale-like parameter's bias, in log (0.1%)
+SCALE_ABS_TARGET = 5e-4
 GRID_BIAS_LIMIT = 0.1  # noise-free with --grid: the grid's bias, in Fisher sds
 GRID_D_MIN = 7.0  # Angstrom: the detector reaches 8.0 A; the margin covers the misset and cell offsets
 MMM = np.array([np.diag(d) for d in ((1, 1, 1), (1, -1, -1), (-1, 1, -1), (-1, -1, 1))])  # 222, Laue mmm
@@ -152,13 +160,24 @@ def predicted_grid_bias(step, sigma, photons, kd="frozen", core=False, core_k=GR
     return GRID_BIAS_K[kd] * (step / sigma) ** 2 * math.sqrt(photons)
 
 
+def predicted_scale_bias(step, sigma, kd="frozen", core=False, core_c=GRID_SCALE_C_CORE):
+    """The scale law: |error in log| of the worst scale-like parameter = C (step / sigma)^2, or
+    C_core step^2 with a core."""
+    if core:
+        return core_c * step ** 2
+    return GRID_SCALE_C[kd] * (step / sigma) ** 2
+
+
 def grid_step_for(toy, size, kd="frozen", device="cpu", core=False):
-    """The largest 1/(2n) whose predicted bias is at most GRID_BIAS_TARGET for this toy's photons."""
+    """The largest 1/(2n) whose predicted bias is at most GRID_BIAS_TARGET (in sds, the diffuse and
+    geometry parameters) and SCALE_ABS_TARGET (absolute, the scale-like ones) for this toy's photons."""
     photons = diffuse_photons(toy, size, device)
     if core:
-        widest = math.sqrt(GRID_BIAS_TARGET / (toy.core_bias_k * math.sqrt(photons)))
+        widest = min(math.sqrt(GRID_BIAS_TARGET / (toy.core_bias_k * math.sqrt(photons))),
+                     math.sqrt(SCALE_ABS_TARGET / toy.core_scale_c))
         return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
-    widest = toy.sigma * math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K[kd] * math.sqrt(photons)))
+    widest = toy.sigma * min(math.sqrt(GRID_BIAS_TARGET / (GRID_BIAS_K[kd] * math.sqrt(photons))),
+                             math.sqrt(SCALE_ABS_TARGET / GRID_SCALE_C[kd]))
     return 1.0 / (2 * math.ceil(1.0 / (2 * widest) - 1e-12))
 
 
@@ -199,7 +218,8 @@ class Toy:
     fluence: float = 2e29  # the same at every size: the detector's extent is fixed, so its photons per solid angle are
     kind: str = "gauss"  # "lorentz" (D3b): LorentzianHalo(amplitude, kappa = sigma) plus Smooth(smooth)
     smooth: float = 0.0
-    core_bias_k: float = GRID_BIAS_K_CORE  # the cored grid's bias law constant, measured per toy
+    core_bias_k: float = GRID_BIAS_K_CORE  # the cored grid's bias law constants, measured per toy
+    core_scale_c: float = GRID_SCALE_C_CORE
 
     @property
     def spot_sd(self) -> float:
@@ -266,7 +286,7 @@ TOYS = {
 # spot sds). kappa = 0.7 is the first with a margin under the limit.
 EXTRA_TOYS = {"sharp": Toy(n_cells=10, sigma=0.05, amplitude=3000.0, kind="lorentz", smooth=10.0),
               "sharp_wide": Toy(n_cells=10, sigma=0.7, amplitude=3000.0 * (0.05 / 0.7) ** 2, kind="lorentz",
-                                smooth=10.0, core_bias_k=0.0189)}
+                                smooth=10.0, core_bias_k=0.00548, core_scale_c=2.4e-5)}
 
 
 _GRIDS = {}
@@ -533,6 +553,15 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
     }
 
 
+def grid_bias(result):
+    """(worst |z| over the diffuse and geometry parameters, worst |error| in log over the scale-like
+    ones, G and k_d): the noise-free grid-bias rule's two parts."""
+    scale = {label(SCALE), label(K_D)}
+    z = [abs(v) for k, v in result["z_gate"].items() if k not in scale]
+    e = [abs(v) for k, v in result["errors"].items() if k in scale]
+    return (max(z) if z else 0.0), (max(e) if e else 0.0)
+
+
 def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=1e-5, grid=None):
     """The gate's verdict for one toy: separability ratios, every fit and seed, and pass/fail."""
     toy = {**TOYS, **EXTRA_TOYS}[toy_name]
@@ -540,12 +569,15 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
     runs = [run_fit(name, size, poisson, seed, toy, device, grid)
             for seed in (seeds if poisson else [0]) for name in fits(grid, toy)]
     worst_ratio = float(max(ratios.values()))
+    worst_scale_bias = None
     if poisson:
         worst_recovery = float(max(abs(z) for r in runs for z in r["z_gate"].values()))
         recovered = bool(worst_recovery < Z_LIMIT)
-    elif grid is not None and (not grid.core or toy.smooth > 0):  # the grid's bias (a nonzero residual), in sds
-        worst_recovery = float(max(abs(z) for r in runs for z in r["z_gate"].values()))
-        recovered = bool(worst_recovery < GRID_BIAS_LIMIT)
+    elif grid is not None and (not grid.core or toy.smooth > 0):  # the grid's bias (a nonzero residual)
+        parts = [grid_bias(r) for r in runs]  # per parameter: sds, and absolute for the scale-like ones
+        worst_recovery = float(max(p[0] for p in parts))
+        worst_scale_bias = float(max(p[1] for p in parts))
+        recovered = bool(worst_recovery < GRID_BIAS_LIMIT and worst_scale_bias < SCALE_ABS_LIMIT)
     else:
         worst_recovery = float(max(abs(e) for r in runs for e in r["errors"].values()))
         recovered = bool(worst_recovery < noise_free_tolerance)
@@ -553,7 +585,7 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
     return {"toy": toy_name, **asdict(toy), "spot_sd": toy.spot_sd, "size": size, "poisson": poisson,
             "grid": None if grid is None else asdict(grid),
             "separability": ratios, "worst_ratio": worst_ratio, "separable": separable,
-            "worst_recovery": worst_recovery, "recovered": recovered, "passed": separable and recovered,
+            "worst_recovery": worst_recovery, "worst_scale_bias": worst_scale_bias, "recovered": recovered, "passed": separable and recovered,
             "fits": runs}
 
 
@@ -587,7 +619,9 @@ def main(argv=None):
         print(f"toy {name}: N={report['n_cells']} spot sd {report['spot_sd']:.3f}, halo sigma {report['sigma']}, "
               f"worst joint/alone sd {report['worst_ratio']:.2f} (limit {SEPARABILITY_LIMIT}), "
               f"worst {'|z|' if args.poisson else noise_free} {report['worst_recovery']:.2e}"
-              + ("" if grid is None else f" (grid step 1/{round(1 / grid.step)}, k_d {grid.kd})"))
+              + ("" if grid is None else f" (grid step 1/{round(1 / grid.step)}, k_d {grid.kd})")
+              + ("" if report["worst_scale_bias"] is None else
+                 f", worst scale bias {report['worst_scale_bias']:.1e} in log (limit {SCALE_ABS_LIMIT})"))
         for r in report["fits"]:
             print(f"  {r['fit']:8s} seed {r['seed']} converged={r['converged']} scaled cond "
                   f"{r['fisher_condition_scaled']:.1e} photons {r['photons']}")
@@ -611,7 +645,9 @@ def main(argv=None):
                 rule = "separability and recovery gated"
             print(f"toy {name}: kappa {toy.sigma} ({toy.sigma / toy.spot_sd:.1f} spot sds), cored grid step "
                   f"1/{round(1 / spec.step)}, worst joint/alone sd {report['worst_ratio']:.2f}, worst "
-                  f"{'|z|' if args.poisson else '|bias| / sd'} {report['worst_recovery']:.2e}, core drift at the "
+                  f"{'|z|' if args.poisson else '|bias| / sd'} {report['worst_recovery']:.2e}"
+                  + ("" if report["worst_scale_bias"] is None else f", scale bias {report['worst_scale_bias']:.1e}")
+                  + f", core drift at the "
                   f"end {min(drifts):.3f}-{max(drifts):.3f}; {rule}: {'PASS' if ok else 'FAIL'}")
             gate = gate and ok
     flagged = not reports["hidden"]["separable"]

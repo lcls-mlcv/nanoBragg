@@ -618,8 +618,17 @@ Each rung uses the result of the one before; real data only after synthetic reco
         Their Fisher sd is set by the bright spots, so a bias in sds says little about accuracy.
       - Diffuse and geometry parameters keep the noise-free grid bias ≤ 0.05 sd (pass limit
         0.1 sd).
-      - The V1 script still judges G by its sd. It is to follow this rule in the next code
-        change, not in this docs commit.
+      - Implemented in V1 (2026-11-06). Both laws are re-derived without the scale-like
+        parameters, judged absolutely:
+        - z = K·(s/σ)²·√P: K 0.00215 (k_d frozen) and 0.00107 (free); with a core K_core 0.00045
+          (sharp) and 0.00548 (sharp_wide).
+        - |Δlog scale| = C·(s/σ)²: C 2.8e-4 (G) and 0.134 (k_d, free); with a core 5e-6 and
+          2.4e-5.
+        - Steps the rule now picks (24² and 64² alike): 1/6 (k_d frozen, was 1/18), 1/56 (k_d
+          free, set by k_d's absolute bias, was 1/46), 1/2 (sharp, was 1/4), 1/4 (sharp_wide,
+          was 1/6).
+        - Gates at 24² and 64² pass. Noise-free worst: 0.041 and 0.031 sd at k_d frozen, with G
+          at 7e-5 in log.
       - Measured, old (diffuse alone refining the geometry too) → new, at 24²:
         - separable 1.28 → 1.29 exact, 1.00 → 1.09 on the grid with k_d free;
         - sharp_wide 1.33 → 1.33;
