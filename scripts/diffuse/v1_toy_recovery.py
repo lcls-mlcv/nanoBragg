@@ -7,7 +7,8 @@ refined back from a start off in every parameter, with refine_lbfgsb on the Pois
 
 - bragg:   Bragg-only image, model without a diffuse term; refines G, misset, cell;
 - diffuse: diffuse-only image (F = 0), G known (with k_d frozen, G and the halo amplitude are one
-           number there); refines misset, cell, amplitude, sigma;
+           number there) and the geometry given (misset and cell at their known values, from indexing
+           and the Bragg data, as a diffuse-only program has them); refines amplitude, sigma;
 - joint:   the sum; refines all of them. The Bragg term fixes G, so the amplitude is free.
 
 Each fit reports the errors (with --poisson, z = error / Fisher sd), the Fisher information's
@@ -16,8 +17,8 @@ Fisher matrix is F = J^T diag(1/mu) J, the Poisson information, with J by centra
 The metric is spot_metric=HKL, the one the plan recommends for joint fits.
 
 Separability, the gate: for each parameter of the joint fit, its Fisher sd in the joint fit over
-its sd in the fit of the half it belongs to (G: bragg; the halo: diffuse; misset and cell: the
-better of the two). Near 1 (or below) the halves do not trade off; the gate demands every
+its sd in the fit of the half it belongs to (G, misset and cell: bragg; the halo: diffuse, with
+the geometry given). Near 1 (or below) the halves do not trade off; the gate demands every
 ratio <= SEPARABILITY_LIMIT and, with --poisson, |z| < Z_LIMIT in every fit and seed.
 
 Two toys (TOYS). "separable" is the gate: a halo 7.5 times as wide as the spot (N = 10), so that
@@ -102,21 +103,22 @@ GEOMETRY_TRUTH = {  # raw parameter values of the synthetic shot; the start is z
 }
 FITS = {
     "bragg": dict(diffuse=False, bragg=True, refine=[SCALE, *MISSET, *CELL]),
-    "diffuse": dict(diffuse=True, bragg=False, refine=[*MISSET, *CELL, *HALO], known=[SCALE]),
+    # diffuse alone means geometry given (decided 2026-11-06): misset and cell held at their known
+    # values (from indexing and the Bragg data), as a diffuse-only program would; joint refines them
+    "diffuse": dict(diffuse=True, bragg=False, refine=[*HALO], known=[SCALE, *MISSET, *CELL]),
     "joint": dict(diffuse=True, bragg=True, refine=[SCALE, *MISSET, *CELL, *HALO]),
 }
 GRID_FITS = {  # --grid: the halo is a frozen grid, its amplitude k_d
     "bragg": FITS["bragg"],
-    "diffuse": dict(diffuse=True, bragg=False, refine=[*MISSET, *CELL, K_D], known=[SCALE]),
+    "diffuse": dict(diffuse=True, bragg=False, refine=[K_D], known=[SCALE, *MISSET, *CELL]),
     "joint": dict(diffuse=True, bragg=True, refine=[SCALE, *MISSET, *CELL, K_D]),
 }
 
 
 GRID_FITS_KD_FROZEN = {  # --grid with k_d frozen at 1, plan decision 3's default: the grid's scale error has
-    "bragg": FITS["bragg"],  # nowhere to go but G and the geometry
-    "diffuse": dict(diffuse=True, bragg=False, refine=[*MISSET, *CELL], known=[SCALE]),
-    "joint": dict(diffuse=True, bragg=True, refine=[SCALE, *MISSET, *CELL]),
-}
+    "bragg": FITS["bragg"],  # nowhere to go but G and the geometry. With the geometry given and nothing
+    "joint": dict(diffuse=True, bragg=True, refine=[SCALE, *MISSET, *CELL]),  # diffuse to refine, there
+}  # is no diffuse-alone fit
 
 
 @dataclass(frozen=True)
@@ -398,7 +400,7 @@ def separability(toy, size, device="cpu", grid=None):
     """Joint Fisher sd over the sd of the half each parameter belongs to (see the module's docstring)."""
     joint, _ = fisher_sd(toy, "joint", size, device, grid)
     bragg, _ = fisher_sd(toy, "bragg", size, device, grid)
-    diffuse, _ = fisher_sd(toy, "diffuse", size, device, grid)
+    diffuse = fisher_sd(toy, "diffuse", size, device, grid)[0] if "diffuse" in fits(grid, toy) else {}
     ratios = {}
     for name, sd in joint.items():
         alone = [half[name] for half in (bragg, diffuse) if name in half]
@@ -535,24 +537,24 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
     """The gate's verdict for one toy: separability ratios, every fit and seed, and pass/fail."""
     toy = {**TOYS, **EXTRA_TOYS}[toy_name]
     ratios = separability(toy, size, device, grid)
-    fits = [run_fit(name, size, poisson, seed, toy, device, grid)
-            for seed in (seeds if poisson else [0]) for name in FITS]
+    runs = [run_fit(name, size, poisson, seed, toy, device, grid)
+            for seed in (seeds if poisson else [0]) for name in fits(grid, toy)]
     worst_ratio = float(max(ratios.values()))
     if poisson:
-        worst_recovery = float(max(abs(z) for r in fits for z in r["z_gate"].values()))
+        worst_recovery = float(max(abs(z) for r in runs for z in r["z_gate"].values()))
         recovered = bool(worst_recovery < Z_LIMIT)
     elif grid is not None and (not grid.core or toy.smooth > 0):  # the grid's bias (a nonzero residual), in sds
-        worst_recovery = float(max(abs(z) for r in fits for z in r["z_gate"].values()))
+        worst_recovery = float(max(abs(z) for r in runs for z in r["z_gate"].values()))
         recovered = bool(worst_recovery < GRID_BIAS_LIMIT)
     else:
-        worst_recovery = float(max(abs(e) for r in fits for e in r["errors"].values()))
+        worst_recovery = float(max(abs(e) for r in runs for e in r["errors"].values()))
         recovered = bool(worst_recovery < noise_free_tolerance)
     separable = bool(worst_ratio <= SEPARABILITY_LIMIT)
     return {"toy": toy_name, **asdict(toy), "spot_sd": toy.spot_sd, "size": size, "poisson": poisson,
             "grid": None if grid is None else asdict(grid),
             "separability": ratios, "worst_ratio": worst_ratio, "separable": separable,
             "worst_recovery": worst_recovery, "recovered": recovered, "passed": separable and recovered,
-            "fits": fits}
+            "fits": runs}
 
 
 def main(argv=None):

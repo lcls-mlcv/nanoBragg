@@ -97,13 +97,18 @@ FLUENCES = [("frozen", 1.0), ("frozen", 4.0), ("free", 1 / 16), ("free", 1 / 4)]
 @pytest.mark.parametrize("kd,scale", FLUENCES)
 @pytest.mark.parametrize("fit", ["diffuse", "joint"])
 def test_noise_free_on_the_grid_the_bias_follows_the_rule(kd, scale, fit):
-    """Data from the exact halo, model on the grid at the rule's step for these photons."""
+    """Data from the exact halo, model on the grid at the rule's step for these photons. With k_d and
+    the grid frozen and the geometry given, a diffuse-alone fit has nothing to refine and is not run."""
     base = v1.TOYS["separable"]
     toy = dataclasses.replace(base, fluence=base.fluence * scale)
     step = v1.grid_step_for(toy, 24, kd)
+    if fit not in v1.fits(v1.GridSpec(step, kd), toy):
+        assert (fit, kd) == ("diffuse", "frozen")
+        return
     result = v1.run_fit(fit, size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(step, kd))
-    # not result["converged"]: on the interpolant's kinks L-BFGS-B may end in its line search (see the script)
-    assert result["iterations"] > 10
+    # not result["converged"]: on the interpolant's kinks L-BFGS-B may end in its line search (see the script);
+    # the diffuse-alone fit refines k_d alone (geometry given) and needs only a few iterations
+    assert result["iterations"] > (10 if fit == "joint" else 1)
     assert ("diffuse_params.delta_log_scale" in result["errors"]) == (kd == "free")
     worst = max(abs(z) for z in result["z"].values())
     assert worst < v1.GRID_BIAS_LIMIT, (step, result["z"])
@@ -244,3 +249,45 @@ def test_a_poorly_identified_parameter_gets_a_profile_z_and_interval():
         assert lo <= result["errors"][label] + v1.get_truth(toy, label) <= hi  # the estimate is inside
     for label in set(result["z"]) - flagged:
         assert result["z_gate"][label] == result["z"][label]
+
+
+
+# Diffuse alone means geometry given (decided 2026-11-06): the diffuse-only fit holds misset and cell at
+# their known values (from indexing and the Bragg data), as a diffuse-only program would; the joint fit
+# refines them. Separability compares the joint fit's halo sd with the diffuse-alone sd (geometry given)
+# and the joint fit's geometry and G with the Bragg-alone fit's.
+
+GEOMETRY_LABELS = {v1.label(k) for k in [*v1.MISSET, *v1.CELL]}
+
+
+@pytest.mark.parametrize("grid", [None, v1.GridSpec(1 / 8, "free"), v1.GridSpec(1 / 4, core=True)])
+@pytest.mark.parametrize("toy_name", ["separable", "sharp_wide"])
+def test_the_diffuse_alone_fit_holds_the_geometry_given(toy_name, grid):
+    toy = {**v1.TOYS, **v1.EXTRA_TOYS}[toy_name]
+    spec = v1.fits(grid, toy)["diffuse"]
+    refined = {v1.label(k) for k in spec["refine"]}
+    assert refined and not refined & GEOMETRY_LABELS
+    assert GEOMETRY_LABELS <= {v1.label(k) for k in spec["known"]}
+    assert GEOMETRY_LABELS <= {v1.label(k) for k in v1.fits(grid, toy)["joint"]["refine"]}
+
+
+def test_with_k_d_and_the_grid_frozen_there_is_no_diffuse_alone_fit():
+    assert "diffuse" not in v1.fits(v1.GridSpec(1 / 8, "frozen"))
+
+
+def test_noise_free_diffuse_alone_recovery_with_the_geometry_given():
+    result = v1.run_fit("diffuse", size=24, poisson=False, seed=0)
+    assert set(result["errors"]) == {"diffuse_params.model.log_amplitude", "diffuse_params.model.log_sigma"}
+    assert all(abs(e) < 1e-5 for e in result["errors"].values())
+
+
+def test_separability_with_the_geometry_given_keeps_the_gated_toys_under_the_limit():
+    """Measured 2026-11-06 (24^2): halo ratios rise only slightly when the diffuse-alone fit is given the
+    geometry: separable 1.28 -> 1.29, sharp_wide 1.33 -> 1.33; the negative cases stay flagged
+    (hidden 14.1, sharp 11.5); the geometry's joint / Bragg-alone ratio is <= 1.04."""
+    separable = v1.separability(v1.TOYS["separable"], 24)
+    wide = v1.separability(v1.EXTRA_TOYS["sharp_wide"], 24)
+    hidden = v1.separability(v1.TOYS["hidden"], 24)
+    assert max(separable.values()) <= v1.SEPARABILITY_LIMIT and max(wide.values()) <= v1.SEPARABILITY_LIMIT
+    assert max(hidden.values()) > v1.SEPARABILITY_LIMIT
+    assert max(v for k, v in separable.items() if k in GEOMETRY_LABELS) < 1.05
