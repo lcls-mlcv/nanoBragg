@@ -22,7 +22,7 @@ from torch import nn
 
 from .config import CrystalShape, SpotMetric
 
-__all__ = ["DiffuseModel", "ConstantDiffuse", "GaussianHalo", "bragg_peak_factor"]
+__all__ = ["DiffuseModel", "ConstantDiffuse", "GaussianHalo", "DiffuseGrid", "bragg_peak_factor"]
 
 
 @runtime_checkable
@@ -43,6 +43,9 @@ class DiffuseModel(Protocol):
     """
 
     def __call__(self, hkl: torch.Tensor) -> torch.Tensor: ...
+
+    # Optional, not part of the runtime check: ``grid() -> DiffuseGrid``, the model's values on a
+    # reciprocal grid (nanobrag_torch.diffuse_grid). DiffuseGrid.from_model samples any model.
 
 
 class ConstantDiffuse(nn.Module):
@@ -266,3 +269,6 @@ def _round_peak_factor(N: torch.Tensor, fudge: float) -> torch.Tensor:
     angle = 2 * math.pi - 4 * acos_a - 4 * acos_b + 4 * corner
     area = 2 * r * (wz * angle).sum(dim=(-2, -1))
     return 0.723601254558268 ** 2 * (wr * _sinc3_sqr(math.pi * math.sqrt(fudge) * r) * area).sum()
+
+
+from .diffuse_grid import DiffuseGrid  # noqa: E402  (after the models: it imports none of them)
