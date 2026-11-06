@@ -15,7 +15,12 @@ DiffuseGrid (mmm ASU) at each step. Per case:
   whole image's detectability: well under 1, the grid error cannot be told from the noise. It
   counts a pixel the grid lights where the exact image is dark as its photons; chi2 =
   sum (grid - exact)^2 / exact, its small-error limit, divides those by about zero;
+- deviance_scaled, best_scale: the deviance after the best-fit scale c of the grid image, the part
+  of the error a free k_d cannot absorb (c = sum exact / sum grid);
 - photons: mean diffuse photons per pixel.
+
+"bench" times 2^20 evaluations of the lysozyme grid (step 1/4), ASU and P1, on the CPU in float64
+and, if available, on MPS in float32.
 
 A smooth model (cosines, periods 3, 4 and 5 in h, k, l) is the control.
 
@@ -89,7 +94,17 @@ def compare(exact, grid):
             "rms_rel": float(delta.pow(2).mean().sqrt() / exact.pow(2).mean().sqrt()),
             "max_z": float((delta.abs()[lit] / torch.maximum(exact, grid)[lit].sqrt()).max()),
             "deviance": float(2 * (delta + log_term).sum()),
+            **_scaled_deviance(exact, grid, positive),
             "photons": float(exact.mean()), "photons_total": float(exact.sum())}
+
+
+def _scaled_deviance(exact, grid, positive):
+    """The deviance after the best-fit scale c of the grid image (what a free k_d absorbs):
+    dD/dc = 0 gives c = sum(exact) / sum(grid)."""
+    scale = exact.sum() / grid.sum()
+    fitted = scale * grid
+    log_term = torch.where(positive, exact * torch.log(torch.where(positive, exact, 1.0) / fitted.clamp(min=1e-300)), 0.0)
+    return {"best_scale": float(scale), "deviance_scaled": float(2 * (fitted - exact + log_term).sum())}
 
 
 def error_table(size):
@@ -112,7 +127,8 @@ def error_table(size):
             rows.append(row)
             print(f"{kind:6s} sigma {sigma!s:5s} step 1/{round(1 / step):<3d} step/sigma "
                   f"{row['step_over_sigma'] or float('nan'):5.2f}  max_rel {row['max_rel']:.2e} "
-                  f"rms_rel {row['rms_rel']:.2e}  max_z {row['max_z']:.2e}  deviance {row['deviance']:.2e}  "
+                  f"rms_rel {row['rms_rel']:.2e}  max_z {row['max_z']:.2e}  deviance {row['deviance']:.2e} "
+                  f"(scaled {row['deviance_scaled']:.2e}, c {row['best_scale']:.4f})  "
                   f"photons/px {row['photons']:.3g}", flush=True)
     return rows
 
@@ -136,12 +152,42 @@ def memory_one(step, symmetric):
             "build_s": built, "lookup_us_per_point": lookup * 1e6}
 
 
+def bench(step, n=1 << 20):
+    rows = []
+    hkl = (torch.rand(n, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(0)) * 2 - 1) * torch.tensor(
+        [39.0, 39.0, 18.5], dtype=torch.float64)
+    devices = [("cpu", torch.float64)] + ([("mps", torch.float32)] if torch.backends.mps.is_available() else [])
+    for storage in ("asu", "p1"):
+        grid = DiffuseGrid.from_model(GaussianHalo(100.0, 0.1), step=step, d_min=2.0, cell=(79.0, 79.0, 38.0),
+                                      point_group=point_group_422() if storage == "asu" else None, refinable=False)
+        for device, dtype in devices:
+            g = grid.to(device=device, dtype=dtype)
+            q = hkl.to(dtype=dtype).to(device)
+            g(q[:1024])  # warm up
+            times = []
+            for _ in range(3):
+                if device == "mps":
+                    torch.mps.synchronize()
+                start = time.perf_counter()
+                g(q)
+                if device == "mps":
+                    torch.mps.synchronize()
+                times.append(time.perf_counter() - start)
+            rows.append({"storage": storage, "device": device, "dtype": str(dtype), "n": n, "best_s": min(times),
+                         "ns_per_point": 1e9 * min(times) / n})
+            print(rows[-1], flush=True)
+    return rows
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     error = sub.add_parser("error")
     error.add_argument("--size", type=int, default=64)
     error.add_argument("--out")
+    timing = sub.add_parser("bench")
+    timing.add_argument("--step", type=float, default=0.25)
+    timing.add_argument("--out")
     memory = sub.add_parser("memory")
     memory.add_argument("--step", type=float, nargs="+", default=[0.25])
     memory.add_argument("--p1", action="store_true", help="also P1 (one value per node)")
@@ -150,6 +196,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "error":
         report = error_table(args.size)
+    elif args.command == "bench":
+        report = bench(args.step)
     elif args.one:
         print(json.dumps(memory_one(args.step[0], args.one == "asu")))
         return 0

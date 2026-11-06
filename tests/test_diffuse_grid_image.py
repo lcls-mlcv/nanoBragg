@@ -294,3 +294,17 @@ def test_shots_share_one_grid():
         torch.testing.assert_close(image, reference, rtol=1e-13, atol=0.0)
         (reference * _weights()).sum().backward()
     torch.testing.assert_close(shared, grid.values.grad, rtol=1e-12, atol=0.0)
+
+
+def test_grid_vs_exact_reports_the_deviance_before_and_after_a_best_fit_scale():
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parent.parent / "scripts" / "diffuse" / "grid_vs_exact.py"
+    spec = importlib.util.spec_from_file_location("grid_vs_exact", path)
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+    exact = torch.rand(8, 8, generator=torch.Generator().manual_seed(9), dtype=DTYPE) + 0.1
+    scaled = script.compare(exact, 1.03 * exact)
+    assert scaled["deviance"] > 1e-4 and scaled["deviance_scaled"] < 1e-12 and scaled["best_scale"] == pytest.approx(1 / 1.03)
+    noisy = script.compare(exact, exact * (1 + 0.05 * torch.randn(8, 8, generator=torch.Generator().manual_seed(10), dtype=DTYPE)))
+    assert 0 < noisy["deviance_scaled"] <= noisy["deviance"]
