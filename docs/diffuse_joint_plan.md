@@ -432,6 +432,36 @@ reference.
       (the start is 0.7× the amplitude and 1.3× the width, ln 1/0.7 = 0.36), and up to 14.7 in
       the narrow toy's collapsed Poisson fit. The placeholder of 0.05 warns in every one of these
       fits, so V2 must set it from the drifts it sees.
+  - **The 128² sharp_wide failure** (2026-11-06, diagnosed with /diagnosing-bugs).
+    - **The root cause was V1's fluence scaling.** The fluence was scaled by (24/size)² while
+      each pixel's solid angle also falls as size⁻², so 128² had 28× fewer photons than 24².
+      sharp_wide had 101 diffuse photons and a Fisher sd of log κ of 1.18. Fixed on D2
+      (feat/diffuse-experiment); 24² is unchanged.
+    - **Ruled out, at seed 2:** the cored grid (the exact model failed the same way, log A +30),
+      a coarse step (1/8 failed too) and the start (starting at the truth failed too).
+    - **At 101 photons the likelihood has degenerate limits that beat the truth.**
+      - κ → 0 puts a near-point spike on pixels with a count (μ 0.73 on a count of 1) and moves
+        misset by about 1 rad: deviance 389 against 402 at the truth.
+      - At 4× the photons the cell collapses instead (log a −50), so every pixel sits in one
+        halo, a nearly flat image: 5 below the truth.
+    - **After the fix**, at 2900 photons at 128², κ is identified (sd 0.22) and five of the six
+      fits recover. The seed-3 diffuse fit does not, with the exact model as with the grid. A
+      κ = 0.7 halo is nearly featureless, so the diffuse-only fit hardly constrains the geometry:
+      misset and log a have Fisher sds 0.45–1.1. The fit finds the collapsed-cell basin, 10 NLL
+      below the truth.
+      - Under the profile rule below: misset[1] z −0.5, log a −4.5, both with intervals unbounded
+        over 16 sds.
+      - misset[2] has sd 0.45, under the rule's threshold, and keeps its Fisher z of 21.
+      - **The 128² gate fails on this toy. It is not tuned.** What would change it is a choice
+        about the toy: fix the geometry in a diffuse-only fit of a near-featureless halo, or
+        separate a narrower core with the spot mask (below) rather than by width.
+  - **Profile likelihood in the gate.** Where a parameter's Fisher sd at the truth exceeds 0.5
+    (log or radian units), V1 refits with it held at the truth.
+    - z_p = sign(p̂ − p)·√(2ΔNLL).
+    - The 1-sd profile interval (2ΔNLL = 1) is reported beside the Fisher z.
+    - The gate uses z_p, with the same |z| < 4, for those parameters.
+  - **κ for real data:** bounded below by eryx's k_floor, 0.5/N_cells. The κ → 0 limit above is
+    unphysical there; the toy leaves κ free to expose it.
 - Pixels: diffuse fits do not need every pixel. A ROI set with a strided subset between
   spots (mask out ±n px around predicted spots, then stride) keeps one shot at 1e4–1e5
   pixels.
@@ -621,7 +651,7 @@ eryx (pushed to `backup` only):
 | Branch | Content |
 |---|---|
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
-| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach (section 2.2): the leftover below about 1% of the core at step 1/16, or below 4% at 1/32. That means the q-dependent amplitude across the halo (\|F(q)\|², q², Debye–Waller) evaluated at hkl, not frozen at h₀; the directional shape from its own elastic or Christoffel term, \|k\|⁻²f(k̂), not a quadratic form; and the exact k_floor (κ off by 2% gives z = 1.8 at 1/8). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model |
+| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach (section 2.2): the leftover below about 1% of the core at step 1/16, or below 4% at 1/32. That means the q-dependent amplitude across the halo (\|F(q)\|², q², Debye–Waller) evaluated at hkl, not frozen at h₀; the directional shape from its own elastic or Christoffel term, \|k\|⁻²f(k̂), not a quadratic form; and the exact k_floor (κ off by 2% gives z = 1.8 at 1/8), which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
