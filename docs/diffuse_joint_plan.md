@@ -475,6 +475,34 @@ reference.
   - What is missing, and not built in D3b: a helper that builds the ±n mask from the predicted
     spots (from the model's Bragg term or `roi_centroids`), keeps it fixed while the geometry
     refines, and feeds it to `mask_array` or a strided ROI set. It belongs with the V2 setup.
+- **The spot-mask pilot, and the grid recommended for eryx (decided 2026-11-06).**
+  - The pilot: eryx `torchbragg-core` ebe9e81, `core_bias.py --mask-radius`. Lysozyme 193l,
+    n_cells 20, mesh 4, k_floor 0.025, V1 geometry at 128², k_d frozen. z is scaled to 1e6
+    diffuse photons.
+  - **Masks are an analysis option, not part of the grid's accuracy budget.** They do not fix
+    the grid bias, and they hurt separability.
+
+    | mask radius (px) | 0 | 1 | 2 | 3 | 4 | 6 |
+    |---|---|---|---|---|---|---|
+    | worst z, order-3 core, 1/16 | 0.32 | 0.34 | 0.41 | 0.41 | 0.40 | 0.22 |
+    | worst z, order-3 core, 1/32 | 0.100 | 0.105 | 0.126 | 0.127 | 0.125 | 0.054 |
+    | diffuse photons removed | 0 | 2.0% | 7.4% | 12.4% | 17.1% | 29.5% |
+    | worst joint/alone ratio | 1.06 | 1.08 | 1.21 | 1.61 | 1.59 | 1.62 |
+
+  - **The worst parameter is the joint Bragg scale G.** Its Fisher sd is tiny because of the
+    bright spots, so a negligible bias is many sds. In absolute terms it is 2.6e-4 in log G at
+    1/16 and 8e-5 at 1/32 (0.03% and 0.008%).
+  - **Per-parameter targets (decided).** Scale-like parameters get an absolute tolerance: the
+    bias in G must be under 0.1%. Diffuse and geometry parameters keep z ≤ 0.05 sd.
+  - With G judged that way, order-3 core, unmasked:
+    - at 1/32 the worst z is 0.037 (joint log a), which meets the target;
+    - at 1/16 it is 0.145, which does not;
+    - an order-2 core at 1/32 gives 0.59.
+  - **Recommended grid for eryx: order-3 core plus step 1/32.** The lysozyme ASU is about
+    3.7 GB, and the one-time sampling takes about 34 min on 64 cores. The optical-block
+    correction is shelved unless V2 shows a disagreement.
+  - Caveat: the pilot's diffuse-only fit still refined the geometry (the old V1 definition).
+    The joint numbers are unaffected.
 
 ## 3. Joint objective
 
@@ -585,6 +613,13 @@ Each rung uses the result of the one before; real data only after synthetic reco
       the fit of its own half: G, misset and cell against Bragg alone; the halo against diffuse
       alone with the geometry given. Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and
       seed (noise-free: errors < 1e-5).
+    - **Grid bias, per-parameter targets (decided 2026-11-06, section 2.2).**
+      - Scale-like parameters (the Bragg scale G) get an absolute tolerance: bias under 0.1%.
+        Their Fisher sd is set by the bright spots, so a bias in sds says little about accuracy.
+      - Diffuse and geometry parameters keep the noise-free grid bias ≤ 0.05 sd (pass limit
+        0.1 sd).
+      - The V1 script still judges G by its sd. It is to follow this rule in the next code
+        change, not in this docs commit.
       - Measured, old (diffuse alone refining the geometry too) → new, at 24²:
         - separable 1.28 → 1.29 exact, 1.00 → 1.09 on the grid with k_d free;
         - sharp_wide 1.33 → 1.33;
@@ -621,7 +656,11 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - recover jointly, and with each half frozen;
   - grid vs exact error;
   - diffuse and joint fits with ±n pixels masked around the predicted spots (section 2.2),
-    reporting the separability ratio and the grid bias against n.
+    reporting the separability ratio and the grid bias against n, as an analysis option: the
+    pilot showed masks do not fix the grid bias;
+  - **a direct check of the grid:** fit the same synthetic data with the cored grid (order-3
+    core, 1/32) and with the exact per-pixel model, and compare the parameters within their
+    noise. The per-pixel path stays the reference and the fallback.
 - **V3 Separability cross-check:**
   - merge the V2 images with `merge_map.py` and fit with ShellFit (map space alone);
   - the springs must agree with the image-space joint fit within the bootstrap SE;
@@ -658,7 +697,7 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 | D1 | the hook: 31d0b2c, 3f653f1, 7b344a4 rebased; `diffuse.py` protocol plus toy models; V0 gate script | V0, full gates |
 | D2 | `ExperimentModel(diffuse=)`, groups diffuse/diffuse_scale, ROI path, components, `SerialExperiment` sharing, D2-T1 shape-integral test, gradient checks | /tdd, V1 |
 | D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test. Done: section 2.2 (error table, memory, decision); `v1_toy_recovery.py --grid` passes, V0 0 differ | V1 on the grid |
-| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2) | `core_candidates.py` (bias at 1e6 photons per candidate and core error), `grid_vs_exact.py error --only sharp sharp+core` at 128², V1 `--grid --grid-core` (machinery) and `--sharp` (noise-free bias under the residual's law), FD and gradcheck, V0 |
+| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2). Recommended for eryx (2026-11-06): order-3 core plus 1/32, per-parameter targets (G absolute < 0.1%, others ≤ 0.05 sd), masks not part of the budget | `core_candidates.py` (bias at 1e6 photons per candidate and core error), `grid_vs_exact.py error --only sharp sharp+core` at 128², V1 `--grid --grid-core` (machinery) and `--sharp` (noise-free bias under the residual's law), FD and gradcheck, V0 |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
 | (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
@@ -668,7 +707,7 @@ eryx (pushed to `backup` only):
 | Branch | Content |
 |---|---|
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
-| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach (section 2.2): the leftover below about 1% of the core at step 1/16, or below 4% at 1/32. That means the q-dependent amplitude across the halo (\|F(q)\|², q², Debye–Waller) evaluated at hkl, not frozen at h₀; the directional shape from its own elastic or Christoffel term, \|k\|⁻²f(k̂), not a quadratic form; and the exact k_floor (κ off by 2% gives z = 1.8 at 1/8), which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model |
+| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach (section 2.2): the leftover below about 1% of the core at step 1/16, or below 4% at 1/32. That means the q-dependent amplitude across the halo (\|F(q)\|², q², Debye–Waller) evaluated at hkl, not frozen at h₀; the directional shape from its own elastic or Christoffel term, \|k\|⁻²f(k̂), not a quadratic form; and the exact k_floor (κ off by 2% gives z = 1.8 at 1/8), which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model. Pilot (torchbragg-core ebe9e81, 2026-11-06): the order-3 core at 1/32 meets it unmasked, with worst z 0.037 once G is judged absolutely (bias 8e-5 in log G); 1/16 gives 0.145 and order 2 gives 0.59 |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
@@ -693,6 +732,14 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    - The V1 grid pass rule stays: bias under 0.1 Fisher sd, with the step from the bias law.
    - L-BFGS-B's ABNORMAL stops on the grid are accepted for now; an AdamW check comes later.
    - Refining the grid values with a smoothness restraint is deferred until after V2.
+   **Decided 2026-11-06, after D3b and the spot-mask pilot (section 2.2):**
+   - The grid is the model's analytic core plus a residual grid. For eryx it is an order-3 core
+     at step 1/32: about 3.7 GB for the lysozyme ASU, sampled once in about 34 min on 64 cores.
+   - Accuracy is judged per parameter: the scale G absolutely (bias < 0.1%), the diffuse and
+     geometry parameters by z ≤ 0.05 sd.
+   - Spot masks are an analysis option, not part of the accuracy budget.
+   - V2 compares grid and per-pixel fits directly. The per-pixel path stays the reference and
+     the fallback.
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
    `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
    factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse
