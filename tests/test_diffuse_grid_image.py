@@ -78,7 +78,7 @@ class Smooth(nn.Module):
 def test_grid_image_is_within_the_trilinear_bound_of_the_exact_halo(sigma, step):
     halo = GaussianHalo(100.0, sigma)
     exact = _image(halo)
-    grid = DiffuseGrid.from_model(halo, step=step, d_min=D_MIN, cell=CELL, rotations=MMM, refinable=False)
+    grid = DiffuseGrid.from_model(halo, step=step, d_min=D_MIN, cell=CELL, point_group=MMM, refinable=False)
     error = (_image(grid) - exact).abs()
     # per axis max |d^2/dh^2| of a Gaussian is A / sigma^2; the nodes lie on the half-integer kinks
     bound = 3 * step ** 2 / 8 * 100.0 / sigma ** 2 * _image(ConstantDiffuse(1.0))
@@ -91,7 +91,7 @@ def test_grid_image_of_a_smooth_model_is_within_its_bound_and_converges_as_step_
     exact = _image(model)
     errors = []
     for step in (1 / 2, 1 / 4):
-        grid = DiffuseGrid.from_model(model, step=step, d_min=D_MIN, cell=CELL, rotations=MMM, refinable=False)
+        grid = DiffuseGrid.from_model(model, step=step, d_min=D_MIN, cell=CELL, point_group=MMM, refinable=False)
         error = (_image(grid) - exact).abs()
         assert (error <= step ** 2 / 8 * model.curvature() * _image(ConstantDiffuse(1.0))).all()
         errors.append(float(error.max()))
@@ -111,7 +111,7 @@ def test_a_grid_too_small_for_the_detector_is_zero_there_or_raises():
 def test_oversampled_and_symmetric_images_match_p1():
     halo = GaussianHalo(100.0, 0.3)
     p1 = DiffuseGrid.from_model(halo, step=1 / 4, d_min=D_MIN, cell=CELL, refinable=False)
-    asu = DiffuseGrid.from_model(halo, step=1 / 4, d_min=D_MIN, cell=CELL, rotations=MMM, refinable=False)
+    asu = DiffuseGrid.from_model(halo, step=1 / 4, d_min=D_MIN, cell=CELL, point_group=MMM, refinable=False)
     torch.testing.assert_close(_image(asu, pixels=12, oversample=2), _image(p1, pixels=12, oversample=2),
                                rtol=1e-13, atol=0)
 
@@ -128,7 +128,7 @@ GEOMETRY = [
 
 
 def _halo_grid(refinable=False):
-    return DiffuseGrid.from_model(GaussianHalo(40.0, 0.15), step=1 / 8, d_min=6.0, cell=CELL, rotations=MMM,
+    return DiffuseGrid.from_model(GaussianHalo(40.0, 0.15), step=1 / 8, d_min=6.0, cell=CELL, point_group=MMM,
                                   refinable=refinable)
 
 

@@ -140,7 +140,7 @@ def toy_grid(toy, step, device="cpu"):
     if key not in _GRIDS:
         halo = GaussianHalo(toy.amplitude, toy.sigma)
         _GRIDS[key] = DiffuseGrid.from_model(halo, step=step, d_min=GRID_D_MIN, cell=(30.0, 35.0, 40.0),
-                                             rotations=MMM, refinable=False, device=torch.device(device))
+                                             point_group=MMM, refinable=False, device=torch.device(device))
     return _GRIDS[key]
 
 

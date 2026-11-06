@@ -7,6 +7,7 @@ values. Images and gradients through the Simulator and ExperimentModel are in
 tests/test_diffuse_grid_image.py.
 """
 import itertools
+import math
 import os
 os.environ.setdefault("NANOBRAGG_DISABLE_COMPILE", "1")
 
@@ -138,7 +139,7 @@ def test_values_are_a_parameter_or_a_buffer():
 def _p1_and_asu(rotations, extent=(2.0, 2.0, 1.5), step=0.25, model=None):
     model = model or GaussianHalo(5.0, 0.2)
     p1 = DiffuseGrid.from_model(model, step=step, extent=extent)
-    asu = DiffuseGrid.from_model(model, step=step, extent=extent, rotations=rotations)
+    asu = DiffuseGrid.from_model(model, step=step, extent=extent, point_group=rotations)
     return p1, asu
 
 
@@ -166,7 +167,7 @@ def test_asu_grid_is_the_p1_grid_with_fewer_values(rotations, ops, most, model):
 @pytest.mark.parametrize("rotations,anomalous", [(PG_422, False), (PG_422, True), (PG_6, False), (None, False)])
 def test_asu_orbits_are_those_of_expand_to_p1(rotations, anomalous):
     """On a grid of step 1 the nodes are Miller indices: the grid's orbits are StructureFactors' orbits."""
-    grid = DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=1.0, extent=(3, 3, 2), rotations=rotations,
+    grid = DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=1.0, extent=(3, 3, 2), point_group=rotations,
                                   anomalous=anomalous, refinable=False)
     nodes = _box(grid.origin.tolist(), grid.step.tolist(), grid.shape).reshape(-1, 3).round().long()
     ids = grid.value_index(nodes - grid.origin.round().long()).numpy()
@@ -186,23 +187,23 @@ def test_asu_orbits_are_those_of_expand_to_p1(rotations, anomalous):
 def test_p1_storage_is_the_default_and_friedel_alone_halves_it():
     p1, friedel = _p1_and_asu(None)
     assert p1.values.ndim == 3
-    friedel = DiffuseGrid.from_model(GaussianHalo(5.0, 0.2), step=0.25, extent=(2, 2, 1.5), rotations=np.eye(3))
+    friedel = DiffuseGrid.from_model(GaussianHalo(5.0, 0.2), step=0.25, extent=(2, 2, 1.5), point_group=np.eye(3))
     assert friedel.values.numel() == (int(np.prod(p1.shape)) + 1) // 2
 
 
 def test_symmetric_grids_must_be_centred_with_equal_steps_on_mixed_axes():
     with pytest.raises(ValueError, match="centred"):
-        DiffuseGrid.from_values(torch.ones(4, 4, 4), origin=(-1.0, -1.0, -1.0), step=0.5, rotations=PG_422)
+        DiffuseGrid.from_values(torch.ones(4, 4, 4), origin=(-1.0, -1.0, -1.0), step=0.5, point_group=PG_422)
     with pytest.raises(ValueError, match="step"):
         DiffuseGrid.from_values(torch.ones(5, 9, 5), origin=(-1.0, -1.0, -1.0), step=(0.5, 0.25, 0.5),
-                                rotations=PG_422)
+                                point_group=PG_422)
     # unequal steps are fine on axes the operators do not mix (l here)
-    DiffuseGrid.from_values(torch.ones(5, 5, 9), origin=(-1.0, -1.0, -1.0), step=(0.5, 0.5, 0.25), rotations=PG_422)
+    DiffuseGrid.from_values(torch.ones(5, 5, 9), origin=(-1.0, -1.0, -1.0), step=(0.5, 0.5, 0.25), point_group=PG_422)
 
 
 def test_from_values_averages_symmetry_mates():
     values = torch.rand(5, 5, 5, dtype=DTYPE, generator=torch.Generator().manual_seed(4))
-    grid = DiffuseGrid.from_values(values, origin=(-1.0, -1.0, -1.0), step=0.5, rotations=np.eye(3))
+    grid = DiffuseGrid.from_values(values, origin=(-1.0, -1.0, -1.0), step=0.5, point_group=np.eye(3))
     expected = 0.5 * (values + values.flip(0, 1, 2))  # Friedel mates: -h is the flipped box
     nodes = _box((-1.0, -1.0, -1.0), (0.5, 0.5, 0.5), (5, 5, 5)).reshape(-1, 3)
     torch.testing.assert_close(grid(nodes), expected.reshape(-1), rtol=0, atol=1e-15)
@@ -242,9 +243,9 @@ class _Counting(nn.Module):
 def test_from_model_evaluates_in_chunks_and_without_a_graph(rotations):
     halo = GaussianHalo(5.0, 0.2)
     counting = _Counting(halo)
-    small = DiffuseGrid.from_model(counting, step=0.25, extent=(1, 1, 1), rotations=rotations, chunk=37)
+    small = DiffuseGrid.from_model(counting, step=0.25, extent=(1, 1, 1), point_group=rotations, chunk=37)
     assert max(counting.calls) <= 37 and len(counting.calls) > 1
-    whole = DiffuseGrid.from_model(halo, step=0.25, extent=(1, 1, 1), rotations=rotations, chunk=None)
+    whole = DiffuseGrid.from_model(halo, step=0.25, extent=(1, 1, 1), point_group=rotations, chunk=None)
     assert torch.equal(small.values, whole.values)
     assert not small.values.grad_fn and small.values.requires_grad
 
@@ -260,7 +261,7 @@ def test_from_model_takes_its_extent_from_d_min_and_the_cell():
 
 def test_from_model_matches_the_model_at_the_nodes():
     halo = GaussianHalo(5.0, 0.2)
-    grid = DiffuseGrid.from_model(halo, step=0.125, extent=(1, 1, 1), rotations=PG_422)
+    grid = DiffuseGrid.from_model(halo, step=0.125, extent=(1, 1, 1), point_group=PG_422)
     nodes = _box(grid.origin.tolist(), grid.step.tolist(), grid.shape).reshape(-1, 3)
     torch.testing.assert_close(grid(nodes), halo(nodes).detach(), rtol=0, atol=1e-14)
 
@@ -274,7 +275,7 @@ def _away_from_cell_edges(grid, hkl, margin=0.05):
 
 @pytest.mark.parametrize("rotations", [None, PG_422])
 def test_gradcheck_in_hkl_and_in_values(rotations):
-    grid = DiffuseGrid.from_model(GaussianHalo(5.0, 0.3), step=0.25, extent=(1, 1, 1), rotations=rotations)
+    grid = DiffuseGrid.from_model(GaussianHalo(5.0, 0.3), step=0.25, extent=(1, 1, 1), point_group=rotations)
     g = torch.Generator().manual_seed(6)
     cells = torch.randint(-3, 3, (8, 3), generator=g).to(DTYPE)
     hkl = ((cells + 0.1 + 0.8 * torch.rand(8, 3, generator=g, dtype=DTYPE)) * 0.25).requires_grad_()
@@ -309,7 +310,97 @@ def _partial(v, u, axis):
 
 
 def test_values_gradient_is_the_trilinear_weights_summed_over_mates():
-    grid = DiffuseGrid.from_model(GaussianHalo(5.0, 0.3), step=0.5, extent=(1, 1, 1), rotations=np.eye(3))
+    grid = DiffuseGrid.from_model(GaussianHalo(5.0, 0.3), step=0.5, extent=(1, 1, 1), point_group=np.eye(3))
     hkl = torch.tensor([[0.2, 0.0, 0.0], [-0.2, 0.0, 0.0]], dtype=DTYPE)  # Friedel mates of each other
     grid(hkl).sum().backward()
     assert grid.values.grad.sum().item() == pytest.approx(2.0, abs=1e-14)  # the weights sum to 1 per point
+
+
+# 6. Audit fixes (2026-11-05).
+
+def test_an_operator_set_that_is_not_a_group_is_refused():
+    """{I, 4-fold} is not closed: its orbits would not partition the nodes, and a lookup would read
+    a neighbouring orbit's value."""
+    not_a_group = np.array([np.eye(3, dtype=np.int64), FOUR_FOLD])
+    with pytest.raises(ValueError, match="not a group"):
+        DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=0.25, extent=(1, 1, 1), point_group=not_a_group,
+                               anomalous=True)
+    # the same generators closed are fine
+    DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=0.25, extent=(1, 1, 1), point_group=group(FOUR_FOLD),
+                           anomalous=True)
+
+
+def test_a_lookup_must_find_its_orbit_exactly():
+    grid = DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=0.5, extent=(1, 1, 1), point_group=PG_422)
+    centre = torch.as_tensor([[n // 2 for n in grid.shape]])
+    lost = grid._canonical_keys(centre)
+    grid._keys = grid._keys[grid._keys != lost]  # the orbit of hkl = 0 lost: it must not read the next one
+    with pytest.raises(RuntimeError, match="orbit"):
+        grid(torch.zeros(1, 3, dtype=DTYPE) + 0.1)
+
+
+def test_point_group_none_is_p1_and_anomalous_needs_a_point_group():
+    """point_group=None stores P1 (no operators, no Friedel mates); StructureFactors' rotations=None
+    is the identity with Friedel's law, which here is point_group=np.eye(3)."""
+    assert DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=0.5, extent=(1, 1, 1)).values.ndim == 3
+    with pytest.raises(ValueError, match="anomalous"):
+        DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=0.5, extent=(1, 1, 1), anomalous=True)
+    with pytest.raises(TypeError):
+        DiffuseGrid.from_model(GaussianHalo(1.0, 0.3), step=0.5, extent=(1, 1, 1), rotations=PG_422)
+
+
+def test_from_model_evaluates_inside_the_box_so_a_bounded_source_works():
+    """Hexagonal operators take nodes out of a rectangular box; each orbit is sampled at a node inside it."""
+    blob = _HexagonalBlob()
+    source = DiffuseGrid.from_model(blob, step=0.25, extent=(2, 2, 1.5), outside="error", refinable=False)
+    extent = (2 - 0.25, 2 - 0.25, 1.5 - 0.25)  # the same box as the source's (it adds a node)
+    asu = DiffuseGrid.from_model(source, step=0.25, extent=extent, point_group=PG_6)
+    reps = asu.value_hkl()
+    assert (reps.abs() <= torch.as_tensor(asu.shape, dtype=DTYPE) // 2 * 0.25 + 1e-12).all()
+    nodes = _box(asu.origin.tolist(), asu.step.tolist(), asu.shape).reshape(-1, 3)
+    torch.testing.assert_close(asu(nodes), blob(nodes), rtol=0, atol=1e-14)
+
+
+def test_non_finite_hkl():
+    """outside="error" refuses inf and NaN; outside="zero" gives 0 at +-inf (outside the box) and NaN at NaN."""
+    hkl = torch.tensor([[float("inf"), 0.0, 0.0], [0.0, -float("inf"), 0.0], [float("nan"), 0.0, 0.0],
+                        [0.1, 0.2, 0.3]], dtype=DTYPE)
+    zero = DiffuseGrid(torch.ones(3, 3, 3, dtype=DTYPE), origin=(-1, -1, -1), step=1.0)
+    out = zero(hkl)
+    assert out[0] == 0 and out[1] == 0 and torch.isnan(out[2]) and out[3] == 1
+    strict = DiffuseGrid(torch.ones(3, 3, 3, dtype=DTYPE), origin=(-1, -1, -1), step=1.0, outside="error")
+    for row in hkl[:3]:
+        with pytest.raises(ValueError, match="finite"):
+            strict(row[None])
+
+
+def test_float32_queries_at_lysozyme_sized_indices():
+    """u = (h - origin) / step reaches about 640 for lysozyme to 2 A at step 1/8. In float32 u carries
+    about 2 ulp(640) = 1.2e-4 of a cell, so the interpolant moves by that times a cell's change in value,
+    plus float32 rounding of the value itself."""
+    shape = (641, 5, 5)
+    origin, step = (-40.0, -0.25, -0.25), (1 / 8, 1 / 8, 1 / 8)
+    nodes = _box(origin, step, shape)
+    values = 10 + torch.sin(2 * math.pi * nodes[..., 0] / 0.9) * torch.cos(nodes[..., 1] + nodes[..., 2])
+    grid = DiffuseGrid(values, origin, step)
+    hkl = torch.stack([torch.linspace(30.0, 39.9, 4001, dtype=DTYPE), torch.full((4001,), 0.07, dtype=DTYPE),
+                       torch.full((4001,), -0.11, dtype=DTYPE)], dim=-1)
+    exact = grid(hkl)
+    single = grid(hkl.to(torch.float32))
+    assert single.dtype == torch.float32
+    cell_change = (values[1:] - values[:-1]).abs().max()
+    bound = 2 * 640 * torch.finfo(torch.float32).eps * cell_change + 4 * torch.finfo(torch.float32).eps * values.abs().max()
+    error = (single.double() - exact).abs().max()
+    assert error <= bound, (float(error), float(bound))
+
+
+def test_output_is_on_the_query_device_and_dtype():
+    grid = DiffuseGrid(torch.ones(3, 3, 3, dtype=DTYPE), origin=(-1, -1, -1), step=1.0)
+    for dtype in (torch.float32, torch.float64):
+        out = grid(torch.zeros(2, 3, dtype=dtype))
+        assert out.dtype == dtype and out.device.type == "cpu"
+    if torch.backends.mps.is_available():
+        on_mps = DiffuseGrid(torch.ones(3, 3, 3, dtype=torch.float32), origin=(-1, -1, -1), step=1.0).to("mps")
+        out = on_mps(torch.zeros(2, 3, dtype=torch.float64))  # computed on the grid's device in its dtype
+        assert out.device.type == "cpu" and out.dtype == torch.float64
+        assert torch.equal(out, torch.ones(2, dtype=torch.float64))

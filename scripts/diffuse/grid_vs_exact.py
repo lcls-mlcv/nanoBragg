@@ -105,7 +105,7 @@ def error_table(size):
                 continue
             start = time.perf_counter()
             grid = DiffuseGrid.from_model(model, step=step, d_min=v1.GRID_D_MIN, cell=(30.0, 35.0, 40.0),
-                                          rotations=v1.MMM, refinable=False)
+                                          point_group=v1.MMM, refinable=False)
             built = time.perf_counter() - start
             row = {"model": kind, "sigma": sigma, "step": step, "step_over_sigma": step / sigma if sigma else None,
                    "values": grid.values.numel(), "build_s": built, **compare(exact, diffuse_image(grid, size, toy))}
@@ -122,7 +122,7 @@ def memory_one(step, symmetric):
     rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     start = time.perf_counter()
     grid = DiffuseGrid.from_model(GaussianHalo(100.0, 0.1), step=step, d_min=2.0, cell=(79.0, 79.0, 38.0),
-                                  rotations=point_group_422() if symmetric else None, refinable=False)
+                                  point_group=point_group_422() if symmetric else None, refinable=False)
     built = time.perf_counter() - start
     peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     scale = 1 if sys.platform == "darwin" else 1024  # ru_maxrss: bytes on macOS, KiB on Linux

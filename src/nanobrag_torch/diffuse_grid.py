@@ -11,19 +11,30 @@ Nodes sit at hkl = origin + step * (i, j, k), i < shape[0] and so on (the layout
 HKLGrid, read here from its fields without importing eryx). Two storages:
 
 - P1: one value per node, the (nx, ny, nz) box itself.
-- symmetric, with a point group (``rotations``, the integer reciprocal-space matrices that
-  StructureFactors takes; with Friedel's law unless ``anomalous``): one value per orbit of
+- symmetric, with ``point_group`` (the integer reciprocal-space matrices that StructureFactors
+  takes as ``rotations``; with Friedel's law unless ``anomalous``): one value per orbit of
   nodes, the Laue ASU, on a box centred on hkl = 0. Node m (hkl = m * step, m integer) has the
   mates m R, so a node's value is found from the largest key of its mates, through the same
   operators (structure_factors.point_group_operators) as StructureFactors' expansion; on a grid
   of step 1 the orbits are those of expand_to_p1 (tests/test_diffuse_grid.py). The operators
-  must map nodes to nodes: steps equal on axes an operator mixes.
+  must form a group (checked: generators alone are refused, not closed silently) and must map
+  nodes to nodes: steps equal on axes an operator mixes. Every lookup must find its orbit's key
+  exactly, or raises RuntimeError.
+
+The argument is ``point_group``, not ``rotations``, because None means something else here:
+P1 storage with no operators at all, where StructureFactors' rotations=None is the identity
+with Friedel's law (here point_group=np.eye(3)). ``anomalous`` needs a point group.
 
 Outside the box the grid is zero (``outside="zero"``, the default): it is the trilinear
 interpolant of its values padded with zeros, so a point less than a step outside sees the
 boundary nodes with that step's weights, and the term vanishes continuously. ``outside="error"``
-raises ValueError for any point beyond the box instead. A box built for a resolution
-(``from_model(d_min=...)``) covers the whole resolution sphere plus a node.
+raises ValueError for any point beyond the box, or not finite, instead. In zero mode a point at
++-inf is outside (0) and a NaN gives NaN. A box built for a resolution (``from_model(d_min=...)``)
+covers the whole resolution sphere plus a node.
+
+Device and dtype: the result is on the query's device and in its dtype, as for the other models.
+The interpolation runs where the values are (a large grid is not copied per call): a query on
+another device is moved there, in the values' dtype, and the result moved back.
 
 Trilinear interpolation is exact for multilinear functions and its error elsewhere is bounded by
 (step^2 / 8) times the second derivatives, per axis. Its gradient in hkl is constant within a cell
@@ -47,6 +58,16 @@ _LOOKUP_CHUNK = 1 << 16  # nodes per pass of the symmetry lookup: bounds its (n,
 _BUILD_CHUNK = 1 << 19  # nodes per pass when the orbits are listed: 0.2 GB per (n, 16, 3) temporary
 
 
+def _check_group(ops: np.ndarray) -> None:
+    """Refuse an operator set not closed under products (its orbits would not partition the nodes)."""
+    members = {R.tobytes() for R in ops}
+    for A in ops:
+        for B in ops:
+            if (A @ B).tobytes() not in members:
+                raise ValueError(f"the operators are not a group: {A.tolist()} @ {B.tolist()} = {(A @ B).tolist()} "
+                                 "is missing; give the whole point group, not its generators")
+
+
 def _triple(value, name) -> np.ndarray:
     array = np.asarray(torch.as_tensor(value).detach().cpu().numpy() if torch.is_tensor(value) else value,
                        dtype=np.float64).reshape(-1)
@@ -60,12 +81,13 @@ def _triple(value, name) -> np.ndarray:
 class DiffuseGrid(nn.Module):
     """A DiffuseModel whose values sit on a regular hkl grid, interpolated trilinearly (see the module).
 
-    values: the (nx, ny, nz) box of values, or None for zeros (with ``shape``). With ``rotations``
+    values: the (nx, ny, nz) box of values, or None for zeros (with ``shape``). With ``point_group``
         a box is averaged over the symmetry mates inside it; a 1D tensor is taken as the ASU
         values themselves, in the order of ``value_hkl()``.
     origin, step: hkl of node (0, 0, 0) and the node spacing, per axis (or one number), in Miller
-        units. With ``rotations`` the box must be centred: origin = -half * step, shape = 2 half + 1.
-    rotations, anomalous: the point group, as StructureFactors takes it; None stores P1.
+        units. With ``point_group`` the box must be centred: origin = -half * step, shape = 2 half + 1.
+    point_group, anomalous: the point group's integer rotations, as StructureFactors' ``rotations``
+        and ``anomalous``; None stores P1 (no operators, no Friedel mates; anomalous then refused).
     refinable: values as an nn.Parameter (the group ``diffuse`` in ExperimentModel), else a buffer.
     outside: "zero" (the grid is zero beyond its box) or "error".
 
@@ -73,7 +95,7 @@ class DiffuseGrid(nn.Module):
     eryx's HKLGrid, with from_values() or from_hkl_grid().
     """
 
-    def __init__(self, values, origin, step, *, shape: Optional[Sequence[int]] = None, rotations=None,
+    def __init__(self, values, origin, step, *, shape: Optional[Sequence[int]] = None, point_group=None,
                  anomalous: bool = False, refinable: bool = True, outside: str = "zero",
                  dtype: torch.dtype = torch.float64, device=None):
         super().__init__()
@@ -96,10 +118,12 @@ class DiffuseGrid(nn.Module):
         self.shape = tuple(int(n) for n in shape)
         if len(self.shape) != 3 or min(self.shape) < 2:
             raise ValueError(f"a grid needs at least 2 nodes per axis, got shape {self.shape}")
-        self.symmetric = rotations is not None or anomalous
+        if point_group is None and anomalous:
+            raise ValueError("anomalous needs a point group: point_group=None stores P1, with no Friedel mates")
+        self.symmetric = point_group is not None
         self._half = None
         if self.symmetric:
-            self._setup_symmetry(rotations, anomalous, device)
+            self._setup_symmetry(point_group, anomalous, device)
         n_values = int(self._keys.numel()) if self.symmetric else self.shape
         stored = torch.zeros(n_values, dtype=dtype, device=device)
         if values is not None:
@@ -127,6 +151,7 @@ class DiffuseGrid(nn.Module):
             raise ValueError("a symmetric grid must be centred on hkl = 0: origin = -half * step, "
                              f"shape = 2 half + 1; got origin {self._origin.tolist()}, shape {self.shape}")
         ops = point_group_operators(rotations, anomalous)
+        _check_group(ops)
         for R in ops:
             i, j = np.nonzero(R)
             if not np.allclose(self._step[i], self._step[j], rtol=1e-12, atol=0):
@@ -163,7 +188,7 @@ class DiffuseGrid(nn.Module):
     def from_values(cls, values, origin, step, **kwargs) -> "DiffuseGrid":
         """A grid from a box of values at hkl = origin + step * (i, j, k) (eryx's HKLGrid layout).
 
-        With ``rotations`` the values are averaged over the symmetry mates inside the box, so a
+        With ``point_group`` the values are averaged over the symmetry mates inside the box, so a
         symmetric box is stored exactly. Other keywords as DiffuseGrid.
         """
         return cls(torch.as_tensor(values), origin, step, **kwargs)
@@ -186,9 +211,9 @@ class DiffuseGrid(nn.Module):
             points and on the half-integer planes.
         chunk: nodes per model call, so that a large grid never holds the model's work for all of
             them at once (None: one call). The model runs under no_grad at the values it stores:
-            with rotations, once per orbit (at its representative, value_hkl()), so it must have
+            with a point group, once per orbit (at a node inside the box, value_hkl()), so it must have
             the point group's symmetry.
-        Other keywords (rotations, anomalous, refinable, outside) as DiffuseGrid.
+        Other keywords (point_group, anomalous, refinable, outside) as DiffuseGrid.
         """
         step = _triple(step, "step")
         if extent is None:
@@ -249,13 +274,21 @@ class DiffuseGrid(nn.Module):
             ny, nz = self.shape[1], self.shape[2]
             index = (flat[:, 0] * ny + flat[:, 1]) * nz + flat[:, 2]
         else:
-            index = torch.cat([torch.searchsorted(self._keys, self._canonical_keys(part))
+            index = torch.cat([self._find(self._canonical_keys(part))
                                for part in flat.split(_LOOKUP_CHUNK)]) if flat.shape[0] else flat[:, 0]
         return index.reshape(ijk.shape[:-1])
 
+    def _find(self, keys: torch.Tensor) -> torch.Tensor:
+        """Positions of orbit keys in _keys, each of which must be there exactly."""
+        index = torch.searchsorted(self._keys, keys).clamp(max=max(self._keys.numel() - 1, 0))
+        if self._keys.numel() == 0 or not bool((self._keys[index] == keys).all()):
+            raise RuntimeError("a node's orbit is not among the grid's orbits: the operators or keys are inconsistent")
+        return index
+
     def value_hkl(self, index: Optional[torch.Tensor] = None) -> torch.Tensor:
         """hkl (n, 3) of stored values (all, or those at ``index`` into values.view(-1)): the nodes of a
-        P1 box, or each orbit's representative (its node of largest key, possibly outside the box)."""
+        P1 box, or for each orbit its node inside the box of largest key (every listed orbit has one), so
+        that a model defined only on the box (another grid, outside="error") can be sampled."""
         device = self.values.device
         if index is None:
             index = torch.arange(self.values.numel(), device=device)
@@ -263,7 +296,12 @@ class DiffuseGrid(nn.Module):
         if not self.symmetric:
             origin = torch.as_tensor(self._origin, dtype=self.values.dtype, device=device)
             return origin + step * self._flat_to_ijk(index).to(self.values.dtype)
-        return step * self._decode(self._keys[index]).to(self.values.dtype)
+        canonical = self._decode(self._keys[index])
+        half = torch.as_tensor(self._half, device=device)
+        mates = sum(canonical[:, None, i, None] * self._ops[None, :, i, :] for i in range(3))  # (n, ops, 3)
+        keys = torch.where((mates.abs() <= half).all(dim=-1), self._encode(mates), torch.full_like(mates[..., 0], -1))
+        inside = mates[torch.arange(mates.shape[0], device=device), keys.argmax(dim=1)]
+        return step * inside.to(self.values.dtype)
 
     def _average_over_mates(self, box: torch.Tensor) -> torch.Tensor:
         total = box.numel()
@@ -282,6 +320,7 @@ class DiffuseGrid(nn.Module):
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
         """Scattering per cell at fractional hkl (n, 3), trilinear in the nodes; on the grid's device."""
         values = self.values
+        query_device, query_dtype = hkl.device, hkl.dtype
         if hkl.device != values.device:
             hkl = hkl.to(dtype=values.dtype).to(device=values.device)
         dtype, device = hkl.dtype, hkl.device
@@ -289,12 +328,17 @@ class DiffuseGrid(nn.Module):
         step = torch.as_tensor(self._step, dtype=dtype, device=device)
         shape = torch.as_tensor(self.shape, device=device)
         u = (hkl - origin) / step
+        finite = torch.isfinite(u).all(dim=-1)
         if self.outside == "error":
+            if not bool(finite.all()):
+                raise ValueError(f"hkl {hkl[~finite][0].tolist()} is not finite (outside='error')")
             beyond = (u < 0) | (u > (shape - 1).to(dtype))
             if bool(beyond.any()):
                 first = hkl[beyond.any(dim=-1)][0].tolist()
                 raise ValueError(f"hkl {first} is outside the grid (origin {self._origin.tolist()}, "
                                  f"step {self._step.tolist()}, shape {self.shape})")
+        nan = torch.isnan(hkl).any(dim=-1)
+        u = torch.where(finite[:, None], u, torch.full_like(u, -2.0))  # +-inf: outside (NaN restored below)
         cell = torch.floor(u.detach())
         fraction = u - cell
         corners = cell.long()[:, None, :] + _CORNERS.to(device)  # (n, 8, 3)
@@ -306,7 +350,12 @@ class DiffuseGrid(nn.Module):
         sides = torch.stack([1 - fraction, fraction], dim=-1)  # (n, 3, 2)
         corner_sides = _CORNERS.to(device)
         weights = sides[:, 0, corner_sides[:, 0]] * sides[:, 1, corner_sides[:, 1]] * sides[:, 2, corner_sides[:, 2]]
-        return (weights * node).sum(dim=-1)
+        result = (weights * node).sum(dim=-1)
+        if bool(nan.any()):
+            result = torch.where(nan, torch.full_like(result, float("nan")), result)
+        if result.device != query_device or result.dtype != query_dtype:
+            result = result.to(device=query_device).to(dtype=query_dtype)  # device first: MPS has no float64
+        return result
 
     def extra_repr(self) -> str:
         storage = f"ASU of {self.values.numel()} orbits" if self.symmetric else "P1"
