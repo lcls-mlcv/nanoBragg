@@ -487,6 +487,7 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 | D1 | the hook: 31d0b2c, 3f653f1, 7b344a4 rebased; `diffuse.py` protocol plus toy models; V0 gate script | V0, full gates |
 | D2 | `ExperimentModel(diffuse=)`, groups diffuse/diffuse_scale, ROI path, components, `SerialExperiment` sharing, D2-T1 shape-integral test, gradient checks | /tdd, V1 |
 | D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test. Done: section 2.2 (error table, memory, decision); `v1_toy_recovery.py --grid` passes, V0 0 differ | V1 on the grid |
+| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory | grid vs exact on a sharp-core toy, V1 on the grid |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
 | (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
@@ -499,7 +500,7 @@ eryx (pushed to `backup` only):
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
-Order: D1 → E1 + D2 → V1 → D3 → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
+Order: D1 → E1 + D2 → V1 → D3 → D3b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
 major goal and on the critical path. The spot-broadening diagnosis runs in parallel from
 the start and must finish before V4. This plan document goes in with D1.
 Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
@@ -514,7 +515,12 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    measured grid-vs-exact error. Measured in D3 (section 2.2): uniform trilinear with the step
    from the bias law (1/18 for the V1 toy with k_d frozen) passes V1, and D3 builds no refined
    core. Real photon counts (1e5–1e6) need step/σ of about 0.05–0.09 (k_d frozen) or 0.02–0.035
-   (free), so the refined or analytic core is decided on V2.
+   (free).
+   **Decided 2026-11-05, after the D3 audit:**
+   - The finer grid near integer hkl is built as its own PR, D3b, before V2.
+   - The V1 grid pass rule stays: bias under 0.1 Fisher sd, with the step from the bias law.
+   - L-BFGS-B's ABNORMAL stops on the grid are accepted for now; an AdamW check comes later.
+   - Refining the grid values with a smoothness restraint is deferred until after V2.
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
    `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
    factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse
