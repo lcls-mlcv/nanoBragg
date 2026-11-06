@@ -132,6 +132,10 @@ class DiffuseModel(Protocol):          # in practice an nn.Module
     # added in D3, optional (not in the runtime check):
     # def grid(self) -> "DiffuseGrid": ...               # values on a reciprocal grid, see 2.2
     # DiffuseGrid.from_model(model, step, d_min=, cell=) samples any model; DiffuseGrid.grid() is itself
+    # added in D3b, optional (not in the runtime check):
+    # def core(self) -> DiffuseModel: ...                # the model's own sharp term near the lattice
+    #                                                    # points, closed form; from_model(core=True)
+    #                                                    # grids only model - core, see 2.2
 ```
 
 - torchBragg ships only the protocol, reference toy models and a grid interpolator:
@@ -331,14 +335,28 @@ reference.
   | candidate | worst z at 1e6 photons | lysozyme memory | lookup |
   |---|---|---|---|
   | uniform 1/8, 1/16, 1/32, 1/64 | 29.8, 5.2, 1.14, 0.38 | 59 MB, 0.47, 3.7, 30 GB | 66–96 ns |
-  | warped tensor grid, 32 nodes a unit (w 0.05; 0.02) | 1.75; 2.6 | 4.2 GB | 72–79 ns |
+  | warped tensor grid, w 0.02, 16; 24; 32 nodes a unit | 11.5; 4.9; 2.6 | 0.53; 1.8; 4.2 GB | 63–72 ns |
+  | warped tensor grid, 24 nodes (w 0.01); 32 nodes (w 0.05) | 6.9; 1.75 | 1.8; 4.2 GB | 69–79 ns |
   | local fine cubes (coarse 1/16, r 0.25, fine 1/64) | 0.39 | 2.6 GB | 180 ns |
   | local fine cubes (coarse 1/32, r 0.125, fine 1/128) | 0.28 | 5.9 GB | 177 ns |
   | **model's core + residual grid, 1/8; 1/16** | **0.057; 0.014** | **59; 468 MB** | 79 ns |
-  | core with M 5% off (1.25, 0.84), 1/8; 1/16 | 0.14; 0.060 | 59; 468 MB | |
-  | core with M 10% off (1.18, 0.88), 1/16 | 0.12 | 468 MB | |
+  | core with M off by errors that cancel, −4%/+5% (1.25, 0.84), 1/8; 1/16 | 0.14; 0.060 | 59; 468 MB | |
+  | core with M off by errors that cancel, −9%/+10% (1.18, 0.88), 1/16 | 0.12 | 468 MB | |
+  | core with M off, all +5% (1.05, 1.365, 0.84), 1/8; 1/16 | 2.29; 0.39 | 59; 468 MB | |
+  | core with M off, all +10%, 1/16 | 0.74 | 468 MB | |
+  | core with κ +2%, 1/8; 1/16 | 1.78; 0.29 | 59; 468 MB | |
+  | core with κ +5%, 1/8; κ +10%, 1/8 | 4.5; 9.0 | 59 MB | |
   | isotropic core (M = 1), 1/16; 1/32 | 0.32; 0.20 | 0.47; 3.7 GB | |
-  | core with κ 10% off, 1/8 | 9.0 | 59 MB | |
+
+  Realistic departures of the truth from the supplied core A(h₀)/(dᵀMd + κ²), z at 1/8, 1/16, 1/32:
+
+  | the truth departs by | z |
+  |---|---|
+  | amplitude varying within the halo (q² and Debye–Waller at hkl, B = 20 Å², the core taking A(h₀)) | 5.9, 1.9, 0.55 |
+  | non-quadratic shape \|d\|²f(d̂), f = 1 + ε(Σd̂⁴ − 3/5)/0.4, ε = 0.1 | 4.6, 1.4, 0.23 |
+  | the same, ε = 0.3 | 11.1, 3.1, 0.66 |
+  | off-diagonal metric, the core given its diagonal | 12.5, 16.1, 22.3 |
+  | off-diagonal metric, the core given it in full | 0.056, 0.014 (1/8, 1/16) |
 
   - **Decided and built: the analytic core.** It is the only candidate that meets the target at
     affordable memory. A tensor grid refines whole planes and lines to reach the points. Fine
@@ -349,18 +367,56 @@ reference.
     - The core is a submodule: its parameters join the group `diffuse`, with gradients in hkl,
       the core and the values (FD and gradcheck).
     - `LorentzianHalo(amplitude, κ, metric)` is the reference core.
-  - **The core must be the model's own term:** κ off by 10% leaves z = 9. For eryx this means
-    `core()` returns the one-phonon leading term with its own k_floor and elastic anisotropy (an
-    E1/E2 item), not a generic fit to it.
-  - The residual is sampled at the core's parameters at build time. If the core's parameters
-    refine far, the residual must be rebuilt (measured on V2).
+  - **The core must be the model's own term, computed from its own parameters.** The audit
+    corrected an earlier claim here. The robustness the first rows suggested held only for errors
+    that cancel; same-sign errors act as an error in κ, and κ off by 2% already gives z = 1.8 at
+    1/8. What eryx's `core()` must reach:
+    - **The rule:** the sharp residual must be under about 1% of the core at step 1/16, and
+      about 4% at 1/32. The core's bias is the uniform grid's (29.8, 5.2, 1.14 at 1/8–1/32)
+      times the residual's share of the core.
+    - **Amplitude:** the q-dependence across the halo (|F(q)|², q², the Debye–Waller factor)
+      evaluated at hkl, not frozen at h₀. A per-lattice-point amplitude table is not enough.
+    - **Shape:** the directional shape from its own elastic or Christoffel term, |k|⁻²f(k̂). A
+      quadratic form misses it by z = 1.4 at 1/16 for a 10% quartic anisotropy.
+    - **Width:** κ, its own k_floor, exactly.
+    - This is an E1/E2 item. Until it exists the D3b decision rests on a core that is not yet
+      shown to exist for eryx.
+  - **LorentzianHalo** takes a full 3 × 3 metric (built). An off-diagonal truth with a diagonal
+    core gives z = 12–22, and with the full metric 0.056 and 0.014. It stays a reference core for
+    tests. A per-lattice-point amplitude would not make it a usable stand-in: the amplitude varies
+    within the halo.
+  - **The frozen residual.** The grid returns core(θ) + [model(θ_b) − core(θ_b)], θ_b the core's
+    parameters at build.
+    - Its gradient in θ is the core's alone.
+    - `core_drift()` exposes |θ − θ_b|. Past `core_drift_tolerance` a warning is given once.
+      The tolerance is a placeholder of 0.05, to be set on V2.
+    - A test with a smooth part that depends on θ shows the stale error growing with the drift.
+    - With refinable values, the residual's values and the core's amplitude are nearly
+      degenerate.
+  - **Checks:**
+    - A core not invariant under the point group is refused at build, by a sampled check.
+    - A core needs 1/(2·step) integer, so that nodes sit on its half-integer kink.
+    - `from_values` refuses `core=`: a residual with its core goes to `DiffuseGrid(values, ...,
+      core=)`.
+    - Outside the box only the core remains.
+  - **Cost:** 2²⁰ lookups, step 1/4, without → with the core: ASU 992 → 1040 ns and P1 71 → 72 ns
+    on the CPU; ASU 330 → 331 ns and P1 15 → 17 ns on MPS. float32: the core's error is under
+    2·ulp(40)·√m/κ.
   - Image table (`grid_vs_exact.py error --size 128 --only sharp sharp+core`; deviance scaled
     to 1e6 photons):
     - without the core, max rel 0.20 / 0.14 / 0.10 and deviance 1.2e4 / 2.0e3 / 350 at steps
       1/8, 1/16, 1/32;
     - with it, max rel 7.5e-5 / 2.0e-5 / 5.1e-6 and deviance 0.73 / 0.053 / 0.003.
-  - V1 `--grid --grid-core` (the halo as the refinable core, with a zero residual) recovers to
-    1e-5 noise-free in all three fits, and flags the hidden toy.
+  - V1 `--grid --grid-core` is a machinery check: the halo is the refinable core, with a zero
+    residual. It recovers to 1e-5 noise-free in all three fits, and flags the hidden toy.
+  - V1 `--sharp`: a Lorentzian core (κ = 0.05) plus a smooth part, on a cored grid.
+    - The step comes from the residual's own bias law, z = K_core·step²·√P, with K_core =
+      0.00276 (measured z: 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8). The rule gives 1/4 at 24²
+      and 1/8 at 1e6 photons. Noise-free bias: 0.0165 sd.
+    - The core is 1.25 spot sds, so it is weakly identified: ratio 10, like the hidden toy.
+    - With Poisson noise its z is reported, not gated. The exact halo fails there too (seed 3,
+      joint: z 15.7 exact, 34 on the grid, both ABNORMAL). The other fits and seeds agree
+      between grid and exact to about 0.01.
 - Pixels: diffuse fits do not need every pixel. A ROI set with a strided subset between
   spots (mask out ±n px around predicted spots, then stride) keeps one shot at 1e4–1e5
   pixels.
@@ -528,7 +584,7 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 | D1 | the hook: 31d0b2c, 3f653f1, 7b344a4 rebased; `diffuse.py` protocol plus toy models; V0 gate script | V0, full gates |
 | D2 | `ExperimentModel(diffuse=)`, groups diffuse/diffuse_scale, ROI path, components, `SerialExperiment` sharing, D2-T1 shape-integral test, gradient checks | /tdd, V1 |
 | D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test. Done: section 2.2 (error table, memory, decision); `v1_toy_recovery.py --grid` passes, V0 0 differ | V1 on the grid |
-| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2) | grid vs exact on a sharp-core toy, V1 on the grid |
+| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2) | `core_candidates.py` (bias at 1e6 photons per candidate and core error), `grid_vs_exact.py error --only sharp sharp+core` at 128², V1 `--grid --grid-core` (machinery) and `--sharp` (noise-free bias under the residual's law), FD and gradcheck, V0 |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
 | (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
