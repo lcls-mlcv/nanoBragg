@@ -444,9 +444,13 @@ def get_truth(toy, wanted):
     raise KeyError(wanted)
 
 
-def _refit(toy, size, name, device, grid, data, start, fixed=None):
+def _refit(toy, size, name, device, grid, data, start, fixed=None, return_model=False):
     """The deviance minimum with every parameter of the fit refined from ``start`` except ``fixed``
-    (key, value), held at its value: one point of a profile."""
+    (key, value), held at its value: one point of a profile.
+
+    A held component of a vector parameter (one of the misset angles) shares its tensor with refined
+    components, so it is held by a gradient mask and re-imposed at every evaluation; a held scalar is
+    simply not refined."""
     fit = fits(grid, toy)[name]
     values = toy.truth()
     model = build(toy, size, fit["diffuse"], fit["bragg"], device, grid)
@@ -454,14 +458,34 @@ def _refit(toy, size, name, device, grid, data, start, fixed=None):
         put(model, key, values[key])
     for key in fit["refine"]:
         put(model, key, start[key])
+    held = None
     if fixed is not None:
         put(model, fixed[0], fixed[1])
     for key in fit["refine"]:
         if fixed is None or key != fixed[0]:
             model.refine(key[0])
-    refine_lbfgsb(model, lambda: deviance(image(model), data), ftol=1e-15, gtol=1e-10, maxiter=1000)
+    if fixed is not None and fixed[1] is not None and fixed[0][1] is not None:
+        parameter, component = _parameter(model, fixed[0])
+        if parameter.requires_grad:  # other components of the tensor refine: hold this one
+            mask = torch.ones_like(parameter)
+            mask[component] = 0
+            held = parameter.register_hook(lambda g: g * mask)
+
+    def objective():
+        if held is not None:
+            put(model, fixed[0], fixed[1])
+        return deviance(image(model), data)
+
+    try:
+        refine_lbfgsb(model, objective, ftol=1e-15, gtol=1e-10, maxiter=1000)
+    finally:
+        if held is not None:
+            held.remove()
+    if held is not None:
+        put(model, fixed[0], fixed[1])
     with torch.no_grad():
-        return float(deviance(image(model), data))
+        value = float(deviance(image(model), data))
+    return (value, model) if return_model else value
 
 
 def profile(toy, size, name, device, grid, data, fitted, key, sd, nll_min):
@@ -470,9 +494,12 @@ def profile(toy, size, name, device, grid, data, fitted, key, sd, nll_min):
     Fisher sd, doubling up to 16 sds, then bisected five times; an end not reached is +-inf."""
     estimate, truth = fitted[key], toy.truth()[key]
     at_truth = _refit(toy, size, name, device, grid, data, fitted, (key, truth))
-    best = min(nll_min, at_truth)
-    delta = max(at_truth - best, 0.0)
-    z = math.copysign(math.sqrt(2 * delta), estimate - truth)
+    # a profile point below the main fit's minimum means the main fit stopped short: flagged, and the
+    # profile is measured from the main fit's value as it is, not from a substituted minimum
+    short_by = max(nll_min - at_truth, 0.0)
+    best = nll_min
+    delta = at_truth - best
+    z = math.copysign(math.sqrt(2 * max(delta, 0.0)), estimate - truth)
     interval = []
     for direction in (-1, 1):
         inside, width = 0.0, sd
@@ -492,7 +519,7 @@ def profile(toy, size, name, device, grid, data, fitted, key, sd, nll_min):
             else:
                 inside = mid
         interval.append(estimate + direction * 0.5 * (inside + outside))
-    return {"z": z, "delta_nll": delta, "interval": interval}
+    return {"z": z, "delta_nll": delta, "interval": interval, "main_fit_short_by": short_by}
 
 
 def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid=None):
@@ -544,6 +571,8 @@ def run_fit(name, size, poisson, seed, toy=TOYS["separable"], device="cpu", grid
         "errors": errors,
         "z": z,
         "profile": profiles,  # the parameters whose Fisher sd exceeds PROFILE_SD: z, delta_nll, interval
+        # the main fit stopped short of a minimum a profile refit found (NLL units; 0 when it did not)
+        "stopped_short_by": max([p["main_fit_short_by"] for p in profiles.values()], default=0.0),
         "z_gate": {lab: profiles[lab]["z"] if lab in profiles else value for lab, value in z.items()},
         "fisher_sd": dict(zip(labels, sd.tolist())),
         "fisher_condition": float(np.linalg.cond(information)),
@@ -585,7 +614,8 @@ def evaluate(toy_name, size, poisson, seeds, device="cpu", noise_free_tolerance=
     return {"toy": toy_name, **asdict(toy), "spot_sd": toy.spot_sd, "size": size, "poisson": poisson,
             "grid": None if grid is None else asdict(grid),
             "separability": ratios, "worst_ratio": worst_ratio, "separable": separable,
-            "worst_recovery": worst_recovery, "worst_scale_bias": worst_scale_bias, "recovered": recovered, "passed": separable and recovered,
+            "worst_recovery": worst_recovery, "worst_scale_bias": worst_scale_bias,
+            "stopped_short": [(r["fit"], r["seed"], r["stopped_short_by"]) for r in runs if r["stopped_short_by"] > 1e-6], "recovered": recovered, "passed": separable and recovered,
             "fits": runs}
 
 
@@ -622,6 +652,8 @@ def main(argv=None):
               + ("" if grid is None else f" (grid step 1/{round(1 / grid.step)}, k_d {grid.kd})")
               + ("" if report["worst_scale_bias"] is None else
                  f", worst scale bias {report['worst_scale_bias']:.1e} in log (limit {SCALE_ABS_LIMIT})"))
+        if report["stopped_short"]:
+            print(f"  main fits that stopped short of a minimum a profile found: {report['stopped_short']}")
         for r in report["fits"]:
             print(f"  {r['fit']:8s} seed {r['seed']} converged={r['converged']} scaled cond "
                   f"{r['fisher_condition_scaled']:.1e} photons {r['photons']}")

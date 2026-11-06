@@ -10,6 +10,7 @@ from pathlib import Path
 os.environ.setdefault("NANOBRAGG_DISABLE_COMPILE", "1")
 
 import pytest
+import torch
 
 pytest.importorskip("scipy")
 _PATH = Path(__file__).resolve().parent.parent / "scripts" / "diffuse" / "v1_toy_recovery.py"
@@ -322,3 +323,28 @@ def test_the_noise_free_grid_verdict_uses_the_per_parameter_rule():
                          grid=v1.GridSpec(v1.grid_step_for(v1.TOYS["separable"], 24), "frozen"))
     assert report["recovered"] and report["worst_scale_bias"] < v1.SCALE_ABS_LIMIT
     assert report["worst_recovery"] < v1.GRID_BIAS_LIMIT
+
+
+# Final audit (2026-11-06)
+
+def test_a_profile_holds_one_component_of_a_vector_parameter():
+    """Holding misset[1] must not let the rest of the misset tensor re-optimise it (the first version
+    refined the whole tensor: a held value 50 sds off cost nothing)."""
+    toy = v1.TOYS["separable"]
+    truth = v1.truth_model(toy, "bragg", 24)
+    with torch.no_grad():
+        data = v1.image(truth)
+    start = {key: toy.truth()[key] for key in v1.FITS["bragg"]["refine"]}
+    held = (v1.MISSET[1], toy.truth()[v1.MISSET[1]] + 0.01)
+    deviance, model = v1._refit(toy, 24, "bragg", "cpu", None, data, start, held, return_model=True)
+    assert v1.get(model, v1.MISSET[1]) == held[1]
+    assert deviance > 1.0  # 50 sds off the truth in noise-free data is far from free
+
+
+def test_a_main_fit_that_stopped_short_is_flagged_not_hidden(monkeypatch):
+    calls = iter([90.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(v1, "_refit", lambda *a, **k: next(calls))
+    out = v1.profile(v1.TOYS["separable"], 24, "diffuse", "cpu", None, None,
+                     {v1.HALO[1]: math.log(0.3)}, v1.HALO[1], 0.6, nll_min=95.0)
+    assert out["main_fit_short_by"] == pytest.approx(5.0)
+    assert out["delta_nll"] == pytest.approx(-5.0)  # reported as is, not clamped to a substituted minimum
