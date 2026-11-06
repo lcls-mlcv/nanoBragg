@@ -52,3 +52,26 @@ def test_the_gate_passes_with_its_exit_code_and_writes_its_report(tmp_path):
 def test_poisson_recovery_is_within_the_fisher_errors():
     report = v1.evaluate("separable", 24, poisson=True, seeds=[3])
     assert report["passed"], (report["worst_ratio"], report["worst_recovery"])
+
+
+def _photons(toy, size, oversample=1):
+    """(diffuse, Bragg) photons of the joint truth image at a size."""
+    import torch
+    model = v1.truth_model(toy, "joint", size, oversample=oversample)
+    with torch.no_grad():
+        model()
+    return float(model.components["diffuse"].sum()), float(model.components["bragg"].sum())
+
+
+def test_photons_per_solid_angle_do_not_change_with_size():
+    """The detector's extent is fixed (12.8 mm at 60 mm); a finer grid of pixels must split the same
+    photons, not lose them as size^-2 (the first version scaled the fluence by (24 / size)^2 as well).
+
+    The halo is compared at pixel centres, 24^2 against 48^2. The spots (sd 0.04 in h) are compared
+    integrated (subpixels 0.033 in h apart) and at 48^2 against 96^2: at 24^2 one spot sits on the
+    detector's edge, and MOSFLM's beam centre, which moves by half a pixel with the pixel size, takes
+    4.8% of the Bragg photons off it (measured: 3.589e6 at 24^2 whatever the oversampling, 3.769e6 and
+    3.770e6 at 48^2 and 96^2)."""
+    toy = v1.TOYS["separable"]
+    assert _photons(toy, 48)[0] == pytest.approx(_photons(toy, 24)[0], rel=0.05)
+    assert _photons(toy, 96, oversample=2)[1] == pytest.approx(_photons(toy, 48, oversample=4)[1], rel=0.05)

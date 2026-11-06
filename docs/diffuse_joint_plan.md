@@ -332,12 +332,21 @@ Each rung uses the result of the one before; real data only after synthetic reco
       - N = 10 (spot sd 0.040): 40, 2.2, 1.28, 1.23.
       - corr(amplitude, σ) is about −0.9 in every joint fit.
     - **The gate toy:** N = 10, σ = 0.3 (7.5 spot sds). Peak 128 e² per cell under F = 100.
-      At 24² that is 8.4 diffuse photons a pixel under spots of 9e5; the fluence keeps photons
-      per solid angle fixed, so 0.17 a pixel at 64². Ratios are 1.28 (amplitude), 1.11 (σ) and
-      1.00 for G, misset and cell. Poisson |z| ≤ 2.3 over seeds 1–3 at 64².
+      At 24² that is 8.4 diffuse photons a pixel under spots of 9e5 (about 4800 diffuse photons
+      over the image). The fluence is the same at every size, so photons per solid angle are
+      fixed: 1.2 a pixel at 64², 0.30 at 128², the same total.
+      - **Corrected 2026-11-05.** The first version also scaled the fluence by (24/size)². That
+        cut the photons as size⁻²: 0.17 a pixel and 680 over the image at 64², 28× fewer at 128².
+        The diagnosis is the D3b sharp_wide failure at 128² (101 diffuse photons), in section 2.2
+        of the D3b plan.
+      - Ratios are 1.28 (amplitude), 1.11 (σ) and 1.00 for G, misset and cell. They do not
+        depend on the photons.
+      - Poisson |z| ≤ 2.3 over seeds 1–3 at 64² was measured at the old, lower photon level and
+        is to be re-measured.
     - **Negative case:** the first toy, N = 5 and σ = 0.12 (1.5 spot sds). The halo hides under
       the spots: ratios 14 (amplitude) and 4.5 (σ). At 128² with seed 1 the joint fit
-      collapsed σ to 0.025 (z = −4.9, at 128²). The report flags it as weakly identified.
+      collapsed σ to 0.025 (z = −4.9). That was at the old photon level, 28× too low, and is to
+      be re-measured. The report flags it as weakly identified.
 - **V2 eryx synthetic recovery:**
   - lysozyme from a public PDB in the SBGrid 747 cell, stills and a rotation wedge, with
     known springs, solvent, G and misset;

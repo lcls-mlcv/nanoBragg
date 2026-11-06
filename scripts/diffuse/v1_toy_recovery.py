@@ -75,7 +75,7 @@ class Toy:
     n_cells: int = 10
     sigma: float = 0.3
     amplitude: float = 128.0
-    fluence: float = 2e29  # at 24 x 24 pixels; scaled so that photons per solid angle do not change with size
+    fluence: float = 2e29  # the same at every size: the detector's extent is fixed, so its photons per solid angle are
 
     @property
     def spot_sd(self) -> float:
@@ -100,13 +100,13 @@ TOYS = {
 }
 
 
-def build(toy, size, diffuse, bragg, device="cpu"):
+def build(toy, size, diffuse, bragg, device="cpu", oversample=1):
     n = toy.n_cells
     crystal = CrystalConfig(cell_a=30.0, cell_b=35.0, cell_c=40.0, misset_deg=(5.0, -3.0, 2.0), N_cells=(n, n, n),
                             default_F=100.0 if bragg else 0.0, shape=CrystalShape.GAUSS, spot_metric=SpotMetric.HKL)
-    detector = DetectorConfig(distance_mm=60.0, pixel_size_mm=12.8 / size, spixels=size, fpixels=size, oversample=1,
+    detector = DetectorConfig(distance_mm=60.0, pixel_size_mm=12.8 / size, spixels=size, fpixels=size, oversample=oversample,
                               detector_convention=DetectorConvention.MOSFLM, detector_pivot=DetectorPivot.BEAM)
-    beam = BeamConfig(wavelength_A=1.2, fluence=toy.fluence * (24.0 / size) ** 2)
+    beam = BeamConfig(wavelength_A=1.2, fluence=toy.fluence)
     halo = GaussianHalo(*toy.start_halo()) if diffuse else None
     model = ExperimentModel(crystal, detector, beam, dtype=DTYPE, device=torch.device(device), diffuse=halo,
                             crystal_system="orthorhombic")
@@ -168,8 +168,8 @@ def fisher(model, keys, step=1e-6):
     return (J[keep] / mu[keep, None]).T @ J[keep]
 
 
-def truth_model(toy, fit, size, device="cpu"):
-    model = build(toy, size, FITS[fit]["diffuse"], FITS[fit]["bragg"], device)
+def truth_model(toy, fit, size, device="cpu", oversample=1):
+    model = build(toy, size, FITS[fit]["diffuse"], FITS[fit]["bragg"], device, oversample)
     truth = toy.truth()
     for key in [SCALE, *MISSET, *CELL] + (HALO if FITS[fit]["diffuse"] else []):
         put(model, key, truth[key])
