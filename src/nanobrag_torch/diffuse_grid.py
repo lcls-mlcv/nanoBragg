@@ -36,6 +36,15 @@ Device and dtype: the result is on the query's device and in its dtype, as for t
 The interpolation runs where the values are (a large grid is not copied per call): a query on
 another device is moved there, in the values' dtype, and the result moved back.
 
+With a ``core`` (D3b), a cheap closed-form DiffuseModel for the sharp part near the lattice points
+that the model supplies (DiffuseModel.core), the grid holds model - core and its value is
+core(hkl) + the residual's interpolant. The core is a submodule, so its parameters refine with the
+values (group ``diffuse``); the residual was sampled at the core's parameters when built, so a core
+that moves far from them should be followed by a rebuild. Measured (plan section 2.2, V1's current
+rules): on a 1/k^2-like core with a k floor of 0.05, a uniform grid needs a step of 1/64 (30 GB for
+lysozyme) to keep the bias under 0.05 sd at 1e6 photons; with the model's own core, 1/8 does on the toy
+(59 MB). For eryx's lysozyme model the recommendation is an order-3 core at 1/32 (about 3.7 GB).
+
 Trilinear interpolation is exact for multilinear functions and its error elsewhere is bounded by
 (step^2 / 8) times the second derivatives, per axis. Its gradient in hkl is constant within a cell
 and jumps at the cell faces; finite-difference checks must not straddle one.
@@ -43,6 +52,7 @@ and jumps at the cell faces; finite-difference checks must not straddle one.
 from __future__ import annotations
 
 import math
+import warnings
 from typing import Optional, Sequence, Union
 
 import numpy as np
@@ -97,8 +107,9 @@ class DiffuseGrid(nn.Module):
 
     def __init__(self, values, origin, step, *, shape: Optional[Sequence[int]] = None, point_group=None,
                  anomalous: bool = False, refinable: bool = True, outside: str = "zero",
-                 dtype: torch.dtype = torch.float64, device=None):
+                 dtype: torch.dtype = torch.float64, device=None, core=None):
         super().__init__()
+        self.core = core  # an nn.Module core registers as a submodule
         if outside not in ("zero", "error"):
             raise ValueError(f"outside must be 'zero' or 'error', got {outside!r}")
         self.outside = outside
@@ -140,6 +151,49 @@ class DiffuseGrid(nn.Module):
             self.values = nn.Parameter(stored)
         else:
             self.register_buffer("values", stored)
+        if core is not None:
+            self._setup_core(core)
+
+    def _setup_core(self, core) -> None:
+        """Checks a core and records its parameters at build, theta_b (see forward)."""
+        on_planes = (np.allclose(0.5 / self._step, np.round(0.5 / self._step), rtol=0, atol=1e-9)
+                     and np.allclose(self._origin / self._step, np.round(self._origin / self._step), rtol=0, atol=1e-9))
+        if not on_planes:
+            raise ValueError(f"with a core, the nodes must lie on the half-integer planes: 1 / (2 step) an integer "
+                             f"and the origin a multiple of the step (step {self._step.tolist()}, origin "
+                             f"{self._origin.tolist()}): the nearest-lattice-point core has a kink there")
+        if self.symmetric:
+            g = torch.Generator().manual_seed(0)
+            device = self.values.device
+            half = torch.as_tensor(self._half * self._step, dtype=torch.float64)
+            hkl = ((torch.rand(256, 3, generator=g, dtype=torch.float64) * 2 - 1) * half).to(device)
+            with torch.no_grad():
+                computed = torch.as_tensor(core(hkl))
+                # the tolerance follows the dtype the core computes in: 1e-9 in float64, 1e3 eps otherwise
+                eps = torch.finfo(computed.dtype).eps if computed.is_floating_point() else 0.0
+                rtol = 1e-9 if computed.dtype == torch.float64 else 1e3 * eps
+                reference = computed.double()
+                for R in self._ops.to(torch.float64):
+                    mate = torch.as_tensor(core(hkl @ R)).double()
+                    if not torch.allclose(mate, reference, rtol=rtol, atol=rtol * 1e-3 * float(reference.abs().max())):
+                        raise ValueError(f"the core is not invariant under the point group (operator {R.long().tolist()}): "
+                                         "the grid stores one residual per orbit, so the core must have its symmetry")
+        self._core_reference = ({name: p.detach().clone().cpu() for name, p in core.named_parameters()}
+                                if isinstance(core, nn.Module) else {})
+        self.core_drift_tolerance = 0.05  # placeholder, to be set on V2 (plan section 2.2)
+        # forward checks the drift on its first call and every core_drift_check_every calls (0: never;
+        # core_drift() on demand): each check copies the core's parameters to the host, a sync on a GPU
+        self.core_drift_check_every = 64
+        self._core_calls = 0
+        self._core_drift_warned = False
+
+    def core_drift(self) -> float:
+        """The largest change of any core parameter since the residual was sampled (theta - theta_b, in the
+        parameters' own units: for log parameters a relative change)."""
+        if self.core is None or not self._core_reference:
+            return 0.0
+        params = dict(self.core.named_parameters())
+        return max(float((params[name].detach().cpu() - ref).abs().max()) for name, ref in self._core_reference.items())
 
     # -- construction ---------------------------------------------------------------------------
 
@@ -189,8 +243,13 @@ class DiffuseGrid(nn.Module):
         """A grid from a box of values at hkl = origin + step * (i, j, k) (eryx's HKLGrid layout).
 
         With ``point_group`` the values are averaged over the symmetry mates inside the box, so a
-        symmetric box is stored exactly. Other keywords as DiffuseGrid.
+        symmetric box is stored exactly. Other keywords as DiffuseGrid, except ``core``: the values here
+        are a model's, and adding a core to them would count it twice. A residual (model - core) with
+        its core goes to DiffuseGrid(values, origin, step, core=...) directly.
         """
+        if kwargs.get("core") is not None:
+            raise ValueError("from_values takes a model's values; a residual with its core goes to "
+                             "DiffuseGrid(values, origin, step, core=...)")
         return cls(torch.as_tensor(values), origin, step, **kwargs)
 
     @classmethod
@@ -201,7 +260,7 @@ class DiffuseGrid(nn.Module):
     @classmethod
     def from_model(cls, model, step: Union[float, Sequence[float]], extent: Optional[Sequence[float]] = None,
                    d_min: Optional[float] = None, cell: Optional[Sequence[float]] = None,
-                   chunk: Optional[int] = 1 << 18, dtype: torch.dtype = torch.float64, device=None,
+                   chunk: Optional[int] = 1 << 18, dtype: torch.dtype = torch.float64, device=None, core=None,
                    **kwargs) -> "DiffuseGrid":
         """Sample a DiffuseModel on the box |h_i| <= extent_i, centred on hkl = 0, nodes step apart.
 
@@ -213,8 +272,14 @@ class DiffuseGrid(nn.Module):
             them at once (None: one call). The model runs under no_grad at the values it stores:
             with a point group, once per orbit (at a node inside the box, value_hkl()), so it must have
             the point group's symmetry.
+        core: a DiffuseModel for the model's sharp part, or True for ``model.core()``. The grid then
+            stores model - core (sampled under no_grad) and adds the core back at every query.
         Other keywords (point_group, anomalous, refinable, outside) as DiffuseGrid.
         """
+        if core is True:
+            if not callable(getattr(model, "core", None)):
+                raise ValueError("core=True needs a model with a core() method")
+            core = model.core()
         step = _triple(step, "step")
         if extent is None:
             if d_min is None or cell is None:
@@ -222,7 +287,8 @@ class DiffuseGrid(nn.Module):
             extent = np.asarray(cell, dtype=np.float64)[:3] / float(d_min)
         extent = _triple(extent, "extent")
         half = np.ceil(extent / step - 1e-9).astype(np.int64) + 1
-        grid = cls(None, -half * step, step, shape=tuple(2 * half + 1), dtype=dtype, device=device, **kwargs)
+        grid = cls(None, -half * step, step, shape=tuple(2 * half + 1), dtype=dtype, device=device, core=core,
+                   **kwargs)
         total = grid.values.numel()
         chunk = total if chunk is None else int(chunk)
         with torch.no_grad():
@@ -230,8 +296,10 @@ class DiffuseGrid(nn.Module):
             for start in range(0, total, chunk):
                 stop = min(start + chunk, total)
                 hkl = grid.value_hkl(torch.arange(start, stop, device=flat_values.device))
-                flat_values[start:stop] = torch.as_tensor(model(hkl)).to(dtype=flat_values.dtype,
-                                                                           device=flat_values.device)
+                sampled = torch.as_tensor(model(hkl))
+                if core is not None:
+                    sampled = sampled - torch.as_tensor(core(hkl)).to(sampled)
+                flat_values[start:stop] = sampled.to(dtype=flat_values.dtype, device=flat_values.device)
         return grid
 
     # -- geometry of the nodes --------------------------------------------------------------------
@@ -249,10 +317,12 @@ class DiffuseGrid(nn.Module):
         return self
 
     def nbytes(self) -> int:
-        """Bytes held: the values, plus the orbit keys of a symmetric grid."""
+        """Bytes held: the values, the orbit keys of a symmetric grid, and the core's parameters and buffers."""
         held = self.values.numel() * self.values.element_size()
         if self.symmetric:
             held += self._keys.numel() * self._keys.element_size()
+        if isinstance(self.core, nn.Module):
+            held += sum(t.numel() * t.element_size() for t in list(self.core.parameters()) + list(self.core.buffers()))
         return held
 
     def _flat_to_ijk(self, flat: torch.Tensor) -> torch.Tensor:
@@ -318,7 +388,32 @@ class DiffuseGrid(nn.Module):
     # -- evaluation ---------------------------------------------------------------------------------
 
     def forward(self, hkl: torch.Tensor) -> torch.Tensor:
-        """Scattering per cell at fractional hkl (n, 3), trilinear in the nodes; on the grid's device."""
+        """Scattering per cell at fractional hkl (n, 3): trilinear in the nodes, plus the core if any.
+
+        With a core the residual is frozen: the grid returns core(theta) + [model(theta_b) - core(theta_b)],
+        theta_b the core's parameters when the residual was sampled. Its gradient in theta is the core's
+        alone; any dependence of the rest of the model on theta is not in it, and a core that is not the
+        model's exact sharp term leaves a sharp residual fixed at theta_b while the core moves.
+        core_drift() is |theta - theta_b|; past core_drift_tolerance (0.05, a placeholder to be set on V2)
+        a warning is given, once: rebuild the grid there. forward checks it on its first call and every
+        core_drift_check_every calls (64; 0 for never), since each check syncs the core's parameters to
+        the host. With refinable values the residual's values and
+        the core's amplitude are nearly degenerate (both scale the halo near the lattice points); refine
+        one of them. Outside the box the residual is zero (or an error) and the core remains.
+        """
+        result = self._interpolate(hkl)
+        if self.core is not None:
+            check = (not self._core_drift_warned and self.core_drift_check_every > 0
+                     and self._core_calls % self.core_drift_check_every == 0)
+            self._core_calls += 1
+            if check and self.core_drift() > self.core_drift_tolerance:
+                self._core_drift_warned = True
+                warnings.warn(f"the core's parameters drifted {self.core_drift():.3g} from where the residual was "
+                              f"sampled (tolerance {self.core_drift_tolerance}): rebuild the grid", UserWarning)
+            result = result + torch.as_tensor(self.core(hkl)).to(device=result.device).to(dtype=result.dtype)
+        return result
+
+    def _interpolate(self, hkl: torch.Tensor) -> torch.Tensor:
         values = self.values
         query_device, query_dtype = hkl.device, hkl.dtype
         if hkl.device != values.device:
@@ -360,4 +455,5 @@ class DiffuseGrid(nn.Module):
     def extra_repr(self) -> str:
         storage = f"ASU of {self.values.numel()} orbits" if self.symmetric else "P1"
         return (f"shape={self.shape}, origin={self._origin.tolist()}, step={self._step.tolist()}, {storage}, "
-                f"outside={self.outside!r}, refinable={isinstance(self.values, nn.Parameter)}")
+                f"outside={self.outside!r}, refinable={isinstance(self.values, nn.Parameter)}, "
+                f"core={'yes' if self.core is not None else 'no'}")

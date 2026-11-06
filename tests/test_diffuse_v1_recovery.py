@@ -10,6 +10,7 @@ from pathlib import Path
 os.environ.setdefault("NANOBRAGG_DISABLE_COMPILE", "1")
 
 import pytest
+import torch
 
 pytest.importorskip("scipy")
 _PATH = Path(__file__).resolve().parent.parent / "scripts" / "diffuse" / "v1_toy_recovery.py"
@@ -85,9 +86,11 @@ def test_the_step_rule_is_the_bias_law_solved_for_the_target():
         step = v1.grid_step_for(toy, 24, kd)
         assert abs(round(1 / (2 * step)) - 1 / (2 * step)) < 1e-9  # a half-integer divisor: nodes on the kinks
         assert v1.predicted_grid_bias(step, toy.sigma, photons, kd) <= v1.GRID_BIAS_TARGET
+        assert v1.predicted_scale_bias(step, toy.sigma, kd) <= v1.SCALE_ABS_TARGET
         coarser = 1 / (1 / step - 2)
-        assert v1.predicted_grid_bias(coarser, toy.sigma, photons, kd) > v1.GRID_BIAS_TARGET
-    assert v1.GRID_BIAS_TARGET <= v1.GRID_BIAS_LIMIT / 2
+        assert (v1.predicted_grid_bias(coarser, toy.sigma, photons, kd) > v1.GRID_BIAS_TARGET
+                or v1.predicted_scale_bias(coarser, toy.sigma, kd) > v1.SCALE_ABS_TARGET)
+    assert v1.GRID_BIAS_TARGET <= v1.GRID_BIAS_LIMIT / 2 and v1.SCALE_ABS_TARGET <= v1.SCALE_ABS_LIMIT / 2
 
 
 # fluence scales, per k_d mode: the rule's step changes with the photons and the bias stays under the limit
@@ -97,19 +100,24 @@ FLUENCES = [("frozen", 1.0), ("frozen", 4.0), ("free", 1 / 16), ("free", 1 / 4)]
 @pytest.mark.parametrize("kd,scale", FLUENCES)
 @pytest.mark.parametrize("fit", ["diffuse", "joint"])
 def test_noise_free_on_the_grid_the_bias_follows_the_rule(kd, scale, fit):
-    """Data from the exact halo, model on the grid at the rule's step for these photons."""
+    """Data from the exact halo, model on the grid at the rule's step for these photons. With k_d and
+    the grid frozen and the geometry given, a diffuse-alone fit has nothing to refine and is not run."""
     base = v1.TOYS["separable"]
     toy = dataclasses.replace(base, fluence=base.fluence * scale)
     step = v1.grid_step_for(toy, 24, kd)
+    if fit not in v1.fits(v1.GridSpec(step, kd), toy):
+        assert (fit, kd) == ("diffuse", "frozen")
+        return
     result = v1.run_fit(fit, size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(step, kd))
-    # not result["converged"]: on the interpolant's kinks L-BFGS-B may end in its line search (see the script)
-    assert result["iterations"] > 10
+    # not result["converged"]: on the interpolant's kinks L-BFGS-B may end in its line search (see the script);
+    # the diffuse-alone fit refines k_d alone (geometry given) and needs only a few iterations
+    assert result["iterations"] > (10 if fit == "joint" else 1)
     assert ("diffuse_params.delta_log_scale" in result["errors"]) == (kd == "free")
-    worst = max(abs(z) for z in result["z"].values())
-    assert worst < v1.GRID_BIAS_LIMIT, (step, result["z"])
-    # the law predicts the worst bias to within a factor of 1.5 (it is fitted on the worst fit, the diffuse one)
-    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), kd)
-    assert worst < 1.5 * predicted
+    worst, scale = v1.grid_bias(result)
+    assert worst < v1.GRID_BIAS_LIMIT and scale < v1.SCALE_ABS_LIMIT, (step, result["z"], result["errors"])
+    # each law bounds its part (fitted on the worst fit at two steps)
+    assert worst < 1.5 * v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), kd)
+    assert scale < 1.5 * v1.predicted_scale_bias(step, toy.sigma, kd)
 
 
 def test_the_rule_gives_a_finer_step_for_more_photons():
@@ -120,6 +128,83 @@ def test_the_rule_gives_a_finer_step_for_more_photons():
 
 def test_the_grid_gate_passes_with_its_exit_code():
     assert v1.main(["--size", "24", "--grid"]) == 0
+
+
+# --grid-core (D3b): the halo is the grid's core, refinable; the residual (zero for this toy) on the grid
+
+@pytest.mark.parametrize("fit", sorted(v1.FITS))
+def test_noise_free_recovery_with_the_halo_as_the_grids_core(fit):
+    grid = v1.GridSpec(1 / 8, kd="frozen", core=True)
+    result = v1.run_fit(fit, size=24, poisson=False, seed=0, grid=grid)
+    if fit != "bragg":
+        assert "diffuse_params.model.core.log_sigma" in result["errors"]
+    for label, error in result["errors"].items():
+        assert abs(error) < 1e-5, (label, error)
+
+
+def test_the_core_gate_passes_and_flags_the_hidden_toy():
+    assert v1.main(["--size", "24", "--grid", "0.125", "--grid-core"]) == 0
+
+
+# --sharp (D3b audit): a Lorentzian core (kappa = 0.5 / N) with a smooth residual the grid carries,
+# under the bias law for the residual: z = K_core step^2 sqrt(P)
+
+def test_the_sharp_toys_step_follows_the_residuals_bias_law():
+    toy = v1.EXTRA_TOYS["sharp"]
+    photons = v1.diffuse_photons(toy, 24)
+    step = v1.grid_step_for(toy, 24, core=True)
+    assert v1.predicted_grid_bias(step, toy.sigma, photons, core=True, core_k=toy.core_bias_k) <= v1.GRID_BIAS_TARGET
+    assert v1.predicted_scale_bias(step, toy.sigma, core=True, core_c=toy.core_scale_c) <= v1.SCALE_ABS_TARGET
+    if step < 0.5:  # a coarser 1/(2n) breaks one of the two
+        coarser = 1 / (1 / step - 2)
+        assert (v1.predicted_grid_bias(coarser, toy.sigma, photons, core=True, core_k=toy.core_bias_k) > v1.GRID_BIAS_TARGET
+                or v1.predicted_scale_bias(coarser, toy.sigma, core=True, core_c=toy.core_scale_c) > v1.SCALE_ABS_TARGET)
+
+
+@pytest.mark.parametrize("fit", ["diffuse", "joint"])
+def test_noise_free_on_the_cored_grid_the_sharp_toy_meets_the_bias_rule(fit):
+    toy = v1.EXTRA_TOYS["sharp"]
+    step = v1.grid_step_for(toy, 24, core=True)
+    result = v1.run_fit(fit, size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(step, core=True))
+    assert "diffuse_params.model.core.log_kappa" in result["errors"]
+    worst, scale = v1.grid_bias(result)
+    predicted = v1.predicted_grid_bias(step, toy.sigma, v1.diffuse_photons(toy, 24), core=True, core_k=toy.core_bias_k)
+    assert worst < v1.GRID_BIAS_LIMIT and worst < 1.5 * predicted, result["z"]
+    assert scale < v1.SCALE_ABS_LIMIT
+
+
+def test_the_sharp_gate_passes_on_the_bias_and_reports_the_core_as_weakly_identified():
+    """kappa = 0.05 is 1.25 spot sds: like the hidden toy its core trades with the spots (about 10)."""
+    report = v1.evaluate("sharp", 24, poisson=False, seeds=[0],
+                         grid=v1.GridSpec(v1.grid_step_for(v1.EXTRA_TOYS["sharp"], 24, core=True), core=True))
+    assert report["recovered"] and not report["separable"]
+    assert v1.main(["--size", "24", "--sharp"]) == 0
+
+
+def test_the_cored_grids_residual_is_built_at_the_fits_start_and_the_drift_is_recorded():
+    """As a real fit would: the leftover is sampled at the starting core, so the drift counts from there."""
+    toy = v1.EXTRA_TOYS["sharp"]
+    model = v1.build(toy, 24, diffuse=True, bragg=False, grid=v1.GridSpec(1 / 4, core=True))
+    assert model.diffuse.core_drift() == 0.0
+    result = v1.run_fit("diffuse", size=24, poisson=False, seed=0, toy=toy, grid=v1.GridSpec(1 / 4, core=True))
+    # the fit moves the amplitude from 0.7 x and kappa from 1.3 x the truth: ln(1.3) = 0.26, ln(1 / 0.7) = 0.36
+    assert result["core_drift"] == pytest.approx(math.log(1 / 0.7), abs=0.01)
+
+
+def test_the_wide_sharp_toy_separates():
+    """A Lorentzian's wings separate from the spots only well past them: measured 2026-11-05 (24^2, no
+    spot mask), worst ratio 4.96, 2.43, 1.82, 1.45, 1.33 at kappa 0.1, 0.2, 0.3, 0.5, 0.7."""
+    toy = v1.EXTRA_TOYS["sharp_wide"]
+    assert toy.sigma / toy.spot_sd >= 5
+    ratios = v1.separability(toy, 24, grid=v1.GridSpec(v1.grid_step_for(toy, 24, core=True), core=True))
+    assert max(ratios.values()) <= v1.SEPARABILITY_LIMIT, ratios
+
+
+def test_poisson_recovery_of_the_wide_sharp_toy_on_the_cored_grid():
+    toy = v1.EXTRA_TOYS["sharp_wide"]
+    report = v1.evaluate("sharp_wide", 24, poisson=True, seeds=[3],
+                         grid=v1.GridSpec(v1.grid_step_for(toy, 24, core=True), core=True))
+    assert report["passed"], (report["worst_ratio"], report["worst_recovery"])
 
 
 def _photons(toy, size, oversample=1):
@@ -143,3 +228,123 @@ def test_photons_per_solid_angle_do_not_change_with_size():
     toy = v1.TOYS["separable"]
     assert _photons(toy, 48)[0] == pytest.approx(_photons(toy, 24)[0], rel=0.05)
     assert _photons(toy, 96, oversample=2)[1] == pytest.approx(_photons(toy, 48, oversample=4)[1], rel=0.05)
+
+
+# Profile likelihood (2026-11-06): where a parameter's Fisher sd exceeds PROFILE_SD (log units) the
+# quadratic Fisher z does not describe the likelihood; the gate uses the profile-likelihood z at the
+# truth, z_p = sign(p_hat - p_true) sqrt(2 (NLL(p_true, rest refit) - NLL_min)), and reports the
+# 1-sd profile interval (2 dNLL = 1) beside the Fisher z.
+
+def test_a_well_identified_fit_gets_no_profile():
+    result = v1.run_fit("joint", size=24, poisson=True, seed=1)
+    assert result["profile"] == {}
+    assert result["z_gate"] == result["z"]
+
+
+def test_a_poorly_identified_parameter_gets_a_profile_z_and_interval():
+    import dataclasses
+    base = v1.EXTRA_TOYS["sharp_wide"]
+    toy = dataclasses.replace(base, fluence=base.fluence / 28.4)  # about 100 diffuse photons: kappa's sd > 0.5
+    grid = v1.GridSpec(1 / 4, core=True)
+    result = v1.run_fit("diffuse", size=24, poisson=True, seed=2, toy=toy, grid=grid)
+    flagged = {k for k, sd in result["fisher_sd"].items() if sd > v1.PROFILE_SD}
+    assert flagged and set(result["profile"]) == flagged
+    for label in flagged:
+        profile = result["profile"][label]
+        assert profile["delta_nll"] >= -1e-6
+        assert result["z_gate"][label] == pytest.approx(profile["z"])
+        lo, hi = profile["interval"]
+        assert lo <= result["errors"][label] + v1.get_truth(toy, label) <= hi  # the estimate is inside
+    for label in set(result["z"]) - flagged:
+        assert result["z_gate"][label] == result["z"][label]
+
+
+
+# Diffuse alone means geometry given (decided 2026-11-06): the diffuse-only fit holds misset and cell at
+# their known values (from indexing and the Bragg data), as a diffuse-only program would; the joint fit
+# refines them. Separability compares the joint fit's halo sd with the diffuse-alone sd (geometry given)
+# and the joint fit's geometry and G with the Bragg-alone fit's.
+
+GEOMETRY_LABELS = {v1.label(k) for k in [*v1.MISSET, *v1.CELL]}
+
+
+@pytest.mark.parametrize("grid", [None, v1.GridSpec(1 / 8, "free"), v1.GridSpec(1 / 4, core=True)])
+@pytest.mark.parametrize("toy_name", ["separable", "sharp_wide"])
+def test_the_diffuse_alone_fit_holds_the_geometry_given(toy_name, grid):
+    toy = {**v1.TOYS, **v1.EXTRA_TOYS}[toy_name]
+    spec = v1.fits(grid, toy)["diffuse"]
+    refined = {v1.label(k) for k in spec["refine"]}
+    assert refined and not refined & GEOMETRY_LABELS
+    assert GEOMETRY_LABELS <= {v1.label(k) for k in spec["known"]}
+    assert GEOMETRY_LABELS <= {v1.label(k) for k in v1.fits(grid, toy)["joint"]["refine"]}
+
+
+def test_with_k_d_and_the_grid_frozen_there_is_no_diffuse_alone_fit():
+    assert "diffuse" not in v1.fits(v1.GridSpec(1 / 8, "frozen"))
+
+
+def test_noise_free_diffuse_alone_recovery_with_the_geometry_given():
+    result = v1.run_fit("diffuse", size=24, poisson=False, seed=0)
+    assert set(result["errors"]) == {"diffuse_params.model.log_amplitude", "diffuse_params.model.log_sigma"}
+    assert all(abs(e) < 1e-5 for e in result["errors"].values())
+
+
+def test_separability_with_the_geometry_given_keeps_the_gated_toys_under_the_limit():
+    """Measured 2026-11-06 (24^2): halo ratios rise only slightly when the diffuse-alone fit is given the
+    geometry: separable 1.28 -> 1.29, sharp_wide 1.33 -> 1.33; the negative cases stay flagged
+    (hidden 14.1, sharp 11.5); the geometry's joint / Bragg-alone ratio is <= 1.04."""
+    separable = v1.separability(v1.TOYS["separable"], 24)
+    wide = v1.separability(v1.EXTRA_TOYS["sharp_wide"], 24)
+    hidden = v1.separability(v1.TOYS["hidden"], 24)
+    assert max(separable.values()) <= v1.SEPARABILITY_LIMIT and max(wide.values()) <= v1.SEPARABILITY_LIMIT
+    assert max(hidden.values()) > v1.SEPARABILITY_LIMIT
+    assert max(v for k, v in separable.items() if k in GEOMETRY_LABELS) < 1.05
+
+
+
+# Per-parameter grid-bias targets (decided 2026-11-06): scale-like parameters (G, k_d) by an absolute
+# bound, |error in log| < SCALE_ABS_LIMIT = 1e-3 (0.1%); the diffuse and geometry parameters by
+# |z| < GRID_BIAS_LIMIT. The Poisson |z| < Z_LIMIT rule is unchanged for every parameter.
+
+def _result(z, errors):
+    return {"z": z, "z_gate": z, "errors": errors}
+
+
+def test_grid_bias_judges_scales_absolutely_and_the_rest_in_sds():
+    G, kd, a = "beam_params.delta_log_spot_scale", "diffuse_params.delta_log_scale", "crystal_params.delta_log_a"
+    worst, scale = v1.grid_bias(_result({G: 12.0, a: 0.03}, {G: 5e-4, a: 1e-6}))
+    assert worst == pytest.approx(0.03) and scale == pytest.approx(5e-4)  # G's z of 12 is not a failure
+    assert v1.grid_bias(_result({kd: 0.01, a: 0.0}, {kd: -2e-3, a: 0.0}))[1] == pytest.approx(2e-3)
+    assert v1.SCALE_ABS_LIMIT == 1e-3
+
+
+def test_the_noise_free_grid_verdict_uses_the_per_parameter_rule():
+    report = v1.evaluate("separable", 24, poisson=False, seeds=[0],
+                         grid=v1.GridSpec(v1.grid_step_for(v1.TOYS["separable"], 24), "frozen"))
+    assert report["recovered"] and report["worst_scale_bias"] < v1.SCALE_ABS_LIMIT
+    assert report["worst_recovery"] < v1.GRID_BIAS_LIMIT
+
+
+# Final audit (2026-11-06)
+
+def test_a_profile_holds_one_component_of_a_vector_parameter():
+    """Holding misset[1] must not let the rest of the misset tensor re-optimise it (the first version
+    refined the whole tensor: a held value 50 sds off cost nothing)."""
+    toy = v1.TOYS["separable"]
+    truth = v1.truth_model(toy, "bragg", 24)
+    with torch.no_grad():
+        data = v1.image(truth)
+    start = {key: toy.truth()[key] for key in v1.FITS["bragg"]["refine"]}
+    held = (v1.MISSET[1], toy.truth()[v1.MISSET[1]] + 0.01)
+    deviance, model = v1._refit(toy, 24, "bragg", "cpu", None, data, start, held, return_model=True)
+    assert v1.get(model, v1.MISSET[1]) == held[1]
+    assert deviance > 1.0  # 50 sds off the truth in noise-free data is far from free
+
+
+def test_a_main_fit_that_stopped_short_is_flagged_not_hidden(monkeypatch):
+    calls = iter([90.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(v1, "_refit", lambda *a, **k: next(calls))
+    out = v1.profile(v1.TOYS["separable"], 24, "diffuse", "cpu", None, None,
+                     {v1.HALO[1]: math.log(0.3)}, v1.HALO[1], 0.6, nll_min=95.0)
+    assert out["main_fit_short_by"] == pytest.approx(5.0)
+    assert out["delta_nll"] == pytest.approx(-5.0)  # reported as is, not clamped to a substituted minimum

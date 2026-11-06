@@ -132,6 +132,10 @@ class DiffuseModel(Protocol):          # in practice an nn.Module
     # added in D3, optional (not in the runtime check):
     # def grid(self) -> "DiffuseGrid": ...               # values on a reciprocal grid, see 2.2
     # DiffuseGrid.from_model(model, step, d_min=, cell=) samples any model; DiffuseGrid.grid() is itself
+    # added in D3b, optional (not in the runtime check):
+    # def core(self) -> DiffuseModel: ...                # the model's own sharp term near the lattice
+    #                                                    # points, closed form; from_model(core=True)
+    #                                                    # grids only model - core, see 2.2
 ```
 
 - torchBragg ships only the protocol, reference toy models and a grid interpolator:
@@ -320,9 +324,242 @@ reference.
   - Recommended for lysozyme: 1/8 as the uniform base, with the core decided on V2. Use the ASU
     (119 MB) where memory binds, and P1 (944 MB) where the lookup cost binds, as on a GPU.
   - The ASU build peak is chunk work: 2¹⁹ nodes × 16 operators, transient.
+- **D3b, the core near integer hkl** (`feat/diffuse-grid-core`, measured 2026-11-05 with
+  `scripts/diffuse/core_candidates.py`).
+  - The toy: a one-phonon-like core with a k floor, A(h₀)·κ²/(dᵀMd + κ²), with κ = 0.5/N = 0.05,
+    M = diag(1, 1.3, 0.8) and A varying ±30% over h₀, plus a smooth part.
+  - The fit: V1 geometry at 128², k_d frozen. The bias is linearised,
+    b = −F⁻¹JᵀW(μ_grid − μ_exact), in sds scaled to 1e6 diffuse photons. The target is z ≤ 0.05.
+  - Memory is for lysozyme to 2 Å on the 4/mmm ASU.
+  - **Current metric (re-measured 2026-11-06, final D3b audit).** These are V1's current rules,
+    `core_candidates.linear_bias_parts`:
+    - with k_d frozen there is no diffuse-alone fit, since the geometry is given and the grid has
+      nothing else to refine;
+    - the joint fit's G is judged by its absolute bias (all ≤ 6.4e-6 in log, against 1e-3), the
+      rest in sds at 1e6 diffuse photons.
+
+    | candidate | worst z, current metric | lysozyme memory |
+    |---|---|---|
+    | uniform 1/8, 1/16, 1/32, 1/64 | 0.49, 0.155, 0.062, 0.015 | 59 MB, 0.47, 3.7, 30 GB |
+    | warped, w 0.02, 16; 24; 32 nodes a unit | 0.161; 0.059; 0.031 | 0.53; 1.8; 4.2 GB |
+    | warped, 24 nodes (w 0.01); 32 nodes (w 0.05) | 0.072; 0.027 | 1.8; 4.2 GB |
+    | local cubes (coarse 1/16, r 0.25, fine 1/64) | 0.004 | 2.6 GB |
+    | local cubes (coarse 1/16 or 1/32, r 0.125, fine 1/128) | 0.011; 0.011 | 2.6; 5.9 GB |
+    | **model's core + residual grid, 1/8; 1/16** | **0.001; 0.000** | **59; 468 MB** |
+    | core, M off by errors that cancel (−4%/+5%), 1/8; 1/16 | 0.014; 0.002 | |
+    | core, M off by errors that cancel (−9%/+10%), 1/16 | 0.005 | |
+    | core, M all +5%, 1/8; 1/16; M all +10%, 1/16 | 0.070; 0.002; 0.004 | |
+    | core, κ +2%, 1/8; 1/16; 1/32 | 0.059; 0.003; 0.001 | |
+    | core, κ +5%, 1/8; 1/16; 1/32; κ +10%, 1/8 | 0.149; 0.007; 0.002; 0.300 | |
+    | core, isotropic (M = 1), 1/16; 1/32 | 0.013; 0.006 | |
+    | truth with q-dependent amplitude, 1/8; 1/16; 1/32 | 0.124; 0.032; 0.008 | |
+    | truth with a quartic shape, ε 0.1, 1/8; 1/16; 1/32 | 0.287; 0.030; 0.009 | |
+    | truth with a quartic shape, ε 0.3, 1/8; 1/16; 1/32 | 0.775; 0.082; 0.026 | |
+    | off-diagonal truth, diagonal core, 1/8; 1/16; 1/32 | 0.258; 0.503; 0.629 | |
+    | off-diagonal truth, full-metric core, 1/8; 1/16 | 0.001; 0.000 | |
+
+    - The ranking stands: the core is the only candidate under the target at 59 MB.
+    - Every candidate does better than in the old metric. Local cubes (2.6 GB), warped grids at
+      32 nodes (4.2 GB) and uniform 1/64 (30 GB) now meet z ≤ 0.05 as well.
+    - The old diffuse-alone fit, which refined the geometry and judged G in sds, was the binding
+      and stricter one.
+  - The table below is the **old metric** (2026-11-05): a diffuse fit that refined the geometry,
+    with G in sds. It is kept for the record.
+
+  | candidate | worst z at 1e6 photons (old metric) | lysozyme memory | lookup |
+  |---|---|---|---|
+  | uniform 1/8, 1/16, 1/32, 1/64 | 29.8, 5.2, 1.14, 0.38 | 59 MB, 0.47, 3.7, 30 GB | 66–96 ns |
+  | warped tensor grid, w 0.02, 16; 24; 32 nodes a unit | 11.5; 4.9; 2.6 | 0.53; 1.8; 4.2 GB | 63–72 ns |
+  | warped tensor grid, 24 nodes (w 0.01); 32 nodes (w 0.05) | 6.9; 1.75 | 1.8; 4.2 GB | 69–79 ns |
+  | local fine cubes (coarse 1/16, r 0.25, fine 1/64) | 0.39 | 2.6 GB | 180 ns |
+  | local fine cubes (coarse 1/32, r 0.125, fine 1/128) | 0.28 | 5.9 GB | 177 ns |
+  | **model's core + residual grid, 1/8; 1/16** | **0.057; 0.014** | **59; 468 MB** | 79 ns |
+  | core with M off by errors that cancel, −4%/+5% (1.25, 0.84), 1/8; 1/16 | 0.14; 0.060 | 59; 468 MB | |
+  | core with M off by errors that cancel, −9%/+10% (1.18, 0.88), 1/16 | 0.12 | 468 MB | |
+  | core with M off, all +5% (1.05, 1.365, 0.84), 1/8; 1/16 | 2.29; 0.39 | 59; 468 MB | |
+  | core with M off, all +10%, 1/16 | 0.74 | 468 MB | |
+  | core with κ +2%, 1/8; 1/16 | 1.78; 0.29 | 59; 468 MB | |
+  | core with κ +5%, 1/8; κ +10%, 1/8 | 4.5; 9.0 | 59 MB | |
+  | isotropic core (M = 1), 1/16; 1/32 | 0.32; 0.20 | 0.47; 3.7 GB | |
+
+  Realistic departures of the truth from the supplied core A(h₀)/(dᵀMd + κ²), z at 1/8, 1/16, 1/32:
+
+  | the truth departs by | z |
+  |---|---|
+  | amplitude varying within the halo (q² and Debye–Waller at hkl, B = 20 Å², the core taking A(h₀)) | 5.9, 1.9, 0.55 |
+  | non-quadratic shape \|d\|²f(d̂), f = 1 + ε(Σd̂⁴ − 3/5)/0.4, ε = 0.1 | 4.6, 1.4, 0.23 |
+  | the same, ε = 0.3 | 11.1, 3.1, 0.66 |
+  | off-diagonal metric, the core given its diagonal | 12.5, 16.1, 22.3 |
+  | off-diagonal metric, the core given it in full | 0.056, 0.014 (1/8, 1/16) |
+
+  - **Decided and built: the analytic core.** It is the only candidate that meets the target at
+    affordable memory. A tensor grid refines whole planes and lines to reach the points. Fine
+    cubes cost one cube per reflection and still leave the coarse grid's error at their faces.
+    - `DiffuseGrid.from_model(model, ..., core=core_module | True)`: True takes
+      `model.core()`, an optional method of the protocol. The grid stores model − core and
+      returns core(hkl) plus the interpolated residual.
+    - The core is a submodule: its parameters join the group `diffuse`, with gradients in hkl,
+      the core and the values (FD and gradcheck).
+    - `LorentzianHalo(amplitude, κ, metric)` is the reference core.
+  - **What eryx's `core()` must reach, in the current metric (2026-11-06).** This replaces the
+    old-metric rule, "residual under about 1% of the core at 1/16, 4% at 1/32", which came from
+    the stricter diffuse fit.
+    - **Anisotropy:** the core must carry the full (off-diagonal) metric of its own elastic term.
+      An off-diagonal truth with a diagonal core fails at every step (0.26, 0.50, 0.63 at 1/8,
+      1/16, 1/32), getting worse with a finer step because the residual stays sharp.
+    - **At step 1/16, tolerated:**
+      - κ within 5% (0.007);
+      - a q-dependent amplitude across the halo, frozen at h₀ (0.032);
+      - a quartic shape error of ε ≤ 0.1 (0.030).
+      ε = 0.3 fails (0.082).
+    - **At step 1/32, tolerated:** ε = 0.3 (0.026), κ within 5% (0.002) and the q amplitude
+      (0.008).
+    - **At step 1/8:** κ within about 2% (0.059 at +2%, already over), and neither the q
+      amplitude (0.124) nor the shape (0.29) is tolerated.
+    - Roughly, the core's bias is the uniform grid's (0.49, 0.155, 0.062 at 1/8–1/32) times the
+      leftover's share of the core. That share must stay under about 10% at 1/8, 30% at 1/16 and
+      80% at 1/32. The κ rows follow this only within about 3×, so the measured rows above are
+      the requirement.
+    - The pilot's recommendation, an order-3 core at 1/32, sits inside these with margin.
+    - This is an E1/E2 item. Until it exists the D3b decision rests on a core that is not yet
+      shown to exist for eryx.
+  - **LorentzianHalo** takes a full 3 × 3 metric (built). An off-diagonal truth with a diagonal
+    core gives z = 0.26–0.63 in the current metric (12–22 in the old one); with the full metric,
+    0.001 and 0.000 (old metric 0.056 and 0.014). It stays a reference core for
+    tests. A per-lattice-point amplitude would not make it a usable stand-in: the amplitude varies
+    within the halo.
+  - **The frozen residual.** The grid returns core(θ) + [model(θ_b) − core(θ_b)], θ_b the core's
+    parameters at build.
+    - Its gradient in θ is the core's alone.
+    - `core_drift()` exposes |θ − θ_b|. Past `core_drift_tolerance` a warning is given once.
+      The tolerance is a placeholder of 0.05, to be set on V2.
+    - A test with a smooth part that depends on θ shows the stale error growing with the drift.
+    - With refinable values, the residual's values and the core's amplitude are nearly
+      degenerate.
+  - **Checks:**
+    - A core not invariant under the point group is refused at build, by a sampled check.
+    - A core needs 1/(2·step) integer, so that nodes sit on its half-integer kink.
+    - `from_values` refuses `core=`: a residual with its core goes to `DiffuseGrid(values, ...,
+      core=)`.
+    - Outside the box only the core remains.
+  - **Cost:** 2²⁰ lookups, step 1/4, without → with the core: ASU 992 → 1040 ns and P1 71 → 72 ns
+    on the CPU; ASU 330 → 331 ns and P1 15 → 17 ns on MPS. float32: the core's error is under
+    2·ulp(40)·√m/κ.
+  - Image table (`grid_vs_exact.py error --size 128 --only sharp sharp+core`; deviance scaled
+    to 1e6 photons):
+    - without the core, max rel 0.20 / 0.14 / 0.10 and deviance 1.2e4 / 2.0e3 / 350 at steps
+      1/8, 1/16, 1/32;
+    - with it, max rel 7.5e-5 / 2.0e-5 / 5.1e-6 and deviance 0.73 / 0.053 / 0.003.
+  - V1 `--grid --grid-core` is a machinery check: the halo is the refinable core, with a zero
+    residual. It recovers to 1e-5 noise-free in all three fits, and flags the hidden toy.
+  - V1 `--sharp`: a Lorentzian core plus a smooth part, on a cored grid.
+    - The grid is built as a real fit would build it: from the model and its core at the fit's
+      starting parameters, so `core_drift()` counts from the start.
+    - The step comes from the residual's own bias law, z = K_core·step²·√P. K_core is measured
+      per toy, since it depends on the Fisher sds the bias is measured in.
+    - **κ = 0.5/N = 0.05**, the negative case.
+      - Under the current rule (2026-11-06; the scale-like parameters judged absolutely, the
+        geometry given in the diffuse-alone fit): K_core = 0.00045, C_core = 5e-6.
+      - The rule picks 1/2. That is the coarsest step the 1/(2n) rule allows, not the law's answer
+        (the law's widest step is 1.08). It is checked directly: at 1/2 the noise-free bias is
+        0.0084 sd at 24² and 0.019 at 64².
+      - Old rule: K_core 0.00276 (z 0.075, 0.0165, 0.0046 at 1/2, 1/4, 1/8), step 1/4, bias
+        0.0165 sd.
+      - The core is 1.25 spot sds, so it is weakly identified: ratio 10, like the hidden toy.
+        It must be flagged.
+      - With Poisson noise its z is reported, not gated (seed 3, joint: 15.7 exact, 15.8 on the
+        grid).
+    - **κ = 0.7**, separable, with the usual rules. A Lorentzian's wings separate from the spots
+      only well past them: with no spot mask the worst ratio is 4.96, 3.17, 2.43, 1.82, 1.57,
+      1.45, 1.33 at κ 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7 (2.5 to 17.6 spot sds), against 1.28
+      for a Gaussian at 7.5 spot sds.
+      - Current rule: K_core = 0.00548 and C_core = 2.4e-5, so the rule gives 1/4. Noise-free bias:
+        0.018 sd at 24² and 0.019 at 64².
+      - Old rule: K_core 0.0189 (z 0.058, 0.016 at 1/4, 1/8; 0.47 at 1/2, not yet in the step²
+        regime), step 1/6, bias 0.024 sd.
+      - Ratio 1.33. Poisson worst |z| 3.06 (seeds 1–3, 24², old rule).
+    - Drift each fit ends with: 0.19–0.57 where the fit recovers. These drifts cannot set the V2
+      threshold: the sharp toys' residual does not depend on θ, so drift costs them nothing. The
+      θ-dependent case is covered only by the unit test with a shared amplitude. (The start is 0.7× the amplitude and 1.3× the width, ln 1/0.7 = 0.36), and up to 14.7 in
+      the narrow toy's collapsed Poisson fit. The placeholder of 0.05 warns in every one of these
+      fits.) V2 must set it from drifts that cost something.
+  - **The 128² sharp_wide failure** (2026-11-06, diagnosed with /diagnosing-bugs).
+    - **The root cause was V1's fluence scaling.** The fluence was scaled by (24/size)² while
+      each pixel's solid angle also falls as size⁻², so 128² had 28× fewer photons than 24².
+      sharp_wide had 101 diffuse photons and a Fisher sd of log κ of 1.18. Fixed on D2
+      (feat/diffuse-experiment); 24² is unchanged.
+    - **Ruled out, at seed 2:** the cored grid (the exact model failed the same way, log A +30),
+      a coarse step (1/8 failed too) and the start (starting at the truth failed too).
+    - **At 101 photons the likelihood has degenerate limits that beat the truth.**
+      - κ → 0 puts a near-point spike on pixels with a count (μ 0.73 on a count of 1) and moves
+        misset by about 1 rad: deviance 389 against 402 at the truth.
+      - At 4× the photons the cell collapses instead (log a −50), so every pixel sits in one
+        halo, a nearly flat image: 5 below the truth.
+    - **After the fix**, at 2900 photons at 128², κ is identified (sd 0.22) and five of the six
+      fits recover. The seed-3 diffuse fit does not, with the exact model as with the grid. A
+      κ = 0.7 halo is nearly featureless, so the diffuse-only fit hardly constrains the geometry:
+      misset and log a have Fisher sds 0.45–1.1. The fit finds the collapsed-cell basin, 10 NLL
+      below the truth.
+      - Under the profile rule below, log a gives z −4.5 with an interval unbounded over 16 sds.
+        **Corrected 2026-11-06:** the "misset[1] z −0.5" recorded here was an artifact. The
+        profile refit re-optimised the held misset angle through the rest of the misset tensor
+        (fixed: a gradient mask now holds it).
+      - misset[2] has sd 0.45, under the rule's threshold, and keeps its Fisher z of 21.
+      - **Re-run 2026-11-06 under the current definitions** (the diffuse-alone fit with the
+        geometry given; the per-parameter grid rule, cored step 1/4): sharp_wide passes at 128²
+        with Poisson seeds 1–3. Worst |z| is 3.23, the ratio 1.33, and no parameter needed the
+        profile rule (44 s on the Mac).
+      - **The 128² gate fails on this toy under the old definition. It is not tuned.** What would change it is a choice
+        about the toy: fix the geometry in a diffuse-only fit of a near-featureless halo, or
+        separate a narrower core with the spot mask (below) rather than by width.
+  - **Profile likelihood in the gate.** Where a parameter's Fisher sd at the truth exceeds 0.5
+    (log or radian units), V1 refits with it held at the truth.
+    - z_p = sign(p̂ − p)·√(2ΔNLL).
+    - The 1-sd profile interval (2ΔNLL = 1) is reported beside the Fisher z.
+    - The gate uses z_p, with the same |z| < 4, for those parameters.
+  - **κ for real data:** bounded below by eryx's k_floor, 0.5/N_cells. The κ → 0 limit above is
+    unphysical there; the toy leaves κ free to expose it.
 - Pixels: diffuse fits do not need every pixel. A ROI set with a strided subset between
   spots (mask out ±n px around predicted spots, then stride) keeps one shot at 1e4–1e5
   pixels.
+- **Spot masks (decided 2026-11-05).** Near the lattice points the diffuse core and the Bragg
+  peak trade off: the core's amplitude and width are the parameters the joint fit cannot tell
+  from the spot. Separability has to come from the halo's wings.
+  - Diffuse and joint fits therefore mask ±n pixels around the predicted spots.
+  - V2 reports the separability ratio and the grid bias against the mask radius n.
+  - What exists: `DetectorConfig.mask_array`, a per-pixel mask that the Simulator and the ROI
+    path (`ExperimentModel._roi_mask_values`) apply.
+  - What is missing, and not built in D3b: a helper that builds the ±n mask from the predicted
+    spots (from the model's Bragg term or `roi_centroids`), keeps it fixed while the geometry
+    refines, and feeds it to `mask_array` or a strided ROI set. It belongs with the V2 setup.
+- **The spot-mask pilot, and the grid recommended for eryx (decided 2026-11-06).**
+  - The pilot: eryx `torchbragg-core` ebe9e81, `core_bias.py --mask-radius`. Lysozyme 193l,
+    n_cells 20, mesh 4, k_floor 0.025, V1 geometry at 128², k_d frozen. z is scaled to 1e6
+    diffuse photons.
+  - **Masks are an analysis option, not part of the grid's accuracy budget.** They do not fix
+    the grid bias, and they hurt separability.
+
+    | mask radius (px) | 0 | 1 | 2 | 3 | 4 | 6 |
+    |---|---|---|---|---|---|---|
+    | worst z, order-3 core, 1/16 | 0.32 | 0.34 | 0.41 | 0.41 | 0.40 | 0.22 |
+    | worst z, order-3 core, 1/32 | 0.100 | 0.105 | 0.126 | 0.127 | 0.125 | 0.054 |
+    | diffuse photons removed | 0 | 2.0% | 7.4% | 12.4% | 17.1% | 29.5% |
+    | worst joint/alone ratio | 1.06 | 1.08 | 1.21 | 1.61 | 1.59 | 1.62 |
+
+  - **The worst parameter is the joint Bragg scale G.** Its Fisher sd is tiny because of the
+    bright spots, so a negligible bias is many sds. In absolute terms it is 2.6e-4 in log G at
+    1/16 and 8e-5 at 1/32 (0.03% and 0.008%).
+  - **Per-parameter targets (decided).** Scale-like parameters get an absolute tolerance: the
+    bias in G must be under 0.1%. Diffuse and geometry parameters keep z ≤ 0.05 sd.
+  - With G judged that way, order-3 core, unmasked:
+    - at 1/32 the worst z is 0.037 (joint log a), which meets the target;
+    - at 1/16 it is 0.145, which does not;
+    - an order-2 core at 1/32 gives 0.59.
+  - **Recommended grid for eryx: order-3 core plus step 1/32.** The lysozyme ASU is about
+    3.7 GB, and the one-time sampling takes about 34 min on 64 cores. The optical-block
+    correction is shelved unless V2 shows a disagreement.
+  - Caveat: the pilot's diffuse-only fit still refined the geometry (the old V1 definition).
+    The joint numbers are unaffected.
 
 ## 3. Joint objective
 
@@ -416,13 +653,50 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - report the Fisher-matrix condition number and the correlations between shared
     parameters.
   - **Gate design (2026-11-05)**, `scripts/diffuse/v1_toy_recovery.py`:
-    - **Fits:** bragg (G, misset, cell), diffuse (misset, cell, halo amplitude and σ, with G
-      known, since with k_d frozen G and the amplitude are one number there), and joint (all).
-      They run on the Poisson deviance, GAUSS with the HKL metric.
-    - **Separability:** for each joint parameter, its Fisher sd in the joint fit over its sd
-      in the fit of its own half (G: bragg; halo: diffuse; misset and cell: the better of the
-      two). Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and seed (noise-free: errors
-      < 1e-5).
+    - **Fits:** bragg (G, misset, cell), diffuse (halo amplitude and σ, with G known and the
+      geometry given), and joint (all). They run on the Poisson deviance, GAUSS with the HKL
+      metric.
+      - G is known in the diffuse fit because with k_d frozen, G and the amplitude are one number
+        there.
+    - **Diffuse alone means geometry given (decided 2026-11-06).** The diffuse-only fit holds
+      misset and cell at their known values, from indexing and the Bragg data, as a diffuse-only
+      program has them; the joint fit refines them. Each half is analysable alone and jointly.
+      - The reason: a halo whose image is nearly featureless does not constrain the geometry.
+        The 128² sharp_wide diffuse-only fit (κ = 0.7) had geometry Fisher sds of 0.45–1.1, and
+        it found a collapsed-cell basin 10 NLL below the truth.
+      - With k_d and the grid frozen there is nothing diffuse to refine, so `--grid` (k_d
+        frozen) has no diffuse-alone fit.
+    - **Separability.** For each joint parameter, its Fisher sd in the joint fit over its sd in
+      the fit of its own half: G, misset and cell against Bragg alone; the halo against diffuse
+      alone with the geometry given. Pass if every ratio is ≤ 1.5 and |z| < 4 in every fit and
+      seed (noise-free: errors < 1e-5).
+    - **Grid bias, per-parameter targets (decided 2026-11-06, section 2.2).**
+      - Scale-like parameters (the Bragg scale G) get an absolute tolerance: bias under 0.1%.
+        Their Fisher sd is set by the bright spots, so a bias in sds says little about accuracy.
+      - Diffuse and geometry parameters keep the noise-free grid bias ≤ 0.05 sd (pass limit
+        0.1 sd).
+      - Implemented in V1 (2026-11-06). Both laws are re-derived without the scale-like
+        parameters, judged absolutely:
+        - z = K·(s/σ)²·√P: K 0.00215 (k_d frozen) and 0.00107 (free); with a core K_core 0.00045
+          (sharp) and 0.00548 (sharp_wide).
+        - |Δlog scale| = C·(s/σ)²: C 2.8e-4 (G) and 0.134 (k_d, free); with a core 5e-6 and
+          2.4e-5.
+        - Steps the rule now picks (24² and 64² alike): 1/6 (k_d frozen, was 1/18), 1/56 (k_d
+          free, set by k_d's absolute bias, was 1/46), 1/2 (sharp, was 1/4), 1/4 (sharp_wide,
+          was 1/6).
+        - Gates at 24² and 64² pass. With k_d frozen at the chosen step (1/6), the worst non-scale
+          bias is 0.041 and 0.031 sd; that figure excludes the scale-like parameters.
+        - G's bias is 7.3e-5 in log, inside its absolute bound of 1e-3, and it is 0.095 sd. In V1
+          the bound is about 1.3 G sds (G's joint sd is 7.7e-4 at 24²), so the "bright spots" reason
+          for an absolute bound comes from the eryx pilot rather than from V1. G is reported in sds
+          as well.
+      - Measured, old (diffuse alone refining the geometry too) → new, at 24²:
+        - separable 1.28 → 1.29 exact, 1.00 → 1.09 on the grid with k_d free;
+        - sharp_wide 1.33 → 1.33;
+        - the negative cases stay flagged: hidden 14.1 → 14.1 (grid, k_d free: 4.25 → 4.82),
+          sharp 10.0 → 11.5.
+        - The geometry's joint/Bragg-alone ratio is ≤ 1.04 in every toy.
+      - The limit is unchanged.
     - **Exit code:** 0 only if the separable toy passes and the negative toy is flagged
       (ratio > 1.5), so the metric is shown to tell them apart.
     - **What sets the ratio:** halo σ over the spot's sd in h, 0.397/N (Fisher at the truth,
@@ -450,7 +724,13 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - lysozyme from a public PDB in the SBGrid 747 cell, stills and a rotation wedge, with
     known springs, solvent, G and misset;
   - recover jointly, and with each half frozen;
-  - grid vs exact error.
+  - grid vs exact error;
+  - diffuse and joint fits with ±n pixels masked around the predicted spots (section 2.2),
+    reporting the separability ratio and the grid bias against n, as an analysis option: the
+    pilot showed masks do not fix the grid bias;
+  - **a direct check of the grid:** fit the same synthetic data with the cored grid (order-3
+    core, 1/32) and with the exact per-pixel model, and compare the parameters within their
+    noise. The per-pixel path stays the reference and the fallback.
 - **V3 Separability cross-check:**
   - merge the V2 images with `merge_map.py` and fit with ShellFit (map space alone);
   - the springs must agree with the image-space joint fit within the bootstrap SE;
@@ -487,7 +767,7 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 | D1 | the hook: 31d0b2c, 3f653f1, 7b344a4 rebased; `diffuse.py` protocol plus toy models; V0 gate script | V0, full gates |
 | D2 | `ExperimentModel(diffuse=)`, groups diffuse/diffuse_scale, ROI path, components, `SerialExperiment` sharing, D2-T1 shape-integral test, gradient checks | /tdd, V1 |
 | D3 | `DiffuseGrid`: ASU grid, symmetry gather, differentiable trilinear interpolation, grid-vs-exact test. Done: section 2.2 (error table, memory, decision); `v1_toy_recovery.py --grid` passes, V0 0 differ | V1 on the grid |
-| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory | grid vs exact on a sharp-core toy, V1 on the grid |
+| D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2). Recommended for eryx (2026-11-06): order-3 core plus 1/32, per-parameter targets (G absolute < 0.1%, others ≤ 0.05 sd), masks not part of the budget | `core_candidates.py` (bias at 1e6 photons per candidate and core error), `grid_vs_exact.py error --only sharp sharp+core` at 128², V1 `--grid --grid-core` (machinery) and `--sharp` (noise-free bias under the residual's law), FD and gradcheck, V0 |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
 | (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
@@ -497,10 +777,11 @@ eryx (pushed to `backup` only):
 | Branch | Content |
 |---|---|
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
+| E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach, in the current metric (section 2.2, 2026-11-06; the old metric said a leftover under 1% at 1/16, 4% at 1/32). It must carry the full, off-diagonal anisotropy of its elastic term (a diagonal core fails at every step). At 1/16 it tolerates κ within 5%, an amplitude frozen at h₀ and a 10% quartic shape error. At 1/32 it tolerates a 30% shape error. At 1/8 it needs κ within about 2% and the q-dependent amplitude and shape. Its k_floor must be exact, which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model. Pilot (torchbragg-core ebe9e81, 2026-11-06): the order-3 core at 1/32 meets it unmasked, with worst z 0.037 once G is judged absolutely (bias 8e-5 in log G); 1/16 gives 0.145 and order 2 gives 0.59 |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 
-Order: D1 → E1 + D2 → V1 → D3 → D3b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
+Order: D1 → E1 + D2 → V1 → D3 → D3b → E1b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
 major goal and on the critical path. The spot-broadening diagnosis runs in parallel from
 the start and must finish before V4. This plan document goes in with D1.
 Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
@@ -514,13 +795,22 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    evaluation as the reference. The fineness of the grid near integer hkl is set by the
    measured grid-vs-exact error. Measured in D3 (section 2.2): uniform trilinear with the step
    from the bias law (1/18 for the V1 toy with k_d frozen) passes V1, and D3 builds no refined
-   core. Real photon counts (1e5–1e6) need step/σ of about 0.05–0.09 (k_d frozen) or 0.02–0.035
+   core. (These D3 numbers predate the per-parameter rule: see the 2026-11-06 addendum below,
+   under which the step is 1/6.) Real photon counts (1e5–1e6) need step/σ of about 0.05–0.09 (k_d frozen) or 0.02–0.035
    (free).
    **Decided 2026-11-05, after the D3 audit:**
    - The finer grid near integer hkl is built as its own PR, D3b, before V2.
    - The V1 grid pass rule stays: bias under 0.1 Fisher sd, with the step from the bias law.
    - L-BFGS-B's ABNORMAL stops on the grid are accepted for now; an AdamW check comes later.
    - Refining the grid values with a smoothness restraint is deferred until after V2.
+   **Decided 2026-11-06, after D3b and the spot-mask pilot (section 2.2):**
+   - The grid is the model's analytic core plus a residual grid. For eryx it is an order-3 core
+     at step 1/32: about 3.7 GB for the lysozyme ASU, sampled once in about 34 min on 64 cores.
+   - Accuracy is judged per parameter: the scale G absolutely (bias < 0.1%), the diffuse and
+     geometry parameters by z ≤ 0.05 sd.
+   - Spot masks are an analysis option, not part of the accuracy budget.
+   - V2 compares grid and per-pixel fits directly. The per-pixel path stays the reference and
+     the fallback.
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
    `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
    factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse

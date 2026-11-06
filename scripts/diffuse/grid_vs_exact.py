@@ -19,8 +19,8 @@ DiffuseGrid (mmm ASU) at each step. Per case:
   of the error a free k_d cannot absorb (c = sum exact / sum grid);
 - photons: mean diffuse photons per pixel.
 
-"bench" times 2^20 evaluations of the lysozyme grid (step 1/4), ASU and P1, on the CPU in float64
-and, if available, on MPS in float32.
+"bench" times 2^20 evaluations of the lysozyme grid (step 1/4), ASU and P1, without and with a
+LorentzianHalo core (the shipped D3b path), on the CPU in float64 and, if available, on MPS in float32.
 
 A smooth model (cosines, periods 3, 4 and 5 in h, k, l) is the control.
 
@@ -47,7 +47,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from nanobrag_torch.diffuse import DiffuseGrid, GaussianHalo
+from nanobrag_torch.diffuse import DiffuseGrid, GaussianHalo, LorentzianHalo
 
 _spec = importlib.util.spec_from_file_location("v1_toy_recovery", Path(__file__).with_name("v1_toy_recovery.py"))
 v1 = importlib.util.module_from_spec(_spec)
@@ -107,12 +107,28 @@ def _scaled_deviance(exact, grid, positive):
     return {"best_scale": float(scale), "deviance_scaled": float(2 * (fitted - exact + log_term).sum())}
 
 
-def error_table(size):
+class _Sum(nn.Module):
+    def __init__(self, *parts):
+        super().__init__()
+        self.parts = nn.ModuleList(parts)
+
+    def forward(self, hkl):
+        return sum(part(hkl) for part in self.parts)
+
+
+def error_table(size, only=None):
+    """Rows per model and step. "sharp" is D3b's toy, LorentzianHalo(1000, kappa 0.05, metric
+    1, 1.3, 0.8) plus Smooth(5); "sharp+core" the same with the Lorentzian as the grid's core."""
     toy = v1.TOYS["separable"]
     rows = []
-    cases = [("halo", sigma, GaussianHalo(toy.amplitude * (toy.sigma / sigma) ** 3, sigma)) for sigma in SIGMAS]
-    cases.append(("smooth", None, Smooth(20.0)))
-    for kind, sigma, model in cases:
+    cases = [("halo", sigma, GaussianHalo(toy.amplitude * (toy.sigma / sigma) ** 3, sigma), None) for sigma in SIGMAS]
+    cases.append(("smooth", None, Smooth(20.0), None))
+    sharp_core = LorentzianHalo(1000.0, 0.05, metric=(1.0, 1.3, 0.8))
+    sharp = _Sum(sharp_core, Smooth(5.0))
+    cases += [("sharp", None, sharp, None), ("sharp+core", None, sharp, sharp_core)]
+    for kind, sigma, model, core in cases:
+        if only and kind not in only:
+            continue
         exact = diffuse_image(model, size, toy)
         for step in STEPS:
             half = np.ceil(np.array([30.0, 35.0, 40.0]) / v1.GRID_D_MIN / step) + 1
@@ -120,7 +136,7 @@ def error_table(size):
                 continue
             start = time.perf_counter()
             grid = DiffuseGrid.from_model(model, step=step, d_min=v1.GRID_D_MIN, cell=(30.0, 35.0, 40.0),
-                                          point_group=v1.MMM, refinable=False)
+                                          point_group=v1.MMM, refinable=False, core=core)
             built = time.perf_counter() - start
             row = {"model": kind, "sigma": sigma, "step": step, "step_over_sigma": step / sigma if sigma else None,
                    "values": grid.values.numel(), "build_s": built, **compare(exact, diffuse_image(grid, size, toy))}
@@ -157,9 +173,12 @@ def bench(step, n=1 << 20):
     hkl = (torch.rand(n, 3, dtype=torch.float64, generator=torch.Generator().manual_seed(0)) * 2 - 1) * torch.tensor(
         [39.0, 39.0, 18.5], dtype=torch.float64)
     devices = [("cpu", torch.float64)] + ([("mps", torch.float32)] if torch.backends.mps.is_available() else [])
-    for storage in ("asu", "p1"):
-        grid = DiffuseGrid.from_model(GaussianHalo(100.0, 0.1), step=step, d_min=2.0, cell=(79.0, 79.0, 38.0),
-                                      point_group=point_group_422() if storage == "asu" else None, refinable=False)
+    for storage in ("asu", "p1", "asu+core", "p1+core"):
+        core = LorentzianHalo(1000.0, 0.05) if storage.endswith("+core") else None  # isotropic: 4/mmm-invariant
+        model = GaussianHalo(100.0, 0.1) if core is None else _Sum(core, GaussianHalo(100.0, 0.1))
+        grid = DiffuseGrid.from_model(model, step=step, d_min=2.0, cell=(79.0, 79.0, 38.0), core=core,
+                                      point_group=point_group_422() if storage.startswith("asu") else None,
+                                      refinable=False)
         for device, dtype in devices:
             g = grid.to(device=device, dtype=dtype)
             q = hkl.to(dtype=dtype).to(device)
@@ -184,6 +203,7 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
     error = sub.add_parser("error")
     error.add_argument("--size", type=int, default=64)
+    error.add_argument("--only", nargs="*", help="models to run (halo, smooth, sharp, sharp+core)")
     error.add_argument("--out")
     timing = sub.add_parser("bench")
     timing.add_argument("--step", type=float, default=0.25)
@@ -195,7 +215,7 @@ def main(argv=None):
     memory.add_argument("--out")
     args = parser.parse_args(argv)
     if args.command == "error":
-        report = error_table(args.size)
+        report = error_table(args.size, args.only)
     elif args.command == "bench":
         report = bench(args.step)
     elif args.one:
