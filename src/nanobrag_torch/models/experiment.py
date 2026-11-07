@@ -1662,6 +1662,27 @@ class ExperimentModel(nn.Module):
                                  _numpy(self._detectors[0].beam_vector), wavelength)
 
     @torch.no_grad()
+    def spot_masks(self, radius_px: float, n_sd: float = 3.0, apply: bool = False) -> list:
+        """Masks around the predicted Bragg spots at the current geometry, one (S, F) bool per panel, True
+        where a pixel is kept (nanobrag_torch.spot_mask.predicted_spot_mask).
+
+        They are built once and do not follow the geometry as it refines: call again to rebuild. With
+        apply=True each is written into its panel's mask_array, multiplied into any mask already there,
+        so the whole-image and ROI paths leave those pixels out of both components.
+        """
+        from ..spot_mask import predicted_spot_mask
+
+        self._sync()
+        masks = [predicted_spot_mask(simulator, radius_px, n_sd) for simulator in self._whole_panel_simulators()]
+        if apply:
+            for detector, mask in zip(self._detectors, masks):
+                kept = mask.to(device=self.device, dtype=self.dtype)
+                if detector.config.mask_array is not None:
+                    kept = kept * detector.config.mask_array.to(device=self.device, dtype=self.dtype)
+                detector.config.mask_array = kept
+        return masks
+
+    @torch.no_grad()
     def roi_centroids(self, observed=None) -> np.ndarray:
         """Each ROI's Bragg-only model centroid (x, y), in dxtbx pixels: NaN where it has no signal.
 
