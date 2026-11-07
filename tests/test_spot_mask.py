@@ -3,19 +3,22 @@ Spot masks predicted from geometry, for diffuse and joint fits (plan section 2.2
 
 The reference is the Bragg image itself: with one F for every reflection and GAUSS spots under the
 HKL metric (no side lobes, unlike SQUARE's sinc), each recorded spot is a local maximum, so the
-predicted centres and the image's maxima must coincide.
+predicted centers and the image's maxima must coincide.
 """
 import os
 os.environ.setdefault("NANOBRAGG_DISABLE_COMPILE", "1")
 
+import pytest
 import torch
 import torch.nn.functional as nnf
 
-from src.nanobrag_torch.config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, SpotMetric
-from src.nanobrag_torch.models.crystal import Crystal
-from src.nanobrag_torch.models.detector import Detector
-from src.nanobrag_torch.simulator import Simulator
-from src.nanobrag_torch.spot_mask import predicted_spot_mask, strided_pixels
+from nanobrag_torch.config import BeamConfig, CrystalConfig, CrystalShape, DetectorConfig, SpotMetric
+from nanobrag_torch.diffuse import GaussianHalo
+from nanobrag_torch.models.crystal import Crystal
+from nanobrag_torch.models.detector import Detector
+from nanobrag_torch.models.experiment import ExperimentModel, SerialExperiment
+from nanobrag_torch.simulator import Simulator
+from nanobrag_torch.spot_mask import predicted_spot_mask, strided_pixels
 
 CRYSTAL = dict(N_cells=(5, 5, 5), default_F=100.0, cell_a=50.0, cell_b=60.0, cell_c=70.0,
                misset_deg=(10.0, 20.0, 30.0), shape=CrystalShape.GAUSS, spot_metric=SpotMetric.HKL)
@@ -23,35 +26,36 @@ DETECTOR = dict(spixels=64, fpixels=64, distance_mm=100.0, pixel_size_mm=0.5)
 BEAM = dict(wavelength_A=1.0, fluence=1e24)
 
 
-def simulator(crystal=None, detector=None, beam=None):
-    return Simulator(Crystal(CrystalConfig(**{**CRYSTAL, **(crystal or {})}), dtype=torch.float64),
-                     Detector(DetectorConfig(**{**DETECTOR, **(detector or {})}), dtype=torch.float64),
-                     beam_config=BeamConfig(**{**BEAM, **(beam or {})}), dtype=torch.float64)
+def simulator(crystal=None, detector=None, beam=None, dtype=torch.float64):
+    return Simulator(Crystal(CrystalConfig(**{**CRYSTAL, **(crystal or {})}), dtype=dtype),
+                     Detector(DetectorConfig(**{**DETECTOR, **(detector or {})}), dtype=dtype),
+                     beam_config=BeamConfig(**{**BEAM, **(beam or {})}), dtype=dtype)
 
 
 def local_maxima(image, floor):
-    """Pixels that are the maximum of their 3x3 neighbourhood and above floor."""
+    """Pixels that are the maximum of their 3x3 neighborhood and above floor."""
     pooled = nnf.max_pool2d(image[None, None], 3, stride=1, padding=1)[0, 0]
     return (image == pooled) & (image > floor)
 
 
-def test_centres_are_the_bragg_images_maxima():
-    sim = simulator()
+@pytest.mark.parametrize("dtype", [torch.float64, torch.float32])
+def test_centers_are_the_bragg_images_maxima(dtype):
+    sim = simulator(dtype=dtype)
     image = sim.run(oversample=1)
-    # A GAUSS-HKL spot n sds from its pixel peaks at exp(-n^2/2) of a centred one: 1.1% at the default
+    # A GAUSS-HKL spot n sds from its pixel peaks at exp(-n^2/2) of a centered one: 1.1% at the default
     # 3 sds. Above 2% (2.8 sds) every recorded spot must be predicted.
     maxima = local_maxima(image, 2e-2 * image.max())
     assert maxima.sum() >= 5, "the test geometry must record several spots"
-    centres = ~predicted_spot_mask(sim, radius_px=1.0)
-    assert not (maxima & ~centres).any(), "a recorded spot was not predicted"
-    on_maxima = local_maxima(image, 0.0)[centres].float().mean()
-    assert on_maxima > 0.9, f"only {on_maxima:.2f} of the predicted centres are maxima of the image"
+    centers = ~predicted_spot_mask(sim, radius_px=1.0)
+    assert not (maxima & ~centers).any(), "a recorded spot was not predicted"
+    on_maxima = local_maxima(image, 0.0)[centers].float().mean()
+    assert on_maxima > 0.9, f"only {on_maxima:.2f} of the predicted centers are maxima of the image"
 
 
 def test_only_the_direct_beam_spot_by_hand():
     # A 4 A cubic cell: the first reflection needs |s| = 0.25/A, past this detector's corners (0.225/A),
     # so the one spot is 000 at the direct beam, and the mask is a disk about one pixel. The beam falls on
-    # the corner of four pixels, equally near 000: a spot still has one centre.
+    # the corner of four pixels, equally near 000: a spot still has one center.
     sim = simulator(crystal=dict(cell_a=4.0, cell_b=4.0, cell_c=4.0, misset_deg=(0.0, 0.0, 0.0)))
     assert predicted_spot_mask(sim, radius_px=0.0).all()
     one = ~predicted_spot_mask(sim, radius_px=1.0)
@@ -61,9 +65,6 @@ def test_only_the_direct_beam_spot_by_hand():
     expected = torch.zeros_like(nine)
     expected[i - 1:i + 2, j - 1:j + 2] = True
     assert torch.equal(nine, expected)
-
-
-import pytest
 
 
 @pytest.mark.parametrize("spread", [dict(mosaic_spread_deg=1.0, mosaic_domains=8, mosaic_seed=7),
@@ -76,8 +77,8 @@ def test_more_orientations_mask_a_superset(spread):
 
 
 def resolution_A(sim):
-    """Bragg's law at each pixel centre, d = lambda / (2 sin theta), theta half the angle from the beam."""
-    pixels = sim._cached_pixel_coords_meters
+    """Bragg's law at each pixel center, d = lambda / (2 sin theta), theta half the angle from the beam."""
+    pixels = sim.detector.get_pixel_coords()
     cos_2theta = (pixels / pixels.norm(dim=-1, keepdim=True)) @ sim.incident_beam_direction
     return 1.0 / (2.0 * torch.sqrt((1 - cos_2theta) / 2))          # lambda = 1 A
 
@@ -102,22 +103,20 @@ def test_strided_pixels_by_hand():
     assert strided_pixels(keep, stride=1).shape == (15, 2)
 
 
-from src.nanobrag_torch.diffuse import GaussianHalo
-from src.nanobrag_torch.models.experiment import ExperimentModel
-
-
-def experiment(mask_array=None):
+def experiment(mask_array=None, diffuse=None, **kwargs):
     detector = DetectorConfig(**DETECTOR, mask_array=mask_array)
     return ExperimentModel(CrystalConfig(**CRYSTAL), detector, BeamConfig(**BEAM), dtype=torch.float64,
-                           diffuse=GaussianHalo(amplitude=40.0, sigma=0.15))
+                           diffuse=diffuse or GaussianHalo(amplitude=40.0, sigma=0.15), **kwargs)
 
 
 def test_experiment_masks_zero_both_components_and_keep_an_existing_mask():
     beamstop = torch.ones(64, 64)
     beamstop[30:34, 30:34] = 0
     model = experiment(mask_array=beamstop)
-    masks = model.spot_masks(radius_px=2.0, apply=True)
+    masks = model.spot_masks(radius_px=2.0)
     assert len(masks) == 1 and masks[0].dtype == torch.bool
+    model.set_mask_arrays([masks[0] & (beamstop > 0)])
+    # wiring: the model's geometry is the bare Simulator's
     assert torch.equal(masks[0], predicted_spot_mask(simulator(), radius_px=2.0))
     with torch.no_grad():
         model()
@@ -129,11 +128,60 @@ def test_experiment_masks_zero_both_components_and_keep_an_existing_mask():
 
 def test_experiment_mask_stays_fixed_while_the_geometry_moves():
     model = experiment()
-    before = model.spot_masks(radius_px=2.0, apply=True)[0]
+    before = model.spot_masks(radius_px=2.0)[0]
+    model.set_mask_arrays([before])
     with torch.no_grad():
-        model.crystal_params.delta_misset_raw.add_(torch.tensor([0.0, 0.0, 0.05], dtype=torch.float64))
+        dict(model.named_parameters())["crystal_params.delta_misset_raw"].add_(
+            torch.tensor([0.0, 0.0, 0.05], dtype=torch.float64))
         model()
     # The halo is positive at every pixel, so the diffuse image is zero exactly where the mask removes.
     assert torch.equal(model.components["diffuse"] == 0, ~before)
     assert not torch.equal(model.spot_masks(radius_px=2.0)[0], before), "the geometry did not move the spots"
     assert not before.requires_grad
+
+
+@pytest.mark.parametrize("dmin", [0.0, 7.0])
+def test_several_sources_mask_the_union_of_each_alone(dmin):
+    # Two sources on the default beam at 1.0 and 1.3 A, with phi steps: each view must pair its pixels with its
+    # own source's wavelength, so the mask is the union of the two single-source masks (also under dmin).
+    crystal = dict(osc_range_deg=1.0, phi_steps=3)
+    directions = torch.tensor([[-1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]], dtype=torch.float64)
+    both = dict(source_directions=directions, source_wavelengths=torch.tensor([1.0e-10, 1.3e-10], dtype=torch.float64),
+                source_weights=torch.ones(2, dtype=torch.float64), dmin=dmin)
+    together = ~predicted_spot_mask(simulator(crystal=crystal, beam=both), radius_px=1.0)
+    alone = [~predicted_spot_mask(simulator(crystal=crystal, beam=dict(wavelength_A=w, dmin=dmin)), radius_px=1.0)
+             for w in (1.0, 1.3)]
+    assert alone[0].sum() > 0 and alone[1].sum() > 0 and not torch.equal(alone[0], alone[1])
+    assert torch.equal(together, alone[0] | alone[1])
+
+
+def two_panels(**kwargs):
+    # Two panels, the second shifted sideways: the multi-panel ROI path caches its pixels (with their masks)
+    panels = [DetectorConfig(**DETECTOR, beam_center_f=f, beam_center_s=16.0) for f in (16.0, -16.0)]
+    return ExperimentModel(CrystalConfig(**CRYSTAL), panels, BeamConfig(**BEAM), dtype=torch.float64,
+                           diffuse=GaussianHalo(amplitude=40.0, sigma=0.15), **kwargs)
+
+
+@pytest.mark.parametrize("make", [lambda: experiment(background_rois=[(0, 63, 0, 63)]),
+                                  lambda: two_panels(background_rois=[(0, 63, 0, 63)] * 2, background_panels=[0, 1])])
+def test_masks_set_after_a_forward_reach_the_roi_path_and_replace_each_other(make):
+    model = make().freeze()                                       # geometry given, as in a diffuse fit
+    with torch.no_grad():
+        assert (model(roi_only=True) > 0).all()                    # the ROI pixels are cached now
+        for radius in (6.0, 2.0):                                  # a sweep: each mask replaces the last
+            masks = model.spot_masks(radius_px=radius)
+            model.set_mask_arrays(masks)
+            values = model(roi_only=True)
+            kept = torch.cat([m[tuple(model.background_params.pixels[model.background_params.panel == i].T)]
+                              for i, m in enumerate(masks)])
+            assert (~kept).any() and kept.any(), radius
+            assert torch.equal(values == 0, ~kept), radius
+
+
+def test_shots_sharing_a_detector_refuse_a_mask_of_their_own():
+    halo = GaussianHalo(amplitude=40.0, sigma=0.15)
+    shots = [experiment(diffuse=halo), experiment(diffuse=halo)]
+    serial = SerialExperiment(shots, share_detector=True)
+    for shot in serial.shots:
+        with pytest.raises(ValueError, match="shared"):
+            shot.set_mask_arrays(shot.spot_masks(radius_px=2.0))

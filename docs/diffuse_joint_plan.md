@@ -444,7 +444,7 @@ reference.
     - `core_drift()` exposes |θ − θ_b|. Past `core_drift_tolerance` a warning is given once.
       The tolerance is a placeholder of 0.05, to be set on V2.
     - **How V2a sets it (decided 2026-11-06).** At points along each V2a grid fit (start, middle,
-      end) the residual is rebuilt at the current θ; the stale-residual image's linearised bias is
+      end) the residual is rebuilt at the current θ; the stale-residual image's linearized bias is
       measured (non-scale parameters in sds, G and k_d absolutely) and fitted against the drift.
       Drift is the largest |Δθ_i|/s_i, with a drift scale s_i measured per parameter (log γ and
       log B_sol need not cost the same). The threshold is the drift at which the worst non-scale
@@ -551,21 +551,32 @@ reference.
   - **Built for V2 (2026-11-06, `feat/diffuse-spot-mask`, stacked on D3b):**
     `nanobrag_torch.spot_mask.predicted_spot_mask(simulator, radius_px, n_sd=3)`.
     - Spots are predicted from the geometry, not from an image (a threshold on a still drops weak
-      partials). Each pixel centre's fractional hkl is computed as the kernel computes it, and its
+      partials). Each pixel center's fractional hkl is computed as the kernel computes it, and its
       distance to the nearest integer hkl is taken in the HKL metric, Σ(N_i d_i)², in GAUSS-HKL
       spot sds (0.397/N).
-    - An integer hkl within n_sd sds of some pixel is a spot. Its centre is the nearest pixel, and
+    - An integer hkl within n_sd sds of some pixel is a spot. Its center is the nearest pixel, and
       ties (a beam on a pixel corner) go to the lowest index.
     - The mask is the union over phi steps, mosaic domains and sources, with no spot beyond dmin.
       It is a fixed bool tensor with no gradient.
     - `strided_pixels(keep, stride)` gives a `pixels=` subset of the kept pixels.
-    - `ExperimentModel.spot_masks(radius_px, n_sd, apply=False)` builds one per panel at the
-      current geometry. `apply=True` multiplies it into each panel's `mask_array` (a beamstop mask
-      already there is kept), so both components drop those pixels, on the whole-image and ROI
-      paths. It stays fixed while the geometry refines, until called again.
-    - Tests (`tests/test_spot_mask.py`): the predicted centres are the Bragg image's maxima; a
-      hand-counted direct-beam case; mosaic and phi give a superset; dmin; strided pixels;
-      ExperimentModel masks zero both components and stay fixed while misset moves.
+    - hkl is taken at pixel centers only, not at the subpixels an oversampled image also samples.
+      The cutoff is the same rule as the pilot's in spot sds: V1's toy (N = 10) puts 3 sds at 0.12 in
+      Miller units, the pilot's cutoff; V2a's N_cells 20 gives 0.06.
+    - `ExperimentModel.spot_masks(radius_px, n_sd)` builds one per panel at the current geometry.
+      It stays fixed while the geometry refines, until called again.
+    - `ExperimentModel.set_mask_arrays(masks)` replaces each panel's `mask_array`, so a radius sweep
+      can go back and forth; a beamstop mask is combined by the caller. Both components then drop
+      those pixels, on the whole-image and ROI paths. It refuses on shots that share one Detector
+      (`SerialExperiment(share_detector=True)`), whose per-shot pixels go through `strided_pixels`.
+    - The multi-panel ROI path cached its pixels on the geometry version alone, so a `mask_array`
+      set after a forward never reached it. It now tracks each panel's mask by identity, as the
+      Simulator already did (no change when no mask changes).
+    - Tests (`tests/test_spot_mask.py`, float64 and float32): the predicted centers are the Bragg
+      image's maxima; a hand-counted direct-beam case with a beam on a pixel corner; mosaic and
+      phi give a superset; dmin; two sources of different wavelength give the union of each alone;
+      strided pixels; masks zero both components; masks set after a forward reach the ROI path on
+      one and two panels and replace each other; they stay fixed while misset moves; shared
+      detectors refuse. The union, dmin, source and refusal tests were mutation-checked.
 - **The spot-mask pilot, and the grid recommended for eryx (decided 2026-11-06).**
   - The pilot: eryx `torchbragg-core` ebe9e81, `core_bias.py --mask-radius`. Lysozyme 193l,
     n_cells 20, mesh 4, k_floor 0.025, V1 geometry at 128², k_d frozen. z is scaled to 1e6
@@ -767,7 +778,7 @@ Each rung uses the result of the one before; real data only after synthetic reco
     - **Data:** lysozyme 193l (public), stills only (a rotation wedge moves to a later V2 step),
       4-8 shots at random orientations, 256² at 0.4 mm and 100 mm, 1 Å, N_cells 20, mesh 4,
       k_floor 0.025, GAUSS spots under the HKL metric. Diffuse photons per shot at 1e5 and 1e6.
-      - Truth images at oversample 3, since pixel centres alias the sharp halo cores (below); fits
+      - Truth images at oversample 3, since pixel centers alias the sharp halo cores (below); fits
         use the same oversample, so grid and exact are compared like for like.
       - A low-resolution cutoff of d_max about 20 Å, as a beamstop: the 000 halo and the low-order
         00l halos make the image's brightest diffuse pixels there (below), which real data do not
@@ -783,11 +794,11 @@ Each rung uses the result of the one before; real data only after synthetic reco
     - **Fits:** Bragg alone (G, misset, cell, N_cells), diffuse alone (geometry given, per V1), and
       joint (all), each on the exact per-pixel path and on the cored grid, setups A and B
       (section 2.2).
-    - **Exact reference (option c, decided):** the linearised bias b = −F⁻¹JᵀW(μ_grid − μ_exact),
+    - **Exact reference (option c, decided):** the linearized bias b = −F⁻¹JᵀW(μ_grid − μ_exact),
       from exact forwards, for every fit; plus full nonlinear exact fits as the direct check. These
       became affordable on 2026-11-06 (below).
     - **Pass rules**, applied to A and B:
-      1. Grid vs exact, linearised, at 1e5 and 1e6 diffuse photons: non-scale parameters (springs,
+      1. Grid vs exact, linearized, at 1e5 and 1e6 diffuse photons: non-scale parameters (springs,
          share, solvent, extra_U, misset, cell, N_cells) ≤ 0.05 sd; G and k_d < 1e-3 in log. The
          full exact and grid fits agree within 0.1 sd.
       2. Recovery: noise-free errors < 1e-5 relative; Poisson |z| < 4 over seeds 1-3 in all three
@@ -814,7 +825,7 @@ Each rung uses the result of the one before; real data only after synthetic reco
         (0, 0, l): 1.60e5 at l = 0.05, 1.38e5 at 0.51, 5.3e4 at 0.95 e² per cell. It looks square
         because the halos tile the reciprocal cells and the figure's clip saturates them. It spans
         about 10 px (4 mm at 100 mm, d ≳ 20 Å), partly behind a typical beamstop: hence d_max.
-      - Figure 9's single-pixel spikes are real sharp halo cores aliased by pixel-centre sampling:
+      - Figure 9's single-pixel spikes are real sharp halo cores aliased by pixel-center sampling:
         114 pixels at 256², |hkl − G| 0.02-0.17 (a pixel spans 0.28 in h), at 1.39× (median, up to
         5.2×) the oversample-3 average. The image totals agree (4641 against 4640 photons); 1% of
         pixels differ by more than 7%. Hence oversample 3 for the truth. Oversample 5 was not
@@ -889,7 +900,7 @@ eryx (pushed to `backup` only):
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
 | E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach, in the current metric (section 2.2, 2026-11-06; the old metric said a leftover under 1% at 1/16, 4% at 1/32). It must carry the full, off-diagonal anisotropy of its elastic term (a diagonal core fails at every step). At 1/16 it tolerates κ within 5%, an amplitude frozen at h₀ and a 10% quartic shape error. At 1/32 it tolerates a 30% shape error. At 1/8 it needs κ within about 2% and the q-dependent amplitude and shape. Its k_floor must be exact, which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model. Pilot (torchbragg-core ebe9e81, 2026-11-06): the order-3 core at 1/32 meets it unmasked, with worst z 0.037 once G is judged absolutely (bias 8e-5 in log G); 1/16 gives 0.145 and order 2 gives 0.59 |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
-| E1c | (decided 2026-11-06) `SpringDiffuse`: the best map-space model as a torchBragg `DiffuseModel` with a `core()`. Start from the insulin top rung (`MultiSpringModel` level 4, ASU bodies, F4 solvent and waters, crystal-2 CC 0.901). It needs: a torch-native `cell_transform`, differentiable in hkl (today it takes numpy); an absolute spring scale tied to the lattice share of the ADPs as `TotalScattering` has (ShellFit leaves the overall spring size undetermined); a k_floor from N_cells; and a `SpringAcousticCore` from the spring blocks at k → 0, with W rephased to body centres. For lysozyme, the body model is rebuilt from 193l with our own solvent, not from the mdx-lib export (CC BY-NC-SA) the map-space ladder used. The absolute scale is the science question: if the ADP-share tie fails for these models, k_d is freed for them. Then V2b |
+| E1c | (decided 2026-11-06) `SpringDiffuse`: the best map-space model as a torchBragg `DiffuseModel` with a `core()`. Start from the insulin top rung (`MultiSpringModel` level 4, ASU bodies, F4 solvent and waters, crystal-2 CC 0.901). It needs: a torch-native `cell_transform`, differentiable in hkl (today it takes numpy); an absolute spring scale tied to the lattice share of the ADPs as `TotalScattering` has (ShellFit leaves the overall spring size undetermined); a k_floor from N_cells; and a `SpringAcousticCore` from the spring blocks at k → 0, with W rephased to body centers. For lysozyme, the body model is rebuilt from 193l with our own solvent, not from the mdx-lib export (CC BY-NC-SA) the map-space ladder used. The absolute scale is the science question: if the ADP-share tie fails for these models, k_d is freed for them. Then V2b |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
 | (fix) | `torchbragg-backward` (2026-11-06): the exact path's backward made linear in the rows (section 5, V2a) |
 

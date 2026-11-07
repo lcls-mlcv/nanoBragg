@@ -2,24 +2,28 @@
 
 Near a lattice point the diffuse core and the Bragg peak trade off, so diffuse and joint fits may
 leave out the pixels around each spot. The spots are predicted from the geometry alone, not from an
-image: each pixel centre's fractional hkl, the nearest integer hkl, and its distance in the HKL
+image: each pixel center's fractional hkl, the nearest integer hkl, and its distance in the HKL
 metric, sum_i (N_i d_i)^2, in units of a GAUSS-HKL spot's sd, 0.397/N per axis. Every integer hkl
-within n_sd sds of some pixel is a spot; its centre is the pixel nearest it. Orientations (phi steps,
-mosaic domains) and sources each predict their own spots, and the mask is their union.
+within n_sd sds of some pixel center is a spot; its center is the pixel nearest it. Each view (one
+source at one phi step and mosaic domain) predicts its own spots, and the mask is their union. hkl is
+taken at pixel centers only, not at the subpixels an oversampled image also samples.
 
 The mask is a plain boolean tensor, built once from the geometry it is given and carrying no
 gradient, so it stays fixed while the geometry refines. Write it into DetectorConfig.mask_array, or
 take a strided pixel set from it (strided_pixels).
 """
+from typing import Iterator, Tuple
+
 import torch
 
 SPOT_SD = 0.397
 """A GAUSS spot's sd in h under the HKL metric is SPOT_SD / N (plan section 5, V1)."""
 
 
-def _pixel_hkl(simulator) -> torch.Tensor:
-    """Fractional hkl at each pixel centre, (n_sources * n_phi * n_mos, S, F, 3), as the kernel computes it:
-    h = a . (d - s0) / lambda with d the unit vector to the pixel and s0 the incident direction."""
+def _views(simulator) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+    """For each source, phi step and mosaic domain: the fractional hkl at each pixel center, (S, F, 3), and
+    |s| in 1/A, (S, F). As the kernel computes them: s = (d - s0) / lambda, with d the unit vector to the
+    pixel and s0 the incident direction (minus the source direction), and h = a . s."""
     simulator._ensure_pixel_coords_current()
     pixels = simulator._cached_pixel_coords_meters.detach()
     d = pixels / pixels.norm(dim=-1, keepdim=True).clamp_min(1e-30)
@@ -28,53 +32,56 @@ def _pixel_hkl(simulator) -> torch.Tensor:
         wavelength_A = simulator._source_wavelengths_A.detach().to(d)
     else:
         incident = simulator.incident_beam_direction.detach().to(d).reshape(1, 3)
-        wavelength_A = torch.as_tensor(simulator.wavelength, dtype=d.dtype, device=d.device).detach().reshape(1)
-    s = (d[None] - incident[:, None, None]) / wavelength_A.reshape(-1, 1, 1, 1)          # (n_src, S, F, 3), 1/A
+        wavelength_A = torch.as_tensor(simulator.wavelength).detach().to(d).reshape(1)
     (rot_a, rot_b, rot_c), _ = simulator.crystal.get_rotated_real_vectors(simulator.crystal.config)
-    axes = torch.stack([rot_a, rot_b, rot_c], dim=-2).detach().to(d).reshape(-1, 3, 3)  # (n_orient, 3, 3), A
-    hkl = torch.einsum("osfj,ncj->nosfc", s, axes)
-    return hkl.reshape(-1, *hkl.shape[2:]), s.norm(dim=-1)
+    axes = torch.stack([rot_a, rot_b, rot_c], dim=-2).detach().to(d).reshape(-1, 3, 3)    # (n_orient, 3, 3), A
+    for source in range(len(incident)):
+        s = (d - incident[source]) / wavelength_A[source]
+        s_norm = s.norm(dim=-1)
+        for axis in axes:
+            yield s @ axis.T, s_norm
 
 
 def predicted_spot_mask(simulator, radius_px: float, n_sd: float = 3.0) -> torch.Tensor:
     """(S, F) bool, True where a pixel is kept: False within radius_px pixels (distance < radius_px) of a
-    predicted spot centre. Spots beyond the simulator's dmin are not predicted."""
+    predicted spot center. No spot is predicted where |s| > 1/dmin, the kernel's dmin rule."""
     with torch.no_grad():
-        hkl, s_norm = _pixel_hkl(simulator)
-        n_views, S, F, _ = hkl.shape
         N = torch.stack([torch.as_tensor(simulator.crystal.N_cells_a), torch.as_tensor(simulator.crystal.N_cells_b),
-                         torch.as_tensor(simulator.crystal.N_cells_c)]).to(hkl).detach()
-        nearest = torch.round(hkl)
-        dist2 = (((hkl - nearest) * N) ** 2).sum(-1)
-        inside = dist2 < (n_sd * SPOT_SD) ** 2
-        dmin = getattr(simulator.beam_config, "dmin", 0.0) or 0.0
-        if dmin > 0:
-            n_src = s_norm.shape[0]
-            inside &= (s_norm.repeat_interleave(n_views // n_src, dim=0) <= 1.0 / dmin)
-        centres = torch.zeros(S * F, dtype=torch.bool, device=hkl.device)
-        view, pixel = torch.nonzero(inside.reshape(n_views, -1), as_tuple=True)
-        if len(view):
-            keys = torch.cat([view[:, None], nearest.reshape(n_views, -1, 3)[view, pixel].long()], dim=1)
-            _, spot = torch.unique(keys, dim=0, return_inverse=True)
-            d2 = dist2.reshape(n_views, -1)[view, pixel]
-            best = torch.full((int(spot.max()) + 1,), float("inf"), dtype=d2.dtype, device=d2.device)
-            best = best.scatter_reduce(0, spot, d2, reduce="amin")
-            # Pixels equally near a spot (a beam on a pixel corner) tie: the lowest pixel index is its centre.
-            nearest_pixel = torch.where(d2 == best[spot], pixel, torch.full_like(pixel, S * F))
-            first = torch.full_like(best, S * F, dtype=pixel.dtype).scatter_reduce(0, spot, nearest_pixel, reduce="amin")
-            centres[first] = True
-        return _dilate(centres.reshape(S, F), radius_px)
+                         torch.as_tensor(simulator.crystal.N_cells_c)]).detach()
+        dmin = simulator.beam_config.dmin
+        centers = None
+        for hkl, s_norm in _views(simulator):
+            if centers is None:
+                S, F, _ = hkl.shape
+                centers = torch.zeros(S * F, dtype=torch.bool, device=hkl.device)
+                N = N.to(hkl)
+            nearest = torch.round(hkl).reshape(-1, 3)
+            dist2 = (((hkl.reshape(-1, 3) - nearest) * N) ** 2).sum(-1)
+            inside = dist2 < (n_sd * SPOT_SD) ** 2
+            if dmin > 0:
+                inside &= s_norm.reshape(-1) <= 1.0 / dmin
+            pixel = torch.nonzero(inside).flatten()
+            if len(pixel):
+                _, spot = torch.unique(nearest[pixel].long(), dim=0, return_inverse=True)
+                d2 = dist2[pixel]
+                best = torch.full((int(spot.max()) + 1,), float("inf"), dtype=d2.dtype, device=d2.device)
+                best = best.scatter_reduce(0, spot, d2, reduce="amin")
+                # Pixels equally near a spot (a beam on a pixel corner) tie: the lowest pixel index is its center.
+                candidate = torch.where(d2 == best[spot], pixel, torch.full_like(pixel, S * F))
+                first = torch.full_like(best, S * F, dtype=pixel.dtype).scatter_reduce(0, spot, candidate, reduce="amin")
+                centers[first] = True
+        return _dilate(centers.reshape(S, F), radius_px)
 
 
-def _dilate(centres: torch.Tensor, radius_px: float) -> torch.Tensor:
-    """keep = no centre within distance < radius_px."""
-    if radius_px <= 0 or not centres.any():
-        return torch.ones_like(centres)
+def _dilate(centers: torch.Tensor, radius_px: float) -> torch.Tensor:
+    """keep = no center within distance < radius_px."""
+    if radius_px <= 0 or not centers.any():
+        return torch.ones_like(centers)
     reach = int(torch.ceil(torch.tensor(radius_px)).item())
-    offsets = torch.arange(-reach, reach + 1, device=centres.device)
+    offsets = torch.arange(-reach, reach + 1, device=centers.device)
     dy, dx = torch.meshgrid(offsets, offsets, indexing="ij")
     disk = ((dy ** 2 + dx ** 2) < radius_px ** 2).to(torch.float32)
-    hit = torch.nn.functional.conv2d(centres.to(torch.float32)[None, None], disk[None, None], padding=reach)[0, 0]
+    hit = torch.nn.functional.conv2d(centers.to(torch.float32)[None, None], disk[None, None], padding=reach)[0, 0]
     return hit == 0
 
 
