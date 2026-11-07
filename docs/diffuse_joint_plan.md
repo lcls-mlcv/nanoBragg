@@ -7,6 +7,13 @@ is implemented and has been through the audit and review of 2026-11-05. Its V1 g
 the GPU gate machine. D3 (`DiffuseGrid`, `feat/diffuse-grid`, stacked on D2) is implemented; its
 grid-vs-exact measurement and the decision it informs are in section 2.2.
 
+Update 2026-11-06: D1, D2 and D3 are merged (#72-#74); D3b (the analytic core) is PR #75. V2 is
+designed (section 5, V2a/V2b, settled with the user 2026-11-06) and its first piece, the spot-mask
+helper (`nanobrag_torch.spot_mask`, branch `feat/diffuse-spot-mask` stacked on D3b), is built. The
+best eryx models (the map-space ladders' top rungs) reach the protocol through a new eryx item, E1c
+(section 7). The spot-broadening diagnosis is done and its fixes are planned before V4 (section 8,
+decision 8).
+
 Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
 (`nanobrag_torch`), eryx = the diffuse-scattering library (PyTorch, GPLv2).
 
@@ -21,6 +28,9 @@ Names: nanoBragg = the C program, diffBragg = simtbx, torchBragg = this package
      Either side can be frozen or left out. torchBragg can render a diffuse-only image, so
      each half can be compared with programs that do only Bragg (diffBragg/hopper, DIALS)
      or only diffuse (mdx2, mdx-lib, EVAL/DECaF).
+   - The end goal (the user, 2026-11-06): the two halves merged and refined hand in hand, with
+     either one switched off when it misbehaves or when a user wants only Bragg or only diffuse.
+     V2 tests the switch both ways (section 5).
 2. **C-first holds with diffuse off.** The diffuse term is an extension that does not exist
    in nanoBragg.c. It lives outside the compiled kernel and adds no work, parameter or state
    when it is absent. The only divergences from C stay the ones in
@@ -433,6 +443,15 @@ reference.
     - Its gradient in θ is the core's alone.
     - `core_drift()` exposes |θ − θ_b|. Past `core_drift_tolerance` a warning is given once.
       The tolerance is a placeholder of 0.05, to be set on V2.
+    - **How V2a sets it (decided 2026-11-06).** At points along each V2a grid fit (start, middle,
+      end) the residual is rebuilt at the current θ; the stale-residual image's linearised bias is
+      measured (non-scale parameters in sds, G and k_d absolutely) and fitted against the drift.
+      Drift is the largest |Δθ_i|/s_i, with a drift scale s_i measured per parameter (log γ and
+      log B_sol need not cost the same). The threshold is the drift at which the worst non-scale
+      bias reaches 0.05 sd or log G's reaches 1e-3, rounded down. Past it the fit **rebuilds the
+      residual** at the current θ and continues (minutes at 1/16 on the GPU gate machine); the
+      one-time warning stays as the fallback where no rebuild is wired. This needs a small
+      torchBragg addition (a residual rebuild on `DiffuseGrid`, or a callback in the refine loop).
     - A test with a smooth part that depends on θ shows the stale error growing with the drift.
     - With refinable values, the residual's values and the core's amplitude are nearly
       degenerate.
@@ -529,9 +548,24 @@ reference.
   - V2 reports the separability ratio and the grid bias against the mask radius n.
   - What exists: `DetectorConfig.mask_array`, a per-pixel mask that the Simulator and the ROI
     path (`ExperimentModel._roi_mask_values`) apply.
-  - What is missing, and not built in D3b: a helper that builds the ±n mask from the predicted
-    spots (from the model's Bragg term or `roi_centroids`), keeps it fixed while the geometry
-    refines, and feeds it to `mask_array` or a strided ROI set. It belongs with the V2 setup.
+  - **Built for V2 (2026-11-06, `feat/diffuse-spot-mask`, stacked on D3b):**
+    `nanobrag_torch.spot_mask.predicted_spot_mask(simulator, radius_px, n_sd=3)`.
+    - Spots are predicted from the geometry, not from an image (a threshold on a still drops weak
+      partials). Each pixel centre's fractional hkl is computed as the kernel computes it, and its
+      distance to the nearest integer hkl is taken in the HKL metric, Σ(N_i d_i)², in GAUSS-HKL
+      spot sds (0.397/N).
+    - An integer hkl within n_sd sds of some pixel is a spot. Its centre is the nearest pixel, and
+      ties (a beam on a pixel corner) go to the lowest index.
+    - The mask is the union over phi steps, mosaic domains and sources, with no spot beyond dmin.
+      It is a fixed bool tensor with no gradient.
+    - `strided_pixels(keep, stride)` gives a `pixels=` subset of the kept pixels.
+    - `ExperimentModel.spot_masks(radius_px, n_sd, apply=False)` builds one per panel at the
+      current geometry. `apply=True` multiplies it into each panel's `mask_array` (a beamstop mask
+      already there is kept), so both components drop those pixels, on the whole-image and ROI
+      paths. It stays fixed while the geometry refines, until called again.
+    - Tests (`tests/test_spot_mask.py`): the predicted centres are the Bragg image's maxima; a
+      hand-counted direct-beam case; mosaic and phi give a superset; dmin; strided pixels;
+      ExperimentModel masks zero both components and stay fixed while misset moves.
 - **The spot-mask pilot, and the grid recommended for eryx (decided 2026-11-06).**
   - The pilot: eryx `torchbragg-core` ebe9e81, `core_bias.py --mask-radius`. Lysozyme 193l,
     n_cells 20, mesh 4, k_floor 0.025, V1 geometry at 128², k_d frozen. z is scaled to 1e6
@@ -558,6 +592,12 @@ reference.
   - **Recommended grid for eryx: order-3 core plus step 1/32.** The lysozyme ASU is about
     3.7 GB, and the one-time sampling takes about 34 min on 64 cores. The optical-block
     correction is shelved unless V2 shows a disagreement.
+  - **Superseded 2026-11-06 (current rules, eryx `core_bias.py --check`; worst non-scale z at
+    1e6 diffuse photons / |Δ log G|):** order 3 at 1/16 gives 0.145 / 2.6e-4 unmasked and
+    **0.033 / 4.2e-4 with a 2-px mask (7% of the diffuse photons), which passes**; order 3 at 1/32
+    gives **0.037 / 8e-5 unmasked (passes)**. Two setups therefore meet the targets: **A**, order 3
+    at 1/16 with a 2-px spot mask (about 470 MB), the default; and **B**, order 3 at 1/32 unmasked
+    (about 3.7 GB), the cross-check. V2a chooses between them (section 5).
   - Caveat: the pilot's diffuse-only fit still refined the geometry (the old V1 definition).
     The joint numbers are unaffected.
 
@@ -720,17 +760,68 @@ Each rung uses the result of the one before; real data only after synthetic reco
       the spots: ratios 14 (amplitude) and 4.5 (σ). At 128² with seed 1 the joint fit
       collapsed σ to 0.025 (z = −4.9). That was at the old photon level, 28× too low, and is to
       be re-measured. The report flags it as weakly identified.
-- **V2 eryx synthetic recovery:**
-  - lysozyme from a public PDB in the SBGrid 747 cell, stills and a rotation wedge, with
-    known springs, solvent, G and misset;
-  - recover jointly, and with each half frozen;
-  - grid vs exact error;
-  - diffuse and joint fits with ±n pixels masked around the predicted spots (section 2.2),
-    reporting the separability ratio and the grid bias against n, as an analysis option: the
-    pilot showed masks do not fix the grid bias;
-  - **a direct check of the grid:** fit the same synthetic data with the cored grid (order-3
-    core, 1/32) and with the exact per-pixel model, and compare the parameters within their
-    noise. The per-pixel path stays the reference and the fallback.
+- **V2 eryx synthetic recovery.** Settled with the user 2026-11-06. It is split in two: V2a tests
+  the machinery on the eryx model that has an absolute scale and a `core()` today, and V2b repeats
+  it on the best eryx model once E1c makes that a `DiffuseModel`.
+  - **V2a, on `TotalScattering`** (atomic GNM one-phonon plus the residual-disorder term):
+    - **Data:** lysozyme 193l (public), stills only (a rotation wedge moves to a later V2 step),
+      4-8 shots at random orientations, 256² at 0.4 mm and 100 mm, 1 Å, N_cells 20, mesh 4,
+      k_floor 0.025, GAUSS spots under the HKL metric. Diffuse photons per shot at 1e5 and 1e6.
+      - Truth images at oversample 3, since pixel centres alias the sharp halo cores (below); fits
+        use the same oversample, so grid and exact are compared like for like.
+      - A low-resolution cutoff of d_max about 20 Å, as a beamstop: the 000 halo and the low-order
+        00l halos make the image's brightest diffuse pixels there (below), which real data do not
+        record.
+    - **Truth and refined parameters:** springs at `interface` level, log γ drawn at about ±0.4
+      with mean 0 and refined with the Σ log² γ restraint as the gauge (grouped, or `class` level,
+      if 193l has too many interfaces); `share` (refine_share, truth 0.5), the diffuse term's
+      absolute level, which tests the tie against G with k_d frozen; solvent log k and log B;
+      `extra_U` (truth 0, refined). Fhkl is fixed at the truth from `write_bragg`, so `extra_U`
+      acts on the diffuse term only until mode b, and its correlation with `share` is reported. One
+      extra joint run frees per-ASU Fhkl (mode a) on the recorded reflections, to measure how much
+      the diffuse term moves F (V3's question) and whether separability survives.
+    - **Fits:** Bragg alone (G, misset, cell, N_cells), diffuse alone (geometry given, per V1), and
+      joint (all), each on the exact per-pixel path and on the cored grid, setups A and B
+      (section 2.2).
+    - **Exact reference (option c, decided):** the linearised bias b = −F⁻¹JᵀW(μ_grid − μ_exact),
+      from exact forwards, for every fit; plus full nonlinear exact fits as the direct check. These
+      became affordable on 2026-11-06 (below).
+    - **Pass rules**, applied to A and B:
+      1. Grid vs exact, linearised, at 1e5 and 1e6 diffuse photons: non-scale parameters (springs,
+         share, solvent, extra_U, misset, cell, N_cells) ≤ 0.05 sd; G and k_d < 1e-3 in log. The
+         full exact and grid fits agree within 0.1 sd.
+      2. Recovery: noise-free errors < 1e-5 relative; Poisson |z| < 4 over seeds 1-3 in all three
+         fits, with the profile-likelihood z where a Fisher sd exceeds 0.5 (as V1).
+      3. Separability: joint/alone sd ratio ≤ 1.5 for every parameter, reported against mask
+         radius 0, 1, 2, 3, 4, 6 px (`spot_mask`); gated only at the chosen setup's radius.
+      4. The switch: with the diffuse term off, the Bragg-alone fit on images that contain diffuse
+         recovers the truth or reports its bias; with Bragg off, the diffuse-alone fit recovers
+         the truth.
+    - **Choosing eryx's grid:** if A passes rules 1-3 it is the default and B the recorded
+      cross-check; if only B passes, B; if neither, stop and diagnose before D4, with no tuning.
+    - **Core drift:** V2a sets the threshold and the rebuild (section 2.2, the frozen residual).
+    - **Measured before V2a (2026-11-06, the exact path, 193l as in progress figure 9):**
+      - Exact-path cost (CPU, 32 threads). The backward was about 200× the forward and grew as the
+        rows squared: at 128², 1271 s for forward plus backward through the eryx parameters and
+        1216 s for the backward through hkl. Cause: `OnePhononTerm` read C[k] and F[index] once per
+        wavevector, and each read's backward fills a zero tensor the size of all of C; with mesh 4
+        every pixel has its own k. Fixed in eryx `torchbragg-backward` (a72b1cb, c04ccc8: one
+        gather and one split; values and gradients bit-identical, pinned by a test). Now 10.7 s
+        and 6.2 s at 128²; 46 s and 39 s at 256².
+      - Figure 9's square box around the direct beam is physical: the forward acoustic halo of 000
+        and the low-order 00l halos, where |F(q)|² is near |F(000)|². The model is continuous
+        across the 000 cell's faces (relative jump 2e-7, as for G ≠ 0) and falls smoothly along
+        (0, 0, l): 1.60e5 at l = 0.05, 1.38e5 at 0.51, 5.3e4 at 0.95 e² per cell. It looks square
+        because the halos tile the reciprocal cells and the figure's clip saturates them. It spans
+        about 10 px (4 mm at 100 mm, d ≳ 20 Å), partly behind a typical beamstop: hence d_max.
+      - Figure 9's single-pixel spikes are real sharp halo cores aliased by pixel-centre sampling:
+        114 pixels at 256², |hkl − G| 0.02-0.17 (a pixel spans 0.28 in h), at 1.39× (median, up to
+        5.2×) the oversample-3 average. The image totals agree (4641 against 4640 photons); 1% of
+        pixels differ by more than 7%. Hence oversample 3 for the truth. Oversample 5 was not
+        measured.
+  - **V2b, on the best eryx model** (after E1c): V2a's design and rules repeated on `SpringDiffuse`,
+    before V3 and V4.
+
 - **V3 Separability cross-check:**
   - merge the V2 images with `merge_map.py` and fit with ShellFit (map space alone);
   - the springs must agree with the image-space joint fit within the bootstrap SE;
@@ -743,7 +834,25 @@ Each rung uses the result of the one before; real data only after synthetic reco
   - joint: does the held-out NLL drop; does the Bragg CC move; does the joint diffuse
     model predict the CXIDB map as well as the map-space fit?
   - **Before V4:** a /diagnosing-bugs pass on the 0.93 ceiling, because halos and spot tails
-    compete for the same pixels.
+    compete for the same pixels. **Done 2026-11-04** (decision 8): the ceiling came from how the
+    data were set up and fitted, not from the forward physics. Its three fixes are V4
+    prerequisites, and a pixel-level joint fit adds a fourth item:
+    1. Train only on reflections whose whole rocking curve lies in the training frames, or model
+       the frames that hold it (a script change). Measured: lin CC 0.928 → 0.959.
+    2. A rotation-summed box objective: an NLL on each reflection's box sums added over all the
+       frames it occupies (boxes on ±2.5 frames), as a loss utility in torchBragg `utils/losses`,
+       grouped by reflection id across shots. Measured on top of 1 and 3: lin 0.973 → 0.984, log
+       0.989 → 0.995. Its L-BFGS took about 5× the iterations: it needs preconditioning or a better
+       F step scale.
+    3. Keep misset honest: hold it to the spindle-phase component, or add a centroid or pixel term
+       so the rotation about the beam is pinned by spot positions. The box-sum objective left that
+       rotation nearly free, and it drifted 0.2° (2.1 px rms at the detector). Measured: +0.012 lin.
+    4. **For the joint fit, which is a pixel NLL:** data spots were wider than the model's (σ about
+       0.65 px against 0.36 px). A box sum is blind to this, but a pixel NLL is not: spot tails
+       would leak into the diffuse pixels around each spot. Add a cheap per-shot Gaussian detector
+       PSF (σ about 0.5 px) to the Bragg term before V4, after fixing the orientation (item 3),
+       since a 2 px rotation offset dominates a 0.3 px width mismatch. Measure on V4's data first;
+       the spot mask (section 2.2) is the fallback.
 - **V5 Insulin** (Zenodo, I213 with the reindexing ambiguity, cosym first): the same as V4,
   against the 0.900 ladder.
 
@@ -770,7 +879,8 @@ torchBragg (lcls-mlcv, PRs into `torch`, one at a time; the maintainer merges):
 | D3b | finer grid near integer hkl, decided 2026-11-05: built before V2, to meet the bias law at 1e5–1e6 diffuse photons for sharp cores at affordable memory. Built as an analytic core supplied by the model plus a residual grid (section 2.2). Recommended for eryx (2026-11-06): order-3 core plus 1/32, per-parameter targets (G absolute < 0.1%, others ≤ 0.05 sd), masks not part of the budget | `core_candidates.py` (bias at 1e6 photons per candidate and core error), `grid_vs_exact.py error --only sharp sharp+core` at 128², V1 `--grid --grid-core` (machinery) and `--sharp` (noise-free bias under the residual's law), FD and gradcheck, V0 |
 | D4 | radial background b(\|q\|) | V1 with background |
 | D5 | Bragg F from the structure model (mode b): F(hkl) from atom tensors in place of the grid; overall B/U, then rigid-body ADPs | V2 |
-| (track) | spot-broadening diagnosis, from the start in parallel; the fix is decided from its result | gates V4 |
+| (track) | spot-broadening diagnosis: done 2026-11-04. Its fixes, before V4 (section 5, V4): whole rocking curves in training, a rotation-summed box loss in `utils/losses`, misset held to the spindle phase or pinned by centroids, and a per-shot detector PSF for the pixel-level joint fit | gates V4 |
+| V2 helper | `spot_mask` (predicted-spot masks, `ExperimentModel.spot_masks`), with the plan's V2 design; stacked on D3b. Then a residual rebuild for the core drift (section 2.2) | /tdd, V0 |
 
 eryx (pushed to `backup` only):
 
@@ -779,11 +889,13 @@ eryx (pushed to `backup` only):
 | E1 | `pyproject.toml`; `eryx.torchbragg.Diffuse` adapter; hkl kept in the graph on the exact path; bounded cache; `grid()` export; integration test resolves the import and fails loudly instead of skipping |
 | E1b | (decided 2026-11-05, before V2) the exact `core()` for D3b's cored grid: the one-phonon leading term computed from the model's own parameters. Accuracy it must reach, in the current metric (section 2.2, 2026-11-06; the old metric said a leftover under 1% at 1/16, 4% at 1/32). It must carry the full, off-diagonal anisotropy of its elastic term (a diagonal core fails at every step). At 1/16 it tolerates κ within 5%, an amplitude frozen at h₀ and a 10% quartic shape error. At 1/32 it tolerates a 30% shape error. At 1/8 it needs κ within about 2% and the q-dependent amplitude and shape. Its k_floor must be exact, which also bounds κ from below in a fit (κ ≥ 0.5/N_cells: the toy's κ → 0 spikes are unphysical). Gate: core_candidates-style bias at 1e6 photons ≤ 0.05 sd on eryx's own model. Pilot (torchbragg-core ebe9e81, 2026-11-06): the order-3 core at 1/32 meets it unmasked, with worst z 0.037 once G is judged absolutely (bias 8e-5 in log G); 1/16 gives 0.145 and order 2 gives 0.59 |
 | E2 | cell as a tensor (A* differentiable); amplitudes() differentiable in atom xyz and U (for D5, and so levels 3-4 later add restraints, not a rewrite); the multi-body/ShellFit ladder terms reachable from the adapter |
+| E1c | (decided 2026-11-06) `SpringDiffuse`: the best map-space model as a torchBragg `DiffuseModel` with a `core()`. Start from the insulin top rung (`MultiSpringModel` level 4, ASU bodies, F4 solvent and waters, crystal-2 CC 0.901). It needs: a torch-native `cell_transform`, differentiable in hkl (today it takes numpy); an absolute spring scale tied to the lattice share of the ADPs as `TotalScattering` has (ShellFit leaves the overall spring size undetermined); a k_floor from N_cells; and a `SpringAcousticCore` from the spring blocks at k → 0, with W rephased to body centres. For lysozyme, the body model is rebuilt from 193l with our own solvent, not from the mdx-lib export (CC BY-NC-SA) the map-space ladder used. The absolute scale is the science question: if the ADP-share tie fails for these models, k_d is freed for them. Then V2b |
 | E3 | `analysis/joint/`: V2–V5 scripts and READMEs |
+| (fix) | `torchbragg-backward` (2026-11-06): the exact path's backward made linear in the rows (section 5, V2a) |
 
-Order: D1 → E1 + D2 → V1 → D3 → D3b → E1b → V2 → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5 (mode b) is the
-major goal and on the critical path. The spot-broadening diagnosis runs in parallel from
-the start and must finish before V4. This plan document goes in with D1.
+Order: D1 → E1 + D2 → V1 → D3 → D3b → E1b → V2a → E1c → V2b → D4 → V3 → E2 + D5 → V4 → V5. E2 + D5
+(mode b) is the major goal and on the critical path. The spot-broadening diagnosis is done; its
+fixes must be in before V4. This plan document goes in with D1.
 Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
 
 ## 8. Decisions (settled 2026-11-04)
@@ -811,6 +923,9 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    - Spot masks are an analysis option, not part of the accuracy budget.
    - V2 compares grid and per-pixel fits directly. The per-pixel path stays the reference and
      the fallback.
+   **Revised 2026-11-06, under the current rules (section 2.2):** setup A (order 3 at 1/16 with a
+   2-px spot mask) is the default and B (order 3 at 1/32, unmasked) the cross-check; V2a's pass
+   rules pick between them (section 5).
 3. **Scale.** Bragg and diffuse are tied absolutely by default. A relative k_d (group
    `diffuse_scale`) is frozen at 1 and can be freed for separable fits. The peak-integral
    factor was measured (D2-T1). Decided 2026-11-05: `ExperimentModel` multiplies the diffuse
@@ -831,6 +946,14 @@ Each PR gets /code-review and /scientific-code-auditor before I ask for a merge.
    diagnosed, not a known cause. Candidates are box truncation, partiality across frames,
    absorption, per-frame scale, the comparison target and a detector PSF. Diagnosis runs
    first, in parallel; the fix is chosen from what it finds. It gates V4.
+   **Diagnosed 2026-11-04.** The CC limit is not forward physics or detector-plane broadening.
+   Three causes stack: reflections whose peak frame was outside the training frames (35 of 593,
+   fitted from their tails); a spurious 0.2° misset about the beam, which the box-sum objective
+   cannot see; and per-frame partiality the model cannot predict well enough (frame-centroid
+   error 0.21 frames against a rocking width of 0.5). Truncation, phi sampling, Lorentz and
+   polarization, and the background were refuted. With all three fixed, lin CC 0.984 and log
+   0.995 against a metric ceiling of about 0.998. **Decided 2026-11-06:** the fixes and a detector
+   PSF are V4 prerequisites (section 5, V4).
 9. **Where things live.** Library code goes in its repos. The joint analyses (V2-V5) go in
    eryx `analysis/joint/` (private), and large outputs stay off both repos. torchBragg gets
    one synthetic demo with the toy model and an api_guide section.
