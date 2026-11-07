@@ -1173,6 +1173,7 @@ class ExperimentModel(nn.Module):
         self._detectors: list = []
         self._panel_pixels = None  # the PanelPixels of the ROIs
         self._panel_pixels_key: Optional[tuple] = None
+        self._panel_pixels_masks: list = []
         self._crystal: Optional[Crystal] = None
         self._detector: Optional[Detector] = None
         self._beam_config: Optional[BeamConfig] = None
@@ -1472,7 +1473,13 @@ class ExperimentModel(nn.Module):
         for detector in self._detectors:
             detector._ensure_geometry_current()
         key = tuple(detector._geometry_version for detector in self._detectors)
-        if key == self._panel_pixels_key:
+        # mask_array is not geometry: a new one (set_mask_arrays) or an in-place edit leaves the version alone,
+        # so each is tracked by identity and its in-place version counter, as Simulator tracks its ROI mask.
+        from ..simulator import _tensor_version
+        masks = [(detector.config.mask_array, _tensor_version(detector.config.mask_array))
+                 for detector in self._detectors]
+        if key == self._panel_pixels_key and len(masks) == len(self._panel_pixels_masks) and all(
+                a is b and u == v for (a, u), (b, v) in zip(masks, self._panel_pixels_masks)):
             return self._panel_pixels
         self._require_uniform_panels()
 
@@ -1495,6 +1502,7 @@ class ExperimentModel(nn.Module):
             mask=self._roi_mask_values(),
         )
         self._panel_pixels_key = key
+        self._panel_pixels_masks = masks
         return self._panel_pixels
 
     def _require_uniform_panels(self) -> None:
@@ -1660,6 +1668,40 @@ class ExperimentModel(nn.Module):
         wavelength = float(self.beam_params.build_config().wavelength_A)
         return SimulatedGeometry(*(_numpy(cell[x]) for x in "abc"), tuple(panels),
                                  _numpy(self._detectors[0].beam_vector), wavelength)
+
+    @torch.no_grad()
+    def spot_masks(self, radius_px: float, n_sd: float = 3.0) -> list:
+        """Masks around the predicted Bragg spots at the current geometry, one (S, F) bool per panel, True
+        where a pixel is kept (nanobrag_torch.spot_mask.predicted_spot_mask).
+
+        They are built once and do not follow the geometry as it refines: call again to rebuild. Give them
+        to set_mask_arrays (combined with any beamstop mask first), or take a pixel subset with
+        nanobrag_torch.spot_mask.strided_pixels.
+        """
+        from ..spot_mask import predicted_spot_mask
+
+        self._sync()
+        return [predicted_spot_mask(simulator, radius_px, n_sd) for simulator in self._whole_panel_simulators()]
+
+    def set_mask_arrays(self, masks) -> None:
+        """Replace each panel's mask_array (nonzero = kept), on the whole-image and ROI paths alike.
+
+        Shots that share one Detector (SerialExperiment(share_detector=True)) have no mask of their own, so
+        this refuses on every one of them: give such shots their pixels with strided_pixels instead.
+        """
+        if self._detectors_synced_by_serial:
+            raise ValueError("this shot's detectors are shared with another shot, so a mask_array would mask both; "
+                             "use spot_mask.strided_pixels for per-shot pixels")
+        self._sync()
+        if len(masks) != len(self._detectors):
+            raise ValueError(f"one mask per panel: {len(self._detectors)} panels, {len(masks)} masks")
+        for detector, mask in zip(self._detectors, masks):
+            mask = torch.as_tensor(mask)
+            shape = (detector.config.spixels, detector.config.fpixels)
+            if tuple(mask.shape) != shape:
+                raise ValueError(f"mask shape {tuple(mask.shape)} does not match the panel's {shape}")
+            # a copy: a later edit of the caller's tensor does not reach the model
+            detector.config.mask_array = mask.to(device=self.device, dtype=self.dtype, copy=True)
 
     @torch.no_grad()
     def roi_centroids(self, observed=None) -> np.ndarray:
