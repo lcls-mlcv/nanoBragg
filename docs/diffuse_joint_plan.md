@@ -568,9 +568,17 @@ reference.
       subset of the kept pixels.
     - Only GAUSS under the HKL metric with fudge 1 and no N_cells_def is supported; other spot shapes
       are refused rather than masked with the wrong width. Thick-sensor layers are not sampled.
+    - Each pixel considers only the lattice point nearest its center, which is right while, in every
+      Miller index i, half a pixel's span plus the spot's reach is under 1/2:
+      span_i/2 + n_sd·0.397/N_i < 1/2 (at N 20, a span up to 0.88; at N 5, 0.52). Past that the mask
+      is refused: the re-audit measured 7-12% of the photons outside it at about 1.2 a pixel (a
+      250-400 Å cell with coarse pixels). V2a is at 0.30.
+    - A partial spot just past the 3-sd cutoff can still be bright on a sparse still (the re-audit:
+      one N 40 case left 6.8% of the photons outside). V2a reports the Bragg share outside the mask
+      for every run.
     - Measured on V2a-like stills (lysozyme cell, N 20, 0.4 mm at 100 mm, 128², oversample 3, three
       orientations; the audit's probe): Bragg photons outside the mask 0.2-0.5% at r = 2 px, against
-      72-94% before; at N 10 and 20 and oversample 1-4, under 0.7% beyond 2.5 px. On MPS the mask
+      72-94% before; at N 10 and 20 and oversample 1-4, at most 0.75% beyond 2.5 px. On MPS the mask
       equals the CPU's, and float32 equals float64.
     - `ExperimentModel.spot_masks(radius_px, n_sd)` builds one per panel at the current geometry.
       It stays fixed while the geometry refines, until called again.

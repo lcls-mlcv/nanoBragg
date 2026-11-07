@@ -208,7 +208,7 @@ def test_spots_smaller_than_a_pixel_are_predicted():
 
 
 def test_curved_detector_spots_are_predicted():
-    sim = simulator(detector=dict(curved_detector=True, distance_mm=50.0))
+    sim = simulator(detector=dict(curved_detector=True, distance_mm=50.0, pixel_size_mm=0.25))
     image = sim.run(oversample=1)
     maxima = local_maxima(image, 2e-2 * image.max())
     assert maxima.sum() >= 5
@@ -252,3 +252,11 @@ def test_set_mask_arrays_copies_and_checks_the_shape():
     assert (model.components["diffuse"] > 0).all()
     with pytest.raises(ValueError, match="shape"):
         model.set_mask_arrays([torch.ones(10, 10)])
+
+
+def test_pixels_spanning_much_of_a_miller_unit_are_refused():
+    # Each pixel considers the lattice point nearest its center hkl, which misses spots once a pixel spans about a
+    # Miller unit (a 250 A cell with 0.5 mm pixels at 100 mm: about 1.2 a pixel). Refused rather than mis-masked.
+    big = simulator(crystal=dict(cell_a=250.0, cell_b=250.0, cell_c=250.0, N_cells=(20, 20, 20)))
+    with pytest.raises(ValueError, match="Miller"):
+        predicted_spot_mask(big, radius_px=2.0)

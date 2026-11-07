@@ -34,6 +34,12 @@ from .config import CrystalShape, SpotMetric
 SPOT_SD = 0.397
 """A GAUSS spot's sd in h under the HKL metric is SPOT_SD / N (plan section 5, V1)."""
 
+# Each pixel considers only the lattice point nearest its center hkl. The pixel holding a spot has its center
+# within half the pixel's span of the spot along the detector, and the spot within n_sd sds of the lattice point
+# off it, so in each Miller index i that lattice point is the nearest integer while
+# span_i / 2 + n_sd * SPOT_SD / N_i < 1/2. Past that the mask is refused rather than mis-made (the audit of
+# 2026-11-06 measured 7-12% of the photons outside the mask at a span of about 1.2, N 20).
+
 _MARGIN = 0.75
 """Largest |delta*| (pixels, either axis) at which a pixel may still claim a spot: above the 1/2 of an
 exact linearization, so that a spot on a pixel edge is never left without a center."""
@@ -102,6 +108,11 @@ def predicted_spot_mask(simulator, radius_px: float, n_sd: float = 3.0) -> torch
                 centers = torch.zeros(S * F, dtype=torch.bool, device=hkl.device)
                 N = N.to(hkl)
             hkl, jacobian = hkl.reshape(-1, 3), jacobian.reshape(-1, 3, 2)
+            span = jacobian.abs().sum(-1).amax(0)                                          # (3,) per Miller index
+            if bool((span / 2 + n_sd * SPOT_SD / N >= 0.5).any()):
+                raise ValueError(f"a pixel spans up to {[round(float(v), 2) for v in span]} in the Miller indices, too "
+                                 f"much for spots {n_sd} sds wide at N {[float(v) for v in N]} to be placed from the "
+                                 "lattice point nearest each pixel center; use finer pixels or a smaller cell")
             g = torch.round(hkl)
             # In the metric's coordinates, x = N * (g - hkl_0) and A = N * J: delta* = argmin |x - A delta|.
             x = (g - hkl) * N
