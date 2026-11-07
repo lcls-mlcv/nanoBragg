@@ -1473,10 +1473,13 @@ class ExperimentModel(nn.Module):
         for detector in self._detectors:
             detector._ensure_geometry_current()
         key = tuple(detector._geometry_version for detector in self._detectors)
-        # mask_array is not geometry: a new one (set_mask_arrays) leaves the version alone, so it is
-        # tracked by identity, as Simulator tracks its own ROI mask.
-        masks = [detector.config.mask_array for detector in self._detectors]
-        if key == self._panel_pixels_key and all(a is b for a, b in zip(masks, self._panel_pixels_masks)):
+        # mask_array is not geometry: a new one (set_mask_arrays) or an in-place edit leaves the version alone,
+        # so each is tracked by identity and its in-place version counter, as Simulator tracks its ROI mask.
+        from ..simulator import _tensor_version
+        masks = [(detector.config.mask_array, _tensor_version(detector.config.mask_array))
+                 for detector in self._detectors]
+        if key == self._panel_pixels_key and len(masks) == len(self._panel_pixels_masks) and all(
+                a is b and u == v for (a, u), (b, v) in zip(masks, self._panel_pixels_masks)):
             return self._panel_pixels
         self._require_uniform_panels()
 
@@ -1693,7 +1696,12 @@ class ExperimentModel(nn.Module):
         if len(masks) != len(self._detectors):
             raise ValueError(f"one mask per panel: {len(self._detectors)} panels, {len(masks)} masks")
         for detector, mask in zip(self._detectors, masks):
-            detector.config.mask_array = torch.as_tensor(mask).to(device=self.device, dtype=self.dtype)
+            mask = torch.as_tensor(mask)
+            shape = (detector.config.spixels, detector.config.fpixels)
+            if tuple(mask.shape) != shape:
+                raise ValueError(f"mask shape {tuple(mask.shape)} does not match the panel's {shape}")
+            # a copy: a later edit of the caller's tensor does not reach the model
+            detector.config.mask_array = mask.to(device=self.device, dtype=self.dtype, copy=True)
 
     @torch.no_grad()
     def roi_centroids(self, observed=None) -> np.ndarray:

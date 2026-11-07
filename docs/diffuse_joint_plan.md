@@ -551,32 +551,46 @@ reference.
   - **Built for V2 (2026-11-06, `feat/diffuse-spot-mask`, stacked on D3b):**
     `nanobrag_torch.spot_mask.predicted_spot_mask(simulator, radius_px, n_sd=3)`.
     - Spots are predicted from the geometry, not from an image (a threshold on a still drops weak
-      partials). Each pixel center's fractional hkl is computed as the kernel computes it, and its
-      distance to the nearest integer hkl is taken in the HKL metric, Σ(N_i d_i)², in GAUSS-HKL
-      spot sds (0.397/N).
-    - An integer hkl within n_sd sds of some pixel is a spot. Its center is the nearest pixel, and
-      ties (a beam on a pixel corner) go to the lowest index.
-    - The mask is the union over phi steps, mosaic domains and sources, with no spot beyond dmin.
-      It is a fixed bool tensor with no gradient.
-    - `strided_pixels(keep, stride)` gives a `pixels=` subset of the kept pixels.
-    - hkl is taken at pixel centers only, not at the subpixels an oversampled image also samples.
-      The cutoff is the same rule as the pilot's in spot sds: V1's toy (N = 10) puts 3 sds at 0.12 in
-      Miller units, the pilot's cutoff; V2a's N_cells 20 gives 0.06.
+      partials), and on the detector surface, not at pixel centers. In V2a's regime a spot is far
+      smaller than a pixel (sd 0.397/20 = 0.02 in h against about 0.3 a pixel), so pixel centers
+      miss most spots. The first version did: the audit of 2026-11-06 measured 10-20 of 77-129
+      recorded spots predicted, and 72-94% of the Bragg photons outside even a 6 px mask.
+    - Around each pixel hkl is linearized in the in-plane offset δ, from the coordinates the kernel
+      uses (planar, then curved on a curved detector). For the nearest integer hkl, the HKL-metric
+      distance Σ(N_i d_i)² is minimized over δ: its minimum is the lattice point's excitation error
+      and δ* is where the spot falls. The hkl is a spot if that error is within n_sd GAUSS-HKL spot
+      sds (0.397/N) and δ* lies in the pixel (up to a margin of 3/4 px for the linearization; the
+      smallest |δ*| wins, then the lowest index).
+    - The cutoff is the pilot's rule in spot sds: V1's toy (N = 10) puts 3 sds at 0.12 in Miller
+      units, the pilot's cutoff; V2a's N_cells 20 gives 0.06.
+    - The mask is the union over phi steps, mosaic domains and sources, with no spot beyond dmin. It
+      is a fixed bool tensor with no gradient. `strided_pixels(keep, stride)` gives a `pixels=`
+      subset of the kept pixels.
+    - Only GAUSS under the HKL metric with fudge 1 and no N_cells_def is supported; other spot shapes
+      are refused rather than masked with the wrong width. Thick-sensor layers are not sampled.
+    - Measured on V2a-like stills (lysozyme cell, N 20, 0.4 mm at 100 mm, 128², oversample 3, three
+      orientations; the audit's probe): Bragg photons outside the mask 0.2-0.5% at r = 2 px, against
+      72-94% before; at N 10 and 20 and oversample 1-4, under 0.7% beyond 2.5 px. On MPS the mask
+      equals the CPU's, and float32 equals float64.
     - `ExperimentModel.spot_masks(radius_px, n_sd)` builds one per panel at the current geometry.
       It stays fixed while the geometry refines, until called again.
-    - `ExperimentModel.set_mask_arrays(masks)` replaces each panel's `mask_array`, so a radius sweep
-      can go back and forth; a beamstop mask is combined by the caller. Both components then drop
-      those pixels, on the whole-image and ROI paths. It refuses on shots that share one Detector
-      (`SerialExperiment(share_detector=True)`), whose per-shot pixels go through `strided_pixels`.
+    - `ExperimentModel.set_mask_arrays(masks)` replaces each panel's `mask_array` with a copy of the
+      mask (shape checked), so a radius sweep can go back and forth; a beamstop mask is combined by
+      the caller. Both components then drop those pixels, on the whole-image and ROI paths. It
+      refuses on shots that share one Detector (`SerialExperiment(share_detector=True)`), whose
+      per-shot pixels go through `strided_pixels`.
     - The multi-panel ROI path cached its pixels on the geometry version alone, so a `mask_array`
-      set after a forward never reached it. It now tracks each panel's mask by identity, as the
-      Simulator already did (no change when no mask changes).
+      replaced or edited in place after a forward never reached it. It now tracks each panel's mask
+      by identity and in-place version counter, as the Simulator does (no change when no mask
+      changes).
     - Tests (`tests/test_spot_mask.py`, float64 and float32): the predicted centers are the Bragg
-      image's maxima; a hand-counted direct-beam case with a beam on a pixel corner; mosaic and
-      phi give a superset; dmin; two sources of different wavelength give the union of each alone;
-      strided pixels; masks zero both components; masks set after a forward reach the ROI path on
-      one and two panels and replace each other; they stay fixed while misset moves; shared
-      detectors refuse. The union, dmin, source and refusal tests were mutation-checked.
+      image's maxima; spots smaller than a pixel, against the oversample-3 Bragg image (every
+      recorded spot masked at r = 2, over 95% of the photons inside); a curved detector; other spot
+      widths refused; a hand-counted direct-beam case with a beam on a pixel corner; mosaic and phi
+      give a superset; dmin; two sources of different wavelength give the union of each alone;
+      strided pixels; masks zero both components; masks set after a forward, or a beamstop edited
+      in place, reach the ROI path on one and two panels; masks replace each other and stay fixed
+      while misset moves; shared detectors refuse; the setter copies and checks the shape.
 - **The spot-mask pilot, and the grid recommended for eryx (decided 2026-11-06).**
   - The pilot: eryx `torchbragg-core` ebe9e81, `core_bias.py --mask-radius`. Lysozyme 193l,
     n_cells 20, mesh 4, k_floor 0.025, V1 geometry at 128², k_d frozen. z is scaled to 1e6

@@ -47,7 +47,9 @@ def test_centers_are_the_bragg_images_maxima(dtype):
     maxima = local_maxima(image, 2e-2 * image.max())
     assert maxima.sum() >= 5, "the test geometry must record several spots"
     centers = ~predicted_spot_mask(sim, radius_px=1.0)
-    assert not (maxima & ~centers).any(), "a recorded spot was not predicted"
+    # A spot on a pixel corner (here 000, the direct beam) records equal maxima in up to four pixels, of which
+    # one is its center: r = 1.5 reaches the diagonal neighbors.
+    assert not (maxima & predicted_spot_mask(sim, radius_px=1.5)).any(), "a recorded spot was not predicted"
     on_maxima = local_maxima(image, 0.0)[centers].float().mean()
     assert on_maxima > 0.9, f"only {on_maxima:.2f} of the predicted centers are maxima of the image"
 
@@ -155,9 +157,10 @@ def test_several_sources_mask_the_union_of_each_alone(dmin):
     assert torch.equal(together, alone[0] | alone[1])
 
 
-def two_panels(**kwargs):
+def two_panels(mask_array=None, **kwargs):
     # Two panels, the second shifted sideways: the multi-panel ROI path caches its pixels (with their masks)
-    panels = [DetectorConfig(**DETECTOR, beam_center_f=f, beam_center_s=16.0) for f in (16.0, -16.0)]
+    panels = [DetectorConfig(**DETECTOR, beam_center_f=f, beam_center_s=16.0, mask_array=mask_array)
+              for f in (16.0, -16.0)]
     return ExperimentModel(CrystalConfig(**CRYSTAL), panels, BeamConfig(**BEAM), dtype=torch.float64,
                            diffuse=GaussianHalo(amplitude=40.0, sigma=0.15), **kwargs)
 
@@ -185,3 +188,67 @@ def test_shots_sharing_a_detector_refuse_a_mask_of_their_own():
     for shot in serial.shots:
         with pytest.raises(ValueError, match="shared"):
             shot.set_mask_arrays(shot.spot_masks(radius_px=2.0))
+
+
+LYSOZYME_LIKE = dict(cell_a=79.0, cell_b=79.0, cell_c=38.0, N_cells=(20, 20, 20), misset_deg=(5.0, 7.0, 11.0))
+FINE = dict(spixels=128, fpixels=128, distance_mm=100.0, pixel_size_mm=0.4)
+
+
+def test_spots_smaller_than_a_pixel_are_predicted():
+    # V2a's regime: a spot (sd 0.397/20 = 0.02 in h) far smaller than a pixel (about 0.3 in h), recorded by the
+    # kernel's subpixels. Every spot of the oversampled image must be masked, and the mask must hold its photons.
+    sim = simulator(crystal=LYSOZYME_LIKE, detector=FINE)
+    image = sim.run(oversample=3)
+    maxima = local_maxima(image, 2e-2 * image.max())
+    assert maxima.sum() >= 20
+    keep = predicted_spot_mask(sim, radius_px=2.0)
+    assert not (maxima & keep).any(), f"{int((maxima & keep).sum())} of {int(maxima.sum())} recorded spots kept"
+    masked_share = float(image[~keep].sum() / image.sum())
+    assert masked_share > 0.95, f"the mask holds only {masked_share:.3f} of the Bragg photons"
+
+
+def test_curved_detector_spots_are_predicted():
+    sim = simulator(detector=dict(curved_detector=True, distance_mm=50.0))
+    image = sim.run(oversample=1)
+    maxima = local_maxima(image, 2e-2 * image.max())
+    assert maxima.sum() >= 5
+    keep = predicted_spot_mask(sim, radius_px=1.5)
+    assert not (maxima & keep).any(), f"{int((maxima & keep).sum())} of {int(maxima.sum())} recorded spots kept"
+
+
+@pytest.mark.parametrize("crystal", [dict(spot_metric=SpotMetric.RECIPROCAL), dict(shape=CrystalShape.SQUARE),
+                                     dict(fudge=0.25), dict(N_cells_def=(1.0, 0.0, 0.0))])
+def test_spot_widths_other_than_gauss_hkl_are_refused(crystal):
+    with pytest.raises(ValueError, match="GAUSS"):
+        predicted_spot_mask(simulator(crystal=crystal), radius_px=1.0)
+
+
+@pytest.mark.parametrize("panels", [1, 2])
+def test_a_beamstop_edited_in_place_reaches_the_roi_path(panels):
+    # A caller's DetectorConfig mask is the model's own tensor, so editing it in place must reach both paths
+    # (Simulator tracks a mask's version as well as its identity; the multi-panel ROI cache must too).
+    beamstop = torch.ones(64, 64)
+    if panels == 1:
+        model = experiment(mask_array=beamstop, background_rois=[(0, 63, 0, 63)])
+    else:
+        model = two_panels(mask_array=beamstop, background_rois=[(0, 63, 0, 63)] * 2, background_panels=[0, 1])
+    model.freeze()
+    with torch.no_grad():
+        assert (model(roi_only=True) > 0).all()
+        beamstop[10:20, 10:20] = 0
+        values = model(roi_only=True)
+    slow, fast = model.background_params.pixels.T
+    shadowed = (slow >= 10) & (slow < 20) & (fast >= 10) & (fast < 20)
+    assert torch.equal(values == 0, shadowed)            # the one beamstop tensor is on every panel
+
+
+def test_set_mask_arrays_copies_and_checks_the_shape():
+    model = experiment()
+    mask = torch.ones(64, 64, dtype=torch.bool)
+    model.set_mask_arrays([mask])
+    mask[:] = False                                            # the caller's tensor is not the model's
+    with torch.no_grad():
+        model()
+    assert (model.components["diffuse"] > 0).all()
+    with pytest.raises(ValueError, match="shape"):
+        model.set_mask_arrays([torch.ones(10, 10)])
